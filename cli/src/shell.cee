@@ -1,0 +1,755 @@
+// The shell: SQL and dot-commands from the command line, standard input or a file read by `.read`, with results
+// and errors printed as the sqlite3 shell prints them.
+//
+// Input is read as shell.c's process_input reads it: a line that starts with `.` when no statement is pending is
+// a dot-command; other lines gather until the text is complete as sqlite3_complete decides (the library's script
+// splitter, `isComplete`), and then run. A statement that cannot be prepared ends the text it is part of ("Parse
+// error"); one that fails as it runs does not ("Error"). Either makes the exit status 1. On the command line, each
+// argument is one text, and the first that fails ends the run.
+
+import sqlite;
+
+/// Where SQL came from, for the place an error message names.
+struct Place {
+    /// The argument's position on the command line (1 is the first after the program's name), or 0 for lines.
+    argument: usize;
+    /// The file `.read` reads, empty for standard input.
+    file: String;
+    /// The line on which the failing text starts.
+    line: usize;
+}
+
+/// Lines of input: standard input, or a text (a file `.read` reads, or a test's input).
+struct Lines {
+    console: bool;
+    text: String;
+    at: usize;
+
+    fn ofConsole() -> Lines => Lines { console: true, text: String.create(), at: 0 };
+
+    fn ofText(text: String) -> Lines => Lines { console: false, text: text, at: 0 };
+
+    /// The next line, without its line ending, into `line`; false at the end of the input.
+    fn next(borrow mut this, line: borrow mut String) -> Result<bool, AllocError> {
+        line.clear();
+        if (this.console) {
+            return Ok(match (Console.readLine(mut line)) { Ok(more) => more, Err(_) => false });
+        }
+        let text = this.text.view();
+        if (this.at >= text.length) {
+            return Ok(false);
+        }
+        let rest = text[this.at..];
+        var end = rest.indexOfByte('\n') ?? rest.length;
+        this.at += (end + 1).min(rest.length);
+        if (end > 0 && rest[end - 1] == '\r') {
+            end -= 1;
+        }
+        line.append(rest[0..end])?;
+        return Ok(true);
+    }
+}
+
+/// Whether `sql` holds no statement: only spaces, comments and semicolons.
+fn isBlank(sql: StringView) -> Result<bool, AllocError> => Ok(splitScript(sql)?.length == 0);
+
+/// Whether `sql` ends a statement, as sqlite3_complete decides: a word written after it would start another.
+fn isComplete(sql: StringView) -> Result<bool, AllocError> {
+    var probe = String.from(sql)?;
+    probe.append("\nx")?;
+    let spans = splitScript(probe.view())?;
+    return Ok(spans.length != 0 && spans[spans.length - 1].start >= sql.length);
+}
+
+/// Whether the error `e` is one SQLite reports when it prepares a statement ("Parse error") rather than when it
+/// runs it ("Error"). The engine does not tell the two apart, so this goes by the kind of error and, for SQL
+/// errors, by the messages SQLite gives only as a statement runs.
+fn isPrepareError(e: borrow SqliteError) -> bool => match (e) {
+    SqliteError.Sql(m) => !isRuntimeMessage(m.view()),
+    SqliteError.Unsupported(_) => true,
+    _ => false,
+};
+
+fn isRuntimeMessage(message: StringView) -> bool =>
+    message.startsWith("cannot commit") ||
+        message.startsWith("cannot rollback") ||
+        message.startsWith("cannot start a transaction") ||
+        message.startsWith("no such savepoint") ||
+        message.startsWith("integer overflow") ||
+        message.startsWith("too many levels of trigger recursion") ||
+        message.startsWith("malformed JSON") ||
+        message.startsWith("JSON ") ||
+        message.startsWith("bad JSON path") ||
+        message.startsWith("string or blob too big") ||
+        message.startsWith("database or disk is full") ||
+        message.startsWith("abort due to");
+
+/// Appends `n` as an English ordinal: 1st, 2nd, 3rd, 4th, 11th, 21st.
+fn appendOrdinal(out: borrow mut String, n: usize) -> Result<void, AllocError> {
+    out.appendNumber(n)?;
+    let suffix =
+        if (n % 100 >= 11 && n % 100 <= 13) "th"
+            else if (n % 10 == 1) "st"
+            else if (n % 10 == 2) "nd"
+            else if (n % 10 == 3) "rd"
+            else "th";
+    return out.append(suffix);
+}
+
+/// A dot-command's words: split at spaces, with '…' and "…" quoting words that hold spaces.
+fn dotWords(line: StringView) -> Result<Vector<String>, AllocError> {
+    var words = Vector<String>.create();
+    let n = line.length;
+    var i: usize = 0;
+    while (i < n) {
+        while (i < n && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r')) {
+            i += 1;
+        }
+        if (i >= n) {
+            break;
+        }
+        let quote = line[i];
+        if (quote == '"' || quote == '\'') {
+            let start = i + 1;
+            i = start;
+            while (i < n && line[i] != quote) {
+                i += 1;
+            }
+            words.push(String.from(line[start..i])?)?;
+            i = (i + 1).min(n);
+        } else {
+            let start = i;
+            while (i < n && line[i] != ' ' && line[i] != '\t' && line[i] != '\r') {
+                i += 1;
+            }
+            words.push(String.from(line[start..i])?)?;
+        }
+    }
+    return Ok(words);
+}
+
+/// A boolean argument as shell.c's booleanValue reads it; null for one it does not know.
+fn booleanValue(word: StringView) -> bool? {
+    if (word.equalsIgnoreAsciiCase("on") || word.equalsIgnoreAsciiCase("yes") || word.equalsIgnoreAsciiCase("true")) {
+        return true;
+    }
+    if (word.equalsIgnoreAsciiCase("off") || word.equalsIgnoreAsciiCase("no") || word.equalsIgnoreAsciiCase("false")) {
+        return false;
+    }
+    return match (word.parseInt<i64>()) {
+        Some(n) => n != 0,
+        null => null,
+    };
+}
+
+/// Whether `name` can be written in SQL without quotes: a letter or `_`, then letters, digits and `_`.
+fn isPlainName(name: StringView) -> bool {
+    if (name.length == 0) {
+        return false;
+    }
+    for (i in 0..name.length) {
+        let c = name[i];
+        let letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+        let digit = c >= '0' && c <= '9';
+        if (!letter && !(digit && i != 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+const HELP: StringView = """
+    .bail on|off             Stop after hitting an error.  Default OFF
+    .exit ?CODE?             Exit this program with return-code CODE
+    .headers on|off          Turn display of headers on or off
+    .help                    Show this message
+    .mode ?MODE?             Set output mode: column, csv, line or list
+    .quit                    Stop interpreting input stream, exit if primary.
+    .read FILE               Read input from FILE
+    .schema ?PATTERN?        Show the CREATE statements matching PATTERN
+    .tables ?PATTERN?        List names of tables matching LIKE pattern PATTERN
+
+    """;
+
+/// The shell's state.
+struct Shell {
+    connection: Connection;
+    mode: OutputMode;
+    /// `.headers`; null until it is given, when only column mode shows headings.
+    headers: bool?;
+    /// `.bail`: stop at the first error.
+    bail: bool;
+    /// What is printed, until `flush` writes it.
+    out: Vector<u8>;
+    errors: String;
+    /// Whether an error happened: the exit status is then 1.
+    errorCount: usize;
+    /// `.quit` or `.exit` was given.
+    quit: bool;
+    /// The status `.exit` gave.
+    exitStatus: i32?;
+    /// Whether `flush` writes to the console (false in tests, which read `out` and `errors`).
+    live: bool;
+    /// How many `.read`s are running inside each other.
+    depth: usize;
+
+    /// Writes what was printed to standard output and standard error.
+    fn flush(borrow mut this) {
+        if (!this.live) {
+            return;
+        }
+        if (this.out.length != 0) {
+            Console.writeBytes(this.out.view());
+            this.out.clear();
+            Console.flush();
+        }
+        if (this.errors.length != 0) {
+            Console.writeError(this.errors.view());
+            this.errors.clear();
+        }
+    }
+
+    fn showHeaders(borrow this) -> bool => match (this.headers) {
+        Some(h) => h,
+        null => match (this.mode) {
+            OutputMode.Column => true,
+            _ => false,
+        },
+    };
+
+    /// Reports an error of a statement from `place`.
+    fn reportSqlError(
+        borrow mut this,
+        prepare: bool,
+        message: StringView,
+        place: borrow Place,
+    ) -> Result<void, AllocError> {
+        this.errorCount += 1;
+        this.errors.append(if (prepare) "Parse error" else "Error")?;
+        if (place.argument != 0) {
+            this.errors.append(" in ")?;
+            appendOrdinal(mut this.errors, place.argument)?;
+            this.errors.append(" command line argument: ")?;
+        } else {
+            this.errors.append(" near line ")?;
+            this.errors.appendNumber(place.line)?;
+            if (place.file.length != 0) {
+                this.errors.append(" of ")?;
+                this.errors.append(place.file.view())?;
+            }
+            this.errors.append(": ")?;
+        }
+        this.errors.append(message)?;
+        this.errors.append("\n")?;
+        return Ok();
+    }
+
+    fn reportError(borrow mut this, message: StringView) -> Result<void, AllocError> {
+        this.errorCount += 1;
+        this.errors.append(message)?;
+        this.errors.append("\n")?;
+        return Ok();
+    }
+
+    /// Runs the statements of `sql` in order, printing their results; false when one failed. A statement that
+    /// cannot be prepared leaves the rest of `sql`, and so does any failure under `.bail`.
+    fn runSql(borrow mut this, sql: StringView, place: borrow Place) -> Result<bool, AllocError> {
+        let spans = splitScript(sql)?;
+        let none = Params.create();
+        let before = this.errorCount;
+        for (i in 0..spans.length) {
+            let text = sql[spans[i].start..spans[i].end];
+            match (this.connection.query(text, borrow none)) {
+                Ok(result) => {
+                    let headers = this.showHeaders();
+                    printResult(mut this.out, borrow result, this.mode, headers)?;
+                }
+                Err(e) => {
+                    let prepare = isPrepareError(borrow e);
+                    this.reportSqlError(prepare, e.message(), place)?;
+                    if (prepare || this.bail) {
+                        this.flush();
+                        return Ok(false);
+                    }
+                }
+            }
+            this.flush();
+        }
+        return Ok(this.errorCount == before);
+    }
+
+    /// The rows of a query the shell makes itself; an error is reported, and gives no row.
+    fn ask(borrow mut this, sql: StringView, params: borrow Params) -> Result<QueryResult?, AllocError> {
+        match (this.connection.query(sql, params)) {
+            Ok(result) => { return Ok(result); }
+            Err(e) => {
+                var message = String.from("Error: ")?;
+                message.append(e.message())?;
+                this.reportError(message.view())?;
+                return Ok(null);
+            }
+        }
+    }
+
+    /// `.tables ?PATTERN?`: the names of tables and views, sorted, in columns.
+    fn tables(borrow mut this, pattern: StringView?) -> Result<void, AllocError> {
+        var sql = String.from(
+            "SELECT name FROM sqlite_schema WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'",
+        )?;
+        var params = Params.create();
+        if (pattern is Some(p)) {
+            sql.append(" AND name LIKE ?1")?;
+            params.add(SqliteValue.text(p)?)?;
+        }
+        sql.append(" ORDER BY 1")?;
+        let result = this.ask(sql.view(), borrow params)? ?? { return Ok(); };
+        var names = Vector<Vector<u8>>.create();
+        for (r in 0..result.rows.length) {
+            names.push(cellBytes(borrow result.rows[r][0])?)?;
+        }
+        if (names.length == 0) {
+            return Ok();
+        }
+        // The fewest rows whose columns, each as wide as its longest name and four spaces apart, fit in 80
+        // characters; names go down the columns. On one row, the shell sets the names five spaces apart.
+        var rows: usize = 1;
+        while (rows < names.length) {
+            let columns = (names.length + rows - 1) / rows;
+            var total: usize = 0;
+            for (c in 0..columns) {
+                var widest: usize = 0;
+                for (r in 0..rows) {
+                    if (c * rows + r < names.length) {
+                        widest = widest.max(displayWidth(names[c * rows + r].view()));
+                    }
+                }
+                total += widest + (if (c == 0) 0 else 4);
+            }
+            if (total <= 80) {
+                break;
+            }
+            rows += 1;
+        }
+        let columns = (names.length + rows - 1) / rows;
+        let gap: usize = if (rows == 1) 5 else 4;
+        var widths = Vector<usize>.create();
+        for (c in 0..columns) {
+            var widest: usize = 0;
+            for (r in 0..rows) {
+                if (c * rows + r < names.length) {
+                    widest = widest.max(displayWidth(names[c * rows + r].view()));
+                }
+            }
+            widths.push(widest)?;
+        }
+        for (r in 0..rows) {
+            let start = this.out.length;
+            for (c in 0..columns) {
+                let k = c * rows + r;
+                if (k >= names.length) {
+                    break;
+                }
+                if (c != 0) {
+                    appendSpaces(mut this.out, gap)?;
+                }
+                appendPadded(mut this.out, names[k].view(), widths[c], false)?;
+            }
+            endLine(mut this.out, start)?;
+        }
+        return Ok();
+    }
+
+    /// `.schema ?PATTERN?`: the CREATE statements in the order they were made; a view's is followed by its columns
+    /// in a comment, as the shell adds them.
+    fn schema(borrow mut this, pattern: StringView?) -> Result<void, AllocError> {
+        var sql = String.from("SELECT type, name, sql FROM sqlite_schema WHERE sql IS NOT NULL")?;
+        var params = Params.create();
+        if (pattern is Some(p)) {
+            sql.append(" AND (name LIKE ?1 OR tbl_name LIKE ?1)")?;
+            params.add(SqliteValue.text(p)?)?;
+        }
+        sql.append(" ORDER BY rowid")?;
+        let result = this.ask(sql.view(), borrow params)? ?? { return Ok(); };
+        let none = Params.create();
+        for (r in 0..result.rows.length) {
+            let row = borrow result.rows[r];
+            let statement = cellBytes(borrow row[2])?;
+            this.out.extend(statement.view())?;
+            let kind = cellBytes(borrow row[0])?;
+            if (kind.view() == "view".bytes()) {
+                let name = row[1].toText()?;
+                var probe = String.from("SELECT * FROM \"")?;
+                for (i in 0..name.length) {
+                    if (name.view()[i] == '"') {
+                        probe.append("\"")?;
+                    }
+                }
+                probe.append(name.view())?;
+                probe.append("\" LIMIT 0")?;
+                if (this.connection.query(probe.view(), borrow none) is Ok(columns)) {
+                    this.out.extend("\n/* ".bytes())?;
+                    this.out.extend(name.view().bytes())?;
+                    this.out.push('(')?;
+                    for (c in 0..columns.columns.length) {
+                        if (c != 0) {
+                            this.out.push(',')?;
+                        }
+                        let column = columns.columns[c].view();
+                        if (isPlainName(column)) {
+                            this.out.extend(column.bytes())?;
+                        } else {
+                            this.out.push('"')?;
+                            this.out.extend(column.bytes())?;
+                            this.out.push('"')?;
+                        }
+                    }
+                    this.out.extend(") */".bytes())?;
+                }
+            }
+            this.out.extend(";\n".bytes())?;
+        }
+        return Ok();
+    }
+
+    /// Runs a dot-command; false when it failed.
+    fn dotCommand(borrow mut this, line: StringView, place: borrow Place) -> Result<bool, AllocError> {
+        let words = dotWords(line[1..])?;
+        if (words.length == 0) {
+            return Ok(true);
+        }
+        let name = words[0].view();
+        let argument: StringView? = if (words.length > 1) words[1].view() else null;
+        if (name == "quit" || name == "q") {
+            this.quit = true;
+            return Ok(true);
+        }
+        if (name == "exit") {
+            this.quit = true;
+            this.exitStatus = match (argument) {
+                Some(a) => a.parseInt<i32>() ?? 0,
+                null => 0,
+            };
+            return Ok(true);
+        }
+        if (name == "headers" || name == "header") {
+            if (words.length != 2) {
+                this.reportError("Usage: .headers on|off")?;
+                return Ok(false);
+            }
+            this.headers = this.booleanArgument(words[1].view())?;
+            return Ok(true);
+        }
+        if (name == "bail") {
+            if (words.length != 2) {
+                this.reportError("Usage: .bail on|off")?;
+                return Ok(false);
+            }
+            this.bail = this.booleanArgument(words[1].view())?;
+            return Ok(true);
+        }
+        if (name == "mode") {
+            match (argument) {
+                null => {
+                    this.out.extend(".mode ".bytes())?;
+                    this.out.extend(modeName(this.mode).bytes())?;
+                    // The headings setting is shown where it differs from the mode's own; line mode has none.
+                    let column = match (this.mode) {
+                        OutputMode.Column => true,
+                        _ => false,
+                    };
+                    let lineMode = match (this.mode) {
+                        OutputMode.Line => true,
+                        _ => false,
+                    };
+                    if (this.headers is Some(h) && h != column && !lineMode) {
+                        this.out.extend((if (h) " --titles on" else " --titles off").bytes())?;
+                    }
+                    this.out.push('\n')?;
+                }
+                Some(a) => {
+                    match (modeNamed(a)) {
+                        Some(m) => { this.mode = m; }
+                        null => {
+                            var message = String.from("Error: unknown mode \"")?;
+                            message.append(a)?;
+                            message.append("\": use column, csv, line or list")?;
+                            this.reportError(message.view())?;
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+            return Ok(true);
+        }
+        if (name == "tables") {
+            let before = this.errorCount;
+            this.tables(argument)?;
+            return Ok(this.errorCount == before);
+        }
+        if (name == "schema") {
+            let before = this.errorCount;
+            this.schema(argument)?;
+            return Ok(this.errorCount == before);
+        }
+        if (name == "help") {
+            this.out.extend(HELP.bytes())?;
+            return Ok(true);
+        }
+        if (name == "read") {
+            let file = argument ?? {
+                this.reportError("Usage: .read FILE")?;
+                return Ok(false);
+            };
+            return this.readFile(file);
+        }
+        var message = String.from("Error: unknown command or invalid arguments:  \"")?;
+        message.append(name)?;
+        message.append("\". Enter \".help\" for help")?;
+        this.reportError(message.view())?;
+        let _ = place;
+        return Ok(false);
+    }
+
+    fn booleanArgument(borrow mut this, word: StringView) -> Result<bool, AllocError> {
+        match (booleanValue(word)) {
+            Some(b) => { return Ok(b); }
+            null => {
+                var message = String.from("ERROR: Not a boolean value: \"")?;
+                message.append(word)?;
+                message.append("\". Assuming \"no\".")?;
+                this.errors.append(message.view())?;
+                this.errors.append("\n")?;
+                return Ok(false);
+            }
+        }
+    }
+
+    /// `.read FILE`: runs the file's lines as input.
+    fn readFile(borrow mut this, path: StringView) -> Result<bool, AllocError> {
+        let before = this.errorCount;
+        let text = match (readWholeFile(path)) {
+            Ok(t) => t,
+            Err(_) => {
+                var message = String.from("Error: cannot open \"")?;
+                message.append(path)?;
+                message.append("\"")?;
+                this.reportError(message.view())?;
+                return Ok(false);
+            }
+        };
+        if (this.depth >= 25) {
+            this.reportError("Error: .read is nested too deeply")?;
+            return Ok(false);
+        }
+        this.depth += 1;
+        var lines = Lines.ofText(text);
+        let finished = this.processInput(mut lines, path);
+        this.depth -= 1;
+        finished?;
+        return Ok(this.errorCount == before);
+    }
+
+    /// Runs input line by line, as shell.c's process_input does. `file` names it in errors (empty for standard
+    /// input).
+    fn processInput(borrow mut this, lines: borrow mut Lines, file: StringView) -> Result<void, AllocError> {
+        var place = Place { argument: 0, file: String.from(file)?, line: 0 };
+        var buffer = String.create();
+        var line = String.create();
+        var lineNumber: usize = 0;
+        var startLine: usize = 0;
+        // As in shell.c, `.bail` stops at the first error of this input, including one made before `.bail on`.
+        let before = this.errorCount;
+        while (!this.quit && (this.errorCount == before || !this.bail) && lines.next(mut line)?) {
+            lineNumber += 1;
+            let text = line.view();
+            if (buffer.length == 0) {
+                if (text.startsWith(".")) {
+                    place.line = lineNumber;
+                    let _ = this.dotCommand(text, borrow place)?;
+                    this.flush();
+                    continue;
+                }
+                if (text.startsWith("#") || isBlank(text)?) {
+                    continue;
+                }
+                startLine = lineNumber;
+            }
+            buffer.append(text)?;
+            buffer.append("\n")?;
+            if (isComplete(buffer.view())?) {
+                place.line = startLine;
+                let _ = this.runSql(buffer.view(), borrow place)?;
+                buffer.clear();
+            }
+        }
+        if (!this.quit && (this.errorCount == before || !this.bail) && !isBlank(buffer.view())?) {
+            place.line = startLine;
+            let _ = this.runSql(buffer.view(), borrow place)?;
+        }
+        return Ok();
+    }
+}
+
+/// The bytes of the file at `path`, as text.
+fn readWholeFile(path: StringView) -> Result<String, IoError> {
+    var file = File.open(path)?;
+    var bytes = Vector<u8>.create();
+    var buffer = [0u8; 4096];
+    loop {
+        let n = file.read(mut buffer[..])?;
+        if (n == 0) {
+            break;
+        }
+        if (bytes.extend(buffer[0..n]) is Err(_)) {
+            return Err(IoError.OutOfMemory);
+        }
+    }
+    let text = StringView.fromUtf8(bytes.view()) ?? { return Err(IoError.InvalidInput); };
+    return match (String.from(text)) {
+        Ok(s) => Ok(s),
+        Err(_) => Err(IoError.OutOfMemory),
+    };
+}
+
+/// What a run of the shell printed, and its exit status.
+struct ShellRun {
+    out: Vector<u8>;
+    errors: String;
+    status: i32;
+}
+
+/// Runs the shell with the command-line `arguments` (without the program's name), reading lines from `input`
+/// when no argument gives SQL. With `live`, output goes to the console as it is made; else it is kept in the
+/// result.
+fn runShell(arguments: Slice<StringView>, input: Lines, live: bool) -> Result<ShellRun, AllocError> {
+    var path: StringView? = null;
+    var commands = Vector<usize>.create();
+    var mode = OutputMode.List;
+    var headers: bool? = null;
+    var bail = false;
+    for (i in 0..arguments.length) {
+        let a = arguments[i];
+        if (path.isSome() && commands.length != 0 || !a.startsWith("-") || a.length == 1) {
+            if (path.isNull()) {
+                path = a;
+            } else {
+                commands.push(i)?;
+            }
+            continue;
+        }
+        let option = if (a.startsWith("--")) a[2..] else a[1..];
+        if (option == "header" || option == "headers") {
+            headers = true;
+        } else if (option == "noheader" || option == "noheaders") {
+            headers = false;
+        } else if (option == "csv") {
+            mode = OutputMode.Csv;
+        } else if (option == "line") {
+            mode = OutputMode.Line;
+        } else if (option == "list") {
+            mode = OutputMode.List;
+        } else if (option == "column") {
+            mode = OutputMode.Column;
+        } else if (option == "bail") {
+            bail = true;
+        } else {
+            var errors = String.from("sqlite3: Error: unknown option: ")?;
+            errors.append(option)?;
+            errors.append("\nUse -help for a list of options.\n")?;
+            if (live) {
+                Console.writeError(errors.view());
+                errors.clear();
+            }
+            return Ok(ShellRun { out: Vector<u8>.create(), errors: errors, status: 1 });
+        }
+    }
+    // Without a file, SQLite opens an in-memory database; this engine keeps databases in files, so the shell
+    // uses a temporary one, removed at the end.
+    var temporary = String.create();
+    let file = match (path) {
+        Some(p) => p,
+        null => {
+            temporary.append(Environment.variable("TMPDIR") ?? "/tmp/")?;
+            if (!temporary.view().endsWith("/")) {
+                temporary.append("/")?;
+            }
+            temporary.append("sqlite-shell-")?;
+            temporary.appendNumber(match (Random.below(1u64 << 48)) { Ok(n) => n, Err(_) => 0 })?;
+            temporary.append(".db")?;
+            temporary.view()
+        },
+    };
+    let connection = match (Connection.open(file)) {
+        Ok(c) => c,
+        Err(e) => {
+            var errors = String.from("Error: unable to open database \"")?;
+            errors.append(file)?;
+            errors.append("\": ")?;
+            errors.append(match (e) {
+                SqliteError.Io(_) => "unable to open database file",
+                _ => e.message(),
+            })?;
+            errors.append("\n")?;
+            if (live) {
+                Console.writeError(errors.view());
+                errors.clear();
+            }
+            return Ok(ShellRun { out: Vector<u8>.create(), errors: errors, status: 1 });
+        }
+    };
+    var shell = Shell {
+        connection: connection,
+        mode: mode,
+        headers: headers,
+        bail: bail,
+        out: Vector<u8>.create(),
+        errors: String.create(),
+        errorCount: 0,
+        quit: false,
+        exitStatus: null,
+        live: live,
+        depth: 0,
+    };
+    if (commands.length != 0) {
+        for (k in 0..commands.length) {
+            let i = commands[k];
+            let text = arguments[i];
+            // The position counts from the program's name, which `arguments` leaves out.
+            let place = Place { argument: i + 1, file: String.create(), line: 1 };
+            if (text.startsWith(".")) {
+                let _ = shell.dotCommand(text, borrow place)?;
+            } else {
+                let _ = shell.runSql(text, borrow place)?;
+            }
+            shell.flush();
+            if (shell.errorCount != 0 || shell.quit) {
+                break;
+            }
+        }
+    } else {
+        var lines = input;
+        shell.processInput(mut lines, "")?;
+    }
+    shell.flush();
+    let status = shell.exitStatus ?? (if (shell.errorCount != 0) 1 else 0);
+    var out = replace(mut shell.out, Vector<u8>.create());
+    var errors = replace(mut shell.errors, String.create());
+    match (shell.connection.close()) {
+        Ok() => {}
+        Err(e) => {
+            errors.append("Error: ")?;
+            errors.append(e.message())?;
+            errors.append("\n")?;
+        }
+    }
+    if (temporary.length != 0) {
+        let _ = File.remove(temporary.view());
+    }
+    if (live) {
+        Console.writeBytes(out.view());
+        out.clear();
+        Console.writeError(errors.view());
+        errors.clear();
+    }
+    return Ok(ShellRun { out: out, errors: errors, status: status });
+}

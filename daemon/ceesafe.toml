@@ -1,0 +1,10 @@
+[package]
+name = "sqlited"
+version = "0.1.0"
+kind = "executable"
+ceesafec = ">=0.93.7"
+tests = ["tests"]
+
+[dependencies]
+sqlite = { path = ".." }
+pgwire = { path = "../pgwire" }

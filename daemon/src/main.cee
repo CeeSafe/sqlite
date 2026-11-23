@@ -1,0 +1,176 @@
+// sqlited: SQLite databases served over the PostgreSQL wire protocol (pgwire/), and nothing else.
+//
+//   sqlited [--bind HOST:PORT] [--data DIRECTORY] [--trust]
+//
+//   --bind     where to listen (default 127.0.0.1:5432; SQLITED_BIND)
+//   --data     the data directory, made if missing (default ./data; SQLITED_DATA); database NAME is
+//              DIRECTORY/NAME/main.db, made on first use
+//   --trust    let every client in without a password
+//
+// Clients authenticate with the password in SQLITED_PASSWORD (at least 8 characters, any user name), sent as
+// PostgreSQL's cleartext password: use it on a trusted network or behind TLS termination. Without a password the
+// daemon refuses to start unless --trust is given. Ctrl+C or SIGTERM stops it: it stops accepting, gives the
+// clients five seconds to finish, and exits.
+//
+//   psql "host=127.0.0.1 port=5432 user=me dbname=mydb"
+
+import pgwire;
+
+/// The daemon's settings.
+struct Settings {
+    host: String;
+    port: u16;
+    data: String;
+    password: String?;
+}
+
+/// `HOST:PORT` (IPv4, `localhost`, or IPv6 in brackets, `[::1]:5432`) as a host and a port; null for text that is
+/// not one.
+fn parseBind(text: StringView) -> Result<Settings?, AllocError> {
+    let colon = text.lastIndexOf(":") ?? { return Ok(null); };
+    let port = text[colon + 1..].parseInt<u16>() ?? { return Ok(null); };
+    var host = text[0..colon];
+    if (host.startsWith("[") && host.endsWith("]")) {
+        host = host[1..host.length - 1];
+    }
+    if (host == "localhost") {
+        host = "127.0.0.1";
+    }
+    if (host.length == 0) {
+        return Ok(null);
+    }
+    return Ok(Settings { host: String.from(host)?, port: port, data: String.create(), password: null });
+}
+
+/// The settings from the command line `arguments` (without the program's name) and the environment variables
+/// `bind`, `data` and `password` (SQLITED_BIND, SQLITED_DATA, SQLITED_PASSWORD); an error message when they are
+/// wrong.
+fn settingsFrom(
+    arguments: Slice<StringView>,
+    bind: StringView?,
+    data: StringView?,
+    password: StringView?,
+) -> Result<Settings, String> {
+    var bindText = bind ?? "127.0.0.1:5432";
+    var dataText = data ?? "data";
+    var trust = false;
+    var i: usize = 0;
+    while (i < arguments.length) {
+        let a = arguments[i];
+        if ((a == "--bind" || a == "--data") && i + 1 < arguments.length) {
+            if (a == "--bind") {
+                bindText = arguments[i + 1];
+            } else {
+                dataText = arguments[i + 1];
+            }
+            i += 2;
+            continue;
+        }
+        if (a == "--trust") {
+            trust = true;
+            i += 1;
+            continue;
+        }
+        return Err(message("unknown argument ", a, "; usage: sqlited [--bind HOST:PORT] [--data DIRECTORY] [--trust]"));
+    }
+    var settings = match (parseBind(bindText)) {
+        Ok(Some(s)) => s,
+        Ok(null) => { return Err(message("the bind address '", bindText, "' is not HOST:PORT")); }
+        Err(_) => { return Err(String.create()); }
+    };
+    settings.data = message(dataText, "", "");
+    match (password) {
+        Some(p) => {
+            if (p.length < 8) {
+                return Err(message("SQLITED_PASSWORD", " ", "must be at least 8 characters"));
+            }
+            settings.password = message(p, "", "");
+        }
+        null => {
+            if (!trust) {
+                return Err(message(
+                    "set SQLITED_PASSWORD (the password every client gives)",
+                    "",
+                    ", or pass --trust to let every client in without one",
+                ));
+            }
+        }
+    }
+    return Ok(settings);
+}
+
+fn message(a: StringView, b: StringView, c: StringView) -> String {
+    var text = String.create();
+    let _ = text.append(a);
+    let _ = text.append(b);
+    let _ = text.append(c);
+    return text;
+}
+
+fn fail(text: StringView) -> never {
+    Console.writeError("sqlited: ");
+    Console.writeErrorLine(text);
+    Process.exit(1);
+}
+
+fn main() {
+    var arguments = Vector<StringView>.create();
+    for (i in 1..Process.argumentCount()) {
+        arguments.push(Process.argument(i) ?? { fail("an argument is not UTF-8"); })!;
+    }
+    let settings = match (settingsFrom(
+        arguments.view(),
+        Environment.variable("SQLITED_BIND"),
+        Environment.variable("SQLITED_DATA"),
+        Environment.variable("SQLITED_PASSWORD"),
+    )) {
+        Ok(s) => s,
+        Err(m) => { fail(m.view()); }
+    };
+    match (Directory.create(settings.data.view())) {
+        Ok() => {}
+        Err(IoError.AlreadyExists) => {}
+        Err(e) => { fail(message("cannot make the data directory: ", e.message(), "")); }
+    }
+    // Signals are taken before the listener starts, so that Ctrl+C stops the daemon cleanly from the start.
+    let signals = match (ProcessSignals.subscribe()) {
+        Ok(s) => s,
+        Err(e) => { fail(message("cannot take signals: ", e.message(), "")); }
+    };
+    let password: StringView? = match (borrow settings.password) {
+        Some(p) => p.view(),
+        null => null,
+    };
+    let server = Arc<PgServer>.create(PgServer.create(settings.data.view(), password)!)!;
+    let listener = match (TcpListener.bind(settings.host.view(), settings.port)) {
+        Ok(l) => Arc<TcpListener>.create(l)!,
+        Err(e) => { fail(message("cannot listen: ", e.message(), "")); }
+    };
+    Console.writeError("sqlited: serving ");
+    Console.writeError(settings.data.view());
+    Console.writeError(" on ");
+    Console.writeError(settings.host.view());
+    Console.writeError(":");
+    var port = String.create();
+    port.appendNumber(settings.port)!;
+    Console.writeErrorLine(port.view());
+    let serving = server.clone();
+    let accepting = listener.clone();
+    let acceptor = Thread.spawn(move () => serve(serving, accepting))!;
+    loop {
+        match (signals.wait()) {
+            ProcessSignal.Hangup => {}
+            _ => { break; }
+        }
+    }
+    Console.writeErrorLine("sqlited: stopping");
+    let _ = listener.get().shutdown();
+    match (acceptor.join()) {
+        Ok() => {}
+        Err(e) => { Console.writeErrorLine(e.message()); }
+    }
+    if (!server.get().waitForClients(5000)) {
+        Console.writeErrorLine("sqlited: clients still connected; exiting");
+    }
+    Process.exit(0);
+}

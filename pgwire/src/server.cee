@@ -1,0 +1,152 @@
+// The server: databases in a data directory, each with a pool of connections, and a thread per client.
+//
+// A database name maps to `<data>/<name>/main.db` (the C# daemon's layout, so a data directory moves between the
+// two), made on first use. Names are letters, digits, `_` and `-` (a `.db` ending is dropped; the empty name is
+// `main`), so a client cannot name a file outside the directory.
+
+import sqlite;
+
+/// A database the server has opened, and the pool of connections to its file.
+struct OpenDatabase {
+    name: String;
+    pool: Arc<ConnectionPool>;
+}
+
+/// A PostgreSQL wire-protocol server over this package's engine.
+public struct PgServer {
+    dataDirectory: String;
+    /// The password every client must give (cleartext password authentication); null to let every client in
+    /// (trust).
+    password: String?;
+    databases: Mutex<Vector<OpenDatabase>>;
+    clients: AtomicUSize;
+    maxClients: usize;
+    connectionsPerDatabase: usize;
+
+    /// A server for the databases under `dataDirectory`, which must exist. With `password`, clients authenticate
+    /// with it; without, every client is let in.
+    public fn create(dataDirectory: StringView, password: StringView?) -> Result<PgServer, AllocError> {
+        return Ok(PgServer {
+            dataDirectory: String.from(dataDirectory)?,
+            password: match (password) {
+                Some(p) => String.from(p)?,
+                null => null,
+            },
+            databases: Mutex<Vector<OpenDatabase>>.create(Vector<OpenDatabase>.create())?,
+            clients: AtomicUSize.create(0),
+            maxClients: 100,
+            connectionsPerDatabase: 16,
+        });
+    }
+
+    /// How many clients may be connected at once (100 by default), and how many connections each database's pool
+    /// opens at most (16; a client holds one for its whole session, so this bounds the clients of one database).
+    public fn setLimits(borrow mut this, maxClients: usize, connectionsPerDatabase: usize) {
+        this.maxClients = maxClients.max(1);
+        this.connectionsPerDatabase = connectionsPerDatabase.max(1);
+    }
+
+    /// How many clients are connected now.
+    public fn clientCount(borrow this) -> usize => this.clients.load();
+
+    /// Waits up to `milliseconds` for every client to leave; whether they did. CeeSafe has no sleep outside async
+    /// code (CEESAFE_FINDINGS.md, finding 23), so this polls.
+    public fn waitForClients(borrow this, milliseconds: u64) -> bool {
+        let deadline = Timer.now() + milliseconds;
+        while (this.clients.load() != 0 && Timer.now() < deadline) {}
+        return this.clients.load() == 0;
+    }
+
+    /// A connection to the database called `name`, from its pool, opening the pool (and making the database) on
+    /// first use.
+    fn checkout(borrow this, name: StringView) -> Result<PooledConnection, PgError> {
+        var base = if (name.length == 0) "main" else name;
+        if (base.length > 3 && base[base.length - 3..].equalsIgnoreAsciiCase(".db")) {
+            base = base[0..base.length - 3];
+        }
+        var valid = base.length != 0 && base.length <= 63;
+        for (i in 0..base.length) {
+            let c = base[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) {
+                valid = false;
+            }
+        }
+        if (!valid) {
+            var message = owned("invalid database name \"");
+            let _ = message.append(name);
+            let _ = message.append("\"");
+            return Err(PgError { state: owned("3D000"), message: message });
+        }
+        let pool = match (this.poolFor(base)) {
+            Ok(p) => p,
+            Err(e) => {
+                var message = owned("cannot open database \"");
+                let _ = message.append(base);
+                let _ = message.append("\": ");
+                let _ = message.append(e.message());
+                return Err(PgError { state: owned(sqlState(borrow e)), message: message });
+            }
+        };
+        return match (pool.get().checkout()) {
+            Ok(c) => Ok(c),
+            Err(SqliteError.Busy(_)) => Err(pgError("53300", "too many connections for this database")),
+            Err(e) => Err(pgError(sqlState(borrow e), e.message())),
+        };
+    }
+
+    fn poolFor(borrow this, name: StringView) -> Result<Arc<ConnectionPool>, SqliteError> {
+        var guard = this.databases.lock();
+        let open = guard.data();
+        for (i in 0..open.length) {
+            if (open[i].name.view() == name) {
+                return Ok(open[i].pool.clone());
+            }
+        }
+        var directory = this.dataDirectory.clone()?;
+        directory.append("/")?;
+        directory.append(name)?;
+        match (Directory.create(directory.view())) {
+            Ok() => {}
+            Err(IoError.AlreadyExists) => {}
+            Err(e) => { return Err(SqliteError.Io(e)); }
+        }
+        directory.append("/main.db")?;
+        let pool = Arc<ConnectionPool>.create(ConnectionPool.open(directory.view(), this.connectionsPerDatabase)?)?;
+        open.push(OpenDatabase { name: String.from(name)?, pool: pool.clone() })?;
+        return Ok(pool);
+    }
+}
+
+/// Serves one client on this thread: counted against the server's limit, which a client past it is told.
+fn serveCounted(server: borrow PgServer, stream: TcpStream) {
+    let before = server.clients.fetchAdd(1);
+    if (before >= server.maxClients) {
+        var wire = Wire.over(stream);
+        let _ = sendFatal(mut wire, "53300", "sorry, too many clients already");
+    } else {
+        serveClient(server, stream);
+    }
+    let _ = server.clients.fetchSub(1);
+}
+
+/// Accepts clients on `listener` until it is shut down (`listener.shutdown()`), serving each on a thread of its
+/// own.
+public fn serve(server: Arc<PgServer>, listener: Arc<TcpListener>) -> Result<void, IoError> {
+    loop {
+        match (listener.get().accept()) {
+            Ok(stream) => {
+                let mine = server.clone();
+                // A client's thread is not joined: it ends when its client goes, and the process may end first.
+                let _ = Thread.service("pgwire client", move () => {
+                    serveCounted(mine.get(), stream);
+                });
+            }
+            Err(IoError.ConnectionAborted) => { return Ok(); }
+            Err(IoError.TooManyOpenFiles) => {
+                // Out of descriptors: the client waits in the backlog until one is freed.
+                continue;
+            }
+            Err(e) => { return Err(e); }
+        }
+    }
+}

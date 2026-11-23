@@ -1,0 +1,363 @@
+// The shell, compared with the sqlite3 shell: each test makes the same database twice with sqlite3, runs the same
+// arguments and input through sqlite3 on one copy and through this shell on the other, and compares what they
+// print, their errors and their exit status. sqlite3 follows a statement it cannot prepare with the statement and
+// a caret under the error's place; this engine does not know the place, so those lines (they start with two
+// spaces) are left out of the comparison. The file this shell wrote must then pass sqlite3's integrity check.
+
+import sqlite;
+
+/// Makes a fresh database at `path` by running `sql` through the sqlite3 shell.
+fn makeDatabase(path: StringView, sql: StringView) -> Result<void, TestFailure> {
+    let _ = File.remove(path);
+    if (sql.length == 0) {
+        return Ok();
+    }
+    var arguments = Vector<StringView>.create();
+    arguments.push(path)!;
+    arguments.push(sql)!;
+    match (Process.run("sqlite3", borrow arguments)) {
+        Ok(0) => { return Ok(); }
+        Ok(_) => { return Check.fail("sqlite3 refused the fixture's SQL"); }
+        Err(_) => { return Check.fail("the sqlite3 shell is needed to make fixtures"); }
+    }
+}
+
+/// `bytes` as text, for messages.
+fn shown(bytes: Slice<u8>) -> String {
+    var text = String.create();
+    for (i in 0..bytes.length) {
+        if (bytes[i] < 0x80) {
+            let _ = text.appendChar(bytes[i] as u32)!;
+        } else {
+            text.append("?")!;
+        }
+    }
+    return text;
+}
+
+/// sqlite3's standard error without the lines that show a statement and point at an error in it.
+fn withoutCarets(errors: Slice<u8>) -> String {
+    let text = shown(errors);
+    var kept = String.create();
+    var lines = text.view().split("\n");
+    while (lines.next() is Some(line)) {
+        if (line.length != 0 && !line.startsWith("  ")) {
+            kept.append(line)!;
+            kept.append("\n")!;
+        }
+    }
+    return kept;
+}
+
+/// Runs `options`, a database made by `setup`, `arguments` and standard input `input` through sqlite3 and this
+/// shell, and compares them.
+fn sameAsSqlite(
+    name: StringView,
+    setup: StringView,
+    options: Slice<StringView>,
+    arguments: Slice<StringView>,
+    input: StringView,
+) -> Result<void, TestFailure> {
+    var theirPath = String.from("out/shell-")!;
+    theirPath.append(name)!;
+    var ourPath = theirPath.clone()!;
+    theirPath.append("-theirs.db")!;
+    ourPath.append("-ours.db")!;
+    makeDatabase(theirPath.view(), setup)?;
+    makeDatabase(ourPath.view(), setup)?;
+
+    var theirArguments = Vector<StringView>.create();
+    var ourArguments = Vector<StringView>.create();
+    for (i in 0..options.length) {
+        theirArguments.push(options[i])!;
+        ourArguments.push(options[i])!;
+    }
+    theirArguments.push(theirPath.view())!;
+    ourArguments.push(ourPath.view())!;
+    for (i in 0..arguments.length) {
+        theirArguments.push(arguments[i])!;
+        ourArguments.push(arguments[i])!;
+    }
+    let theirs = Process.capture("sqlite3", borrow theirArguments, input.bytes())!;
+    let ours = runShell(ourArguments.view(), Lines.ofText(String.from(input)!), false)!;
+
+    let theirErrors = withoutCarets(theirs.stderr.view());
+    let ourErrors = withoutCarets(ours.errors.view().bytes());
+    if (theirs.stdout.view() != ours.out.view() || theirErrors.view() != ourErrors.view()
+        || theirs.status != ours.status) {
+        var message = String.from(name)!;
+        message.append("\n  sqlite3 printed:\n")!;
+        message.append(shown(theirs.stdout.view()).view())!;
+        message.append(theirErrors.view())!;
+        message.append("  status ")!;
+        message.appendNumber(theirs.status)!;
+        message.append("\n  this shell printed:\n")!;
+        message.append(shown(ours.out.view()).view())!;
+        message.append(ourErrors.view())!;
+        message.append("  status ")!;
+        message.appendNumber(ours.status)!;
+        return Check.fail(message.view());
+    }
+
+    var check = Vector<StringView>.create();
+    check.push(ourPath.view())!;
+    check.push("PRAGMA integrity_check")!;
+    let verdict = Process.capture("sqlite3", borrow check, "".bytes())!;
+    return Check.equalBytes("ok\n".bytes(), verdict.stdout.view());
+}
+
+/// The same, with only standard input.
+fn sameInput(name: StringView, setup: StringView, input: StringView) -> Result<void, TestFailure> {
+    let none = Vector<StringView>.create();
+    return sameAsSqlite(name, setup, none.view(), none.view(), input);
+}
+
+const PEOPLE: StringView = """
+    CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT, score REAL, photo BLOB);
+    INSERT INTO people VALUES (1, 'Ann', 1.5, x'414243'), (22, 'Bob, Jr.', -2, NULL), (333, 'say "hi"', 123456.25, x'00');
+    INSERT INTO people VALUES (4444, 'two
+    lines', NULL, NULL);
+    CREATE INDEX people_score ON people(score);
+    CREATE VIEW best AS SELECT name, score * 2 FROM people WHERE score > 0;
+    """;
+
+@test
+fn listModeAndHeaders() -> Result<void, TestFailure> {
+    return sameInput("list", PEOPLE, """
+        SELECT * FROM people;
+        SELECT 1, 2.0, 0.1 + 0.2, 1e20, NULL, 'x', x'4142';
+        .headers on
+        SELECT id, name AS "the name" FROM people ORDER BY id DESC;
+        SELECT * FROM people WHERE 0;
+        .headers off
+        SELECT count(*) FROM people;
+        SELECT 'a' || char(9) || 'b', 'c' || char(10) || 'd';
+        """);
+}
+
+@test
+fn csvMode() -> Result<void, TestFailure> {
+    return sameInput("csv", PEOPLE, """
+        .mode csv
+        SELECT * FROM people;
+        .headers on
+        SELECT ' lead', 'a"b', 'x', 1.0, NULL, '', 'é', 'it''s', 'a-b' AS "odd name";
+        .mode
+        """);
+}
+
+@test
+fn lineMode() -> Result<void, TestFailure> {
+    return sameInput("line", PEOPLE, """
+        .mode line
+        SELECT * FROM people;
+        SELECT 1 AS a, 'x' AS abc;
+        SELECT 1 AS a WHERE 0;
+        """);
+}
+
+@test
+fn columnMode() -> Result<void, TestFailure> {
+    return sameInput("column", PEOPLE, """
+        .mode column
+        SELECT id, name, score FROM people;
+        SELECT 1 AS n, 22.5 AS r, NULL AS z, 'abc' AS s, 'abcdefg' AS longer UNION ALL SELECT 100, 'x', 3, 'de', 'q';
+        SELECT 'héllo' AS w UNION ALL SELECT 'a';
+        SELECT 'a' || char(9) || 'b' AS s;
+        SELECT '12' AS s, 12 AS i UNION ALL SELECT 'abcd', 1;
+        SELECT 1 AS number, 'a' AS text, 2.5 AS float;
+        .headers off
+        SELECT id, name FROM people WHERE id < 100;
+        .mode list
+        SELECT 1 AS a;
+        """);
+}
+
+@test
+fn tablesAndSchema() -> Result<void, TestFailure> {
+    return sameInput("schema", """
+        CREATE TABLE one(x);
+        CREATE TABLE two(id INTEGER PRIMARY KEY AUTOINCREMENT, y);
+        CREATE INDEX two_y ON two(y);
+        CREATE VIEW v AS SELECT 1, x AS k FROM one;
+        INSERT INTO two(y) VALUES (5);
+        """, """
+        .tables
+        .tables t%
+        .tables nothing%
+        .schema
+        .schema two
+        .schema v
+        CREATE TABLE three(z);
+        .tables
+        """);
+}
+
+@test
+fn errorsInInput() -> Result<void, TestFailure> {
+    return sameInput("input-errors", PEOPLE, """
+        SELECT 1;
+        SELECT nope;
+        SELECT 2;
+
+        SELECT
+          nope
+          FROM people;
+        INSERT INTO people(id) VALUES (1);
+        SELECT nope; SELECT 5;
+        COMMIT; SELECT 6;
+        SELECT * FROM missing;
+        SELECT 3 + * 2;
+        SELECT 7;
+        """);
+}
+
+@test
+fn incompleteInputAtTheEnd() -> Result<void, TestFailure> {
+    return sameInput("incomplete", PEOPLE, "SELECT 1;\nSELECT 1 +\n");
+}
+
+@test
+fn statementsAsSqlite3CompleteSplitsThem() -> Result<void, TestFailure> {
+    // The C# shell ended a statement at the first semicolon outside quotes, so it ran a trigger's body a statement
+    // at a time; it also ran text after a semicolon on the same line with the statement before it.
+    return sameInput("split", PEOPLE, """
+        -- a comment alone
+        ;
+        # a remark
+        SELECT 1;-- a comment after
+        SELECT
+          2
+        ;
+        CREATE TRIGGER t AFTER INSERT ON people BEGIN
+          SELECT CASE WHEN 1 THEN 2 END;
+          UPDATE people SET score = 0 WHERE id = new.id;
+        END;
+        INSERT INTO people(id) VALUES (9);
+        SELECT id, score FROM people WHERE id = 9;
+        SELECT 'semi;colon', "x;" FROM (SELECT 1 AS "x;");
+        SELECT 3; SELECT 4;
+        SELECT 5
+        """);
+}
+
+@test
+fn argumentsRunInOrder() -> Result<void, TestFailure> {
+    // The C# shell joined the arguments with spaces into one text, so two statements without semicolons were a
+    // syntax error.
+    let none = Vector<StringView>.create();
+    var arguments = Vector<StringView>.create();
+    arguments.push("SELECT 1")!;
+    arguments.push(".tables")!;
+    arguments.push("SELECT 2; SELECT 3")!;
+    arguments.push("INSERT INTO people(id, name) VALUES (5, 'Eve'); SELECT name FROM people WHERE id = 5")!;
+    return sameAsSqlite("arguments", PEOPLE, none.view(), arguments.view(), "");
+}
+
+@test
+fn anArgumentThatFailsEndsTheRun() -> Result<void, TestFailure> {
+    let none = Vector<StringView>.create();
+    var arguments = Vector<StringView>.create();
+    arguments.push("SELECT 1; SELECT nope; SELECT 2")!;
+    arguments.push("SELECT 3")!;
+    sameAsSqlite("argument-parse-error", PEOPLE, none.view(), arguments.view(), "")?;
+    arguments.clear();
+    arguments.push("INSERT INTO people(id) VALUES (1); SELECT 2")!;
+    arguments.push("SELECT 3")!;
+    sameAsSqlite("argument-runtime-error", PEOPLE, none.view(), arguments.view(), "")?;
+    arguments.clear();
+    arguments.push(".bogus")!;
+    arguments.push("SELECT 3")!;
+    return sameAsSqlite("argument-bad-command", PEOPLE, none.view(), arguments.view(), "");
+}
+
+@test
+fn options() -> Result<void, TestFailure> {
+    var options = Vector<StringView>.create();
+    options.push("-csv")!;
+    options.push("-header")!;
+    var arguments = Vector<StringView>.create();
+    arguments.push("SELECT id, name FROM people")!;
+    sameAsSqlite("options-csv", PEOPLE, options.view(), arguments.view(), "")?;
+    options.clear();
+    options.push("-line")!;
+    return sameAsSqlite("options-line", PEOPLE, options.view(), arguments.view(), "");
+}
+
+@test
+fn bailReadAndExit() -> Result<void, TestFailure> {
+    let script = "out/shell-read.sql";
+    var file = File.create(script)!;
+    file.write("SELECT 42;\nSELECT nope;\nSELECT 43;\n".bytes())!;
+    sameInput("read", PEOPLE, """
+        .read out/shell-read.sql
+        .read out/no-such-file.sql
+        SELECT 5;
+        """)?;
+    sameInput("bail-after-error", PEOPLE, """
+        .read out/shell-read.sql
+        .bail on
+        SELECT 6;
+        """)?;
+    sameInput("bail", PEOPLE, """
+        .bail on
+        SELECT 4;
+        COMMIT;
+        SELECT 5;
+        """)?;
+    sameInput("exit", PEOPLE, """
+        SELECT 1;
+        .exit 3
+        SELECT 2;
+        """)?;
+    return sameInput("quit", PEOPLE, """
+        SELECT 1;
+        .quit
+        SELECT 2;
+        """);
+}
+
+@test
+fn dotCommandErrors() -> Result<void, TestFailure> {
+    return sameInput("dot-errors", PEOPLE, """
+        .bogus
+        .headers
+        .headers maybe
+        SELECT 1 AS a;
+        .headers 1
+        SELECT 1 AS a;
+         .tables
+        ;
+        """);
+}
+
+@test
+fn changesAreWrittenToTheFile() -> Result<void, TestFailure> {
+    return sameInput("writes", "", """
+        CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE, c);
+        INSERT INTO t VALUES (1, 'x', 1.5), (2, 'y', NULL);
+        INSERT INTO t VALUES (3, 'x', 0);
+        BEGIN;
+        UPDATE t SET c = 'changed' WHERE a = 2;
+        DELETE FROM t WHERE a = 1;
+        COMMIT;
+        BEGIN;
+        INSERT INTO t VALUES (10, 'gone', 0);
+        ROLLBACK;
+        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500)
+        INSERT INTO t(b, c) SELECT 'row ' || i, i * i FROM n;
+        SELECT count(*), sum(c) FROM t;
+        SELECT * FROM t ORDER BY a LIMIT 3;
+        """);
+}
+
+@test
+fn valueTextIsSqlites() -> Result<void, TestFailure> {
+    // The library's SqliteValue.toText, which the shell prints reals with.
+    Check.equalText("2.0", SqliteValue.Real(2.0).toText()!.view())?;
+    Check.equalText("0.30000000000000004", SqliteValue.Real(0.1 + 0.2).toText()!.view())?;
+    Check.equalText("1.0e+20", SqliteValue.Real(1e20).toText()!.view())?;
+    Check.equalText("-7", SqliteValue.Integer(-7).toText()!.view())?;
+    Check.equalText("", SqliteValue.Null.toText()!.view())?;
+    return Ok();
+}

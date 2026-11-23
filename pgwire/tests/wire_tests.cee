@@ -1,0 +1,747 @@
+// The server, driven over TCP on 127.0.0.1 by a raw protocol client written here: each test starts a server on a
+// free port, sends messages byte by byte as a PostgreSQL client would, and compares the server's replies, written
+// one a line (`describeMessage`), with what the protocol (and PostgreSQL) give.
+
+import sqlite;
+
+/// A server running on a thread of the test. Dropped (as when a check fails), it shuts the listener down, so that
+/// the thread it then joins ends.
+struct Running {
+    server: Arc<PgServer>;
+    listener: Arc<TcpListener>;
+    thread: Thread<Result<void, IoError>>?;
+    port: u16;
+
+    drop {
+        let _ = this.listener.get().shutdown();
+    }
+}
+
+fn makeDirectory(path: StringView) {
+    let _ = Directory.create(path);
+}
+
+/// Starts a server over `out/pg-tests`, with the database `database` made empty.
+fn startServer(database: StringView, password: StringView?) -> Running {
+    makeDirectory("out");
+    makeDirectory("out/pg-tests");
+    var file = String.from("out/pg-tests/")!;
+    file.append(database)!;
+    file.append("/main.db")!;
+    let _ = File.remove(file.view());
+    let server = Arc<PgServer>.create(PgServer.create("out/pg-tests", password)!)!;
+    let listener = Arc<TcpListener>.create(TcpListener.bind("127.0.0.1", 0)!)!;
+    let port = listener.get().port()!;
+    let accepting = listener.clone();
+    let serving = server.clone();
+    let thread = Thread.spawn(move () => serve(serving, accepting))!;
+    return Running { server: server, listener: listener, thread: thread, port: port };
+}
+
+fn stopServer(running: Running) -> Result<void, TestFailure> {
+    var r = running;
+    r.listener.get().shutdown()!;
+    let thread = replace(mut r.thread, null) ?? { return Check.fail("the server was stopped twice"); };
+    let finished = thread.join();
+    Check.isTrue(finished.isOk(), "the server stops when its listener is shut down")?;
+    // The clients' threads end once their clients have gone: before the test ends, so nothing is left allocated.
+    return Check.isTrue(r.server.get().waitForClients(5000), "every client's session ends");
+}
+
+/// A raw protocol client.
+struct Client {
+    wire: Wire;
+
+    fn connect(port: u16) -> Client => Client { wire: Wire.over(TcpStream.connect("127.0.0.1", port)!) };
+
+    fn send(borrow mut this, kind: u8, payload: borrow Vector<u8>) {
+        let b = begin(mut this.wire.output, kind)!;
+        this.wire.output.extend(payload.view())!;
+        end(mut this.wire.output, b);
+        this.wire.flush()!;
+    }
+
+    fn sendStartup(borrow mut this, code: u32, pairs: Slice<StringView>) {
+        var body = Vector<u8>.create();
+        body.pushBE(code)!;
+        for (i in 0..pairs.length) {
+            putText(mut body, pairs[i])!;
+        }
+        if (pairs.length != 0) {
+            body.push(0)!;
+        }
+        this.wire.output.pushBE(truncate<u32>(body.length + 4))!;
+        this.wire.output.extend(body.view())!;
+        this.wire.flush()!;
+    }
+
+    /// The server's next message, one line of text; "EOF" when it closed the connection.
+    fn next(borrow mut this) -> String {
+        match (this.wire.readMessage()) {
+            Ok(Some(m)) => { return describeMessage(borrow m); }
+            Ok(null) => { return String.from("EOF")!; }
+            Err(_) => { return String.from("broken")!; }
+        }
+    }
+
+    /// The server's messages up to and including ReadyForQuery (or the end of the connection), a line each.
+    fn untilReady(borrow mut this) -> String {
+        var text = String.create();
+        loop {
+            let line = this.next();
+            text.append(line.view())!;
+            text.append("\n")!;
+            if (line.view().startsWith("Z ") || line.view() == "EOF" || line.view() == "broken") {
+                return text;
+            }
+        }
+    }
+
+    fn query(borrow mut this, sql: StringView) -> String {
+        var payload = Vector<u8>.create();
+        putText(mut payload, sql)!;
+        this.send('Q', borrow payload);
+        return this.untilReady();
+    }
+
+    /// Connects as `user` to `database` with the password `password` if the server asks for one; the replies
+    /// up to ReadyForQuery, ParameterStatus and BackendKeyData left out.
+    fn logIn(borrow mut this, user: StringView, database: StringView, password: StringView) -> String {
+        var pairs = Vector<StringView>.create();
+        pairs.push("user")!;
+        pairs.push(user)!;
+        pairs.push("database")!;
+        pairs.push(database)!;
+        this.sendStartup(196608, pairs.view());
+        var text = String.create();
+        loop {
+            let line = this.next();
+            if (line.view() == "R 3") {
+                var payload = Vector<u8>.create();
+                putText(mut payload, password)!;
+                this.send('p', borrow payload);
+            }
+            if (!line.view().startsWith("S ") && !line.view().startsWith("K")) {
+                text.append(line.view())!;
+                text.append("\n")!;
+            }
+            if (line.view().startsWith("Z ") || line.view() == "EOF" || line.view() == "broken"
+                || line.view().startsWith("E ")) {
+                return text;
+            }
+        }
+    }
+
+    fn terminate(borrow mut this) {
+        let none = Vector<u8>.create();
+        this.send('X', borrow none);
+    }
+}
+
+fn hexText(out: borrow mut String, bytes: Slice<u8>) {
+    let digits = "0123456789abcdef";
+    for (i in 0..bytes.length) {
+        out.append(digits[(bytes[i] >> 4) as usize..(bytes[i] >> 4) as usize + 1])!;
+        out.append(digits[(bytes[i] & 15) as usize..(bytes[i] & 15) as usize + 1])!;
+    }
+}
+
+/// A server message as one line: its type letter, then its content (names and type OIDs of a RowDescription,
+/// `|`-separated values of a DataRow with NULL for a null, the SQLSTATE and message of an error, …).
+fn describeMessage(m: borrow Message) -> String {
+    let bytes = m.payload.view();
+    var text = String.create();
+    let _ = text.appendChar(m.kind as u32)!;
+    var cursor = Cursor.start();
+    if (m.kind == 'T') {
+        let count = cursor.i16(bytes)!;
+        for (i in 0..count) {
+            let name = cursor.text(bytes)!;
+            let _ = cursor.i32(bytes);
+            let _ = cursor.i16(bytes);
+            let oid = cursor.i32(bytes)!;
+            let _ = cursor.i16(bytes);
+            let _ = cursor.i32(bytes);
+            let format = cursor.i16(bytes)!;
+            text.append(" ")!;
+            text.append(name.view())!;
+            text.append(":")!;
+            text.appendNumber(oid)!;
+            if (format == 1) {
+                text.append("b")!;
+            }
+        }
+    } else if (m.kind == 'D') {
+        let count = cursor.i16(bytes)!;
+        text.append(" ")!;
+        for (i in 0..count) {
+            if (i != 0) {
+                text.append("|")!;
+            }
+            let length = cursor.i32(bytes)!;
+            if (length < 0) {
+                text.append("NULL")!;
+                continue;
+            }
+            let start = cursor.skip(bytes, truncate<usize>(length))!;
+            let value = bytes[start..start + truncate<usize>(length)];
+            match (StringView.fromUtf8(value)) {
+                Some(v) => {
+                    var printable = true;
+                    for (k in 0..value.length) {
+                        if (value[k] < 0x20) {
+                            printable = false;
+                        }
+                    }
+                    if (printable) {
+                        text.append(v)!;
+                    } else {
+                        text.append("0x")!;
+                        hexText(mut text, value);
+                    }
+                }
+                null => {
+                    text.append("0x")!;
+                    hexText(mut text, value);
+                }
+            }
+        }
+    } else if (m.kind == 'E' || m.kind == 'N') {
+        var severity = String.create();
+        var state = String.create();
+        var message = String.create();
+        loop {
+            let field = cursor.byte(bytes)!;
+            if (field == 0) {
+                break;
+            }
+            let value = cursor.text(bytes)!;
+            if (field == 'S') {
+                severity = value;
+            } else if (field == 'C') {
+                state = value;
+            } else if (field == 'M') {
+                message = value;
+            }
+        }
+        text.append(" ")!;
+        if (severity.view() != "ERROR") {
+            text.append(severity.view())!;
+            text.append(" ")!;
+        }
+        text.append(state.view())!;
+        text.append(" ")!;
+        text.append(message.view())!;
+    } else if (m.kind == 'C' || m.kind == 'S') {
+        while (!cursor.atEnd(bytes)) {
+            text.append(" ")!;
+            text.append(cursor.text(bytes)!.view())!;
+        }
+    } else if (m.kind == 'Z') {
+        text.append(" ")!;
+        let _ = text.appendChar((cursor.byte(bytes)!) as u32)!;
+    } else if (m.kind == 'R') {
+        text.append(" ")!;
+        text.appendNumber(cursor.i32(bytes)!)!;
+    } else if (m.kind == 't') {
+        let count = cursor.i16(bytes)!;
+        for (i in 0..count) {
+            text.append(" ")!;
+            text.appendNumber(cursor.i32(bytes)!)!;
+        }
+    } else if (m.kind == 'v') {
+        text.append(" ")!;
+        text.appendNumber(cursor.i32(bytes)!)!;
+        let count = cursor.i32(bytes)!;
+        for (i in 0..count) {
+            text.append(" ")!;
+            text.append(cursor.text(bytes)!.view())!;
+        }
+    }
+    return text;
+}
+
+/// A Parse message's payload.
+fn parseMessage(name: StringView, sql: StringView, types: Slice<u32>) -> Vector<u8> {
+    var p = Vector<u8>.create();
+    putText(mut p, name)!;
+    putText(mut p, sql)!;
+    p.pushBE(truncate<u16>(types.length))!;
+    for (i in 0..types.length) {
+        p.pushBE(types[i])!;
+    }
+    return p;
+}
+
+/// A Bind message's payload, with every parameter in text (null for NULL) and every result in `resultFormat`.
+fn bindMessage(portal: StringView, statement: StringView, values: Slice<StringView?>, resultFormat: i16) -> Vector<u8> {
+    var p = Vector<u8>.create();
+    putText(mut p, portal)!;
+    putText(mut p, statement)!;
+    p.pushBE(0u16)!;
+    p.pushBE(truncate<u16>(values.length))!;
+    for (i in 0..values.length) {
+        match (values[i]) {
+            Some(v) => {
+                p.pushBE(truncate<u32>(v.length))!;
+                p.extend(v.bytes())!;
+            }
+            null => { p.pushBE(0xFFFFFFFFu32)!; }
+        }
+    }
+    p.pushBE(1u16)!;
+    p.pushBE(truncate<u16>(resultFormat))!;
+    return p;
+}
+
+fn nameMessage(kind: u8, name: StringView) -> Vector<u8> {
+    var p = Vector<u8>.create();
+    p.push(kind)!;
+    putText(mut p, name)!;
+    return p;
+}
+
+fn executeMessage(portal: StringView, limit: u32) -> Vector<u8> {
+    var p = Vector<u8>.create();
+    putText(mut p, portal)!;
+    p.pushBE(limit)!;
+    return p;
+}
+
+fn sync(client: borrow mut Client) -> String {
+    let none = Vector<u8>.create();
+    client.send('S', borrow none);
+    return client.untilReady();
+}
+
+// ── tests ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+@test
+fn startupRefusesSslAndSendsSessionParameters() -> Result<void, TestFailure> {
+    let running = startServer("startup", null);
+    var client = Client.connect(running.port);
+    let none = Vector<StringView>.create();
+    client.sendStartup(80877103, none.view());
+    var answer = [0u8; 1];
+    let got = client.wire.stream.read(mut answer[..])!;
+    Check.isTrue(got == 1 && answer[0] == 'N', "an SSLRequest is answered 'N'")?;
+    var pairs = Vector<StringView>.create();
+    pairs.push("user")!;
+    pairs.push("ann")!;
+    pairs.push("database")!;
+    pairs.push("startup")!;
+    pairs.push("application_name")!;
+    pairs.push("tests")!;
+    client.sendStartup(196608, pairs.view());
+    let replies = client.untilReady();
+    Check.isTrue(replies.view().startsWith("R 0\n"), "trust: AuthenticationOk at once")?;
+    Check.isTrue(replies.view().contains("S server_encoding UTF8\n"), "server_encoding")?;
+    Check.isTrue(replies.view().contains("S session_authorization ann\n"), "session_authorization")?;
+    Check.isTrue(replies.view().contains("S application_name tests\n"), "application_name")?;
+    Check.isTrue(replies.view().contains("\nK\n"), "BackendKeyData")?;
+    Check.isTrue(replies.view().endsWith("Z I\n"), "ReadyForQuery, idle")?;
+    client.terminate();
+    Check.equalText("EOF", client.next().view())?;
+    return stopServer(running);
+}
+
+@test
+fn simpleQueries() -> Result<void, TestFailure> {
+    let running = startServer("simple", null);
+    var client = Client.connect(running.port);
+    Check.equalText("R 0\nZ I\n", client.logIn("u", "simple", "").view())?;
+    Check.equalText("""
+        C CREATE TABLE
+        C INSERT 0 2
+        T a:20 b:25 c:701 d:17
+        D 1|x|1.5|\x00ff
+        D 2|NULL|2|NULL
+        C SELECT 2
+        T a:25 b:25
+        C SELECT 0
+        C UPDATE 2
+        C DELETE 1
+        Z I
+
+        """, client.query("""
+        CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT, c REAL, d BLOB);
+        INSERT INTO t VALUES (1, 'x', 1.5, x'00ff'), (2, NULL, 2.0, NULL);
+        SELECT * FROM t;
+        SELECT a, b FROM t WHERE 0;
+        UPDATE t SET c = c + 1;
+        DELETE FROM t WHERE a = 2
+        """).view())?;
+    Check.equalText("I\nZ I\n", client.query(" -- nothing\n;").view())?;
+    Check.equalText("""
+        T ?column?:20
+        D 1
+        C SELECT 1
+        E 42703 no such column: nope
+        Z I
+
+        """, client.query("SELECT 1 AS \"?column?\"; SELECT nope; SELECT 2").view())?;
+    Check.equalText("""
+        C CREATE INDEX
+        C CREATE VIEW
+        C DROP VIEW
+        C ALTER TABLE
+        C INSERT 0 3
+        Z I
+
+        """, client.query("""
+        CREATE UNIQUE INDEX tb ON t(b);
+        CREATE VIEW v AS SELECT 1;
+        DROP VIEW v;
+        ALTER TABLE t ADD COLUMN e;
+        WITH n(i) AS (VALUES (10), (11), (12)) INSERT INTO t(a) SELECT i FROM n
+        """).view())?;
+    client.terminate();
+    return stopServer(running);
+}
+
+@test
+fn columnTypesComeFromEveryRow() -> Result<void, TestFailure> {
+    // The C# typed a column by its first row: bigint here, and then sent 'a' as a bigint.
+    let running = startServer("types", null);
+    var client = Client.connect(running.port);
+    let _ = client.logIn("u", "types", "");
+    Check.equalText("""
+        T x:25
+        D 1
+        D a
+        C SELECT 2
+        Z I
+
+        """, client.query("SELECT 1 AS x UNION ALL SELECT 'a'").view())?;
+    Check.equalText("""
+        T x:701 y:20 z:25
+        D 1|NULL|NULL
+        D 2.5|7|NULL
+        D 1e+20|NULL|NULL
+        D 1e-05|NULL|NULL
+        D 0.30000000000000004|NULL|NULL
+        D 123456789012345|NULL|NULL
+        D -Infinity|NULL|NULL
+        C SELECT 7
+        Z I
+
+        """, client.query("""
+        SELECT 1 AS x, NULL AS y, NULL AS z UNION ALL SELECT 2.5, 7, NULL UNION ALL SELECT 1e20, NULL, NULL
+        UNION ALL SELECT 0.00001, NULL, NULL UNION ALL SELECT 0.1 + 0.2, NULL, NULL
+        UNION ALL SELECT 123456789012345.0, NULL, NULL UNION ALL SELECT -1e999, NULL, NULL
+        """).view())?;
+    client.terminate();
+    return stopServer(running);
+}
+
+@test
+fn transactionsShowInReadyForQuery() -> Result<void, TestFailure> {
+    let running = startServer("transactions", null);
+    var client = Client.connect(running.port);
+    let _ = client.logIn("u", "transactions", "");
+    let _ = client.query("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT NOT NULL, c CHECK (c > 0))");
+    Check.equalText("C BEGIN\nZ T\n", client.query("BEGIN").view())?;
+    Check.equalText("C INSERT 0 1\nZ T\n", client.query("INSERT INTO t VALUES (1, 'x', 1)").view())?;
+    // SQLite's model: a failed statement undoes itself only, and the transaction goes on.
+    Check.equalText("E 23505 UNIQUE constraint failed: t.a\nZ T\n", client.query("INSERT INTO t VALUES (1, 'y', 1)").view())?;
+    Check.equalText("E 23502 NOT NULL constraint failed: t.b\nZ T\n", client.query("INSERT INTO t VALUES (2, NULL, 1)").view())?;
+    Check.equalText("E 23514 CHECK constraint failed: c > 0\nZ T\n", client.query("INSERT INTO t VALUES (3, 'z', 0)").view())?;
+    Check.equalText("C COMMIT\nZ I\n", client.query("COMMIT").view())?;
+    Check.equalText("E 25P01 cannot commit - no transaction is active\nZ I\n", client.query("COMMIT").view())?;
+    // PostgreSQL's spellings.
+    Check.equalText("C BEGIN\nZ T\n", client.query("START TRANSACTION ISOLATION LEVEL SERIALIZABLE").view())?;
+    Check.equalText("C DELETE 1\nZ T\n", client.query("DELETE FROM t").view())?;
+    Check.equalText("C ROLLBACK\nZ I\n", client.query("ABORT").view())?;
+    Check.equalText("C SET\nZ I\n", client.query("SET client_min_messages TO warning").view())?;
+    Check.equalText("C DISCARD ALL\nZ I\n", client.query("DISCARD ALL").view())?;
+    Check.equalText("T a:20\nD 1\nC SELECT 1\nZ I\n", client.query("SELECT a FROM t").view())?;
+    client.terminate();
+    return stopServer(running);
+}
+
+@test
+fn extendedQueryProtocol() -> Result<void, TestFailure> {
+    let running = startServer("extended", null);
+    var client = Client.connect(running.port);
+    let _ = client.logIn("u", "extended", "");
+    let _ = client.query("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)");
+
+    // $2 before $1: SQLite numbers them by first appearance; the server binds them by name.
+    let noTypes: Slice<u32> = [];
+    let p = parseMessage("s1", "SELECT $2 || $1 AS joined, $1 + 1 AS next", noTypes);
+    client.send('P', borrow p);
+    var values: [StringView?; 2] = [Some("41"), Some("x")];
+    let b = bindMessage("", "s1", values[..], 0);
+    client.send('B', borrow b);
+    let d = nameMessage('P', "");
+    client.send('D', borrow d);
+    let e = executeMessage("", 0);
+    client.send('E', borrow e);
+    Check.equalText("1\n2\nT joined:25 next:20\nD x41|42\nC SELECT 1\nZ I\n", sync(mut client).view())?;
+
+    // A statement's Describe: its parameters, and its columns as text (nothing has run).
+    let ds = nameMessage('S', "s1");
+    client.send('D', borrow ds);
+    Check.equalText("t 25 25\nT joined:25 next:25\nZ I\n", sync(mut client).view())?;
+
+    // Executed without Describe, the rows are still sent (the C# dropped them); RETURNING runs once.
+    let insert: [u32; 2] = [20, 25];
+    let pi = parseMessage("ins", "INSERT INTO t VALUES ($1, $2) RETURNING a, b", insert[..]);
+    client.send('P', borrow pi);
+    var row: [StringView?; 2] = [Some("7"), null];
+    let bi = bindMessage("", "ins", row[..], 0);
+    client.send('B', borrow bi);
+    let ei = executeMessage("", 0);
+    client.send('E', borrow ei);
+    Check.equalText("1\n2\nD 7|NULL\nC INSERT 0 1\nZ I\n", sync(mut client).view())?;
+    Check.equalText("T count(*):20\nD 1\nC SELECT 1\nZ I\n", client.query("SELECT count(*) FROM t").view())?;
+
+    // Describing a statement with RETURNING finds its columns without changing the table.
+    let dins = nameMessage('S', "ins");
+    client.send('D', borrow dins);
+    Check.equalText("t 20 25\nT a:25 b:25\nZ I\n", sync(mut client).view())?;
+    Check.equalText("T count(*):20\nD 1\nC SELECT 1\nZ I\n", client.query("SELECT count(*) FROM t").view())?;
+
+    // Results in the binary format.
+    let pb = parseMessage("", "SELECT 258 AS i, 0.5 AS r, x'0102' AS b, 'é' AS t", noTypes);
+    client.send('P', borrow pb);
+    let none: Slice<StringView?> = [];
+    let bb = bindMessage("", "", none, 1);
+    client.send('B', borrow bb);
+    client.send('D', borrow d);
+    client.send('E', borrow e);
+    Check.equalText(
+        "1\n2\nT i:20b r:701b b:17b t:25b\nD 0x0000000000000102|0x3fe0000000000000|0x0102|é\nC SELECT 1\nZ I\n",
+        sync(mut client).view(),
+    )?;
+
+    // Close.
+    let cs = nameMessage('S', "s1");
+    client.send('C', borrow cs);
+    let b2 = bindMessage("", "s1", values[..], 0);
+    client.send('B', borrow b2);
+    Check.equalText("3\nE 26000 prepared statement \"s1\" does not exist\nZ I\n", sync(mut client).view())?;
+    client.terminate();
+    return stopServer(running);
+}
+
+@test
+fn executeWithARowLimitSuspendsThePortal() -> Result<void, TestFailure> {
+    let running = startServer("suspend", null);
+    var client = Client.connect(running.port);
+    let _ = client.logIn("u", "suspend", "");
+    let noTypes: Slice<u32> = [];
+    let p = parseMessage("", "VALUES (1), (2), (3), (4), (5)", noTypes);
+    client.send('P', borrow p);
+    let none: Slice<StringView?> = [];
+    let b = bindMessage("c", "", none, 0);
+    client.send('B', borrow b);
+    let two = executeMessage("c", 2);
+    client.send('E', borrow two);
+    client.send('E', borrow two);
+    client.send('E', borrow two);
+    Check.equalText("1\n2\nD 1\nD 2\ns\nD 3\nD 4\ns\nD 5\nC SELECT 5\nZ I\n", sync(mut client).view())?;
+    client.terminate();
+    return stopServer(running);
+}
+
+@test
+fn extendedErrorsSkipToSync() -> Result<void, TestFailure> {
+    let running = startServer("errors", null);
+    var client = Client.connect(running.port);
+    let _ = client.logIn("u", "errors", "");
+    let noTypes: Slice<u32> = [];
+    let none: Slice<StringView?> = [];
+
+    let bad = bindMessage("", "missing", none, 0);
+    client.send('B', borrow bad);
+    let e = executeMessage("", 0);
+    client.send('E', borrow e);
+    Check.equalText("E 26000 prepared statement \"missing\" does not exist\nZ I\n", sync(mut client).view())?;
+
+    let p = parseMessage("twice", "SELECT $1", noTypes);
+    client.send('P', borrow p);
+    client.send('P', borrow p);
+    Check.equalText("1\nE 42P05 prepared statement \"twice\" already exists\nZ I\n", sync(mut client).view())?;
+
+    let b = bindMessage("", "twice", none, 0);
+    client.send('B', borrow b);
+    Check.equalText(
+        "E 08P01 bind message supplies 0 parameters, but prepared statement \"twice\" requires 1\nZ I\n",
+        sync(mut client).view(),
+    )?;
+
+    let many = parseMessage("", "SELECT 1; SELECT 2", noTypes);
+    client.send('P', borrow many);
+    Check.equalText("E 42601 cannot insert multiple commands into a prepared statement\nZ I\n", sync(mut client).view())?;
+
+    let typed: [u32; 1] = [20];
+    let pt = parseMessage("", "SELECT $1 + 1", typed[..]);
+    client.send('P', borrow pt);
+    var word: [StringView?; 1] = [Some("abc")];
+    let bt = bindMessage("", "", word[..], 0);
+    client.send('B', borrow bt);
+    Check.equalText("1\nE 22P02 invalid input syntax for type bigint: \"abc\"\nZ I\n", sync(mut client).view())?;
+
+    let ps = parseMessage("", "SELECT nope", noTypes);
+    client.send('P', borrow ps);
+    let bs = bindMessage("", "", none, 0);
+    client.send('B', borrow bs);
+    let d = nameMessage('P', "");
+    client.send('D', borrow d);
+    client.send('E', borrow e);
+    Check.equalText("1\n2\nE 42703 no such column: nope\nZ I\n", sync(mut client).view())?;
+
+    // A message type the protocol does not have ends the session.
+    let empty = Vector<u8>.create();
+    client.send('!', borrow empty);
+    Check.equalText("E FATAL 08P01 invalid frontend message type 33", client.next().view())?;
+    Check.equalText("EOF", client.next().view())?;
+    return stopServer(running);
+}
+
+@test
+fn passwordsAndDatabaseNames() -> Result<void, TestFailure> {
+    let running = startServer("secret", "sesame-sesame");
+    var wrong = Client.connect(running.port);
+    Check.equalText("R 3\nE FATAL 28P01 password authentication failed for user \"bob\"\n", wrong.logIn("bob", "secret", "nope").view())?;
+    Check.equalText("EOF", wrong.next().view())?;
+    var right = Client.connect(running.port);
+    Check.equalText("R 3\nR 0\nZ I\n", right.logIn("bob", "secret", "sesame-sesame").view())?;
+    right.terminate();
+    var badName = Client.connect(running.port);
+    Check.equalText(
+        "R 3\nE FATAL 3D000 invalid database name \"../escape\"\n",
+        badName.logIn("bob", "../escape", "sesame-sesame").view(),
+    )?;
+    var noUser = Client.connect(running.port);
+    var pairs = Vector<StringView>.create();
+    pairs.push("database")!;
+    pairs.push("secret")!;
+    noUser.sendStartup(196608, pairs.view());
+    Check.equalText("E FATAL 28000 no PostgreSQL user name specified in startup packet", noUser.next().view())?;
+    var oldProtocol = Client.connect(running.port);
+    oldProtocol.sendStartup(131072, pairs.view());
+    Check.equalText("E FATAL 0A000 unsupported frontend protocol 2.0: server supports 3.0 to 3.0", oldProtocol.next().view())?;
+    return stopServer(running);
+}
+
+@test
+fn newerProtocolVersionsAreNegotiated() -> Result<void, TestFailure> {
+    let running = startServer("negotiate", null);
+    var client = Client.connect(running.port);
+    var pairs = Vector<StringView>.create();
+    pairs.push("user")!;
+    pairs.push("u")!;
+    pairs.push("database")!;
+    pairs.push("negotiate")!;
+    pairs.push("_pq_.something")!;
+    pairs.push("on")!;
+    client.sendStartup(196610, pairs.view());
+    Check.equalText("v 0 _pq_.something", client.next().view())?;
+    Check.equalText("R 0", client.next().view())?;
+    let rest = client.untilReady();
+    Check.isTrue(rest.view().endsWith("Z I\n"), "the session starts in 3.0")?;
+    client.terminate();
+    return stopServer(running);
+}
+
+@test
+fn clientsShareTheDatabaseFile() -> Result<void, TestFailure> {
+    let running = startServer("shared", null);
+    var first = Client.connect(running.port);
+    let _ = first.logIn("u", "shared.db", "");
+    var second = Client.connect(running.port);
+    let _ = second.logIn("u", "shared", "");
+    let _ = first.query("CREATE TABLE t(x); BEGIN; INSERT INTO t VALUES (1)");
+    Check.equalText("C COMMIT\nZ I\n", first.query("COMMIT").view())?;
+    Check.equalText("T x:20\nD 1\nC SELECT 1\nZ I\n", second.query("SELECT x FROM t").view())?;
+    let _ = second.query("INSERT INTO t SELECT x + 1 FROM t");
+    Check.equalText("T count(*):20\nD 2\nC SELECT 1\nZ I\n", first.query("SELECT count(*) FROM t").view())?;
+    first.terminate();
+    second.terminate();
+    Check.equalText("EOF", first.next().view())?;
+    Check.equalText("EOF", second.next().view())?;
+    let stopped = stopServer(running);
+    // The file is where the C# daemon kept it, and SQLite finds nothing wrong with it.
+    var arguments = Vector<StringView>.create();
+    arguments.push("out/pg-tests/shared/main.db")!;
+    arguments.push("PRAGMA integrity_check; SELECT count(*) FROM t")!;
+    let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
+    Check.equalBytes("ok\n2\n".bytes(), output.stdout.view())?;
+    return stopped;
+}
+
+@test
+fn malformedMessagesEndTheSession() -> Result<void, TestFailure> {
+    let running = startServer("malformed", null);
+    var client = Client.connect(running.port);
+    let _ = client.logIn("u", "malformed", "");
+    // A Bind whose parameter length runs past the message's end.
+    var p = Vector<u8>.create();
+    putText(mut p, "")!;
+    putText(mut p, "")!;
+    p.pushBE(0u16)!;
+    p.pushBE(1u16)!;
+    p.pushBE(1000u32)!;
+    let ok = parseMessage("", "SELECT $1", [0u32][..]);
+    client.send('P', borrow ok);
+    client.send('B', borrow p);
+    Check.equalText("1", client.next().view())?;
+    Check.equalText("E FATAL 08P01 insufficient data left in message", client.next().view())?;
+    Check.equalText("EOF", client.next().view())?;
+    // A length word below the minimum.
+    var other = Client.connect(running.port);
+    let _ = other.logIn("u", "malformed", "");
+    other.wire.output.push('Q')!;
+    other.wire.output.pushBE(2u32)!;
+    other.wire.flush()!;
+    Check.equalText("E FATAL 08P01 invalid message length", other.next().view())?;
+    return stopServer(running);
+}
+
+@test
+fn psqlTalksToTheServer() -> Result<void, TestFailure> {
+    var probe = Vector<StringView>.create();
+    probe.push("--version")!;
+    if (Process.capture("psql", borrow probe, "".bytes()) is Err(_)) {
+        Console.writeLine("psql is not installed: skipped");
+        return Ok();
+    }
+    let running = startServer("psql", null);
+    var connection = String.from("host=127.0.0.1 sslmode=prefer user=tester dbname=psql port=")!;
+    connection.appendNumber(running.port)!;
+    var arguments = Vector<StringView>.create();
+    arguments.push("-X")!;
+    arguments.push("-A")!;
+    arguments.push("-q")!;
+    arguments.push("-v")!;
+    arguments.push("ON_ERROR_STOP=0")!;
+    arguments.push(connection.view())!;
+    let script = """
+        CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT, c REAL);
+        INSERT INTO t VALUES (1, 'one', 1.5), (2, NULL, -2);
+        SELECT * FROM t ORDER BY a;
+        SELECT nope;
+        BEGIN;
+        UPDATE t SET b = 'two' WHERE a = 2;
+        COMMIT;
+        SELECT b FROM t WHERE a = 2;
+        SELECT $1::text;
+        """;
+    let output = Process.capture("psql", borrow arguments, script.bytes())!;
+    let stopped = stopServer(running);
+    Check.equalText("""
+        a|b|c
+        1|one|1.5
+        2||-2
+        (2 rows)
+        b
+        two
+        (1 row)
+
+        """, StringView.fromUtf8(output.stdout.view()) ?? "not UTF-8")?;
+    let errors = StringView.fromUtf8(output.stderr.view()) ?? "not UTF-8";
+    Check.isTrue(errors.contains("ERROR:  no such column: nope"), "psql shows the server's error")?;
+    return stopped;
+}
