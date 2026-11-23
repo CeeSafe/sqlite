@@ -1,0 +1,798 @@
+// printf() and format(): a port of SQLite 3.53's sqlite3_str_vappendf (printf.c, public domain) as its SQL
+// function printfFunc drives it, with arguments taken from the call (getIntArg, getDoubleArg, getTextArg) rather
+// than from a C va_list. Every conversion the SQL path allows is here: %d %i %u %f %e %E %g %G %x %X %o %s %z %q %Q
+// %w %c %p %r %n %%, the flags `-+ #0,!`, widths and precisions written out or taken from the arguments with `*`.
+// An argument that is missing reads as NULL; NULL is 0 for a number and no text for a string. An unknown
+// conversion (or %T, %S, which only SQLite itself may use) ends the output where it stands, as in SQLite.
+//
+// The text is built as bytes, as SQLite builds it, and becomes text at the end: where SQLite's result would not be
+// UTF-8 (a precision that cuts a character in two, a blob that is not UTF-8) each stray byte becomes U+FFFD.
+//
+// Differences from the C# engine, which this replaces (each checked against sqlite3 3.54):
+// - the C# printf knew d i u f e E g G s x X o c q Q w and threw on any other conversion; %p, %r, %z and %n are
+//   here, and an unknown conversion ends the output as in SQLite;
+// - the C# had no `#`, `!`, `,` or space flag and no `*`; a lone `%` at the end of the format was dropped;
+// - reals were formatted by .NET (`1E+20` for %g, `∞` for infinity, rounding of its own); here they go through
+//   SQLite's sqlite3FpDecode, with its 16-digit limit, `Inf`, and the `!` flag's 20 digits;
+// - %d of a real or text went through a double, so large integers lost digits; %u of a negative number printed
+//   a minus sign rather than the 64-bit unsigned value; %x and %o ignored precision and the `0` flag's padding;
+// - %s precision counted UTF-16 units, not bytes (or characters with `!`); %c of '' or NULL threw rather than
+//   giving a NUL; %q and %w of NULL gave '' rather than `(NULL)`;
+// - printf(NULL), printf() and an empty result gave '' rather than NULL.
+
+/// SQLite's default limit on the length of a text (SQLITE_MAX_LENGTH).
+const PRINTF_LENGTH_LIMIT: i64 = 1_000_000_000;
+
+/// SQLite's limit on the precision of a real's conversion (SQLITE_FP_PRECISION_LIMIT).
+const PRINTF_REAL_PRECISION_LIMIT: i64 = 100_000_000;
+
+/// The text being built, as SQLite's StrAccum: bytes, and whether it went past the length limit.
+struct PrintfText {
+    bytes: Vector<u8>;
+    tooBig: bool;
+
+    /// Whether `extra` more bytes keep the text inside the limit (sqlite3StrAccumEnlarge's test); when they do
+    /// not, the text is too big and nothing more is added.
+    fn fits(borrow mut this, extra: i64) -> bool {
+        if (this.tooBig) {
+            return false;
+        }
+        if (truncate<i64>(this.bytes.length) + extra + 1 > PRINTF_LENGTH_LIMIT) {
+            this.tooBig = true;
+            this.bytes.clear();
+            return false;
+        }
+        return true;
+    }
+
+    fn repeat(borrow mut this, b: u8, count: i64) -> Result<void, AllocError> {
+        if (count <= 0) {
+            return Ok();
+        }
+        return this.bytes.resize(this.bytes.length + truncate<usize>(count), b);
+    }
+
+    /// Appends a converted field, padded with spaces to `width` on the left or, with `left`, on the right.
+    fn field(borrow mut this, text: Slice<u8>, width: i64, left: bool) -> Result<void, AllocError> {
+        let length = truncate<i64>(text.length);
+        let pad = width - length;
+        if (!this.fits(if (pad > 0) width else length)) {
+            return Ok();
+        }
+        if (!left) {
+            this.repeat(' ', pad)?;
+        }
+        this.bytes.extend(text)?;
+        if (left) {
+            this.repeat(' ', pad)?;
+        }
+        return Ok();
+    }
+}
+
+/// The arguments after the format, taken in turn (PrintfArguments); one past the last reads as NULL.
+struct PrintfArguments<region r> {
+    values: Slice<r, SqliteValue>;
+    used: usize;
+
+    /// getIntArg.
+    fn integer(borrow mut this) -> i64 {
+        if (this.used >= this.values.length) {
+            return 0;
+        }
+        let v = integerValue(borrow this.values[this.used]);
+        this.used += 1;
+        return v;
+    }
+
+    /// getDoubleArg.
+    fn real(borrow mut this) -> f64 {
+        if (this.used >= this.values.length) {
+            return 0.0;
+        }
+        let r = realValue(borrow this.values[this.used]);
+        this.used += 1;
+        return r;
+    }
+
+    /// getTextArg: the value's text up to its first NUL, as the C string; `null` for NULL.
+    fn text(borrow mut this) -> Result<Vector<u8>?, AllocError> {
+        if (this.used >= this.values.length) {
+            return Ok(null);
+        }
+        let value = borrow this.values[this.used];
+        this.used += 1;
+        var bytes = Vector<u8>.create();
+        match (value) {
+            SqliteValue.Null => { return Ok(null); }
+            SqliteValue.Text(s) => { bytes.extend(beforeNul(s.view().bytes()))?; }
+            SqliteValue.Blob(b) => { bytes.extend(beforeNul(b.view()))?; }
+            _ => {
+                let text = valueText(value)?;
+                bytes.extend(text.view().bytes())?;
+            }
+        }
+        return Ok(Some(bytes));
+    }
+}
+
+/// The flags, width and precision of one conversion.
+struct PrintfSpec {
+    leftJustify: bool;
+    /// '+', ' ' or 0.
+    signFlag: u8;
+    alternate: bool;
+    /// The `!` flag.
+    alternate2: bool;
+    zeroPad: bool;
+    thousands: bool;
+    width: i64;
+    /// -1 when none was given.
+    precision: i64;
+}
+
+/// printf(FORMAT, ...) and format(FORMAT, ...): NULL when there is no format or it is NULL.
+fn printfFunction(values: Slice<SqliteValue>) -> Result<SqliteValue, SqliteError> {
+    if (values.length == 0 || values[0].isNull()) {
+        return Ok(SqliteValue.Null);
+    }
+    var format = Vector<u8>.create();
+    match (borrow values[0]) {
+        SqliteValue.Text(s) => { format.extend(beforeNul(s.view().bytes()))?; }
+        SqliteValue.Blob(b) => { format.extend(beforeNul(b.view()))?; }
+        other => {
+            let text = valueText(other)?;
+            format.extend(text.view().bytes())?;
+        }
+    }
+    var out = PrintfText { bytes: Vector<u8>.create(), tooBig: false };
+    var args = PrintfArguments { values: values[1..], used: 0 };
+    renderPrintf(mut out, format.view(), mut args)?;
+    if (out.tooBig) {
+        return Err(sqlError("string or blob too big"));
+    }
+    if (out.bytes.length == 0) {
+        // SQLite's text was never allocated, and an unallocated result is NULL.
+        return Ok(SqliteValue.Null);
+    }
+    return Ok(SqliteValue.Text(textFromBytesLossy(out.bytes.view())?));
+}
+
+/// sqlite3_str_vappendf with SQLITE_PRINTF_SQLFUNC: renders `fmt` into `out`.
+fn renderPrintf(
+    out: borrow mut PrintfText,
+    fmt: Slice<u8>,
+    args: borrow mut PrintfArguments,
+) -> Result<void, AllocError> {
+    let n = fmt.length;
+    let at = (k: usize) => if (k < n) fmt[k] else 0u8;
+    var p: usize = 0;
+    while (at(p) != 0) {
+        if (fmt[p] != '%') {
+            let start = p;
+            while (p < n && fmt[p] != '%') {
+                p += 1;
+            }
+            if (!out.fits(truncate<i64>(p - start))) {
+                return Ok();
+            }
+            out.bytes.extend(fmt[start..p])?;
+            if (p >= n) {
+                break;
+            }
+        }
+        p += 1;
+        var c = at(p);
+        if (c == 0) {
+            if (out.fits(1)) {
+                out.bytes.push('%')?;
+            }
+            break;
+        }
+        var spec = PrintfSpec {
+            leftJustify: false,
+            signFlag: 0,
+            alternate: false,
+            alternate2: false,
+            zeroPad: false,
+            thousands: false,
+            width: 0,
+            precision: -1,
+        };
+        var done = false;
+        loop {
+            match (c) {
+                '-' => { spec.leftJustify = true; }
+                '+' => { spec.signFlag = '+'; }
+                ' ' => { spec.signFlag = ' '; }
+                '#' => { spec.alternate = true; }
+                '!' => { spec.alternate2 = true; }
+                '0' => { spec.zeroPad = true; }
+                ',' => { spec.thousands = true; }
+                'l' => {
+                    // A length modifier: it means nothing for SQL arguments.
+                    p += 1;
+                    c = at(p);
+                    if (c == 'l') {
+                        p += 1;
+                        c = at(p);
+                    }
+                    done = true;
+                }
+                '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' => {
+                    var wx = (c - '0') as u32;
+                    loop {
+                        p += 1;
+                        c = at(p);
+                        if (c < '0' || c > '9') {
+                            break;
+                        }
+                        wx = wx.wrappingMul(10).wrappingAdd((c - '0') as u32);
+                    }
+                    spec.width = (wx & 0x7fffffff) as i64;
+                    if (c != '.' && c != 'l') {
+                        done = true;
+                    } else {
+                        p -= 1;
+                    }
+                }
+                '*' => {
+                    var w = truncate<i32>(args.integer());
+                    if (w < 0) {
+                        spec.leftJustify = true;
+                        w = if (w >= -2147483647) 0 - w else 0;
+                    }
+                    spec.width = w as i64;
+                    c = at(p + 1);
+                    if (c != '.' && c != 'l') {
+                        p += 1;
+                        done = true;
+                    }
+                }
+                '.' => {
+                    p += 1;
+                    c = at(p);
+                    if (c == '*') {
+                        var precision = truncate<i32>(args.integer());
+                        if (precision < 0) {
+                            precision = if (precision >= -2147483647) 0 - precision else -1;
+                        }
+                        spec.precision = precision as i64;
+                        p += 1;
+                        c = at(p);
+                    } else {
+                        var px: u32 = 0;
+                        while (c >= '0' && c <= '9') {
+                            px = px.wrappingMul(10).wrappingAdd((c - '0') as u32);
+                            p += 1;
+                            c = at(p);
+                        }
+                        spec.precision = (px & 0x7fffffff) as i64;
+                    }
+                    if (c == 'l') {
+                        p -= 1;
+                    } else {
+                        done = true;
+                    }
+                }
+                _ => { done = true; }
+            }
+            if (done) {
+                break;
+            }
+            p += 1;
+            c = at(p);
+            if (c == 0) {
+                break;
+            }
+        }
+        match (c) {
+            'd' | 'i' | 'u' | 'r' | 'x' | 'X' | 'o' | 'p' => { printfInteger(out, args, c, spec)?; }
+            'f' | 'e' | 'E' | 'g' | 'G' => { printfFloat(out, args, c, spec)?; }
+            'n' => {}
+            '%' => { out.field("%".bytes(), spec.width, spec.leftJustify)?; }
+            'c' => { appendCharacter(out, args, spec)?; }
+            's' | 'z' => { appendString(out, args, spec)?; }
+            'q' | 'Q' | 'w' => { appendEscaped(out, args, c, spec)?; }
+            _ => {
+                // An unknown conversion, or %T and %S, which are SQLite's own: the output ends here.
+                return Ok();
+            }
+        }
+        if (out.tooBig) {
+            return Ok();
+        }
+        p += 1;
+    }
+    return Ok();
+}
+
+fn digitCharacter(d: u64, upper: bool) -> u8 {
+    let small = truncate<u8>(d);
+    if (small < 10) {
+        return '0' + small;
+    }
+    return (if (upper) 'A' else 'a') + small - 10;
+}
+
+/// %d %i %u %r %x %X %o %p.
+fn printfInteger(
+    out: borrow mut PrintfText,
+    args: borrow mut PrintfArguments,
+    conv: u8,
+    spec: PrintfSpec,
+) -> Result<void, AllocError> {
+    let signed = conv == 'd' || conv == 'i' || conv == 'r';
+    let base: u64 = if (conv == 'x' || conv == 'X' || conv == 'p') 16 else if (conv == 'o') 8 else 10;
+    let thousands = spec.thousands && (conv == 'd' || conv == 'i' || conv == 'u');
+    let v = args.integer();
+    var magnitude = truncate<u64>(v);
+    var prefix: u8 = 0;
+    if (signed) {
+        if (v < 0) {
+            magnitude = (~magnitude).wrappingAdd(1);
+            prefix = '-';
+        } else {
+            prefix = spec.signFlag;
+        }
+    }
+    let alternate = spec.alternate && magnitude != 0;
+    var precision = spec.precision;
+    let signWidth: i64 = if (prefix != 0) 1 else 0;
+    if (spec.zeroPad && precision < spec.width - signWidth) {
+        precision = spec.width - signWidth;
+    }
+    // printfTempBuf: a field too large for SQLite's limit is refused before it is made.
+    if (precision >= 70 - 10 - 70 / 3) {
+        var need = precision + 10;
+        if (thousands) {
+            need += precision / 3;
+        }
+        if (need > PRINTF_LENGTH_LIMIT) {
+            out.tooBig = true;
+            out.bytes.clear();
+            return Ok();
+        }
+    }
+    var body = Vector<u8>.create();
+    var value = magnitude;
+    loop {
+        body.push(digitCharacter(value % base, conv != 'x'))?;
+        value /= base;
+        if (value == 0) {
+            break;
+        }
+    }
+    let count = body.length;
+    for (i in 0..count / 2) {
+        body.swap(i, count - 1 - i);
+    }
+    if (conv == 'r') {
+        let suffixes = "thstndrd".bytes();
+        var x = truncate<usize>(magnitude % 10);
+        if (x >= 4 || (magnitude / 10) % 10 == 1) {
+            x = 0;
+        }
+        body.push(suffixes[x * 2])?;
+        body.push(suffixes[x * 2 + 1])?;
+    }
+    let length = truncate<i64>(body.length);
+    let zeros = if (precision > length) precision - length else 0;
+    let digits = length + zeros;
+    let commas = if (thousands) (digits - 1) / 3 else 0;
+    let prefixLength: i64 =
+        signWidth + (if (alternate && conv != 'd' && conv != 'i' && conv != 'u' && conv != 'r') (if (conv == 'o') 1
+            else 2) else 0);
+    let total = digits + commas + prefixLength;
+    if (!out.fits(if (spec.width > total) spec.width else total)) {
+        return Ok();
+    }
+    var field = Vector<u8>.withCapacity(truncate<usize>(total))?;
+    if (alternate) {
+        match (conv) {
+            'x' | 'p' => { field.extend("0x".bytes())?; }
+            'X' => { field.extend("0X".bytes())?; }
+            'o' => { field.push('0')?; }
+            _ => {}
+        }
+    }
+    if (prefix != 0) {
+        field.push(prefix)?;
+    }
+    var k: i64 = 0;
+    while (k < digits) {
+        field.push(if (k < zeros) '0' else body[truncate<usize>(k - zeros)])?;
+        let remaining = digits - 1 - k;
+        if (thousands && remaining > 0 && remaining % 3 == 0) {
+            field.push(',')?;
+        }
+        k += 1;
+    }
+    return out.field(field.view(), spec.width, spec.leftJustify);
+}
+
+/// What sqlite3FpDecode makes of a real: its sign, its significant digits and where the decimal point falls
+/// (0.d1d2… × 10^point), or that it is infinite (1) or NaN (2).
+struct FpDecoded {
+    negative: bool;
+    special: u8;
+    digits: Vector<u8>;
+    point: i32;
+
+    fn of(value: f64, iRound: i32, mxRound: i32) -> Result<FpDecoded, AllocError> {
+        var r = value;
+        var negative = false;
+        if (r < 0.0) {
+            negative = true;
+            r = 0.0 - r;
+        } else if (r == 0.0) {
+            var zero = Vector<u8>.create();
+            zero.push('0')?;
+            return Ok(FpDecoded { negative: false, special: 0, digits: zero, point: 1 });
+        }
+        if (r != r) {
+            return Ok(FpDecoded { negative: negative, special: 2, digits: Vector<u8>.create(), point: 0 });
+        }
+        if (r > 1.7976931348623157e308) {
+            return Ok(FpDecoded { negative: negative, special: 1, digits: Vector<u8>.create(), point: 0 });
+        }
+        let decoded = DecodedReal.rounded(r, iRound, mxRound)?;
+        return Ok(FpDecoded { negative: negative, special: 0, digits: decoded.digits, point: decoded.point });
+    }
+}
+
+/// %f %e %E %g %G.
+fn printfFloat(
+    out: borrow mut PrintfText,
+    args: borrow mut PrintfArguments,
+    conv: u8,
+    spec: PrintfSpec,
+) -> Result<void, AllocError> {
+    let value = args.real();
+    var precision = if (spec.precision < 0) 6 else spec.precision;
+    if (precision > PRINTF_REAL_PRECISION_LIMIT) {
+        precision = PRINTF_REAL_PRECISION_LIMIT;
+    }
+    let generic = conv == 'g' || conv == 'G';
+    var exponential = conv == 'e' || conv == 'E';
+    var iRound: i32 = 0;
+    if (conv == 'f') {
+        iRound = 0 - truncate<i32>(precision);
+    } else if (generic) {
+        if (precision == 0) {
+            precision = 1;
+        }
+        iRound = truncate<i32>(precision);
+    } else {
+        iRound = truncate<i32>(precision) + 1;
+    }
+    var s = FpDecoded.of(value, iRound, if (spec.alternate2) 20 else 16)?;
+    if (s.special == 2) {
+        let text = if (spec.zeroPad) "null" else "NaN";
+        return out.field(text.bytes(), spec.width, spec.leftJustify);
+    }
+    if (s.special == 1) {
+        if (spec.zeroPad) {
+            // With the `0` flag, infinity is written as 9e999, which reads back as infinity.
+            s.digits.push('9')?;
+            s.point = 1000;
+        } else {
+            var text = Vector<u8>.create();
+            if (s.negative) {
+                text.push('-')?;
+            } else if (spec.signFlag != 0) {
+                text.push(spec.signFlag)?;
+            }
+            text.extend("Inf".bytes())?;
+            return out.field(text.view(), spec.width, spec.leftJustify);
+        }
+    }
+    var prefix: u8 = spec.signFlag;
+    if (s.negative) {
+        // `#` with %f drops the sign of a value shown as zero.
+        let showsZero = spec.alternate && spec.signFlag == 0 && conv == 'f' && s.point <= iRound;
+        prefix = if (showsZero) 0 else '-';
+    }
+    let exp = s.point - 1;
+    var removeTrailingZeros = spec.alternate2;
+    if (generic) {
+        precision -= 1;
+        removeTrailingZeros = !spec.alternate;
+        if (exp < -4 || (exp as i64) > precision) {
+            exponential = true;
+        } else {
+            precision = precision - (exp as i64);
+        }
+    }
+    var e2: i32 = if (exponential) 0 else s.point - 1;
+    var needed = (if (e2 > 0) e2 as i64 else 0) + precision + spec.width + 10;
+    if (spec.thousands && e2 > 0) {
+        needed += ((e2 + 2) / 3) as i64;
+    }
+    if (!out.fits(needed)) {
+        return Ok();
+    }
+    let showPoint = precision > 0 || spec.alternate || spec.alternate2;
+    let digits = s.digits.view();
+    let n = digits.length;
+    var b = Vector<u8>.create();
+    if (prefix != 0) {
+        b.push(prefix)?;
+    }
+    var j: usize = 0;
+    if (e2 < 0) {
+        b.push('0')?;
+    } else if (spec.thousands) {
+        while (e2 >= 0) {
+            if (j < n) {
+                b.push(digits[j])?;
+                j += 1;
+            } else {
+                b.push('0')?;
+            }
+            if (e2 % 3 == 0 && e2 > 1) {
+                b.push(',')?;
+            }
+            e2 -= 1;
+        }
+    } else {
+        j = (truncate<usize>(e2) + 1).min(n);
+        b.extend(digits[0..j])?;
+        e2 -= truncate<i32>(j);
+        if (e2 >= 0) {
+            b.resize(b.length + truncate<usize>(e2) + 1, '0')?;
+            e2 = -1;
+        }
+    }
+    if (showPoint) {
+        b.push('.')?;
+    }
+    if (e2 < -1 && precision > 0) {
+        let nn = ((-1 - e2) as i64).min(precision);
+        b.resize(b.length + truncate<usize>(nn), '0')?;
+        precision -= nn;
+    }
+    if (precision > 0) {
+        var nn = truncate<i64>(n - j);
+        if (nn > precision) {
+            nn = precision;
+        }
+        if (nn > 0) {
+            b.extend(digits[j..j + truncate<usize>(nn)])?;
+            precision -= nn;
+        }
+        if (precision > 0 && !removeTrailingZeros) {
+            b.resize(b.length + truncate<usize>(precision), '0')?;
+        }
+    }
+    if (removeTrailingZeros && showPoint) {
+        while (b.length > 0 && b[b.length - 1] == '0') {
+            let _ = b.pop();
+        }
+        if (b.length > 0 && b[b.length - 1] == '.') {
+            if (spec.alternate2) {
+                b.push('0')?;
+            } else {
+                let _ = b.pop();
+            }
+        }
+    }
+    if (exponential) {
+        var e = s.point - 1;
+        b.push(if (conv == 'E' || conv == 'G') 'E' else 'e')?;
+        if (e < 0) {
+            b.push('-')?;
+            e = 0 - e;
+        } else {
+            b.push('+')?;
+        }
+        if (e >= 100) {
+            b.push('0' + truncate<u8>(e / 100))?;
+            e = e % 100;
+        }
+        b.push('0' + truncate<u8>(e / 10))?;
+        b.push('0' + truncate<u8>(e % 10))?;
+    }
+    let length = truncate<i64>(b.length);
+    if (length >= spec.width) {
+        out.bytes.extend(b.view())?;
+        return Ok();
+    }
+    let pad = spec.width - length;
+    if (spec.leftJustify) {
+        out.bytes.extend(b.view())?;
+        out.repeat(' ', pad)?;
+    } else if (!spec.zeroPad) {
+        out.repeat(' ', pad)?;
+        out.bytes.extend(b.view())?;
+    } else {
+        // Zeros go after the sign.
+        let adj: usize = if (prefix != 0) 1 else 0;
+        out.bytes.extend(b.view()[0..adj])?;
+        out.repeat('0', pad)?;
+        out.bytes.extend(b.view()[adj..])?;
+    }
+    return Ok();
+}
+
+/// The width of a field whose length is counted in bytes, widened by its UTF-8 continuation bytes so that it
+/// counts characters (adjust_width_for_utf8, for the `!` flag).
+fn widthForCharacters(width: i64, text: Slice<u8>) -> i64 {
+    var w = width;
+    for (b in text) {
+        if ((b & 0xC0) == 0x80) {
+            w += 1;
+        }
+    }
+    return w;
+}
+
+/// %c: the first character of the argument's text, `precision` times.
+fn appendCharacter(
+    out: borrow mut PrintfText,
+    args: borrow mut PrintfArguments,
+    spec: PrintfSpec,
+) -> Result<void, AllocError> {
+    var buf = Vector<u8>.create();
+    match (args.text()?) {
+        Some(text) => {
+            if (text.length == 0) {
+                buf.push(0)?;
+            } else {
+                buf.push(text[0])?;
+                if ((text[0] & 0xC0) == 0xC0) {
+                    var k: usize = 1;
+                    while (buf.length < 4 && k < text.length && (text[k] & 0xC0) == 0x80) {
+                        buf.push(text[k])?;
+                        k += 1;
+                    }
+                }
+            }
+        }
+        null => { buf.push(0)?; }
+    }
+    var width = spec.width;
+    let precision = spec.precision;
+    if (precision > 1) {
+        width -= precision - 1;
+        if (width > 1 && !spec.leftJustify) {
+            if (!out.fits(width - 1)) {
+                return Ok();
+            }
+            out.repeat(' ', width - 1)?;
+            width = 0;
+        }
+        let copies = precision - 1;
+        if (!out.fits(truncate<i64>(buf.length) * copies)) {
+            return Ok();
+        }
+        var i: i64 = 0;
+        while (i < copies) {
+            out.bytes.extend(buf.view())?;
+            i += 1;
+        }
+    }
+    if (width > 0) {
+        width = widthForCharacters(width, buf.view());
+    }
+    return out.field(buf.view(), width, spec.leftJustify);
+}
+
+/// %s and %z: the argument's text, cut to `precision` bytes (characters with `!`).
+fn appendString(
+    out: borrow mut PrintfText,
+    args: borrow mut PrintfArguments,
+    spec: PrintfSpec,
+) -> Result<void, AllocError> {
+    let text = args.text()? ?? Vector<u8>.create();
+    let bytes = text.view();
+    var length = bytes.length;
+    if (spec.precision >= 0) {
+        if (spec.alternate2) {
+            var z: usize = 0;
+            var characters = spec.precision;
+            while (characters > 0 && z < bytes.length) {
+                characters -= 1;
+                let lead = bytes[z];
+                z += 1;
+                if (lead >= 0xC0) {
+                    while (z < bytes.length && (bytes[z] & 0xC0) == 0x80) {
+                        z += 1;
+                    }
+                }
+            }
+            length = z;
+        } else if (spec.precision < truncate<i64>(bytes.length)) {
+            length = truncate<usize>(spec.precision);
+        }
+    }
+    let shown = bytes[0..length];
+    var width = spec.width;
+    if (spec.alternate2 && width > 0) {
+        width = widthForCharacters(width, shown);
+    }
+    return out.field(shown, width, spec.leftJustify);
+}
+
+/// %q, %Q and %w: the text with its quotes doubled; %Q also quotes it, or is NULL; `#` escapes control
+/// characters as unistr() reads them.
+fn appendEscaped(
+    out: borrow mut PrintfText,
+    args: borrow mut PrintfArguments,
+    conv: u8,
+    spec: PrintfSpec,
+) -> Result<void, AllocError> {
+    var needQuote = 0;
+    var escarg = Vector<u8>.create();
+    match (args.text()?) {
+        Some(text) => {
+            escarg = text;
+            if (conv == 'Q') {
+                needQuote = 1;
+            }
+        }
+        null => { escarg.extend((if (conv == 'Q') "NULL" else "(NULL)").bytes())?; }
+    }
+    let arg = escarg.view();
+    let q: u8 = if (conv == 'w') '"' else '\'';
+    var alternate = spec.alternate && conv != 'w';
+    // How much of the text to use: `precision` bytes, or characters with `!`.
+    var k = spec.precision;
+    var i: usize = 0;
+    while (k != 0 && i < arg.length) {
+        let ch = arg[i];
+        if (spec.alternate2 && (ch & 0xC0) == 0xC0) {
+            while (i + 1 < arg.length && (arg[i + 1] & 0xC0) == 0x80) {
+                i += 1;
+            }
+        }
+        i += 1;
+        k -= 1;
+    }
+    if (alternate) {
+        var controls = false;
+        for (b in arg[0..i]) {
+            if (b <= 0x1F) {
+                controls = true;
+            }
+        }
+        if (controls || conv == 'q') {
+            if (conv == 'Q') {
+                needQuote = 2;
+            }
+        } else {
+            alternate = false;
+        }
+    }
+    var b = Vector<u8>.create();
+    if (needQuote == 2) {
+        b.extend("unistr('".bytes())?;
+    } else if (needQuote == 1) {
+        b.push('\'')?;
+    }
+    for (ch in arg[0..i]) {
+        if (alternate && ch == '\\') {
+            b.extend("\\\\".bytes())?;
+        } else if (alternate && ch <= 0x1F) {
+            b.extend("\\u00".bytes())?;
+            b.push(if (ch >= 0x10) '1' else '0')?;
+            b.push(digitCharacter((ch & 0xF) as u64, false))?;
+        } else {
+            b.push(ch)?;
+            if (ch == q) {
+                b.push(ch)?;
+            }
+        }
+    }
+    if (needQuote != 0) {
+        b.push('\'')?;
+        if (needQuote == 2) {
+            b.push(')')?;
+        }
+    }
+    var width = spec.width;
+    if (spec.alternate2 && width > 0) {
+        width = widthForCharacters(width, b.view());
+    }
+    return out.field(b.view(), width, spec.leftJustify);
+}

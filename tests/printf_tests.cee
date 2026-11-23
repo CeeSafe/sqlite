@@ -1,0 +1,159 @@
+// printf() and format(), compared with the sqlite3 shell conversion by conversion.
+
+const PRINTF_FIXTURE: StringView = """
+    CREATE TABLE t(a INTEGER, b REAL, c TEXT, d BLOB);
+    INSERT INTO t VALUES (1, 3.0, 'it''s', x'414243'), (-9223372036854775808, -0.5, 'say "hi"', NULL),
+        (9223372036854775807, 1e300, NULL, x'00'), (NULL, 2.5e-310, 'héllo', x'e282ac');
+    """;
+
+/// A fresh fixture for one test.
+fn printfFixture(name: StringView) -> Result<String, TestFailure> {
+    var path = String.from("out/printf-")!;
+    path.append(name)!;
+    path.append(".db")!;
+    makeDatabase(path.view(), PRINTF_FIXTURE)?;
+    return Ok(path);
+}
+
+@test
+fn printfIntegers() -> Result<void, TestFailure> {
+    let path = printfFixture("integers")?;
+    return sameAnswers(path.view(), """
+        SELECT printf('%d|%i|%u', 42, -42, -42), printf('%5d|%-5d|%05d|%+d|% d|%+05d|% 05d', 42, 42, 42, 42, 42, 42, 42)
+        SELECT printf('%d %d', 9223372036854775807, -9223372036854775808), printf('%u %x %X %o', -9223372036854775808, -1, -1, -1)
+        SELECT printf('%+d|% d|%+u|%+x', -9223372036854775808, 9223372036854775807, 5, 5)
+        SELECT printf('%.5d|%8.5d|%-8.5d|%08.5d|%.0d|%.0d|%.d', 42, 42, 42, 42, 0, 7, 0)
+        SELECT printf('%,d|%,d|%,d|%,d|%,u|%,i|%,d', 1234567, -1234567, 999, 1000, -1, 12, -9223372036854775808)
+        SELECT printf('%,010d|%,.7d|%+,d|%,x|%,o|%-,12d|', 1234, 5, 1234567, 1234567, 1234567, 1234567)
+        SELECT printf('%x|%X|%o|%#x|%#X|%#o|%#x|%#o|%#X', 255, 255, 8, 255, 255, 8, 0, 0, -1)
+        SELECT printf('%#010x|%#-10x|%#.6o|%10.4x|%#08o|%08X', 255, 255, 8, 255, 8, 48879)
+        SELECT printf('%p|%#p|%10p|%.4p|%-8p|%p', 255, 255, 4096, 1, 10, -1)
+        SELECT printf('%r %r %r %r %r %r %r %r %r %r', 0, 1, 2, 3, 4, 11, 12, 13, 21, 111)
+        SELECT printf('%r|%5r|%-6r|%.5r|%+r|%05r|%,r|%r', 112, 22, 3, 1, 101, 2, 1234, -23)
+        SELECT printf('%d|%d|%d|%d|%d', 3.99, -3.99, '12abc', 'abc', x'3132'), printf('%d %d', 1e300, -1e300), printf('%x', 2.5)
+        SELECT printf('%ld|%lld|%lu|%llx|%5ld|%l.3d', 1, 2, 3, 255, 4, 5)
+        SELECT printf('%i', ' 42 '), printf('%d', '9223372036854775808'), printf('%d', '-9223372036854775809'), printf('%d', 1e999)
+        SELECT printf('%d|%x|%u|%,d', a, a, a, a) FROM t ORDER BY rowid
+        """);
+}
+
+@test
+fn printfReals() -> Result<void, TestFailure> {
+    let path = printfFixture("reals")?;
+    return sameAnswers(path.view(), """
+        SELECT printf('%f|%e|%E|%g|%G', 3.14159, 3.14159, 3.14159, 3.14159, 3.14159)
+        SELECT printf('%.2f|%.0f|%#.0f|%10.3f|%-10.3f|%010.3f|%+.2f|% .2f', 2.345, 2.5, 2.5, 3.14159, 3.14159, -3.14159, 1.0, 1.0)
+        SELECT printf('%.3e|%.0e|%#.0e|%12.4E|%-12.4e|%012.4e|%+e|% e', 12345.678, 12345.678, 12345.678, 0.000123, 0.000123, -0.000123, 1.0, 1.0)
+        SELECT printf('%g|%g|%g|%g|%g|%g|%g|%g', 100000, 1000000, 1e-4, 1e-5, 0.0001234, 123456789, 0.5, 100)
+        SELECT printf('%.3g|%.10g|%#g|%#.3g|%.0g|%G|%g|%#G', 1234.5, 1 / 3.0, 1.5, 1.0, 123.0, 1e-10, 1e100, 2e-20)
+        SELECT printf('%!.17g|%!.20g|%!g|%!.3f|%!e|%!.0f|%!.15g|%!.0e', 0.1, 0.1, 1.0, 1.0, 1.5, 3.0, 49.47, 5.0)
+        SELECT printf('%.20f|%.30e|%.25g|%!.30f|%!.25e', 0.1, 0.1, 0.1, 0.1, 1 / 3.0)
+        SELECT printf('%.15g|%.16g|%.17g|%.18g|%!.16g|%!.17g|%!.18g|%!.19g|%!.20g|%!.21g', 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1)
+        SELECT printf('%!.17g|%!.17g|%!.17g|%!.17g|%.17g', 49.47, 0.3, 1e23, 123456789012345680, 2 / 3.0)
+        SELECT printf('%f|%e|%g|%!g|%#g|%+f', 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        SELECT printf('%f|%e|%g|%+f|%#.0f|%+.1e', -0.0, -0.0, -0.0, -0.0, -0.0, -0.0), printf('%f', 0.0 * -1)
+        SELECT printf('%.2f|%#.2f|%+#.2f|%.2f|%#.1f|%#.2f|% #.2f', -0.001, -0.001, -0.001, -0.005, -0.04, -0.005, -0.001)
+        SELECT printf('%f|%.3f|%e|%g|%.0f|%.0f|%.0f', 9.9999999, 9.9995, 9.9999999e10, 999999.5, 0.5, 1.5, 0.49)
+        SELECT printf('%.1f|%.2f|%.3f|%.1e|%.1g', 0.05, 0.005, 0.0005, 9.96, 0.96)
+        SELECT printf('%,f|%,.2f|%,g|%,e|%,.0f|%,f|%,010.1f|%,.3g', 1234567.891, -1234567.891, 1234567.0, 1234567.0, 999.5, 0.5, 1234.5, 1234.5)
+        SELECT printf('%,.2f|%,f|%#,015.3f|%,g', 1e20, 1e300, -1234567.891, 1e20)
+        SELECT printf('%f|%f|%f|%g|%e', 'abc', '1.5e3xyz', x'312e35', NULL, '  -2.5'), printf('%f', 9223372036854775807), printf('%.0f', 9007199254740993)
+        SELECT printf('%.*f|%.*f|%*.*f|%-*f|%*f|%.*e', 2, 3.14159, -2, 3.14159, 10, 3, 3.14159, 12, 1.5, -12, 1.5, 0, 2.5)
+        SELECT printf('%.100e|%.100g|%#.40g|%.60f', 1 / 3.0, 1 / 3.0, 0.1, 2 / 3.0)
+        SELECT printf('%5.1f|%e|%g|%!.17g|%s', b, b, b, b, b) FROM t ORDER BY rowid
+        """);
+}
+
+@test
+fn printfRealExtremes() -> Result<void, TestFailure> {
+    let path = printfFixture("real-extremes")?;
+    return sameAnswers(path.view(), """
+        SELECT printf('%f|%e|%g|%10f|%-10f|%+f|% f|%G|%E', 1e999, 1e999, 1e999, 1e999, -1e999, 1e999, 1e999, 1e999, -1e999)
+        SELECT printf('%010e|%010g|%-010g|%010.2E|%+010e|%!010g|%#010g', -1e999, 1e999, 1e999, -1e999, 1e999, 1e999, 1e999)
+        SELECT printf('%010f', 1e999), printf('%010.1f', -1e999), printf('%0,10.1f', 1e999)
+        SELECT printf('%f|%e|%g', 1.7976931348623157e308, 1.7976931348623157e308, 4.9e-324)
+        SELECT printf('%.400f', 4.9e-324), printf('%.330f', 2.2250738585072014e-308)
+        SELECT printf('%e|%g|%.17g|%!.17g|%!.20e|%!g', 2.2250738585072014e-308, 5e-324, 1e23, 1e23, 4.9e-324, 1.7976931348623157e308)
+        SELECT printf('%e|%g|%e|%g|%E', 1e-300, 1e-300, 1e300, 1e300, 1e-100)
+        SELECT printf('%f', 1e300), printf('%f', -1.7976931348623157e308), printf('%,f', 1e100)
+        SELECT printf('%.3f|%.10f|%f|%e', 1e-320, 1e-5, 123456789012345678901234567890.0, 123456789012345678901234567890.0)
+        SELECT length(printf('%.100000000f', 1)), substr(printf('%.100000000f', 2.5), 1, 10), length(printf('%.200000000f', 1.5))
+        SELECT length(printf('%.*f', 2147483647, 1.5)), length(printf('%.*e', 2147483647, 1.5)), length(printf('%.*g', 200000000, 1.5))
+        SELECT length(printf('%.*g', 200000000, 1.5e-3)), length(printf('%#.*g', 100000000, 1.5)), length(printf('%!.*g', 100000000, 1.5))
+        """);
+}
+
+@test
+fn printfStrings() -> Result<void, TestFailure> {
+    let path = printfFixture("strings")?;
+    return sameAnswers(path.view(), """
+        SELECT printf('%s|%10s|%-10s|%.2s|%10.2s|%-10.2s|', 'hello', 'hello', 'hello', 'hello', 'hello', 'hello')
+        SELECT printf('%s|%s|%s|%s|%s|%s', 12, 1.5, 1e20, x'616263', NULL, -0.0), printf('[%s][%5s][%-5s][%.0s]', NULL, NULL, NULL, NULL)
+        SELECT printf('%z|%5z|%.1z|%-4z|', 'abc', 'abc', 'abc', 'abc')
+        SELECT printf('%!.2s|%!5s|%!-5s|%5s|%.3s|%!.10s|%!s|%!.0s|', 'héllo', 'héé', 'héé', 'héé', 'héllo', 'héllo', 'héé', 'é')
+        SELECT printf('%!.1s|%!.2s|%!6s|%6s|', '😀x', '😀x', '😀x', '😀x')
+        SELECT printf('%s', 'a' || char(0) || 'b'), length(printf('%s|', 'a' || char(0) || 'b')), printf('%s|', x'610062')
+        SELECT printf('%.0s|%.*s|%.*s|%*s|%-*s|', 'abc', 2, 'abcdef', -2, 'abcdef', 6, 'ab', 6, 'ab')
+        SELECT printf('%s|%s|%10.3s|', c, d, c) FROM t ORDER BY rowid
+        """);
+}
+
+@test
+fn printfCharacters() -> Result<void, TestFailure> {
+    let path = printfFixture("characters")?;
+    return sameAnswers(path.view(), """
+        SELECT printf('%c|%c|%c|%c|%c', 'abc', 65, 1.5, 'é', x'4243')
+        SELECT hex(printf('%c', NULL)), hex(printf('%c', '')), hex(printf('%3c', NULL)), hex(printf('%.3c', '')), hex(printf('%c'))
+        SELECT printf('%5c|%-5c|%.3c|%5.3c|%-5.3c|%.0c|%.1c|%!5c|', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'é')
+        SELECT printf('%5c|%.3c|%-4.2c|%2.5c|%6.3c|', 'é', 'é', 'é', 'x', 'é')
+        SELECT printf('%c|%.3c|%3c|', '😀', '😀', '😀'), length(printf('%.1000c', 'ab')), printf('%*.*c|', 6, 3, 'z'), printf('%-*.*c|', 6, 3, 'z')
+        SELECT length(printf('%.*c', 1000000, 'é')), length(printf('%.12345c', 'q'))
+        """);
+}
+
+@test
+fn printfQuoting() -> Result<void, TestFailure> {
+    let path = printfFixture("quoting")?;
+    return sameAnswers(path.view(), """
+        SELECT printf('%q|%Q|%w', 'it''s', 'it''s', 'it''s'), printf('%q|%Q|%w', 'say "hi"', 'say "hi"', 'say "hi"')
+        SELECT printf('%q|%Q|%w', NULL, NULL, NULL), printf('%.2q|%.2Q|%.3w|%.1Q', NULL, NULL, NULL, 'x''y'), printf('%.3q|%.3Q', 'a''''b', 'a''''b')
+        SELECT printf('%10q|%-10Q|%10w|%5Q|%.0Q|', 'a''b', 'a''b', 'a"b', NULL, 'abc')
+        SELECT printf('%#q|%#Q|%#Q|%#w', 'a\b' || char(10) || 'c''', 'a\b' || char(9), 'plain\', 'x' || char(10) || '"'), printf('%#q|%#Q', NULL, NULL)
+        SELECT printf('%#q|%#Q|%#.2Q|%#.3Q', char(1, 31, 16, 127), char(27) || '''', 'ab' || char(10), 'ab' || char(10))
+        SELECT printf('%!.2q|%!.2Q|%!8Q|%8Q|%!.1w|', 'héé', 'é''é', 'é''é', 'é''é', 'é"')
+        SELECT printf('%Q|%q|%Q|%Q', 12, 1.5, x'41', ''), printf('%q', '''''')
+        SELECT printf('%Q|%q|%w', c, c, c) FROM t ORDER BY rowid
+        """);
+}
+
+@test
+fn printfFlagsAndParsing() -> Result<void, TestFailure> {
+    let path = printfFixture("flags")?;
+    return sameAnswers(path.view(), """
+        SELECT printf('%%|%5%|%-5%|x'), printf('abc%'), printf('%'), printf('100%% %d%%', 5), printf('%%%')
+        SELECT printf('abc%y def'), printf('a%Tb', 1), printf('a%Sb'), printf('a%5'), printf('a%-'), printf('a%.'), printf('a%l'), printf('a%ll'), printf('%5-d|', 3)
+        SELECT printf('a%ld%b', 1), printf('%d%k%d', 1, 2), printf('x%.3'), printf('x%*'), printf('x%.*'), printf('é%Aé')
+        SELECT printf('%n%d', 5), printf('x%ny', 1), printf('%d %n%d', 1, 2), printf('%5n|')
+        SELECT printf('%-05d|%0-5d|%+ d|% +d|%#d|%!d|%!5x|%--5d|%++d', 3, 3, 3, 3, 3, 3, 255, 3, 3)
+        SELECT printf('%*d|%-*d|%*d|%*d', 5, 1, 5, 1, -5, 1, 4294967301, 1), printf('%*d|', -2147483648, 7), printf('%*d|', 2147483648, 7)
+        SELECT printf('%.*d|%.*d|%.*d', 3, 7, -3, 7, 4294967299, 7), printf('%.*d|', -2147483648, 7), printf('%-*.*d|', 6, 3, 7)
+        SELECT printf('%*.*f|', NULL, NULL, 1.5), printf('%*d|'), printf('%.*s|', 'x', 'abc'), printf('%*s|', '4abc', 'z'), printf('%*s|', 2.9, 'z')
+        SELECT printf('%2147483648d|', 1), printf('%.2147483649d|', 1), printf('%4294967301d|', 1), printf('%.4294967298x|', 255)
+        SELECT printf('%d|%f|%s|%c|%q|%Q|%w|%x|%e|%g|%r|%p', NULL, NULL, NULL, 'c', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+        SELECT printf('%d|%f|%s|%q|%Q|%w|%x|%e|%g|%r|%p|%u|%i|%o|%X|%E|%G|%z')
+        SELECT printf('%s %s', 'only'), printf('no conversions', 1, 2, 3), printf('%d %d %d', 1), printf('%5s|%-5d|%5.2f|', 'a')
+        SELECT printf(NULL), printf(NULL, 1), typeof(printf()), printf(''), typeof(printf('')), format('%d-%s', 1, 'a'), FORMAT('%5.1f', 2.25)
+        SELECT printf(12), printf(1.5), printf(x'2564', 7), printf('%d' || char(0) || '%d', 1, 2), Printf('%d', 3), format()
+        SELECT typeof(printf('%s', '')), typeof(printf('%n')), typeof(printf('%y')), typeof(printf('%.0s', 'abc')), typeof(printf('%')), typeof(printf('%.0c', '')), typeof(printf(x''))
+        SELECT typeof(printf('%d', 1)), printf('%s', printf('%5d', 3)), length(format('%10000d', 1)), length(printf('%-123456s|', 'x'))
+        SELECT printf('%2147483647d', 1)
+        SELECT printf('%.2147483647d', 1)
+        SELECT printf('%2147483647f', 1)
+        SELECT printf('%.*c', 2147483647, 'a')
+        SELECT printf('%*s', 2147483647, 'a')
+        SELECT printf('%2147483647%')
+        SELECT printf('%2147483647c', 'a')
+        SELECT printf('%2147483647.2e', 1)
+        SELECT printf('a%2147483647d', 1)
+        """);
+}
