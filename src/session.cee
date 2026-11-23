@@ -25,6 +25,9 @@ public struct Session {
     synchronous: i64;
     cacheSize: i64;
     busyTimeout: i64;
+    /// The trigger firing now, and the names of those running.
+    trigger: TriggerContext?;
+    activeTriggers: Vector<String>;
 
     /// Opens the database file at `path`, making an empty database if there is none.
     public fn open(path: StringView) -> Result<Session, SqliteError> {
@@ -47,6 +50,8 @@ public struct Session {
             synchronous: 2,
             cacheSize: -2000,
             busyTimeout: 0,
+            trigger: null,
+            activeTriggers: Vector<String>.create(),
         });
     }
 
@@ -199,6 +204,10 @@ public struct Session {
                 return Ok(emptyResult());
             }
             Stmt.Pragma(s) => { return executePragma(s, this); }
+            Stmt.CreateTrigger(s) => {
+                executeCreateTrigger(s, sql, this)?;
+                return Ok(emptyResult());
+            }
             Stmt.AlterTable(s) => {
                 executeAlterTable(s, sql, this)?;
                 return Ok(emptyResult());
@@ -208,9 +217,9 @@ public struct Session {
                 return Ok(emptyResult());
             }
             Stmt.Select(select) => {
-                var compiler = Compiler.create();
+                var compiler = newCompiler(this)?;
                 let plan = compileSelect(mut compiler, select, this)?;
-                var frame = newFrame(mut compiler, params)?;
+                var frame = newFrame(mut compiler, params, this)?;
                 let rows = runSelect(borrow plan, mut frame, this)?;
                 return Ok(QueryResult { columns: cloneStrings(borrow plan.columnNames)?, rows: rows });
             }
@@ -247,7 +256,11 @@ fn emptyResult() -> QueryResult =>
     QueryResult { columns: Vector<String>.create(), rows: Vector<Vector<SqliteValue>>.create() };
 
 /// The frame a compiled statement runs in: its slots, parameters and CTEs, and its time.
-fn newFrame(compiler: borrow mut Compiler, params: Slice<SqliteValue>) -> Result<Frame, SqliteError> {
+fn newFrame(
+    compiler: borrow mut Compiler,
+    params: Slice<SqliteValue>,
+    db: borrow Session,
+) -> Result<Frame, SqliteError> {
     var frame = Frame.create();
     let _ = frame.pushSlots(compiler.slotsInUse)?;
     frame.params = cloneValues(params)?;
@@ -259,5 +272,6 @@ fn newFrame(compiler: borrow mut Compiler, params: Slice<SqliteValue>) -> Result
         frame.working.push(Vector<Vector<SqliteValue>>.create())?;
     }
     frame.nowMillis = Clock.now().millis();
+    fillTriggerSlots(mut frame, db)?;
     return Ok(frame);
 }

@@ -209,7 +209,7 @@ fn pragmaRows(
     }
     if (name.equalsIgnoreAsciiCase("index_info") || name.equalsIgnoreAsciiCase("index_xinfo")) {
         let extended = name.equalsIgnoreAsciiCase("index_xinfo");
-        var compiler = Compiler.create();
+        var compiler = newCompiler(db)?;
         var indexTable: String? = null;
         for (e in 0..db.entries.length) {
             if (db.entries[e].kind.view() == "index" && db.entries[e].name.view().equalsIgnoreAsciiCase(arg)) {

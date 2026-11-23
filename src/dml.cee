@@ -44,6 +44,7 @@ struct TableWriter {
     generated: Vector<GeneratedColumn>;
     checks: Vector<XExpr>;
     checkNames: Vector<String>;
+    triggers: Vector<TriggerPlan>;
 }
 
 fn tableScope(table: borrow TableSchema, slot: usize) -> Result<Scope, AllocError> {
@@ -69,7 +70,7 @@ fn compileInTable(
     slot: usize,
     db: borrow mut Session,
 ) -> Result<XExpr, SqliteError> {
-    let saved = replace(mut compiler.scopes, Vector<Scope>.create());
+    let saved = replace(mut compiler.scopes, compiler.freshScopes()?);
     compiler.scopes.push(tableScope(table, slot)?)?;
     let result = compiler.compile(e, db);
     compiler.scopes = saved;
@@ -244,9 +245,6 @@ impl TableWriter {
         if (table.withoutRowid) {
             return Err(unsupported("changing WITHOUT ROWID tables is not supported yet"));
         }
-        if (db.hasTriggers(table.name.view())) {
-            return Err(unsupported("tables with triggers cannot be changed yet"));
-        }
         let slot = compiler.slotsInUse;
         compiler.slotsInUse += 1;
         let read = tablePlan(borrow table, compiler, slot, db)?;
@@ -257,7 +255,7 @@ impl TableWriter {
             var d: XExpr? = null;
             if (borrow table.columns[c].defaultValue is Some(v)) {
                 // A default sees no columns.
-                let saved = replace(mut compiler.scopes, Vector<Scope>.create());
+                let saved = replace(mut compiler.scopes, compiler.freshScopes()?);
                 let compiled = compiler.compile(borrow v.expr, db);
                 compiler.scopes = saved;
                 d = compiled?;
@@ -278,6 +276,7 @@ impl TableWriter {
             checks.push(compileInTable(compiler, borrow table.checks[k].expr, borrow table, slot, db)?)?;
             checkNames.push(table.checks[k].text.clone()?)?;
         }
+        let triggers = tableTriggers(db, table.name.view())?;
         return Ok(
             TableWriter {
                 table: table,
@@ -288,6 +287,7 @@ impl TableWriter {
                 generated: generated,
                 checks: checks,
                 checkNames: checkNames,
+                triggers: triggers,
             },
         );
     }
@@ -721,7 +721,7 @@ fn compileInsertSource(
     db: borrow mut Session,
 ) -> Result<InsertSourcePlan, SqliteError> {
     // The values see no table: not even the one they go into.
-    let saved = replace(mut compiler.scopes, Vector<Scope>.create());
+    let saved = replace(mut compiler.scopes, compiler.freshScopes()?);
     let result = compileInsertSourceInner(stmt, compiler, db);
     compiler.scopes = saved;
     return result;
@@ -778,7 +778,7 @@ fn executeInsert(
     params: Slice<SqliteValue>,
     db: borrow mut Session,
 ) -> Result<QueryResult, SqliteError> {
-    var compiler = Compiler.create();
+    var compiler = newCompiler(db)?;
     let writer = TableWriter.create(mut compiler, stmt.table.name.view(), db)?;
     let table = borrow writer.table;
     // Which column each value goes to.
@@ -820,7 +820,7 @@ fn executeInsert(
         let _ = compileWith(mut compiler, with, db)?;
     }
     let source = compileInsertSource(stmt, mut compiler, db)?;
-    var frame = newFrame(mut compiler, params)?;
+    var frame = newFrame(mut compiler, params, db)?;
     var rows = insertRows(borrow source, mut frame, db)?;
     var output = Vector<Vector<SqliteValue>>.create();
     let action = stmt.conflict ?? ConflictAction.Abort;
@@ -890,6 +890,22 @@ fn executeInsert(
         }
         frame.slots[writer.slot] = Slot { values: values, rowId: rowId, isNull: false };
         writer.computeGeneratedColumns(mut frame, db)?;
+        if (writer.triggers.length != 0) {
+            let noRow: Slot? = null;
+            let proposed: Slot? = copySlot(borrow frame.slots[writer.slot])?;
+            if (!fireTriggers(
+                borrow writer.triggers,
+                borrow writer.table,
+                TriggerEvent.Insert,
+                TriggerTiming.Before,
+                borrow noRow,
+                borrow proposed,
+                [],
+                db,
+            )?) {
+                continue;
+            }
+        }
         if (!writer.checkRow(action, mut frame, db)?) {
             continue;
         }
@@ -933,6 +949,20 @@ fn executeInsert(
         writer.writeRow(mut frame, db)?;
         if (table.autoincrement) {
             db.updateSequence(table.name.view(), rowId)?;
+        }
+        if (writer.triggers.length != 0) {
+            let noRow: Slot? = null;
+            let inserted: Slot? = copySlot(borrow frame.slots[writer.slot])?;
+            let _ = fireTriggers(
+                borrow writer.triggers,
+                borrow writer.table,
+                TriggerEvent.Insert,
+                TriggerTiming.After,
+                borrow noRow,
+                borrow inserted,
+                [],
+                db,
+            )?;
         }
         db.lastInsertRowid = rowId;
         count += 1;
@@ -1030,7 +1060,7 @@ fn executeDelete(
     params: Slice<SqliteValue>,
     db: borrow mut Session,
 ) -> Result<QueryResult, SqliteError> {
-    var compiler = Compiler.create();
+    var compiler = newCompiler(db)?;
     let writer = TableWriter.create(mut compiler, stmt.table.name.view(), db)?;
     if (borrow stmt.with is Some(with)) {
         let _ = compileWith(mut compiler, with, db)?;
@@ -1040,12 +1070,33 @@ fn executeDelete(
         filter = compileInTable(mut compiler, f, borrow writer.table, writer.slot, db)?;
     }
     let returning = compileReturning(mut compiler, borrow stmt.returning, borrow writer, db)?;
-    var frame = newFrame(mut compiler, params)?;
+    var frame = newFrame(mut compiler, params, db)?;
     let rowids = matchingRows(borrow writer, borrow filter, mut frame, db)?;
     var output = Vector<Vector<SqliteValue>>.create();
+    var count: i64 = 0;
     for (i in 0..rowids.length) {
         if (!writer.loadRow(rowids[i], mut frame, db)?) {
             continue;
+        }
+        if (writer.triggers.length != 0) {
+            let noRow: Slot? = null;
+            let old: Slot? = copySlot(borrow frame.slots[writer.slot])?;
+            if (!fireTriggers(
+                borrow writer.triggers,
+                borrow writer.table,
+                TriggerEvent.Delete,
+                TriggerTiming.Before,
+                borrow old,
+                borrow noRow,
+                [],
+                db,
+            )?) {
+                continue;
+            }
+            // The trigger may have changed or removed the row.
+            if (!writer.loadRow(rowids[i], mut frame, db)?) {
+                continue;
+            }
         }
         if (returning.length != 0) {
             var out = Vector<SqliteValue>.withCapacity(returning.length)?;
@@ -1054,10 +1105,25 @@ fn executeDelete(
             }
             output.push(out)?;
         }
+        let deleted: Slot? = if (writer.triggers.length != 0) copySlot(borrow frame.slots[writer.slot])? else null;
         writer.deleteRow(rowids[i], mut frame, db)?;
+        count += 1;
+        if (writer.triggers.length != 0) {
+            let noRow: Slot? = null;
+            let _ = fireTriggers(
+                borrow writer.triggers,
+                borrow writer.table,
+                TriggerEvent.Delete,
+                TriggerTiming.After,
+                borrow deleted,
+                borrow noRow,
+                [],
+                db,
+            )?;
+        }
     }
     writer.finish(mut frame, db)?;
-    db.changes = truncate<i64>(rowids.length);
+    db.changes = count;
     db.totalChanges += db.changes;
     return Ok(QueryResult { columns: returningNames(borrow stmt.returning, borrow writer.table)?, rows: output });
 }
@@ -1132,6 +1198,23 @@ fn updateLoadedRow(
     }
     frame.slots[writer.slot].rowId = newRowid;
     writer.computeGeneratedColumns(frame, db)?;
+    let oldForTriggers: Slot? = if (writer.triggers.length != 0) copySlot(borrow oldSlot)? else null;
+    if (writer.triggers.length != 0) {
+        let proposed: Slot? = copySlot(borrow frame.slots[writer.slot])?;
+        if (!fireTriggers(
+            borrow writer.triggers,
+            table,
+            TriggerEvent.Update,
+            TriggerTiming.Before,
+            borrow oldForTriggers,
+            borrow proposed,
+            set.targets.view(),
+            db,
+        )?) {
+            frame.slots[writer.slot] = oldSlot;
+            return Ok(false);
+        }
+    }
     if (!writer.checkRow(action, frame, db)?) {
         frame.slots[writer.slot] = oldSlot;
         return Ok(false);
@@ -1156,6 +1239,19 @@ fn updateLoadedRow(
     }
     frame.slots[writer.slot] = newSlot;
     writer.writeRow(frame, db)?;
+    if (writer.triggers.length != 0) {
+        let updated: Slot? = copySlot(borrow frame.slots[writer.slot])?;
+        let _ = fireTriggers(
+            borrow writer.triggers,
+            table,
+            TriggerEvent.Update,
+            TriggerTiming.After,
+            borrow oldForTriggers,
+            borrow updated,
+            set.targets.view(),
+            db,
+        )?;
+    }
     return Ok(true);
 }
 
@@ -1180,12 +1276,12 @@ fn executeUpdate(
     if (stmt.from.isSome()) {
         return Err(unsupported("UPDATE … FROM is not supported yet"));
     }
-    var compiler = Compiler.create();
+    var compiler = newCompiler(db)?;
     let writer = TableWriter.create(mut compiler, stmt.table.name.view(), db)?;
     if (borrow stmt.with is Some(with)) {
         let _ = compileWith(mut compiler, with, db)?;
     }
-    let saved = replace(mut compiler.scopes, Vector<Scope>.create());
+    let saved = replace(mut compiler.scopes, compiler.freshScopes()?);
     compiler.scopes.push(tableScope(borrow writer.table, writer.slot)?)?;
     let set = compileAssignments(mut compiler, borrow stmt.assignments, borrow writer.table, db);
     var filter: XExpr? = null;
@@ -1195,7 +1291,7 @@ fn executeUpdate(
     compiler.scopes = saved;
     let assignments = set?;
     let returning = compileReturning(mut compiler, borrow stmt.returning, borrow writer, db)?;
-    var frame = newFrame(mut compiler, params)?;
+    var frame = newFrame(mut compiler, params, db)?;
     let rowids = matchingRows(borrow writer, borrow filter, mut frame, db)?;
     let action = stmt.conflict ?? ConflictAction.Abort;
     var output = Vector<Vector<SqliteValue>>.create();
@@ -1288,7 +1384,7 @@ fn compileUpserts(
             }
         }
         // DO UPDATE sees the existing row by the table's name and the proposed one as "excluded".
-        let saved = replace(mut compiler.scopes, Vector<Scope>.create());
+        let saved = replace(mut compiler.scopes, compiler.freshScopes()?);
         var scope = tableScope(table, writer.slot)?;
         // Unqualified names are the table's: "excluded" is named only when written.
         var hidden = Vector<String>.create();

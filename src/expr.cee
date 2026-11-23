@@ -196,7 +196,7 @@ enum XExpr {
 
 /// A RAISE() in a trigger, which stops its statement; carried as an error.
 fn raiseError(action: RaiseAction, message: String) -> SqliteError => match (action) {
-    RaiseAction.Ignore => SqliteError.Constraint(String.from("RAISE(IGNORE)").ok() ?? String.create()),
+    RaiseAction.Ignore => SqliteError.RaiseIgnore,
     _ => SqliteError.Constraint(message),
 };
 
@@ -654,6 +654,8 @@ struct Compiler {
     ctePlans: Vector<CtePlan?>;
     /// How many recursive CTEs' working tables have been numbered.
     workingTables: usize;
+    /// Inside a trigger: NEW and OLD, which every scope of the statement sees.
+    triggerScope: Scope?;
 }
 
 /// A common table expression's name in scope.

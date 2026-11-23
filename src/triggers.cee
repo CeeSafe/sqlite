@@ -1,0 +1,274 @@
+// Triggers: CREATE TRIGGER, and firing them around the rows INSERT, UPDATE and DELETE change.
+//
+// A trigger's WHEN and body see the row through NEW and OLD: an outer scope of two sources in the first two slots,
+// which every statement the trigger runs gets ahead of its own.
+//
+// As in SQLite: BEFORE triggers run before the row changes and AFTER triggers after; UPDATE OF fires only when SET
+// names one of the columns; RAISE(IGNORE) skips the row and the rest of the trigger; a trigger does not fire
+// again while it is running (recursive_triggers is off); a body's changes do not count in changes().
+//
+// Not yet supported, and refused by name: INSTEAD OF triggers on views, and TEMP triggers.
+
+/// The rows a firing trigger sees, and the table's columns that name them.
+struct TriggerContext {
+    columns: Vector<ScopeColumn>;
+    rowidAlias: usize?;
+    old: Slot?;
+    new: Slot?;
+}
+
+/// A trigger of a table, parsed from its statement.
+struct TriggerPlan {
+    name: String;
+    timing: TriggerTiming;
+    event: TriggerEvent;
+    updateOf: Vector<String>;
+    when: Expr?;
+    body: Vector<Stmt>;
+}
+
+/// The triggers on table `name`.
+fn tableTriggers(db: borrow Session, name: StringView) -> Result<Vector<TriggerPlan>, SqliteError> {
+    var out = Vector<TriggerPlan>.create();
+    for (i in 0..db.entries.length) {
+        let entry = borrow db.entries[i];
+        if (entry.kind.view() != "trigger" || !entry.tableName.view().equalsIgnoreAsciiCase(name)) {
+            continue;
+        }
+        let Some(sql) = borrow entry.sql else {
+            continue;
+        };
+        let Stmt.CreateTrigger(stmt) = Parser.parseStatement(sql.view())? else {
+            return Err(corrupt("a trigger's definition is not a CREATE TRIGGER statement"));
+        };
+        let owned: CreateTriggerStmt = stmt;
+        out.push(
+            TriggerPlan {
+                name: owned.name.name,
+                timing: owned.timing,
+                event: owned.event,
+                updateOf: owned.updateOf,
+                when: owned.when,
+                body: owned.body,
+            },
+        )?;
+    }
+    return Ok(out);
+}
+
+fn copyScope(scope: borrow Scope) -> Result<Scope, AllocError> {
+    var sources = Vector<ScopeSource>.withCapacity(scope.sources.length)?;
+    for (i in 0..scope.sources.length) {
+        let s = borrow scope.sources[i];
+        sources.push(
+            ScopeSource {
+                name: s.name.clone()?,
+                columns: cloneScopeColumns(borrow s.columns)?,
+                slot: s.slot,
+                hasRowid: s.hasRowid,
+                rowidAlias: s.rowidAlias,
+                merged: cloneStrings(borrow s.merged)?,
+            },
+        )?;
+    }
+    return Ok(Scope { sources: sources });
+}
+
+/// A compiler for a statement: inside a trigger, with NEW and OLD as an outer scope in slots 0 and 1.
+fn newCompiler(db: borrow Session) -> Result<Compiler, AllocError> {
+    var compiler = Compiler.create();
+    if (borrow db.trigger is Some(context)) {
+        var scope = Scope { sources: Vector<ScopeSource>.create() };
+        scope.sources.push(
+            ScopeSource {
+                name: String.from("old")?,
+                columns: cloneScopeColumns(borrow context.columns)?,
+                slot: 0,
+                hasRowid: true,
+                rowidAlias: context.rowidAlias,
+                merged: Vector<String>.create(),
+            },
+        )?;
+        scope.sources.push(
+            ScopeSource {
+                name: String.from("new")?,
+                columns: cloneScopeColumns(borrow context.columns)?,
+                slot: 1,
+                hasRowid: true,
+                rowidAlias: context.rowidAlias,
+                merged: Vector<String>.create(),
+            },
+        )?;
+        compiler.triggerScope = copyScope(borrow scope)?;
+        compiler.scopes.push(scope)?;
+        compiler.slotsInUse = 2;
+    }
+    return Ok(compiler);
+}
+
+impl Compiler {
+    /// Scopes for an expression that sees no tables of its statement: only NEW and OLD inside a trigger.
+    fn freshScopes(borrow this) -> Result<Vector<Scope>, AllocError> {
+        var scopes = Vector<Scope>.create();
+        if (borrow this.triggerScope is Some(scope)) {
+            scopes.push(copyScope(scope)?)?;
+        }
+        return Ok(scopes);
+    }
+}
+
+/// Fills a frame's NEW and OLD slots from the firing trigger.
+fn fillTriggerSlots(frame: borrow mut Frame, db: borrow Session) -> Result<void, AllocError> {
+    if (borrow db.trigger is Some(context)) {
+        if (borrow context.old is Some(old)) {
+            frame.slots[0] = copySlot(old)?;
+        } else {
+            frame.slots[0] = Slot { values: Vector<SqliteValue>.create(), rowId: 0, isNull: true };
+        }
+        if (borrow context.new is Some(new)) {
+            frame.slots[1] = copySlot(new)?;
+        } else {
+            frame.slots[1] = Slot { values: Vector<SqliteValue>.create(), rowId: 0, isNull: true };
+        }
+    }
+    return Ok();
+}
+
+/// Fires the triggers of `event` and `timing` for one row. False when RAISE(IGNORE) asked to skip the row.
+fn fireTriggers(
+    triggers: borrow Vector<TriggerPlan>,
+    table: borrow TableSchema,
+    event: TriggerEvent,
+    timing: TriggerTiming,
+    old: borrow Slot?,
+    new: borrow Slot?,
+    setColumns: Slice<usize>,
+    db: borrow mut Session,
+) -> Result<bool, SqliteError> {
+    for (t in 0..triggers.length) {
+        let trigger = borrow triggers[t];
+        if (trigger.event != event || trigger.timing != timing) {
+            continue;
+        }
+        if (trigger.updateOf.length != 0) {
+            var named = false;
+            for (k in 0..trigger.updateOf.length) {
+                for (c in 0..setColumns.length) {
+                    if (setColumns[c] < table.columns.length &&
+                        table.columns[setColumns[c]].name.view().equalsIgnoreAsciiCase(
+                            trigger.updateOf[k].view(),
+                        )) {
+                        named = true;
+                    }
+                }
+            }
+            if (!named) {
+                continue;
+            }
+        }
+        // Not again while it runs.
+        var running = false;
+        for (k in 0..db.activeTriggers.length) {
+            running = running || db.activeTriggers[k].view().equalsIgnoreAsciiCase(trigger.name.view());
+        }
+        if (running) {
+            continue;
+        }
+        var oldCopy: Slot? = null;
+        if (old is Some(o)) {
+            oldCopy = copySlot(o)?;
+        }
+        var newCopy: Slot? = null;
+        if (new is Some(n)) {
+            newCopy = copySlot(n)?;
+        }
+        let context = TriggerContext {
+            columns: tableScopeColumns(table)?,
+            rowidAlias: table.rowidAlias,
+            old: oldCopy,
+            new: newCopy,
+        };
+        let saved = replace(mut db.trigger, context);
+        db.activeTriggers.push(trigger.name.clone()?)?;
+        let result = runTrigger(trigger, db);
+        let _ = db.activeTriggers.pop();
+        db.trigger = saved;
+        match (result) {
+            Ok(_) => {}
+            Err(SqliteError.RaiseIgnore) => { return Ok(false); }
+            Err(e) => { return Err(e); }
+        }
+    }
+    return Ok(true);
+}
+
+/// Runs one trigger for the row in `db.trigger`: its WHEN, then its body.
+fn runTrigger(trigger: borrow TriggerPlan, db: borrow mut Session) -> Result<void, SqliteError> {
+    if (borrow trigger.when is Some(w)) {
+        var compiler = newCompiler(db)?;
+        let condition = compiler.compile(w, db)?;
+        var frame = newFrame(mut compiler, [], db)?;
+        let v = evaluate(borrow condition, mut frame, db)?;
+        if (!isTrue(borrow v)) {
+            return Ok();
+        }
+    }
+    for (s in 0..trigger.body.length) {
+        let changes = db.changes;
+        let total = db.totalChanges;
+        let last = db.lastInsertRowid;
+        let result = db.run(borrow trigger.body[s], "", []);
+        db.changes = changes;
+        db.totalChanges = total;
+        db.lastInsertRowid = last;
+        let _ = result?;
+    }
+    return Ok();
+}
+
+/// CREATE TRIGGER.
+fn executeCreateTrigger(
+    stmt: borrow CreateTriggerStmt,
+    sql: StringView,
+    db: borrow mut Session,
+) -> Result<void, SqliteError> {
+    if (stmt.temporary) {
+        return Err(unsupported("TEMP triggers are not supported yet"));
+    }
+    let name = stmt.name.name.view();
+    for (i in 0..db.entries.length) {
+        if (db.entries[i].kind.view() == "trigger" && db.entries[i].name.view().equalsIgnoreAsciiCase(name)) {
+            if (stmt.ifNotExists) {
+                return Ok();
+            }
+            var message = String.from("trigger ")?;
+            message.append(name)?;
+            message.append(" already exists")?;
+            return Err(SqliteError.Sql(message));
+        }
+    }
+    let table = stmt.table.view();
+    let isView = db.viewSql(table)?.isSome();
+    if (!isView && db.catalog.table(table)?.isNull()) {
+        return Err(namedError("no such table: main.", table));
+    }
+    if (isReservedName(table)) {
+        return Err(sqlError("cannot create trigger on system table"));
+    }
+    if (isView && stmt.timing != TriggerTiming.InsteadOf) {
+        var message = String.from("cannot create ")?;
+        message.append(if (stmt.timing == TriggerTiming.Before) "BEFORE" else "AFTER")?;
+        message.append(" trigger on view: ")?;
+        message.append(table)?;
+        return Err(SqliteError.Sql(message));
+    }
+    if (!isView && stmt.timing == TriggerTiming.InsteadOf) {
+        return Err(namedError("cannot create INSTEAD OF trigger on table: ", table));
+    }
+    if (isView) {
+        return Err(unsupported("INSTEAD OF triggers on views are not supported yet"));
+    }
+    addSchemaRow(db, "trigger", name, table, 0, sql)?;
+    db.pager.bumpSchemaCookie()?;
+    return db.reloadSchema();
+}

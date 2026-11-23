@@ -292,3 +292,32 @@ fn upsertsFollowSqlite() -> Result<void, TestFailure> {
         SELECT * FROM n ORDER BY id
         """);
 }
+
+@test
+fn triggersFireAsInSqlite() -> Result<void, TestFailure> {
+    return sameSession("triggers", """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, v INT, note TEXT)
+        CREATE TABLE log(seq INTEGER PRIMARY KEY, what TEXT, old_v INT, new_v INT)
+        CREATE TRIGGER t_ins AFTER INSERT ON t BEGIN INSERT INTO log(what, new_v) VALUES ('ins', new.v); END
+        CREATE TRIGGER t_upd AFTER UPDATE OF v ON t WHEN new.v <> old.v BEGIN INSERT INTO log(what, old_v, new_v) VALUES ('upd', old.v, new.v); END
+        CREATE TRIGGER t_del BEFORE DELETE ON t BEGIN INSERT INTO log(what, old_v) VALUES ('del', old.v); END
+        CREATE TRIGGER t_guard BEFORE INSERT ON t WHEN new.v < 0 BEGIN SELECT RAISE(ABORT, 'negative'); END
+        CREATE TRIGGER t_skip BEFORE INSERT ON t WHEN new.v = 0 BEGIN SELECT RAISE(IGNORE); END
+        INSERT INTO t(v, note) VALUES (1, 'a'), (2, 'b'), (0, 'skipped'), (3, 'c')
+        INSERT INTO t(v) VALUES (-1)
+        UPDATE t SET v = v * 10 WHERE id <= 2
+        UPDATE t SET note = 'n'
+        UPDATE t SET v = v WHERE id = 3
+        DELETE FROM t WHERE v > 20
+        SELECT * FROM t ORDER BY id
+        SELECT what, old_v, new_v FROM log ORDER BY seq
+        SELECT changes()
+        CREATE TRIGGER t_ins AFTER INSERT ON t BEGIN SELECT 1; END
+        CREATE TRIGGER nope AFTER INSERT ON nosuch BEGIN SELECT 1; END
+        DROP TRIGGER t_guard
+        INSERT INTO t(v) VALUES (-5)
+        SELECT count(*) FROM t
+        DROP TABLE t
+        SELECT count(*) FROM sqlite_schema WHERE type = 'trigger'
+        """);
+}

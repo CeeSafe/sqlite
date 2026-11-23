@@ -148,6 +148,7 @@ impl Compiler {
         cteNames: Vector<CteName>.create(),
         ctePlans: Vector<CtePlan?>.create(),
         workingTables: 0,
+        triggerScope: null,
     };
 
     /// Compiles an expression.

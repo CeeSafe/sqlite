@@ -238,9 +238,9 @@ fn executeCreateIndex(
     addSchemaRow(db, "index", name, tableName.view(), root, sql)?;
     db.reloadSchema()?;
     // Fill it, checking UNIQUE as rows go in.
-    var compiler = Compiler.create();
+    var compiler = newCompiler(db)?;
     let writer = TableWriter.create(mut compiler, tableName.view(), db)?;
-    var frame = newFrame(mut compiler, [])?;
+    var frame = newFrame(mut compiler, [], db)?;
     for (i in 0..writer.indexes.length) {
         let index = borrow writer.indexes[i];
         if (!index.name.view().equalsIgnoreAsciiCase(name)) {
@@ -285,7 +285,7 @@ fn executeCreateView(
         }
         return Err(existsError("view", name));
     }
-    var compiler = Compiler.create();
+    var compiler = newCompiler(db)?;
     let plan = compileSelect(mut compiler, borrow stmt.select, db)?;
     let none = Vector<String>.create();
     let _ = planScopeColumns(borrow plan, if (stmt.columns.length != 0) borrow stmt.columns else borrow none)?;
