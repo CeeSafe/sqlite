@@ -70,7 +70,11 @@ struct Record {
         match (serialType) {
             0 | 10 | 11 => { return Ok(SqliteValue.Null); }
             1..=6 => { return Ok(SqliteValue.Integer(Record.readIntBE(body))); }
-            7 => { return Ok(SqliteValue.Real(f64.fromBits(Record.readRawBE(body)))); }
+            7 => {
+                // SQLite reads a NaN as NULL: it never holds one as a value.
+                let r = f64.fromBits(Record.readRawBE(body));
+                return Ok(if (r != r) SqliteValue.Null else SqliteValue.Real(r));
+            }
             8 => { return Ok(SqliteValue.Integer(0)); }
             9 => { return Ok(SqliteValue.Integer(1)); }
             _ => {}

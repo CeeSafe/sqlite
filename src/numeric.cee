@@ -1,0 +1,585 @@
+// Numbers in text and text in numbers, as SQLite converts them. The conversions between reals and decimal text
+// are ports of SQLite 3.53's own (sqlite3AtoF, sqlite3FpDecode and the routines under them, which are public
+// domain): they are not always correctly rounded, and the text a real becomes must be SQLite's, digit for digit.
+//
+// Differences from the C# engine, which this replaces (each checked against sqlite3 3.54):
+// - text used as a number converts its longest numeric prefix, as SQLite does: '12abc' + 1 is 13, '1e3x' * 1 is
+//   1000.0. The C# parsed the whole text with .NET and took 0 when that failed;
+// - numbers are recognised by SQLite's syntax only: digits are ASCII, there are no thousands separators, and
+//   'Infinity', 'NaN' and '0x10' are not numbers. The C# used .NET's number parser;
+// - a real is written as SQLite writes it (`%!.17g`, shortened when that reads back as the same real):
+//   `1.0e+20`, `0.30000000000000004`, `0.33333333333333332`. The C# wrote .NET's G15 (`1E+20`, `0.3`), which loses
+//   values and is not what SQLite shows;
+// - CAST(text AS INTEGER) reads the integer prefix exactly and saturates. The C# went through a double, so
+//   CAST('9007199254740993' AS INTEGER) came out one too small, and CAST('1e3' AS INTEGER) was 1000, not 1;
+// - a real becomes an integer for storage only when it is one exactly and strictly inside the 64-bit range;
+//   the C# turned 2^63 into the smallest integer.
+
+/// SQLite's white space: space, tab, newline, vertical tab, form feed, carriage return.
+fn isNumberSpace(c: u8) -> bool => c == ' ' || (c >= 9 && c <= 13);
+
+// ── 128-bit products and powers of ten ───────────────────────────────────────────────────────────────────────
+
+const POWERS_OF_10_FIRST: i32 = -348;
+const POWERS_OF_10_LAST: i32 = 347;
+
+/// 10^p × 2^k for p = 0..26, with its top bit set.
+const POWER_BASE: [u64; 27] = [
+    0x8000000000000000, 0xa000000000000000, 0xc800000000000000, 0xfa00000000000000, 0x9c40000000000000,
+    0xc350000000000000, 0xf424000000000000, 0x9896800000000000, 0xbebc200000000000, 0xee6b280000000000,
+    0x9502f90000000000, 0xba43b74000000000, 0xe8d4a51000000000, 0x9184e72a00000000, 0xb5e620f480000000,
+    0xe35fa931a0000000, 0x8e1bc9bf04000000, 0xb1a2bc2ec5000000, 0xde0b6b3a76400000, 0x8ac7230489e80000,
+    0xad78ebc5ac620000, 0xd8d726b7177a8000, 0x878678326eac9000, 0xa968163f0a57b400, 0xd3c21bcecceda100,
+    0x84595161401484a0, 0xa56fa5b99019a5c8,
+];
+
+/// 10^(27(g-13)) × 2^k with its top bit set, for g = 0..25; entry 13 is the special case 10^-1.
+const POWER_SCALE: [u64; 26] = [
+    0x8049a4ac0c5811ae, 0xcf42894a5dce35ea, 0xa76c582338ed2621, 0x873e4f75e2224e68, 0xda7f5bf590966848,
+    0xb080392cc4349dec, 0x8e938662882af53e, 0xe65829b3046b0afa, 0xba121a4650e4ddeb, 0x964e858c91ba2655,
+    0xf2d56790ab41c2a2, 0xc428d05aa4751e4c, 0x9e74d1b791e07e48, 0xcccccccccccccccc, 0xcecb8f27f4200f3a,
+    0xa70c3c40a64e6c51, 0x86f0ac99b4e8dafd, 0xda01ee641a708de9, 0xb01ae745b101e9e4, 0x8e41ade9fbebc27d,
+    0xe5d3ef282a242e81, 0xb9a74a0637ce2ee1, 0x95f83d0a1fb69cd9, 0xf24a01a73cf2dccf, 0xc3b8358109e84f07,
+    0x9e19db92b4e31ba9,
+];
+
+/// The next 32 bits of each entry of POWER_SCALE.
+const POWER_SCALE_LOW: [u32; 26] = [
+    0x205b896d, 0x52064cad, 0xaf2af2b8, 0x5a7744a7, 0xaf39a475, 0xbd8d794e, 0x547eb47b, 0x0cb4a5a3, 0x92f34d62,
+    0x3a6a07f9, 0xfae27299, 0xaa97e14c, 0x775ea265, 0xcccccccc, 0x00000000, 0x999090b6, 0x69a028bb, 0xe80e6f48,
+    0x5ec05dd0, 0x14588f14, 0x8f1668c9, 0x6d953e2c, 0x4abdaf10, 0xbc633b39, 0x0a862f81, 0x6c07a2c2,
+];
+
+/// A 64-bit value and the 32 bits after it.
+struct Wide96 {
+    high: u64;
+    low: u32;
+}
+
+fn floorDivide(value: i64, divisor: i64) -> i64 {
+    let quotient = value / divisor;
+    return if (value % divisor != 0 && value < 0) quotient - 1 else quotient;
+}
+
+/// floor(log2(10^p)).
+fn pwr10to2(p: i32) -> i32 => truncate<i32>(floorDivide((p as i64) * 108853, 32768));
+
+/// floor(log10(2^p)).
+fn pwr2to10(p: i32) -> i32 => truncate<i32>(floorDivide((p as i64) * 78913, 262144));
+
+/// The upper 96 bits of the 160-bit product of (a, aLow) × b: the top 64 and the 32 after them.
+fn multiply160(a: u64, aLow: u32, b: u64) -> Wide96 {
+    var high = a.mulHigh(b);
+    var low = a.wrappingMul(b);
+    let small = aLow as u64;
+    let shifted = (small.mulHigh(b) << 32) | (small.wrappingMul(b) >> 32);
+    let sum = low.wrappingAdd(shifted);
+    if (sum < low) {
+        high += 1;
+    }
+    low = sum;
+    return Wide96 { high: high, low: truncate<u32>(low >> 32) };
+}
+
+/// The 96 most significant bits of 10^p, shifted so the top bit is set (powerOfTen).
+fn powerOfTen(p: i32) -> Wide96 {
+    if (p == -1) {
+        return Wide96 { high: POWER_SCALE[13], low: POWER_SCALE_LOW[13] };
+    }
+    if (p >= 0 && p < 27) {
+        return Wide96 { high: POWER_BASE[truncate<usize>(p)], low: 0 };
+    }
+    let g = truncate<i32>(floorDivide(p as i64, 27));
+    let n = p - g * 27;
+    let at = truncate<usize>(g + 13);
+    let scale = POWER_SCALE[at];
+    if (n == 0) {
+        return Wide96 { high: scale, low: POWER_SCALE_LOW[at] };
+    }
+    let product = multiply160(scale, POWER_SCALE_LOW[at], POWER_BASE[truncate<usize>(n)]);
+    var x = product.high;
+    var low = product.low;
+    if ((x & 0x8000000000000000) == 0) {
+        x = (x << 1) | ((low >> 31) & 1) as u64;
+        low = (low << 1) | 1;
+    }
+    return Wide96 { high: x, low: low };
+}
+
+/// A real approximating d × 10^p (sqlite3Fp10Convert2).
+fn fp10Convert2(d: u64, p: i32) -> f64 {
+    if (p < POWERS_OF_10_FIRST) {
+        return 0.0;
+    }
+    if (p > POWERS_OF_10_LAST) {
+        return f64.fromBits(0x7FF0000000000000);
+    }
+    let b = 64 - truncate<i32>(d.leadingZeros());
+    let lp = pwr10to2(p);
+    var e = 53 - b - lp;
+    if (e > 1074) {
+        if (e >= 1130) {
+            return 0.0;
+        }
+        e = 1074;
+    }
+    let s = 0 - (e - (64 - b) + lp + 3);
+    let power = powerOfTen(p);
+    var pwr10h = power.high;
+    var pwr10l = power.low;
+    if (pwr10l != 0) {
+        pwr10h += 1;
+        pwr10l = pwr10l ^ 0xFFFFFFFF;
+    }
+    let x = d << truncate<u32>(64 - b);
+    var hi = x.mulHigh(pwr10h);
+    let lo = x.wrappingMul(pwr10h);
+    let mid1 = truncate<u32>(lo >> 32);
+    var sticky: u64 = 1;
+    let shift = truncate<u32>(s);
+    if ((hi & ((1u64 << shift) - 1)) == 0) {
+        let mid2 = truncate<u32>(x.mulHigh((pwr10l as u64) << 32) >> 32);
+        sticky = if (mid1.wrappingSub(mid2) > 1) 1 else 0;
+        if (mid1 < mid2) {
+            hi -= 1;
+        }
+    }
+    var u = (hi >> shift) | sticky;
+    if (u >= (1u64 << 55) - 2) {
+        u = (u >> 1) | (u & 1);
+        e -= 1;
+    }
+    var m = (u + 1 + ((u >> 2) & 1)) >> 2;
+    if (e <= -972) {
+        return f64.fromBits(0x7FF0000000000000);
+    }
+    if ((m & (1u64 << 52)) != 0) {
+        m = (m & ((1u64 << 52) ^ 0xFFFF_FFFF_FFFF_FFFF)) | (truncate<u64>(1075 - e) << 52);
+    }
+    return f64.fromBits(m);
+}
+
+/// For m × 2^e with m's top bit set: a decimal d × 10^p of at least `digits` significant digits
+/// (sqlite3Fp2Convert10).
+struct Decimal64 {
+    digits: u64;
+    power: i32;
+
+    fn of(m: u64, e: i32, digits: i32) -> Decimal64 {
+        let p = digits - 1 - pwr2to10(e + 63);
+        let h = m.mulHigh(powerOfTen(p).high);
+        if (digits == 18) {
+            let shifted = h >> truncate<u32>(0 - (e + pwr10to2(p) + 2));
+            return Decimal64 { digits: (shifted + ((shifted << 1) & 2)) >> 1, power: 0 - p };
+        }
+        return Decimal64 { digits: h >> truncate<u32>(0 - (e + pwr10to2(p) + 1)), power: 0 - p };
+    }
+}
+
+// ── text to numbers ──────────────────────────────────────────────────────────────────────────────────────────
+
+/// What sqlite3AtoF makes of a text: the value of its longest numeric prefix, and what kind of prefix it was.
+struct RealParse {
+    value: f64;
+    /// Some prefix of the text is a number.
+    hasPrefix: bool;
+    /// The number has a decimal point or an exponent.
+    isReal: bool;
+    /// Nothing but white space follows the number.
+    pure: bool;
+
+    /// Parses `text` as sqlite3AtoF does. A zero byte ends the text, as it does in SQLite.
+    fn of(text: Slice<u8>) -> RealParse {
+        var i: usize = 0;
+        let n = text.length;
+        let at = (index: usize) => if (index < n) text[index] else 0u8;
+        var negative = false;
+        var s: u64 = 0;
+        var d: i32 = 0;
+        var digits = false;
+        var real = false;
+        while (isNumberSpace(at(i))) {
+            i += 1;
+        }
+        if (at(i) == '-' || at(i) == '+') {
+            negative = at(i) == '-';
+            i += 1;
+        }
+        let limit: u64 = (0xFFFF_FFFF_FFFF_FFFF - 9) / 10;
+        if (isSqlDigit(at(i))) {
+            while (isSqlDigit(at(i))) {
+                digits = true;
+                if (s < limit) {
+                    s = s * 10 + (at(i) - '0') as u64;
+                } else {
+                    // Further digits only scale the value.
+                    d += 1;
+                }
+                i += 1;
+            }
+        }
+        if (at(i) == '.') {
+            if (isSqlDigit(at(i + 1))) {
+                i += 1;
+                digits = true;
+                while (isSqlDigit(at(i))) {
+                    if (s < limit) {
+                        s = s * 10 + (at(i) - '0') as u64;
+                        d -= 1;
+                    }
+                    i += 1;
+                }
+                real = true;
+            } else if (digits) {
+                i += 1;
+                real = true;
+            }
+        }
+        if (!digits) {
+            return RealParse { value: 0.0, hasPrefix: false, isReal: false, pure: false };
+        }
+        if (at(i) == 'e' || at(i) == 'E') {
+            var j = i + 1;
+            var sign: i32 = 1;
+            if (at(j) == '-') {
+                sign = -1;
+                j += 1;
+            } else if (at(j) == '+') {
+                j += 1;
+            }
+            if (isSqlDigit(at(j))) {
+                var exponent: i32 = 0;
+                while (isSqlDigit(at(j))) {
+                    exponent = if (exponent < 10000) exponent * 10 + (at(j) - '0') as i32 else 10000;
+                    j += 1;
+                }
+                d += sign * exponent;
+                real = true;
+                i = j;
+            }
+        }
+        var value = if (s == 0) 0.0 else fp10Convert2(s, d);
+        if (negative) {
+            value = 0.0 - value;
+        }
+        var rest = i;
+        while (isNumberSpace(at(rest))) {
+            rest += 1;
+        }
+        return RealParse { value: value, hasPrefix: true, isReal: real, pure: at(rest) == 0 };
+    }
+}
+
+/// The integer at the start of a text, after leading white space: `[+-]? digits`, saturated to 64 bits
+/// (sqlite3Atoi64).
+struct IntegerPrefix {
+    value: i64;
+    hasDigits: bool;
+    /// The digits stood for a number outside the 64-bit range.
+    overflow: bool;
+    /// Nothing but white space follows the digits.
+    pure: bool;
+
+    fn scan(text: Slice<u8>) -> IntegerPrefix {
+        var i: usize = 0;
+        while (i < text.length && isNumberSpace(text[i])) {
+            i += 1;
+        }
+        var negative = false;
+        if (i < text.length && (text[i] == '+' || text[i] == '-')) {
+            negative = text[i] == '-';
+            i += 1;
+        }
+        let limit: u64 = 9223372036854775808;
+        var magnitude: u64 = 0;
+        var overflow = false;
+        var hasDigits = false;
+        while (i < text.length && isSqlDigit(text[i])) {
+            hasDigits = true;
+            let digit = (text[i] - '0') as u64;
+            if (!overflow) {
+                if (magnitude > (limit - digit) / 10) {
+                    overflow = true;
+                } else {
+                    magnitude = magnitude * 10 + digit;
+                }
+            }
+            i += 1;
+        }
+        if (!overflow && !negative && magnitude == limit) {
+            overflow = true;
+        }
+        var value: i64 = 0;
+        if (overflow) {
+            value = if (negative) -9223372036854775808 else 9223372036854775807;
+        } else if (negative) {
+            value = if (magnitude == limit) -9223372036854775808 else 0 - truncate<i64>(magnitude);
+        } else {
+            value = truncate<i64>(magnitude);
+        }
+        var rest = i;
+        while (rest < text.length && isNumberSpace(text[rest])) {
+            rest += 1;
+        }
+        return IntegerPrefix { value: value, hasDigits: hasDigits, overflow: overflow, pure: rest == text.length };
+    }
+
+    /// sqlite3Atoi64's result: -1 no digits, 0 a whole integer that fits, 1 text after it, 2 or 3 too large.
+    fn code(borrow this) -> i32 {
+        if (!this.hasDigits) {
+            return -1;
+        }
+        if (this.overflow) {
+            return 2;
+        }
+        return if (this.pure) 0 else 1;
+    }
+}
+
+/// A real as the nearest 64-bit integer toward zero, saturated (sqlite3RealToI64); NaN is 0.
+fn realToInteger(r: f64) -> i64 {
+    if (r < -9223372036854774784.0) {
+        return -9223372036854775808;
+    }
+    if (r > 9223372036854774784.0) {
+        return 9223372036854775807;
+    }
+    return saturatingTruncate<i64>(r);
+}
+
+/// The integer a real is, when it is one exactly and strictly inside the 64-bit range (sqlite3VdbeIntegerAffinity).
+fn realAsExactInteger(r: f64) -> i64? {
+    let i = realToInteger(r);
+    if (round<f64>(i) == r && i > -9223372036854775808 && i < 9223372036854775807) {
+        return i;
+    }
+    return null;
+}
+
+/// Whether a real and an integer are the same value, within ±2^51 (sqlite3RealSameAsInt).
+fn realSameAsInteger(r: f64, i: i64) -> bool =>
+    r == 0.0 || (round<f64>(i).bits() == r.bits() && i >= -2251799813685248 && i < 2251799813685248);
+
+/// Text used as a number in arithmetic (computeNumericType): an integer when its numeric prefix has an integer's
+/// syntax and fits, else a real; 0 when there is no number at all.
+fn textAsNumber(text: Slice<u8>) -> SqliteValue {
+    let parsed = RealParse.of(text);
+    if (!parsed.isReal) {
+        let integer = IntegerPrefix.scan(text);
+        let code = integer.code();
+        if ((parsed.pure && code == 0) || (!parsed.pure && code <= 1)) {
+            return SqliteValue.Integer(integer.value);
+        }
+    }
+    return SqliteValue.Real(parsed.value);
+}
+
+/// Text stored in a column of numeric affinity (applyNumericAffinity): a number when the whole text is one, else
+/// `null`, and it stays text. With `tryForInt`, a real that is an integer exactly becomes one.
+fn textWithNumericAffinity(text: Slice<u8>, tryForInt: bool) -> SqliteValue? {
+    let parsed = RealParse.of(text);
+    if (!parsed.hasPrefix || !parsed.pure) {
+        return null;
+    }
+    if (!parsed.isReal) {
+        let i = realToInteger(parsed.value);
+        if (realSameAsInteger(parsed.value, i)) {
+            return SqliteValue.Integer(i);
+        }
+        let integer = IntegerPrefix.scan(text);
+        if (integer.code() == 0) {
+            return SqliteValue.Integer(integer.value);
+        }
+    }
+    if (tryForInt && realAsExactInteger(parsed.value) is Some(i)) {
+        return SqliteValue.Integer(i);
+    }
+    return SqliteValue.Real(parsed.value);
+}
+
+/// CAST(text AS NUMERIC) (sqlite3VdbeMemNumerify).
+fn textCastToNumeric(text: Slice<u8>) -> SqliteValue {
+    let parsed = RealParse.of(text);
+    if (!parsed.isReal) {
+        let integer = IntegerPrefix.scan(text);
+        if (integer.code() < 2) {
+            return SqliteValue.Integer(integer.value);
+        }
+    }
+    let i = realToInteger(parsed.value);
+    if (realSameAsInteger(parsed.value, i)) {
+        return SqliteValue.Integer(i);
+    }
+    return SqliteValue.Real(parsed.value);
+}
+
+// ── reals to text ────────────────────────────────────────────────────────────────────────────────────────────
+
+/// A real's significant digits, as sqlite3FpDecode gives them for `%!.17g`: the digits and where the decimal
+/// point falls (the value is 0.d1d2… × 10^point).
+struct DecodedReal {
+    digits: Vector<u8>;
+    point: i32;
+
+    /// `r` must be finite and greater than zero.
+    fn of(r: f64) -> Result<DecodedReal, AllocError> {
+        let bits = r.bits();
+        var e = truncate<i32>((bits >> 52) & 0x7ff);
+        var v = bits & 0x000fffffffffffff;
+        if (e == 0) {
+            let shift = v.leadingZeros();
+            v = v << shift;
+            e = -1074 - truncate<i32>(shift);
+        } else {
+            v = (v << 11) | 0x8000000000000000;
+            e -= 1086;
+        }
+        let decimal = Decimal64.of(v, e, 18);
+        var z = Vector<u8>.withCapacity(21)?;
+        var value = decimal.digits;
+        while (value > 0) {
+            z.push(truncate<u8>(value % 10) + '0')?;
+            value /= 10;
+        }
+        // Most significant first.
+        let count = z.length;
+        for (i in 0..count / 2) {
+            z.swap(i, count - 1 - i);
+        }
+        var n = truncate<i32>(z.length);
+        var point = n + decimal.power;
+        let exp = decimal.power;
+        var iRound: i32 = 17;
+        if (iRound < n || n > 20) {
+            // With exactly 17 digits, `!` tries fewer when they read back as the same real.
+            if (z[15] == '9' && z[14] == '9') {
+                var jj: i32 = 14;
+                while (jj > 0 && z[truncate<usize>(jj - 1)] == '9') {
+                    jj -= 1;
+                }
+                var v2: u64 = 1;
+                if (jj != 0) {
+                    v2 = (z[0] - '0') as u64;
+                    for (k in 1..truncate<usize>(jj)) {
+                        v2 = v2 * 10 + (z[k] - '0') as u64;
+                    }
+                    v2 += 1;
+                }
+                if (r == fp10Convert2(v2, exp + n - jj)) {
+                    iRound = jj + 1;
+                }
+            } else if (point >= n || (z[15] == '0' && z[14] == '0' && z[13] == '0')) {
+                var jj: i32 = 13;
+                while (z[truncate<usize>(jj - 1)] == '0') {
+                    jj -= 1;
+                }
+                var v2 = (z[0] - '0') as u64;
+                for (k in 1..truncate<usize>(jj)) {
+                    v2 = v2 * 10 + (z[k] - '0') as u64;
+                }
+                if (r == fp10Convert2(v2, exp + n - jj)) {
+                    iRound = jj + 1;
+                }
+            }
+            n = iRound;
+            let cut = truncate<usize>(iRound);
+            if (z[cut] >= '5') {
+                var j = cut;
+                loop {
+                    j -= 1;
+                    z[j] += 1;
+                    if (z[j] <= '9') {
+                        break;
+                    }
+                    z[j] = '0';
+                    if (j == 0) {
+                        z.insert(0, '1')?;
+                        n += 1;
+                        point += 1;
+                        break;
+                    }
+                }
+            }
+            z.truncate(truncate<usize>(n));
+        }
+        while (z.length > 1 && z[z.length - 1] == '0') {
+            let _ = z.pop();
+        }
+        return Ok(DecodedReal { digits: z, point: point });
+    }
+}
+
+/// Appends ASCII bytes to a string.
+fn appendAscii(out: borrow mut String, bytes: Slice<u8>) -> Result<void, AllocError> =>
+    out.append(StringView.fromUtf8(bytes)!);
+
+/// Appends a real as SQLite writes it as text (`%!.17g`).
+fn appendReal(out: borrow mut String, r: f64) -> Result<void, AllocError> {
+    if (r != r) {
+        // SQLite never keeps a NaN; its printf would show one so.
+        return out.append("NaN");
+    }
+    if (r == 0.0) {
+        return out.append("0.0");
+    }
+    if (r > 1.7976931348623157e308) {
+        return out.append("Inf");
+    }
+    if (r < -1.7976931348623157e308) {
+        return out.append("-Inf");
+    }
+    let decoded = DecodedReal.of(r.abs())?;
+    let digits = decoded.digits.view();
+    if (r < 0.0) {
+        out.append("-")?;
+    }
+    let exp = decoded.point - 1;
+    if (exp < -4 || exp > 16) {
+        appendAscii(out, digits[0..1])?;
+        out.append(".")?;
+        if (digits.length == 1) {
+            out.append("0")?;
+        } else {
+            appendAscii(out, digits[1..])?;
+        }
+        out.append(if (exp < 0) "e-" else "e+")?;
+        let magnitude = exp.abs();
+        if (magnitude >= 100) {
+            out.appendNumber(magnitude)?;
+        } else {
+            if (magnitude < 10) {
+                out.append("0")?;
+            }
+            out.appendNumber(magnitude)?;
+        }
+        return Ok();
+    }
+    if (exp < 0) {
+        out.append("0.")?;
+        for (i in 0..truncate<usize>(-1 - exp)) {
+            out.append("0")?;
+        }
+        return appendAscii(out, digits);
+    }
+    let whole = truncate<usize>(exp) + 1;
+    if (whole <= digits.length) {
+        appendAscii(out, digits[0..whole])?;
+    } else {
+        appendAscii(out, digits)?;
+        for (i in digits.length..whole) {
+            out.append("0")?;
+        }
+    }
+    out.append(".")?;
+    if (digits.length <= whole) {
+        return out.append("0");
+    }
+    return appendAscii(out, digits[whole..]);
+}
+
+/// A real as SQLite writes it as text.
+fn realText(r: f64) -> Result<String, AllocError> {
+    var out = String.create();
+    appendReal(mut out, r)?;
+    return Ok(out);
+}

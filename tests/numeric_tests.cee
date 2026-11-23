@@ -1,0 +1,155 @@
+// Numbers as text and text as numbers, checked against what sqlite3 3.54 shows.
+
+fn realShows(r: f64, expected: StringView) -> Result<void, TestFailure> {
+    let text = realText(r)!;
+    return Check.equalText(expected, text.view());
+}
+
+@test
+fn realsAreWrittenAsSqliteWritesThem() -> Result<void, TestFailure> {
+    realShows(0.1 + 0.2, "0.30000000000000004")?;
+    realShows(0.1 + 0.7, "0.79999999999999993")?;
+    realShows(0.1, "0.1")?;
+    realShows(1e20, "1.0e+20")?;
+    realShows(1.5e-7, "1.5e-07")?;
+    realShows(100.0, "100.0")?;
+    realShows(1e14, "100000000000000.0")?;
+    realShows(1e15 + 0.5, "1000000000000000.5")?;
+    realShows(1e16, "10000000000000000.0")?;
+    realShows(1e17, "1.0e+17")?;
+    realShows(1.5e17, "1.5e+17")?;
+    realShows(1234567890123456.0, "1234567890123456.0")?;
+    realShows(12345678901234567.0, "12345678901234568.0")?;
+    realShows(99999999999999990.0, "99999999999999984.0")?;
+    realShows(123456789012345678.0, "1.2345678901234568e+17")?;
+    realShows(0.0001, "0.0001")?;
+    realShows(0.00001, "1.0e-05")?;
+    realShows(0.000123456789012345678, "0.00012345678901234567")?;
+    realShows(1.0 / 3.0, "0.33333333333333332")?; // SQLite rounds twice: not 0.33333333333333331
+    realShows(2.0 / 3.0, "0.66666666666666663")?;
+    realShows(4.35, "4.35")?;
+    realShows(1e-300, "1.0e-300")?;
+    realShows(1.7976931348623157e308, "1.7976931348623157e+308")?;
+    realShows(9.2233720368547758e18, "9.2233720368547758e+18")?;
+    realShows(-2.5e15, "-2500000000000000.0")?;
+    realShows(-0.0, "0.0")?;
+    realShows(3.14159265358979, "3.14159265358979")?;
+    realShows(1e308 * 10.0, "Inf")?;
+    realShows(-1e308 * 10.0, "-Inf")?;
+    return Ok();
+}
+
+fn isReal(value: SqliteValue, expected: f64) -> bool => value is SqliteValue.Real(r) && r == expected;
+
+fn numberOf(text: StringView) -> SqliteValue => textAsNumber(text.bytes());
+
+@test
+fn textIsReadAsSqliteReadsIt() -> Result<void, TestFailure> {
+    Check.isTrue(numberOf("12abc") is SqliteValue.Integer(12), "'12abc' is 12")?;
+    Check.isTrue(numberOf(" 12 ") is SqliteValue.Integer(12), "' 12 ' is 12")?;
+    Check.isTrue(isReal(numberOf("1e3x"), 1000.0), "'1e3x' is 1000.0")?;
+    Check.isTrue(numberOf("0x10") is SqliteValue.Integer(0), "'0x10' is 0")?;
+    Check.isTrue(numberOf("abc") is SqliteValue.Integer(0), "'abc' is 0")?;
+    Check.isTrue(numberOf("") is SqliteValue.Integer(0), "'' is 0")?;
+    Check.isTrue(isReal(numberOf(".5"), 0.5), "'.5' is 0.5")?;
+    Check.isTrue(isReal(numberOf("5."), 5.0), "'5.' is 5.0")?;
+    Check.isTrue(numberOf("1e") is SqliteValue.Integer(1), "an exponent without digits is not one")?;
+    Check.isTrue(numberOf("-") is SqliteValue.Integer(0), "a sign alone is 0")?;
+    Check.isTrue(numberOf("Infinity") is SqliteValue.Integer(0), "'Infinity' is not a number")?;
+    Check.isTrue(numberOf("9223372036854775807") is SqliteValue.Integer(9223372036854775807), "the largest integer")?;
+    Check.isTrue(numberOf("9223372036854775808") is SqliteValue.Real(_), "one more is a real")?;
+    Check.isTrue(numberOf("-9223372036854775808") is SqliteValue.Integer(-9223372036854775808), "the smallest integer")?;
+    Check.isTrue(numberOf("1e400") is SqliteValue.Real(_), "a huge exponent is a real")?;
+    Check.isTrue(numberOf("٣") is SqliteValue.Integer(0), "digits of other scripts are not digits")?;
+    return Ok();
+}
+
+fn stored(text: StringView, tryForInt: bool) -> SqliteValue => textWithNumericAffinity(text.bytes(), tryForInt) ?? SqliteValue.Null;
+
+@test
+fn numericAffinityTakesOnlyWholeNumbers() -> Result<void, TestFailure> {
+    Check.isTrue(stored("3.0", true) is SqliteValue.Integer(3), "'3.0' into INTEGER is 3")?;
+    Check.isTrue(isReal(stored("3.0", false), 3.0), "'3.0' into REAL is 3.0")?;
+    Check.isTrue(stored(" 12 ", true) is SqliteValue.Integer(12), "white space around is allowed")?;
+    Check.isTrue(stored("1e16", true) is SqliteValue.Integer(10000000000000000), "'1e16' into INTEGER is an integer")?;
+    Check.isTrue(stored("1.5e3", true) is SqliteValue.Integer(1500), "'1.5e3' is 1500")?;
+    Check.isTrue(stored("9223372036854775808", true) is SqliteValue.Real(_), "too large for an integer")?;
+    Check.isTrue(stored("12abc", true).isNull(), "'12abc' stays text")?;
+    Check.isTrue(stored("0x10", true).isNull(), "'0x10' stays text")?;
+    Check.isTrue(stored("", true).isNull(), "'' stays text")?;
+    Check.isTrue(realAsExactInteger(9.2233720368547758e18).isNull(), "2^63 is not an integer")?;
+    Check.isTrue(realAsExactInteger(-0.0) == Some(0), "-0.0 is 0")?;
+    Check.isTrue(realAsExactInteger(2.5).isNull(), "2.5 is not an integer")?;
+    let prefix = IntegerPrefix.scan("  -12.7abc".bytes());
+    Check.equalI64(-12, prefix.value)?;
+    Check.equalI64(9223372036854775807, IntegerPrefix.scan("12345678901234567890".bytes()).value)?;
+    Check.equalI64(9007199254740993, IntegerPrefix.scan("9007199254740993".bytes()).value)?;
+    Check.equalI64(1, IntegerPrefix.scan("1e3".bytes()).value)?;
+    return Ok();
+}
+
+@test
+fn twentyThousandRandomRealsReadAsSqliteShowsThem() -> Result<void, TestFailure> {
+    let path = "out/numeric-reals.db";
+    makeDatabase(path, """
+        CREATE TABLE r(id INTEGER PRIMARY KEY, x REAL);
+        WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 20000)
+        INSERT INTO r(x) SELECT CASE i % 5
+            WHEN 0 THEN (random() / 9223372036854775807.0) * pow(10, abs(random() % 616) - 308)
+            WHEN 1 THEN (random() % 100000000) / pow(10, abs(random() % 20))
+            WHEN 2 THEN random() / 1024.0
+            WHEN 3 THEN 1.0 / (abs(random() % 100000) + 1)
+            ELSE (random() / 9223372036854775807.0) * pow(2, abs(random() % 2100) - 1075) END FROM c;
+        """)?;
+    let expected = askSqlite(path, "SELECT x FROM r ORDER BY id")?;
+    var reader = DatabaseReader.open(path)!;
+    var cursor = reader.scanTable("r")!;
+    var ours = String.create();
+    while (reader.nextRow(mut cursor)! is Some(row)) {
+        match (borrow row.columns[1]) {
+            SqliteValue.Real(x) => { appendReal(mut ours, x)!; }
+            // SQLite stores an integral real in a REAL column as an integer, and reads it back as a real.
+            SqliteValue.Integer(i) => { appendReal(mut ours, round<f64>(i))!; }
+            SqliteValue.Null => {}
+            _ => { return Check.fail("expected a number"); }
+        }
+        ours.append("\n")!;
+    }
+    // Compare line by line, so a failure names the value.
+    var theirs = expected.view().split("\n");
+    var mine = ours.view().split("\n");
+    var line: u64 = 0;
+    while (theirs.next() is Some(a)) {
+        line += 1;
+        let b = mine.next() ?? "<missing>";
+        if (a != b) {
+            var message = String.from("line ")!;
+            message.appendNumber(line)!;
+            message.append(": sqlite3 shows ")!;
+            message.append(a)!;
+            message.append(", this engine ")!;
+            message.append(b)!;
+            return Check.fail(message.view());
+        }
+    }
+    return Ok();
+}
+
+fn parsesAs(text: StringView, expectedBits: u64) -> Result<void, TestFailure> {
+    let parsed = RealParse.of(text.bytes());
+    return Check.equalU64(expectedBits, parsed.value.bits());
+}
+
+@test
+fn textIsReadAsSqlitesAtoFReadsIt() -> Result<void, TestFailure> {
+    // SQLite reads only about 19 significant digits, so this rounds down where a correct parser rounds up.
+    parsesAs("3500000000000000.2500001", 3500000000000000.0.bits())?;
+    parsesAs("0.1", 0.1.bits())?;
+    parsesAs("1e400", f64.fromBits(0x7FF0000000000000).bits())?;
+    parsesAs("1e-400", 0)?;
+    parsesAs("-.5", (-0.5).bits())?;
+    parsesAs("4.9406564584124654e-324", 1)?;
+    realShows(f64.fromBits(1), "4.9406564584124654e-324")?;
+    realShows(49.47, "49.47")?;
+    return Ok();
+}
