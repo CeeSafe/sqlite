@@ -18,9 +18,11 @@
 // The date and time functions are in datetime.cee, printf() and format() in printf.cee, and the JSON functions
 // are named here and computed in json.cee.
 //
-// Not yet ported: the jsonb_* functions, json_each and json_tree, and the math functions beyond sqrt, abs, sign,
-// floor, ceil, trunc, mod and pi (they need a port of a math library, which CeeSafe lacks). Calling one is "no
-// such function".
+// The math functions (sin, log, pow and the rest) compute with libm.cee, a port of FreeBSD's msun; their results
+// may differ in the last bit from the platform's libm that sqlite3 uses. floor(), ceil(), trunc(), sqrt() and
+// mod() of a blob or of text that is not a number are NULL, as in SQLite.
+//
+// Not yet ported: the jsonb_* functions, json_each and json_tree. Calling one is "no such function".
 
 enum ScalarFunction {
     Abs,
@@ -96,6 +98,28 @@ enum ScalarFunction {
     Unlikely,
     Upper,
     ZeroBlob,
+    // The math functions (SQLITE_ENABLE_MATH_FUNCTIONS) beyond those above, computed by mathFunction with libm.cee.
+    Acos,
+    Acosh,
+    Asin,
+    Asinh,
+    Atan,
+    Atan2,
+    Atanh,
+    Cos,
+    Cosh,
+    Degrees,
+    Exp,
+    Ln,
+    Log,
+    Log10,
+    Log2,
+    Pow,
+    Radians,
+    Sin,
+    Sinh,
+    Tan,
+    Tanh,
 }
 
 /// The function and whether `argc` arguments suit it.
@@ -189,6 +213,27 @@ fn scalarEntry(name: StringView, argc: usize) -> FunctionEntry? {
         "unlikely" => entry(ScalarFunction.Unlikely, argc, 1, 1),
         "upper" => entry(ScalarFunction.Upper, argc, 1, 1),
         "zeroblob" => entry(ScalarFunction.ZeroBlob, argc, 1, 1),
+        "acos" => entry(ScalarFunction.Acos, argc, 1, 1),
+        "acosh" => entry(ScalarFunction.Acosh, argc, 1, 1),
+        "asin" => entry(ScalarFunction.Asin, argc, 1, 1),
+        "asinh" => entry(ScalarFunction.Asinh, argc, 1, 1),
+        "atan" => entry(ScalarFunction.Atan, argc, 1, 1),
+        "atan2" => entry(ScalarFunction.Atan2, argc, 2, 2),
+        "atanh" => entry(ScalarFunction.Atanh, argc, 1, 1),
+        "cos" => entry(ScalarFunction.Cos, argc, 1, 1),
+        "cosh" => entry(ScalarFunction.Cosh, argc, 1, 1),
+        "degrees" => entry(ScalarFunction.Degrees, argc, 1, 1),
+        "exp" => entry(ScalarFunction.Exp, argc, 1, 1),
+        "ln" => entry(ScalarFunction.Ln, argc, 1, 1),
+        "log" => entry(ScalarFunction.Log, argc, 1, 2),
+        "log10" => entry(ScalarFunction.Log10, argc, 1, 1),
+        "log2" => entry(ScalarFunction.Log2, argc, 1, 1),
+        "pow" | "power" => entry(ScalarFunction.Pow, argc, 2, 2),
+        "radians" => entry(ScalarFunction.Radians, argc, 1, 1),
+        "sin" => entry(ScalarFunction.Sin, argc, 1, 1),
+        "sinh" => entry(ScalarFunction.Sinh, argc, 1, 1),
+        "tan" => entry(ScalarFunction.Tan, argc, 1, 1),
+        "tanh" => entry(ScalarFunction.Tanh, argc, 1, 1),
         _ => null,
     };
 }
@@ -747,7 +792,7 @@ fn randomBytes(count: usize) -> Result<Vector<u8>, SqliteError> {
 
 /// floor(), ceil() and trunc(): an integer stays as it is, a real becomes integral, and text is read as a number.
 fn roundingFunction(function: ScalarFunction, value: borrow SqliteValue) -> SqliteValue {
-    let number = numericValue(value);
+    let number = mathOperand(value) ?? SqliteValue.Null;
     match (number) {
         SqliteValue.Integer(i) => { return SqliteValue.Integer(i); }
         SqliteValue.Real(r) => {
@@ -759,6 +804,73 @@ fn roundingFunction(function: ScalarFunction, value: borrow SqliteValue) -> Sqli
         }
         _ => { return SqliteValue.Null; }
     }
+}
+
+/// An argument of a math function as sqlite3_value_numeric_type sees it: an integer or a real, text that is a
+/// number entirely converted to one; anything else (other text, a blob, NULL) is `null` and the result NULL.
+fn mathOperand(value: borrow SqliteValue) -> SqliteValue? => match (value) {
+    SqliteValue.Integer(i) => SqliteValue.Integer(i),
+    SqliteValue.Real(r) => SqliteValue.Real(r),
+    SqliteValue.Text(s) => textWithNumericAffinity(s.view().bytes(), false),
+    _ => null,
+};
+
+/// The argument of a math function as a double, or `null` when it is not a number.
+fn mathNumber(value: borrow SqliteValue) -> f64? {
+    let number = mathOperand(value) ?? { return null; };
+    return realValue(borrow number);
+}
+
+/// The math functions of func.c (math1Func, math2Func, logFunc, degToRad, radToDeg), computed by libm.cee. A NaN
+/// result (a domain error) is NULL, as sqlite3_result_double makes it.
+fn mathFunction(function: ScalarFunction, v: Slice<SqliteValue>) -> SqliteValue {
+    let x = mathNumber(borrow v[0]) ?? { return SqliteValue.Null; };
+    if (function == ScalarFunction.Log ||
+        function == ScalarFunction.Ln || function == ScalarFunction.Log10 || function == ScalarFunction.Log2) {
+        if (x <= 0.0) {
+            return SqliteValue.Null;
+        }
+        if (v.length == 2) {
+            // log(B, X). As in logFunc, the base must be above 1 (a base in (0, 1] is NULL too), and X is read
+            // with sqlite3_value_double, which takes the numeric prefix of text and 0 for NULL.
+            let base = libmLnAccurate(x);
+            if (base <= 0.0) {
+                return SqliteValue.Null;
+            }
+            let y = realValue(borrow v[1]);
+            if (y <= 0.0) {
+                return SqliteValue.Null;
+            }
+            return realResult(libmLnAccurate(y) / base);
+        }
+        return realResult(match (function) {
+            ScalarFunction.Ln => libmLnAccurate(x),
+            ScalarFunction.Log2 => libmLog2Accurate(x),
+            // log(X) is the base-10 logarithm, as in SQLite.
+            _ => libmLog10Accurate(x),
+        });
+    }
+    if (function == ScalarFunction.Atan2 || function == ScalarFunction.Pow) {
+        let y = mathNumber(borrow v[1]) ?? { return SqliteValue.Null; };
+        return realResult(if (function == ScalarFunction.Pow) libmPow(x, y) else libmAtan2(x, y));
+    }
+    return realResult(match (function) {
+        ScalarFunction.Acos => libmAcosAccurate(x),
+        ScalarFunction.Acosh => libmAcosh(x),
+        ScalarFunction.Asin => libmAsinAccurate(x),
+        ScalarFunction.Asinh => libmAsinh(x),
+        ScalarFunction.Atan => libmAtan(x),
+        ScalarFunction.Atanh => libmAtanh(x),
+        ScalarFunction.Cos => libmCos(x),
+        ScalarFunction.Cosh => libmCoshAccurate(x),
+        ScalarFunction.Degrees => x * (180.0 / 3.141592653589793),
+        ScalarFunction.Exp => libmExpAccurate(x),
+        ScalarFunction.Radians => x * (3.141592653589793 / 180.0),
+        ScalarFunction.Sin => libmSin(x),
+        ScalarFunction.Sinh => libmSinhAccurate(x),
+        ScalarFunction.Tan => libmTan(x),
+        _ => libmTanhAccurate(x),
+    });
 }
 
 /// fmod(x, y), exactly: x - trunc(x / y) * y computed without rounding error.
@@ -840,6 +952,9 @@ fn callFunction(
         }
         ScalarFunction.Ceil | ScalarFunction.Floor | ScalarFunction.Trunc => {
             return Ok(roundingFunction(call.function, borrow v[0]));
+        }
+        ScalarFunction.Acos | ScalarFunction.Acosh | ScalarFunction.Asin | ScalarFunction.Asinh | ScalarFunction.Atan | ScalarFunction.Atan2 | ScalarFunction.Atanh | ScalarFunction.Cos | ScalarFunction.Cosh | ScalarFunction.Degrees | ScalarFunction.Exp | ScalarFunction.Ln | ScalarFunction.Log | ScalarFunction.Log10 | ScalarFunction.Log2 | ScalarFunction.Pow | ScalarFunction.Radians | ScalarFunction.Sin | ScalarFunction.Sinh | ScalarFunction.Tan | ScalarFunction.Tanh => {
+            return Ok(mathFunction(call.function, v));
         }
         ScalarFunction.Date | ScalarFunction.Datetime | ScalarFunction.JulianDay | ScalarFunction.Strftime | ScalarFunction.Time | ScalarFunction.TimeDiff | ScalarFunction.UnixEpoch => {
             return dateTimeFunction(call.function, v, frame.nowMillis);
@@ -1030,11 +1145,9 @@ fn callFunction(
             return Ok(values.swapRemove(best));
         }
         ScalarFunction.Mod => {
-            if (v[0].isNull() || v[1].isNull()) {
-                return Ok(SqliteValue.Null);
-            }
-            let r = floatRemainder(realValue(borrow v[0]), realValue(borrow v[1]));
-            return Ok(realResult(r));
+            let x = mathNumber(borrow v[0]) ?? { return Ok(SqliteValue.Null); };
+            let y = mathNumber(borrow v[1]) ?? { return Ok(SqliteValue.Null); };
+            return Ok(realResult(floatRemainder(x, y)));
         }
         ScalarFunction.NullIf => {
             if (!v[0].isNull() && !v[1].isNull() && compareValues(borrow v[0], borrow v[1], call.collation) == 0) {
@@ -1118,11 +1231,8 @@ fn callFunction(
             }
         }
         ScalarFunction.Sqrt => {
-            if (v[0].isNull()) {
-                return Ok(SqliteValue.Null);
-            }
-            let x = realValue(borrow v[0]);
-            return Ok(if (x < 0.0) SqliteValue.Null else realResult(x.sqrt()));
+            let x = mathNumber(borrow v[0]) ?? { return Ok(SqliteValue.Null); };
+            return Ok(realResult(x.sqrt()));
         }
         ScalarFunction.SqliteVersion => { return Ok(SqliteValue.text(SQLITE_VERSION)?); }
         ScalarFunction.Substr => {
