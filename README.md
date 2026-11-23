@@ -453,6 +453,11 @@ Choices where the C# concept does not fit CeeSafe:
   names repeat, the innermost answering. The pager keeps a stack of undo levels, the running statement's on top.
   The C# refused savepoints.
 
+- **ANALYZE and REINDEX** (`analyzeAndReindexLikeSqlite`): ANALYZE writes sqlite_stat1 as SQLite does, row for
+  row (index columns under their collations, partial indexes over their rows, a WITHOUT ROWID key under the
+  table's name, nothing for an empty table); REINDEX rebuilds every index. The planner does not use the
+  statistics yet. The C# refused both.
+
 ## Known differences from SQLite in PRAGMA integrity_check
 
 The report matches the `sqlite3` shell's row for row on the tests' damaged files, with these exceptions:

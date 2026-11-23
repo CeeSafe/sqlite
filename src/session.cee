@@ -315,6 +315,14 @@ public struct Session {
                 this.reloadSchema()?;
                 return Ok(emptyResult());
             }
+            Stmt.Analyze(target) => {
+                executeAnalyze(target, this)?;
+                return Ok(emptyResult());
+            }
+            Stmt.Reindex => {
+                executeReindex(this)?;
+                return Ok(emptyResult());
+            }
             _ => { return Err(unsupported("this statement is not supported yet")); }
         }
     }

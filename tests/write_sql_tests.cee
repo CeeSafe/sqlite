@@ -690,3 +690,32 @@ fn savepointsNestAsInSqlite() -> Result<void, TestFailure> {
         PRAGMA integrity_check
         """);
 }
+
+@test
+fn analyzeAndReindexLikeSqlite() -> Result<void, TestFailure> {
+    return sameScript("analyze", """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, a, b, c UNIQUE, s TEXT COLLATE NOCASE)
+        CREATE INDEX t_ab ON t(a, b)
+        CREATE INDEX t_p ON t(b) WHERE b > 5
+        CREATE INDEX t_s ON t(s)
+        CREATE INDEX t_e ON t(a + b)
+        CREATE TABLE e(x)
+        CREATE TABLE ei(x)
+        CREATE INDEX ei_x ON ei(x)
+        CREATE TABLE n(x)
+        INSERT INTO n VALUES (1), (2)
+        CREATE TABLE w(k PRIMARY KEY, v) WITHOUT ROWID
+        INSERT INTO w VALUES (1, 1), (2, 1), (3, 2)
+        WITH RECURSIVE q(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM q WHERE i < 100) INSERT INTO t SELECT i, i % 7, i % 3, i, char(65 + i % 5 + (i % 2) * 32) FROM q
+        ANALYZE
+        SELECT * FROM sqlite_stat1 ORDER BY tbl, idx
+        SELECT type, name, sql FROM sqlite_schema WHERE name LIKE 'sqlite_stat%'
+        INSERT INTO n VALUES (3)
+        ANALYZE n
+        ANALYZE t_ab
+        SELECT * FROM sqlite_stat1 ORDER BY tbl, idx
+        ANALYZE nosuch
+        REINDEX
+        SELECT count(*) FROM t WHERE a = 3
+        """);
+}
