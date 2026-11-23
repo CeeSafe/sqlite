@@ -520,13 +520,13 @@ struct Session {
         if (!returning && first != "PRAGMA") {
             return Ok(null);
         }
-        // The engine has no SAVEPOINT yet, so the statement is tried in a transaction of its own, and not inside the
-        // client's: there its columns are not known until it runs.
-        if (connection.inTransaction() || connection.query("BEGIN", borrow none).isErr()) {
+        // The statement is tried inside a savepoint and undone, which works inside the client's transaction too.
+        if (connection.query("SAVEPOINT pgwire_describe", borrow none).isErr()) {
             return Ok(null);
         }
         let probed = connection.query(sql, borrow none);
-        let _ = connection.query("ROLLBACK", borrow none);
+        let _ = connection.query("ROLLBACK TO pgwire_describe", borrow none);
+        let _ = connection.query("RELEASE pgwire_describe", borrow none);
         return match (probed) {
             Ok(r) => if (r.columns.length == 0) Ok(null) else Ok(r.columns),
             Err(_) => Ok(null),

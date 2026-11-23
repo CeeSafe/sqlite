@@ -554,8 +554,7 @@ PostgreSQL:
   type is text, and SQLite's affinity converts it;
 - a portal runs when it is first described or executed, and keeps its rows for later Executes: a portal described
   and never executed has still run. Describe of a prepared `INSERT … RETURNING` or PRAGMA finds its columns by
-  running it in a transaction that is rolled back, and gives NoData inside the client's own transaction (the
-  engine has no SAVEPOINT yet);
+  running it inside a savepoint that is rolled back, which works inside the client's own transaction too;
 - no cancel requests (statements run to the end), no COPY, no function calls, no notices, no SSL (put a TLS
   proxy in front), and cleartext passwords only (no MD5 or SCRAM).
 

@@ -502,6 +502,14 @@ fn extendedQueryProtocol() -> Result<void, TestFailure> {
     Check.equalText("t 20 25\nT a:25 b:25\nZ I\n", sync(mut client).view())?;
     Check.equalText("T count(*):20\nD 1\nC SELECT 1\nZ I\n", client.query("SELECT count(*) FROM t").view())?;
 
+    // Inside the client's own transaction too: the probe is a savepoint, undone, and the transaction goes on.
+    Check.equalText("C BEGIN\nZ T\n", client.query("BEGIN").view())?;
+    Check.equalText("C INSERT 0 1\nZ T\n", client.query("INSERT INTO t VALUES (8, 'kept')").view())?;
+    client.send('D', borrow dins);
+    Check.equalText("t 20 25\nT a:25 b:25\nZ T\n", sync(mut client).view())?;
+    Check.equalText("C COMMIT\nZ I\n", client.query("COMMIT").view())?;
+    Check.equalText("T count(*):20\nD 2\nC SELECT 1\nZ I\n", client.query("SELECT count(*) FROM t").view())?;
+
     // Results in the binary format.
     let pb = parseMessage("", "SELECT 258 AS i, 0.5 AS r, x'0102' AS b, 'é' AS t", noTypes);
     client.send('P', borrow pb);
