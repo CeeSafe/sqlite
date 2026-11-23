@@ -12,8 +12,9 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 inverses. SQLite's math functions (`exp()`, `ln()`, `pow()`, `sin()` …) need all of them, with results identical to
 the platform libm in the last bit, since reals are shown with 17 significant digits.
 
-Workaround: none yet; those SQL functions report "no such function". A port of an fdlibm-style library into the
-package is the fallback, but a correctly rounded library in `lib/core` would serve every program.
+Workaround: `src/libm.cee`, a port of FreeBSD msun with double-double versions of exp, the logs, pow, sinh, cosh,
+tanh, asin, acos and atan2. It still differs from macOS's libm in the last bit for some arguments (README.md lists
+how often); a correctly rounded library in `lib/core` would serve every program.
 
 ### 2. No arithmetic right shift, no shifts on signed integers
 

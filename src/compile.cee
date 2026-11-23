@@ -415,6 +415,11 @@ impl Compiler {
                         );
                     }
                     UnaryOp.Negate => {
+                        // A real literal is negated as it is read, as SQLite does: `-0.0` is negative zero, where
+                        // `-x` is `0 - x`.
+                        if (inner.expr is XExpr.Value(SqliteValue.Real(r)) && isLiteral(operand)) {
+                            return Ok(plain(XExpr.Value(SqliteValue.Real(-r))));
+                        }
                         return Ok(
                             Compiled {
                                 expr: XExpr.Negate(Box.create(inner.expr)?),

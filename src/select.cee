@@ -461,6 +461,10 @@ fn constantValue(e: borrow Expr) -> Result<SqliteValue?, SqliteError> {
         }
         Expr.Unary(UnaryOp.Negate, x) => {
             if (constantValue(x)? is Some(v)) {
+                // `-0.0` is negative zero, as SQLite reads it.
+                if (v is SqliteValue.Real(r) && isLiteral(x)) {
+                    return Ok(SqliteValue.Real(-r));
+                }
                 return Ok(negate(borrow v));
             }
             return Ok(null);
@@ -1537,3 +1541,5 @@ fn schemaTableSchema() -> Result<TableSchema, SqliteError> {
     };
     return buildTableSchema(stmt, "sqlite_schema", 1, definition);
 }
+
+fn isLiteral(e: borrow Expr) -> bool => e is Expr.Literal(_);
