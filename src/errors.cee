@@ -16,6 +16,8 @@ public enum SqliteError {
     Constraint(String),
     /// The engine does not support what was asked.
     Unsupported(String),
+    /// Another connection of the same pool holds the database (SQLITE_BUSY), and the busy timeout ran out.
+    Busy(String),
     /// RAISE(IGNORE) in a trigger: the row is skipped, and the statement goes on.
     RaiseIgnore,
 }
@@ -30,6 +32,7 @@ impl SqliteError {
         SqliteError.Sql(m) => m.view(),
         SqliteError.Constraint(m) => m.view(),
         SqliteError.Unsupported(m) => m.view(),
+        SqliteError.Busy(m) => m.view(),
         SqliteError.RaiseIgnore => "RAISE(IGNORE)",
     };
 }

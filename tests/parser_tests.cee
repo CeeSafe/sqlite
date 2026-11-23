@@ -101,7 +101,9 @@ fn primariesParse() -> Result<void, TestFailure> {
     Check.equalText("TRUE", shape("true").view())?;
     Check.equalText("\"true\".\"x\"", shape("true.x").view())?;
     Check.equalText("x'00ff'", shape("x'00ff'").view())?;
-    Check.equalText(":name", shape(":name").view())?;
+    // Parameters are numbered as they are read, in SQLite's order, and kept as `?N`.
+    Check.equalText("?1", shape(":name").view())?;
+    Check.equalText("(((?1 + ?2) + ?1) + ?3)", shape(":a + ?2 + :a + ?").view())?;
     Check.equalText("RAISE(ABORT, 'no')", shape("RAISE(ABORT, 'no')").view())?;
     Check.equalText("RAISE(IGNORE)", shape("RAISE(IGNORE)").view())?;
     return Ok();

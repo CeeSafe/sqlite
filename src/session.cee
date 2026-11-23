@@ -58,6 +58,15 @@ public struct Session {
         });
     }
 
+    /// Forgets every page and the schema read so far, after another connection changed the file: the next
+    /// statement reads them afresh. The settings and change counts stay. (For the API's connections, which call it
+    /// when a transaction starts and the file's change counter moved since their last one.)
+    fn reopen(borrow mut this) -> Result<void, SqliteError> {
+        let path = String.from(this.pager.filePath())?;
+        this.pager = WritablePager.open(path.view())?;
+        return this.reloadSchema();
+    }
+
     /// Reads the schema again, after a statement changed it.
     fn reloadSchema(borrow mut this) -> Result<void, SqliteError> {
         this.entries = readSchemaEntries(mut this.pager)?;

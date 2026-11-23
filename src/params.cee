@@ -1,0 +1,98 @@
+// SQLite's numbering of a statement's parameters (sqlite3ExprAssignVarNumber in expr.c), in the order they are
+// written: `?` takes the next number, `?NNN` is NNN, and `:name`, `@name` and `$name` take the next number the first
+// time and keep it. A statement's numbers come from its text alone, so every part of it (a subquery, RETURNING,
+// UPDATE … FROM) agrees on them however the engine compiles it.
+
+/// The largest parameter number, SQLite's default SQLITE_MAX_VARIABLE_NUMBER.
+const MAX_PARAMETER_NUMBER: usize = 32766;
+
+/// A parameter's name and its number from 1.
+public struct ParameterName {
+    public name: String;
+    public number: usize;
+}
+
+/// The numbers given so far in one statement.
+struct ParamNumbering {
+    /// The largest number given, which is the statement's parameter count.
+    count: usize;
+    /// Each named parameter, and each `?NNN` whose number had no name yet, in the order first seen.
+    names: Vector<ParameterName>;
+
+    fn create() -> ParamNumbering => ParamNumbering { count: 0, names: Vector<ParameterName>.create() };
+
+    /// The number, from 1, of the parameter written as `text` (`?`, `?NNN`, `:a`, `@a` or `$a`).
+    fn number(borrow mut this, text: StringView) -> Result<usize, SqliteError> {
+        if (text == "?") {
+            this.count += 1;
+            return this.checked(this.count);
+        }
+        if (text[0] == '?') {
+            let n = text[1..].parseInt<usize>() ?? 0;
+            if (n == 0 || n > MAX_PARAMETER_NUMBER) {
+                return Err(sqlError("variable number must be between ?1 and ?32766"));
+            }
+            if (n > this.count) {
+                this.count = n;
+            }
+            if (this.nameOf(n).isNull()) {
+                this.names.push(ParameterName { name: String.from(text)?, number: n })?;
+            }
+            return Ok(n);
+        }
+        for (i in 0..this.names.length) {
+            if (this.names[i].name.view() == text) {
+                return Ok(this.names[i].number);
+            }
+        }
+        this.count += 1;
+        this.names.push(ParameterName { name: String.from(text)?, number: this.count })?;
+        return this.checked(this.count);
+    }
+
+    fn checked(borrow this, n: usize) -> Result<usize, SqliteError> {
+        if (n > MAX_PARAMETER_NUMBER) {
+            return Err(sqlError("too many SQL variables"));
+        }
+        return Ok(n);
+    }
+
+    /// The name of parameter `n`: the first one written with that number.
+    fn nameOf(borrow this, n: usize) -> StringView? {
+        for (i in 0..this.names.length) {
+            if (this.names[i].number == n) {
+                return this.names[i].name.view();
+            }
+        }
+        return null;
+    }
+}
+
+/// A statement's parameters as SQLite numbers them: how many there are (the largest number) and their names.
+public struct StatementParameters {
+    public count: usize;
+    public names: Vector<ParameterName>;
+
+    /// The number of the parameter called `name`, written with its prefix (`:a`, `@a`, `$a`, `?3`), as
+    /// sqlite3_bind_parameter_index finds it; null when the statement has none of that name.
+    public fn indexOf(borrow this, name: StringView) -> usize? {
+        for (i in 0..this.names.length) {
+            if (this.names[i].name.view() == name) {
+                return this.names[i].number;
+            }
+        }
+        return null;
+    }
+}
+
+/// The parameters of the statement `sql`, numbered as SQLite numbers them.
+public fn statementParameters(sql: StringView) -> Result<StatementParameters, SqliteError> {
+    let tokens = Tokenizer.tokenize(sql)?;
+    var numbering = ParamNumbering.create();
+    for (i in 0..tokens.length) {
+        if (tokens[i].kind == TokenKind.Param) {
+            let _ = numbering.number(tokens[i].text.view())?;
+        }
+    }
+    return Ok(StatementParameters { count: numbering.count, names: numbering.names });
+}

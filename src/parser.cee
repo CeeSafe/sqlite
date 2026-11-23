@@ -87,10 +87,19 @@ struct Parser {
     private height: u32;
     /// The statement's text, for the names of result columns.
     private source: String;
+    /// The statement's parameters, numbered in the order they are written, as SQLite numbers them.
+    private params: ParamNumbering;
 
     /// The one statement in `sql`, which may end with a semicolon.
     fn parseStatement(sql: StringView) -> Result<Stmt, SqliteError> {
-        var p = Parser { tokens: Tokenizer.tokenize(sql)?, at: 0, nesting: 0, height: 0, source: String.from(sql)? };
+        var p = Parser {
+            tokens: Tokenizer.tokenize(sql)?,
+            at: 0,
+            nesting: 0,
+            height: 0,
+            source: String.from(sql)?,
+            params: ParamNumbering.create(),
+        };
         let stmt = p.statement()?;
         let _ = p.acceptOp(";");
         p.expectEnd()?;
@@ -99,13 +108,21 @@ struct Parser {
 
     /// Every statement in `sql`.
     fn parseProgram(sql: StringView) -> Result<Vector<Stmt>, SqliteError> {
-        var p = Parser { tokens: Tokenizer.tokenize(sql)?, at: 0, nesting: 0, height: 0, source: String.from(sql)? };
+        var p = Parser {
+            tokens: Tokenizer.tokenize(sql)?,
+            at: 0,
+            nesting: 0,
+            height: 0,
+            source: String.from(sql)?,
+            params: ParamNumbering.create(),
+        };
         var list = Vector<Stmt>.create();
         loop {
             while (p.acceptOp(";")) {}
             if (p.kind() == TokenKind.Eof) {
                 break;
             }
+            p.params = ParamNumbering.create();
             list.push(p.statement()?)?;
             if (!p.isOp(";")) {
                 break;
@@ -117,7 +134,14 @@ struct Parser {
 
     /// The expression that `tokens` (ending with an Eof token) spell.
     fn parseExpressionTokens(tokens: Vector<Token>) -> Result<Expr, SqliteError> {
-        var p = Parser { tokens: tokens, at: 0, nesting: 0, height: 0, source: String.create() };
+        var p = Parser {
+            tokens: tokens,
+            at: 0,
+            nesting: 0,
+            height: 0,
+            source: String.create(),
+            params: ParamNumbering.create(),
+        };
         let expr = p.expr()?;
         p.expectEnd()?;
         return Ok(expr);
@@ -1580,8 +1604,14 @@ struct Parser {
             TokenKind.StringLit => { return this.literal(LiteralKind.String); }
             TokenKind.BlobLit => { return this.literal(LiteralKind.Blob); }
             TokenKind.Param => {
+                // The parameter is numbered here, in the order of the text, and kept as `?N`: the parts of a
+                // statement are compiled in another order (RETURNING first, UPDATE … FROM by two compilers).
                 this.height = 1;
-                return Ok(Expr.Param(this.takeText()?));
+                let text = this.takeText()?;
+                let n = this.params.number(text.view())?;
+                var numbered = String.from("?")?;
+                numbered.appendNumber(n)?;
+                return Ok(Expr.Param(numbered));
             }
             _ => {}
         }

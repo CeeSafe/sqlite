@@ -1,0 +1,119 @@
+// A pool of connections to one database file, which threads may share.
+//
+// The C# pool handed out connections that shared one in-memory copy of the database: statements were serialised
+// by a lock, but transactions were not kept apart, so one connection saw another's uncommitted rows, and a
+// connection given back inside a transaction went to the next caller with it still open. For `:memory:` it gave
+// every caller the same connection at once. Here:
+// - the pool's connections share a gate (see `Connection`): a transaction holds it from its start to its end, so
+//   transactions run one at a time and see only committed data, and a connection reads the file afresh when
+//   another committed since its last transaction. This engine takes no file locks (CEESAFE_FINDINGS.md, finding
+//   3), so the gate is what keeps the pool's writers from damaging the file; it does nothing about other
+//   processes;
+// - a connection given back with a transaction open is rolled back before anyone else gets it;
+// - waits end: a checkout with every connection out, and a statement whose connection cannot take the gate, wait
+//   up to the busy timeout and then fail with `SqliteError.Busy`, rather than hang a thread that holds what it is
+//   waiting for.
+//
+// Sharing: a `ConnectionPool` is `Share` (its parts are a channel, atomics and an immutable path), so threads share
+// it through an `Arc<ConnectionPool>` and call `checkout` on it at once; each `PooledConnection` is owned by one
+// thread at a time, and may move to another (it is `Send`).
+
+/// A pool of up to `maxConnections` connections to one file.
+public struct ConnectionPool {
+    path: String;
+    gate: Channel<GateToken>;
+    idle: Channel<Connection>;
+    /// How many connections exist, idle or out.
+    opened: Arc<AtomicUSize>;
+    maxConnections: usize;
+    /// Milliseconds a checkout waits for a free connection, and each connection waits for the gate.
+    busyTimeout: i64;
+
+    /// A pool for the database file at `path`, making an empty database if there is none. One connection is
+    /// opened at once, so a file that cannot be opened is an error here; the rest are opened as they are needed.
+    public fn open(path: StringView, maxConnections: usize) -> Result<ConnectionPool, SqliteError> {
+        let max = maxConnections.max(1);
+        let gate = Channel<GateToken>.create(1)?;
+        let _ = gate.trySend(GateToken {});
+        var first = Connection.openWithGate(path, gate.clone(), 5000)?;
+        first.setBusyTimeout(5000);
+        let idle = Channel<Connection>.create(max)?;
+        let _ = idle.trySend(first);
+        return Ok(ConnectionPool {
+            path: String.from(path)?,
+            gate: gate,
+            idle: idle,
+            opened: Arc<AtomicUSize>.create(AtomicUSize.create(1))?,
+            maxConnections: max,
+            busyTimeout: 5000,
+        });
+    }
+
+    /// Sets how long, in milliseconds, a checkout waits for a free connection and a statement waits for another
+    /// connection's transaction to end; 0 fails at once. The default is 5000. It applies to connections from
+    /// their next checkout.
+    public fn setBusyTimeout(borrow mut this, milliseconds: i64) {
+        this.busyTimeout = milliseconds.max(0);
+    }
+
+    /// A connection of the pool, opening one if none is idle and the pool is not full, else waiting for one to
+    /// come back. It goes back to the pool when the `PooledConnection` is dropped.
+    public fn checkout(borrow this) -> Result<PooledConnection, SqliteError> {
+        var found = this.idle.tryRecv();
+        if (found.isNull()) {
+            let count = this.opened.get().fetchAdd(1);
+            if (count < this.maxConnections) {
+                match (Connection.openWithGate(this.path.view(), this.gate.clone(), this.busyTimeout)) {
+                    Ok(c) => { found = c; }
+                    Err(e) => {
+                        let _ = this.opened.get().fetchSub(1);
+                        return Err(e);
+                    }
+                }
+            } else {
+                let _ = this.opened.get().fetchSub(1);
+                found = takeFrom(borrow this.idle, this.busyTimeout);
+            }
+        }
+        var connection = found ?? {
+            return Err(SqliteError.Busy(String.from("every connection of the pool is in use")?));
+        };
+        connection.setBusyTimeout(this.busyTimeout);
+        return Ok(PooledConnection { connection: connection, home: this.idle.clone(), opened: this.opened.clone() });
+    }
+
+    /// How many connections the pool has made and not closed, idle or checked out.
+    public fn openConnections(borrow this) -> usize => this.opened.get().load();
+}
+
+/// A connection checked out of a pool. Dropping it gives the connection back, rolled back first if it was left
+/// inside a transaction.
+public struct PooledConnection {
+    connection: Connection?;
+    home: Channel<Connection>;
+    opened: Arc<AtomicUSize>;
+
+    drop {
+        if (replace(mut this.connection, null) is Some(c)) {
+            var connection = c;
+            if (connection.inTransaction() && connection.rollback().isErr()) {
+                // A connection that cannot roll back is closed rather than handed on; dropping it forgets its
+                // changes, and the pool may open another.
+                let _ = this.opened.get().fetchSub(1);
+                return;
+            }
+            if (this.home.trySend(connection) is Err(_)) {
+                let _ = this.opened.get().fetchSub(1);
+            }
+        }
+    }
+
+    /// The connection, to run statements on.
+    public fn get(borrow mut this) -> borrow mut Connection {
+        // Only the drop block takes the connection out.
+        match (borrow mut this.connection) {
+            Some(c) => { return c; }
+            null => { panic("a pooled connection without its connection"); }
+        }
+    }
+}
