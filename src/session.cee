@@ -43,6 +43,8 @@ public struct Session {
     conflictFailure: ConflictAction?;
     /// Indexes the running statement left to be rebuilt (by table and root), which a FAIL must rebuild.
     staleIndexes: Vector<StaleIndex>;
+    /// The rows the running INSERT, UPDATE or DELETE has changed so far: what changes() says after an OR FAIL.
+    runningChanges: i64;
     /// SAVEPOINT names open, innermost last, each with its level in the pager; and whether the outermost began
     /// the transaction (so that releasing it commits).
     savepoints: Vector<NamedSavepoint>;
@@ -93,6 +95,7 @@ public struct Session {
             savepoints: Vector<NamedSavepoint>.create(),
             conflictFailure: null,
             staleIndexes: Vector<StaleIndex>.create(),
+            runningChanges: 0,
             savepointBegan: false,
             trigger: null,
             activeTriggers: Vector<String>.create(),
@@ -232,13 +235,16 @@ public struct Session {
         let stmt = Parser.parseStatement(written)?;
         this.beginStatementAll();
         this.conflictFailure = null;
+        this.runningChanges = 0;
         let result = this.run(borrow stmt, text, params);
         let failure = replace(mut this.conflictFailure, null);
         let keep = result.isOk() || failure == Some(ConflictAction.Fail);
         if (result.isOk()) {
             this.endStatementAll();
         } else if (failure == Some(ConflictAction.Fail)) {
-            // OR FAIL: the rows changed before the failure stay; indexes left to rebuild are rebuilt now.
+            // OR FAIL: the rows changed before the failure stay, and count; indexes left to rebuild are rebuilt.
+            this.changes = this.runningChanges;
+            this.totalChanges += this.runningChanges;
             rebuildStaleIndexes(this)?;
             this.endStatementAll();
             this.reloadAllSchemas()?;

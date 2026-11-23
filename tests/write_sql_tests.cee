@@ -762,6 +762,7 @@ fn failAndRollbackActions() -> Result<void, TestFailure> {
         CREATE INDEX t_s ON t(s)
         INSERT INTO t VALUES (1, 'a', 1, 'x')
         INSERT OR FAIL INTO t VALUES (2, 'b', 2, 'y'), (3, 'a', 3, 'z'), (4, 'c', 4, 'w')
+        SELECT changes(), total_changes()
         SELECT * FROM t
         BEGIN
         INSERT INTO t VALUES (5, 'e', 5, 'v')

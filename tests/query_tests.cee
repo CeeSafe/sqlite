@@ -610,3 +610,15 @@ fn slidingFramesOfReals() -> Result<void, TestFailure> {
         SELECT id, sum(i) OVER (ORDER BY id ROWS BETWEEN 5 PRECEDING AND CURRENT ROW), count(r) OVER (ORDER BY id RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) FROM t ORDER BY id
         """);
 }
+
+@test
+fn unknownCollationsAreRefusedAsInSqlite() -> Result<void, TestFailure> {
+    let path = "out/query-collations.db";
+    makeDatabase(path, "CREATE TABLE t(x TEXT COLLATE NOCASE); INSERT INTO t VALUES ('a'), ('B');")?;
+    return sameAnswers(path, """
+        SELECT x FROM t ORDER BY x COLLATE nosuch
+        SELECT x FROM t WHERE x = 'A' COLLATE binary
+        SELECT x COLLATE RTRIM = 'a  ' FROM t ORDER BY 1
+        SELECT x FROM t ORDER BY x COLLATE "nocase" DESC
+        """);
+}

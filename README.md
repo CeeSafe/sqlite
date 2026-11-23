@@ -405,7 +405,7 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   bytes. The C# refused VACUUM.
 - **OR FAIL and OR ROLLBACK** (`failAndRollbackActions`), from a statement, a constraint's ON CONFLICT or a
   trigger's RAISE: FAIL keeps the rows the statement changed before the failing one (indexes it left to rebuild
-  are rebuilt then), ROLLBACK ends the whole transaction. changes() does not count the rows FAIL kept.
+  are rebuilt then), ROLLBACK ends the whole transaction. changes() counts the rows FAIL kept, as in SQLite.
 
 - **TEMP and ATTACH** (`tempTablesAndAttachedDatabases`): names resolve as in SQLite (TEMP, then main, then the
   attached databases in order, or the schema written), `sqlite_temp_schema` and `aux.sqlite_schema` read each
