@@ -1,0 +1,394 @@
+// Values between SQLite's storage classes and PostgreSQL's types: the type a result column is announced with, a
+// value written in the text and binary formats, and a bound parameter read from either.
+
+import sqlite;
+
+const OID_BOOL: u32 = 16;
+const OID_BYTEA: u32 = 17;
+const OID_NAME: u32 = 19;
+const OID_INT8: u32 = 20;
+const OID_INT2: u32 = 21;
+const OID_INT4: u32 = 23;
+const OID_TEXT: u32 = 25;
+const OID_OID: u32 = 26;
+const OID_JSON: u32 = 114;
+const OID_FLOAT4: u32 = 700;
+const OID_FLOAT8: u32 = 701;
+const OID_UNKNOWN: u32 = 705;
+const OID_BPCHAR: u32 = 1042;
+const OID_VARCHAR: u32 = 1043;
+const OID_NUMERIC: u32 = 1700;
+const OID_JSONB: u32 = 3802;
+
+/// An error to report to the client: its SQLSTATE and message.
+struct PgError {
+    state: String;
+    message: String;
+}
+
+/// `text` as a `String`; empty when memory runs out, for a message that cannot be made.
+fn owned(text: StringView) -> String => match (String.from(text)) {
+    Ok(s) => s,
+    Err(_) => String.create(),
+};
+
+fn pgError(state: StringView, message: StringView) -> PgError =>
+    PgError { state: owned(state), message: owned(message) };
+
+/// The type a result column is announced with. SQLite's columns have no fixed type, so it is decided from the
+/// values the column holds: bigint when every value that is not NULL is an integer, double precision when they are
+/// numbers and one is a real, bytea when they are blobs, and text otherwise (and for a column of NULLs alone).
+/// The C# looked at the first row only, and announced bigint for a column whose later rows held text.
+fn columnType(rows: borrow Vector<Vector<SqliteValue>>, column: usize) -> u32 {
+    var integers = false;
+    var reals = false;
+    var blobs = false;
+    var texts = false;
+    for (r in 0..rows.length) {
+        if (column >= rows[r].length) {
+            continue;
+        }
+        match (borrow rows[r][column]) {
+            SqliteValue.Null => {}
+            SqliteValue.Integer(_) => { integers = true; }
+            SqliteValue.Real(_) => { reals = true; }
+            SqliteValue.Text(_) => { texts = true; }
+            SqliteValue.Blob(_) => { blobs = true; }
+        }
+    }
+    if (texts || (blobs && (integers || reals))) {
+        return OID_TEXT;
+    }
+    if (blobs) {
+        return OID_BYTEA;
+    }
+    if (reals) {
+        return OID_FLOAT8;
+    }
+    if (integers) {
+        return OID_INT8;
+    }
+    return OID_TEXT;
+}
+
+/// The typlen of a type in RowDescription: the size of a fixed-size type, -1 for one of varying size.
+fn typeSize(oid: u32) -> i16 => if (oid == OID_INT8 || oid == OID_FLOAT8) 8 else -1;
+
+// ── output ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+fn appendHexByte(out: borrow mut Vector<u8>, b: u8) -> Result<void, AllocError> {
+    let digits = "0123456789abcdef";
+    out.push(digits[(b >> 4) as usize])?;
+    out.push(digits[(b & 15) as usize])?;
+    return Ok();
+}
+
+/// A double as PostgreSQL's float8out writes it (extra_float_digits 1, the default since PostgreSQL 12): the
+/// shortest digits that read back as the same value, in plain notation for decimal exponents from -4 to 14 and
+/// with an exponent of at least two digits otherwise (`1e+15`, `1e-05`); `NaN`, `Infinity`, `-Infinity`, `-0`.
+fn appendFloat8(out: borrow mut Vector<u8>, f: f64) -> Result<void, AllocError> {
+    if (f != f) {
+        return out.extend("NaN".bytes());
+    }
+    if (f == 1.0 / 0.0) {
+        return out.extend("Infinity".bytes());
+    }
+    if (f == -1.0 / 0.0) {
+        return out.extend("-Infinity".bytes());
+    }
+    if (f == 0.0) {
+        return out.extend((if ((f.bits() >> 63) != 0) "-0" else "0").bytes());
+    }
+    // The shortest digits, from CeeSafe's own printing (ECMAScript's layout), and the exponent of the first.
+    var shortest = String.create();
+    shortest.appendNumber(f.abs())?;
+    let text = shortest.view();
+    var digits = Vector<u8>.create();
+    var exponent: i32 = 0;
+    var mantissa = text;
+    if (text.indexOfByte('e') is Some(e)) {
+        mantissa = text[0..e];
+        exponent = text[e + 1..].parseInt<i32>() ?? 0;
+        for (i in 0..mantissa.length) {
+            if (mantissa[i] != '.') {
+                digits.push(mantissa[i])?;
+            }
+        }
+    } else {
+        let point = mantissa.indexOfByte('.') ?? mantissa.length;
+        var seenDigit = false;
+        var position: i32 = checkedTruncate<i32>(point) ?? 0;
+        for (i in 0..mantissa.length) {
+            let c = mantissa[i];
+            if (c == '.') {
+                continue;
+            }
+            position -= 1;
+            if (!seenDigit && c == '0') {
+                continue;
+            }
+            if (!seenDigit) {
+                seenDigit = true;
+                exponent = position;
+            }
+            digits.push(c)?;
+        }
+    }
+    while (digits.length > 1 && digits[digits.length - 1] == '0') {
+        let _ = digits.pop();
+    }
+    if (f < 0.0) {
+        out.push('-')?;
+    }
+    let count = checkedTruncate<i32>(digits.length) ?? 0;
+    if (exponent >= -4 && exponent < 15) {
+        if (exponent < 0) {
+            out.extend("0.".bytes())?;
+            for (i in 0..(-exponent - 1)) {
+                out.push('0')?;
+            }
+            return out.extend(digits.view());
+        }
+        for (i in 0..(exponent + 1)) {
+            let k = truncate<usize>(i);
+            out.push(if (i < count) digits[k] else '0')?;
+        }
+        if (count > exponent + 1) {
+            out.push('.')?;
+            out.extend(digits.view()[truncate<usize>(exponent + 1)..])?;
+        }
+        return Ok();
+    }
+    out.push(digits[0])?;
+    if (digits.length > 1) {
+        out.push('.')?;
+        out.extend(digits.view()[1..])?;
+    }
+    out.push('e')?;
+    out.push(if (exponent < 0) '-' else '+')?;
+    let magnitude = exponent.unsignedAbs();
+    if (magnitude < 10) {
+        out.push('0')?;
+    }
+    var number = String.create();
+    number.appendNumber(magnitude)?;
+    return out.extend(number.view().bytes());
+}
+
+/// `value` in the text format, for a column announced as `oid`: integers in decimal, reals as float8out writes
+/// them in a double precision column and as SQLite writes them as text in a text column, blobs as bytea's hex
+/// (`\x0aff`), text as it is.
+fn appendText(out: borrow mut Vector<u8>, value: borrow SqliteValue, oid: u32) -> Result<void, AllocError> {
+    match (value) {
+        SqliteValue.Null => {}
+        SqliteValue.Integer(i) => {
+            var number = String.create();
+            number.appendNumber(i)?;
+            out.extend(number.view().bytes())?;
+        }
+        SqliteValue.Real(r) => {
+            if (oid == OID_FLOAT8) {
+                appendFloat8(mut out, r)?;
+            } else {
+                let text = value.toText()?;
+                out.extend(text.view().bytes())?;
+            }
+        }
+        SqliteValue.Text(s) => { out.extend(s.view().bytes())?; }
+        SqliteValue.Blob(b) => {
+            out.extend("\\x".bytes())?;
+            for (i in 0..b.length) {
+                appendHexByte(mut out, b[i])?;
+            }
+        }
+    }
+    return Ok();
+}
+
+/// `value` in the binary format of `oid` (one of the types `columnType` announces).
+fn appendBinary(out: borrow mut Vector<u8>, value: borrow SqliteValue, oid: u32) -> Result<void, AllocError> {
+    if (oid == OID_INT8) {
+        if (value is SqliteValue.Integer(i)) {
+            return out.pushBE(truncate<u64>(i));
+        }
+    }
+    if (oid == OID_FLOAT8) {
+        match (value) {
+            SqliteValue.Real(r) => { return out.pushBE(r.bits()); }
+            SqliteValue.Integer(i) => { return out.pushBE(round<f64>(i).bits()); }
+            _ => {}
+        }
+    }
+    if (oid == OID_BYTEA) {
+        if (value is SqliteValue.Blob(b)) {
+            return out.extend(b.view());
+        }
+    }
+    // text: its binary format is its text.
+    return appendText(mut out, value, oid);
+}
+
+// ── input ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+fn typeName(oid: u32) -> StringView =>
+    if (oid == OID_BOOL) "boolean"
+        else if (oid == OID_INT2) "smallint"
+        else if (oid == OID_INT4) "integer"
+        else if (oid == OID_INT8) "bigint"
+        else if (oid == OID_OID) "oid"
+        else if (oid == OID_FLOAT4) "real"
+        else if (oid == OID_FLOAT8) "double precision"
+        else if (oid == OID_NUMERIC) "numeric"
+        else if (oid == OID_BYTEA) "bytea"
+        else "text";
+
+fn invalidInput(oid: u32, text: StringView) -> PgError {
+    var message = owned("invalid input syntax for type ");
+    let _ = message.append(typeName(oid));
+    let _ = message.append(": \"");
+    let _ = message.append(text);
+    let _ = message.append("\"");
+    return PgError { state: owned("22P02"), message: message };
+}
+
+fn hexValue(c: u8) -> u8? =>
+    if (c >= '0' && c <= '9') c - '0'
+        else if (c >= 'a' && c <= 'f') c - 'a' + 10
+        else if (c >= 'A' && c <= 'F') c - 'A' + 10
+        else null;
+
+/// bytea's text input: `\x` and hex digits, or the escape format (`\\` and `\nnn` octal escapes).
+fn parseBytea(text: StringView) -> Result<SqliteValue, PgError> {
+    let bytes = text.bytes();
+    var out = Vector<u8>.create();
+    if (text.startsWith("\\x")) {
+        var i: usize = 2;
+        while (i < bytes.length) {
+            if (bytes[i] == ' ' || bytes[i] == '\t' || bytes[i] == '\n' || bytes[i] == '\r') {
+                i += 1;
+                continue;
+            }
+            let high = hexValue(bytes[i]) ?? { return Err(pgError("22P02", "invalid hexadecimal digit")); };
+            if (i + 1 >= bytes.length) {
+                return Err(pgError("22P02", "invalid hexadecimal data: odd number of digits"));
+            }
+            let low = hexValue(bytes[i + 1]) ?? { return Err(pgError("22P02", "invalid hexadecimal digit")); };
+            if (out.push(high * 16 + low) is Err(_)) {
+                return Err(pgError("53200", "out of memory"));
+            }
+            i += 2;
+        }
+        return Ok(SqliteValue.Blob(out));
+    }
+    var i: usize = 0;
+    while (i < bytes.length) {
+        var b = bytes[i];
+        if (b == '\\') {
+            if (i + 1 < bytes.length && bytes[i + 1] == '\\') {
+                i += 2;
+            } else if (i + 3 < bytes.length + 0 && bytes[i + 1] >= '0' && bytes[i + 1] <= '3' &&
+                bytes[i + 2] >= '0' && bytes[i + 2] <= '7' && bytes[i + 3] >= '0' && bytes[i + 3] <= '7') {
+                b = (bytes[i + 1] - '0') * 64 + (bytes[i + 2] - '0') * 8 + (bytes[i + 3] - '0');
+                i += 4;
+            } else {
+                return Err(invalidInput(OID_BYTEA, text));
+            }
+        } else {
+            i += 1;
+        }
+        if (out.push(b) is Err(_)) {
+            return Err(pgError("53200", "out of memory"));
+        }
+    }
+    return Ok(SqliteValue.Blob(out));
+}
+
+/// A parameter sent in the text format, for a parameter of type `oid` (0 when the client left it unspecified).
+fn parseTextValue(bytes: Slice<u8>, oid: u32) -> Result<SqliteValue, PgError> {
+    let text = StringView.fromUtf8(bytes) ?? {
+        return Err(pgError("22021", "invalid byte sequence for encoding \"UTF8\""));
+    };
+    if (oid == OID_INT2 || oid == OID_INT4 || oid == OID_INT8 || oid == OID_OID) {
+        let n = text.trim().parseInt<i64>() ?? { return Err(invalidInput(oid, text)); };
+        return Ok(SqliteValue.Integer(n));
+    }
+    if (oid == OID_FLOAT4 || oid == OID_FLOAT8 || oid == OID_NUMERIC) {
+        let trimmed = text.trim();
+        if (oid == OID_NUMERIC && trimmed.parseInt<i64>() is Some(n)) {
+            return Ok(SqliteValue.Integer(n));
+        }
+        let f = trimmed.parseFloat<f64>() ?? { return Err(invalidInput(oid, text)); };
+        return Ok(SqliteValue.Real(f));
+    }
+    if (oid == OID_BOOL) {
+        let t = text.trim();
+        if (t.equalsIgnoreAsciiCase("t") || t.equalsIgnoreAsciiCase("true") || t.equalsIgnoreAsciiCase("y") ||
+            t.equalsIgnoreAsciiCase("yes") || t.equalsIgnoreAsciiCase("on") || t == "1") {
+            return Ok(SqliteValue.Integer(1));
+        }
+        if (t.equalsIgnoreAsciiCase("f") || t.equalsIgnoreAsciiCase("false") || t.equalsIgnoreAsciiCase("n") ||
+            t.equalsIgnoreAsciiCase("no") || t.equalsIgnoreAsciiCase("off") || t == "0") {
+            return Ok(SqliteValue.Integer(0));
+        }
+        return Err(invalidInput(oid, text));
+    }
+    if (oid == OID_BYTEA) {
+        return parseBytea(text);
+    }
+    return match (SqliteValue.text(text)) {
+        Ok(v) => Ok(v),
+        Err(_) => Err(pgError("53200", "out of memory")),
+    };
+}
+
+/// A parameter sent in the binary format, for a parameter of type `oid`. The C# turned a bytea into the text of
+/// its hex digits; here it is a blob.
+fn parseBinaryValue(bytes: Slice<u8>, oid: u32, number: usize) -> Result<SqliteValue, PgError> {
+    let size: usize =
+        if (oid == OID_BOOL) 1
+            else if (oid == OID_INT2) 2
+            else if (oid == OID_INT4 || oid == OID_OID || oid == OID_FLOAT4) 4
+            else if (oid == OID_INT8 || oid == OID_FLOAT8) 8
+            else 0;
+    if (size != 0 && bytes.length != size) {
+        var message = owned("incorrect binary data format in bind parameter ");
+        let _ = message.appendNumber(number);
+        return Err(PgError { state: owned("22P03"), message: message });
+    }
+    if (oid == OID_BOOL) {
+        return Ok(SqliteValue.Integer(if (bytes[0] != 0) 1 else 0));
+    }
+    if (oid == OID_INT2) {
+        return Ok(SqliteValue.Integer(bytes.readBE<i16>(0) as i64));
+    }
+    if (oid == OID_INT4) {
+        return Ok(SqliteValue.Integer(bytes.readBE<i32>(0) as i64));
+    }
+    if (oid == OID_OID) {
+        return Ok(SqliteValue.Integer(bytes.readBE<u32>(0) as i64));
+    }
+    if (oid == OID_INT8) {
+        return Ok(SqliteValue.Integer(bytes.readBE<i64>(0)));
+    }
+    if (oid == OID_FLOAT4) {
+        return Ok(SqliteValue.Real(f32.fromBits(bytes.readBE<u32>(0)) as f64));
+    }
+    if (oid == OID_FLOAT8) {
+        return Ok(SqliteValue.Real(f64.fromBits(bytes.readBE<u64>(0))));
+    }
+    if (oid == OID_BYTEA) {
+        return match (SqliteValue.blob(bytes)) {
+            Ok(v) => Ok(v),
+            Err(_) => Err(pgError("53200", "out of memory")),
+        };
+    }
+    if (oid == 0 || oid == OID_TEXT || oid == OID_VARCHAR || oid == OID_BPCHAR || oid == OID_NAME ||
+        oid == OID_UNKNOWN || oid == OID_JSON || oid == OID_JSONB) {
+        // jsonb's binary format is a version byte (1) and the text.
+        let text = if (oid == OID_JSONB && bytes.length != 0 && bytes[0] == 1) bytes[1..] else bytes;
+        return parseTextValue(text, OID_TEXT);
+    }
+    var message = owned("binary format is not supported for parameters of type ");
+    let _ = message.appendNumber(oid);
+    return Err(PgError { state: owned("0A000"), message: message });
+}

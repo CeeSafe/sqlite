@@ -1,0 +1,26 @@
+// sqlite_shell: a sqlite3-like command-line shell over this package's engine.
+//
+//   sqlite_shell [OPTIONS] [FILE] [SQL|.COMMAND]...
+//
+// With SQL arguments, runs each and exits; without, reads statements and dot-commands from standard input.
+// Options: -header, -noheader, -csv, -line, -list, -column, -bail.
+
+fn main() {
+    var arguments = Vector<StringView>.create();
+    for (i in 1..Process.argumentCount()) {
+        match (Process.argument(i)) {
+            Some(a) => { arguments.push(a)!; }
+            null => {
+                Console.writeErrorLine("sqlite3: Error: an argument is not UTF-8");
+                Process.exit(1);
+            }
+        }
+    }
+    match (runShell(arguments.view(), Lines.ofConsole(), true)) {
+        Ok(run) => { Process.exit(run.status); }
+        Err(_) => {
+            Console.writeErrorLine("Error: out of memory");
+            Process.exit(1);
+        }
+    }
+}

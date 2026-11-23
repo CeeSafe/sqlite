@@ -1,0 +1,373 @@
+// Printing a result as the sqlite3 shell (3.54) prints it in each output mode.
+//
+// - list: the values joined by `|`, NULL as nothing, a blob's bytes as they are;
+// - csv: joined by `,`, lines ended by CRLF, a text quoted when it is empty or holds a space, a quote, an
+//   apostrophe, a comma, a control character or a byte that is not ASCII (shell.c's needCsvQuote);
+// - line: one `name: value` line a column, the names right-aligned, a blank line between rows;
+// - column: each column as wide as its widest value (and heading, when headings are shown), headings centred and
+//   underlined with dashes, numbers right-aligned and the rest left-aligned, two spaces between columns and none at
+//   a line's end; a value with line breaks takes a line for each, and the rows are then set apart by blank lines.
+
+import sqlite;
+
+/// How results are printed (`.mode`).
+enum OutputMode {
+    List,
+    Csv,
+    Line,
+    Column,
+}
+
+fn modeName(mode: OutputMode) -> StringView => match (mode) {
+    OutputMode.List => "list",
+    OutputMode.Csv => "csv",
+    OutputMode.Line => "line",
+    OutputMode.Column => "column",
+};
+
+fn modeNamed(name: StringView) -> OutputMode? {
+    if (name == "list") {
+        return OutputMode.List;
+    }
+    if (name == "csv") {
+        return OutputMode.Csv;
+    }
+    if (name == "line") {
+        return OutputMode.Line;
+    }
+    if (name == "column") {
+        return OutputMode.Column;
+    }
+    return null;
+}
+
+/// The bytes the shell prints for `value`: NULL as nothing, numbers as SQLite writes them as text, and the bytes of
+/// a text or a blob with their control characters shown (`appendShown`).
+fn cellBytes(value: borrow SqliteValue) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    match (value) {
+        SqliteValue.Null => {}
+        SqliteValue.Integer(i) => {
+            var text = String.create();
+            text.appendNumber(i)?;
+            out.extend(text.view().bytes())?;
+        }
+        SqliteValue.Real(_) => {
+            let text = value.toText()?;
+            out.extend(text.view().bytes())?;
+        }
+        SqliteValue.Text(s) => { appendShown(mut out, s.view().bytes())?; }
+        SqliteValue.Blob(b) => { appendShown(mut out, b.view())?; }
+    }
+    return Ok(out);
+}
+
+/// Appends `bytes` as the shell (3.54) shows a value: a control character other than a tab or a line feed as `^`
+/// and the letter it is a control of (`^@` for a zero byte, `^M` for a carriage return).
+fn appendShown(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    for (i in 0..bytes.length) {
+        let b = bytes[i];
+        if (b < 0x20 && b != '\t' && b != '\n') {
+            out.push('^')?;
+            out.push(b + 0x40)?;
+        } else {
+            out.push(b)?;
+        }
+    }
+    return Ok();
+}
+
+fn isNumber(value: borrow SqliteValue) -> bool => match (value) {
+    SqliteValue.Integer(_) => true,
+    SqliteValue.Real(_) => true,
+    _ => false,
+};
+
+fn appendSpaces(out: borrow mut Vector<u8>, count: usize) -> Result<void, AllocError> {
+    for (i in 0..count) {
+        out.push(' ')?;
+    }
+    return Ok();
+}
+
+/// How many characters `bytes` holds when it is UTF-8 (each byte that does not continue a character counts).
+fn displayWidth(bytes: Slice<u8>) -> usize {
+    var width: usize = 0;
+    for (i in 0..bytes.length) {
+        if ((bytes[i] & 0xC0) != 0x80) {
+            width += 1;
+        }
+    }
+    return width;
+}
+
+// ── list ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+fn printList(out: borrow mut Vector<u8>, result: borrow QueryResult, headers: bool) -> Result<void, AllocError> {
+    if (headers) {
+        for (c in 0..result.columns.length) {
+            if (c != 0) {
+                out.push('|')?;
+            }
+            out.extend(result.columns[c].view().bytes())?;
+        }
+        out.push('\n')?;
+    }
+    for (r in 0..result.rows.length) {
+        let row = borrow result.rows[r];
+        for (c in 0..row.length) {
+            if (c != 0) {
+                out.push('|')?;
+            }
+            let cell = cellBytes(borrow row[c])?;
+            out.extend(cell.view())?;
+        }
+        out.push('\n')?;
+    }
+    return Ok();
+}
+
+// ── csv ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Whether shell.c's output_csv quotes a text holding `bytes`.
+fn needsCsvQuote(bytes: Slice<u8>) -> bool {
+    if (bytes.length == 0) {
+        return true;
+    }
+    for (i in 0..bytes.length) {
+        let b = bytes[i];
+        if (b <= 0x20 || b == '"' || b == '\'' || b == ',' || b >= 0x7F) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn appendCsvText(out: borrow mut Vector<u8>, bytes: Slice<u8>) -> Result<void, AllocError> {
+    if (!needsCsvQuote(bytes)) {
+        return appendShown(mut out, bytes);
+    }
+    out.push('"')?;
+    for (i in 0..bytes.length) {
+        if (bytes[i] == '"') {
+            out.push('"')?;
+        }
+        appendShown(mut out, bytes[i..i + 1])?;
+    }
+    out.push('"')?;
+    return Ok();
+}
+
+fn printCsv(out: borrow mut Vector<u8>, result: borrow QueryResult, headers: bool) -> Result<void, AllocError> {
+    if (headers) {
+        for (c in 0..result.columns.length) {
+            if (c != 0) {
+                out.push(',')?;
+            }
+            appendCsvText(mut out, result.columns[c].view().bytes())?;
+        }
+        out.extend("\r\n".bytes())?;
+    }
+    for (r in 0..result.rows.length) {
+        let row = borrow result.rows[r];
+        for (c in 0..row.length) {
+            if (c != 0) {
+                out.push(',')?;
+            }
+            match (borrow row[c]) {
+                SqliteValue.Null => {}
+                SqliteValue.Text(s) => { appendCsvText(mut out, s.view().bytes())?; }
+                _ => {
+                    let cell = cellBytes(borrow row[c])?;
+                    out.extend(cell.view())?;
+                }
+            }
+        }
+        out.extend("\r\n".bytes())?;
+    }
+    return Ok();
+}
+
+// ── line ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+fn printLines(out: borrow mut Vector<u8>, result: borrow QueryResult) -> Result<void, AllocError> {
+    var width: usize = 0;
+    for (c in 0..result.columns.length) {
+        width = width.max(displayWidth(result.columns[c].view().bytes()));
+    }
+    for (r in 0..result.rows.length) {
+        if (r != 0) {
+            out.push('\n')?;
+        }
+        let row = borrow result.rows[r];
+        for (c in 0..row.length.min(result.columns.length)) {
+            let name = result.columns[c].view().bytes();
+            appendSpaces(mut out, width - displayWidth(name))?;
+            out.extend(name)?;
+            out.extend(": ".bytes())?;
+            let cell = cellBytes(borrow row[c])?;
+            let bytes = cell.view();
+            for (i in 0..bytes.length) {
+                out.push(bytes[i])?;
+                if (bytes[i] == '\n') {
+                    // The lines after a value's first start under its first character.
+                    appendSpaces(mut out, width + 2)?;
+                }
+            }
+            out.push('\n')?;
+        }
+    }
+    return Ok();
+}
+
+// ── column ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// One value of a column-mode table: its lines, tabs expanded to stops every eight characters.
+struct ColumnCell {
+    lines: Vector<Vector<u8>>;
+    right: bool;
+}
+
+fn columnCell(bytes: Slice<u8>, right: bool) -> Result<ColumnCell, AllocError> {
+    var lines = Vector<Vector<u8>>.create();
+    var line = Vector<u8>.create();
+    var at: usize = 0;
+    for (i in 0..bytes.length) {
+        let b = bytes[i];
+        if (b == '\n') {
+            lines.push(replace(mut line, Vector<u8>.create()))?;
+            at = 0;
+        } else if (b == '\t') {
+            let fill = 8 - at % 8;
+            appendSpaces(mut line, fill)?;
+            at += fill;
+        } else {
+            line.push(b)?;
+            if ((b & 0xC0) != 0x80) {
+                at += 1;
+            }
+        }
+    }
+    lines.push(line)?;
+    return Ok(ColumnCell { lines: lines, right: right });
+}
+
+/// Appends `bytes` padded to `width` characters: on the left when `right`, else on the right.
+fn appendPadded(out: borrow mut Vector<u8>, bytes: Slice<u8>, width: usize, right: bool) -> Result<void, AllocError> {
+    let fill = width - displayWidth(bytes).min(width);
+    if (right) {
+        appendSpaces(mut out, fill)?;
+        out.extend(bytes)?;
+    } else {
+        out.extend(bytes)?;
+        appendSpaces(mut out, fill)?;
+    }
+    return Ok();
+}
+
+/// Ends a line of `out` that started at `start`: the spaces at its end are dropped.
+fn endLine(out: borrow mut Vector<u8>, start: usize) -> Result<void, AllocError> {
+    while (out.length > start && out[out.length - 1] == ' ') {
+        let _ = out.pop();
+    }
+    out.push('\n')?;
+    return Ok();
+}
+
+fn printColumns(out: borrow mut Vector<u8>, result: borrow QueryResult, headers: bool) -> Result<void, AllocError> {
+    let count = result.columns.length;
+    var widths = Vector<usize>.create();
+    for (c in 0..count) {
+        widths.push(if (headers) displayWidth(result.columns[c].view().bytes()) else 0)?;
+    }
+    var rows = Vector<Vector<ColumnCell>>.create();
+    var multiline = false;
+    for (r in 0..result.rows.length) {
+        let row = borrow result.rows[r];
+        var cells = Vector<ColumnCell>.create();
+        for (c in 0..count) {
+            let cell = if (c < row.length) {
+                let bytes = cellBytes(borrow row[c])?;
+                columnCell(bytes.view(), isNumber(borrow row[c]))?
+            } else {
+                columnCell("".bytes(), false)?
+            };
+            if (cell.lines.length > 1) {
+                multiline = true;
+            }
+            for (k in 0..cell.lines.length) {
+                widths[c] = widths[c].max(displayWidth(cell.lines[k].view()));
+            }
+            cells.push(cell)?;
+        }
+        rows.push(cells)?;
+    }
+    if (headers) {
+        var start = out.length;
+        for (c in 0..count) {
+            if (c != 0) {
+                out.extend("  ".bytes())?;
+            }
+            let name = result.columns[c].view().bytes();
+            let fill = widths[c] - displayWidth(name).min(widths[c]);
+            appendSpaces(mut out, fill / 2)?;
+            out.extend(name)?;
+            appendSpaces(mut out, fill - fill / 2)?;
+        }
+        endLine(mut out, start)?;
+        start = out.length;
+        for (c in 0..count) {
+            if (c != 0) {
+                out.extend("  ".bytes())?;
+            }
+            for (i in 0..widths[c]) {
+                out.push('-')?;
+            }
+        }
+        endLine(mut out, start)?;
+    }
+    for (r in 0..rows.length) {
+        if (multiline && r != 0) {
+            out.push('\n')?;
+        }
+        let cells = borrow rows[r];
+        var height: usize = 1;
+        for (c in 0..count) {
+            height = height.max(cells[c].lines.length);
+        }
+        for (k in 0..height) {
+            let start = out.length;
+            for (c in 0..count) {
+                if (c != 0) {
+                    out.extend("  ".bytes())?;
+                }
+                let cell = borrow cells[c];
+                if (k < cell.lines.length) {
+                    appendPadded(mut out, cell.lines[k].view(), widths[c], cell.right)?;
+                } else {
+                    appendSpaces(mut out, widths[c])?;
+                }
+            }
+            endLine(mut out, start)?;
+        }
+    }
+    return Ok();
+}
+
+/// Prints `result` in `mode`; nothing when it has no row, as the shell does.
+fn printResult(
+    out: borrow mut Vector<u8>,
+    result: borrow QueryResult,
+    mode: OutputMode,
+    headers: bool,
+) -> Result<void, AllocError> {
+    if (result.columns.length == 0 || result.rows.length == 0) {
+        return Ok();
+    }
+    return match (mode) {
+        OutputMode.List => printList(mut out, result, headers),
+        OutputMode.Csv => printCsv(mut out, result, headers),
+        OutputMode.Line => printLines(mut out, result),
+        OutputMode.Column => printColumns(mut out, result, headers),
+    };
+}

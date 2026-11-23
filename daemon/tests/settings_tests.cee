@@ -1,0 +1,50 @@
+// The daemon's settings: the bind address, the data directory, and when it refuses to start.
+
+fn settingsOf(arguments: Slice<StringView>, bind: StringView?, password: StringView?) -> Result<Settings, String> =>
+    settingsFrom(arguments, bind, null, password);
+
+@test
+fn defaults() -> Result<void, TestFailure> {
+    let none: Slice<StringView> = [];
+    let s = settingsOf(none, null, "a-long-secret")!;
+    Check.equalText("127.0.0.1", s.host.view())?;
+    Check.equalU64(5432, s.port as u64)?;
+    Check.equalText("data", s.data.view())?;
+    return Check.isTrue(s.password.isSome(), "the password is kept");
+}
+
+@test
+fn bindAddresses() -> Result<void, TestFailure> {
+    let none: Slice<StringView> = [];
+    let v6 = settingsOf(none, "[::1]:6000", "a-long-secret")!;
+    Check.equalText("::1", v6.host.view())?;
+    Check.equalU64(6000, v6.port as u64)?;
+    let local = settingsOf(none, "localhost:7", "a-long-secret")!;
+    Check.equalText("127.0.0.1", local.host.view())?;
+    var arguments = Vector<StringView>.create();
+    arguments.push("--bind")!;
+    arguments.push("0.0.0.0:15432")!;
+    arguments.push("--data")!;
+    arguments.push("/srv/sqlite")!;
+    let flags = settingsOf(arguments.view(), "127.0.0.1:1", "a-long-secret")!;
+    Check.equalText("0.0.0.0", flags.host.view())?;
+    Check.equalU64(15432, flags.port as u64)?;
+    Check.equalText("/srv/sqlite", flags.data.view())?;
+    Check.isTrue(settingsOf(none, "nowhere", "a-long-secret").isErr(), "a bind without a port")?;
+    Check.isTrue(settingsOf(none, "host:99999", "a-long-secret").isErr(), "a port past 65535")?;
+    return Check.isTrue(settingsOf(none, ":5432", "a-long-secret").isErr(), "a bind without a host");
+}
+
+@test
+fn aPasswordOrTrustIsNeeded() -> Result<void, TestFailure> {
+    let none: Slice<StringView> = [];
+    Check.isTrue(settingsOf(none, null, null).isErr(), "no password and no --trust")?;
+    Check.isTrue(settingsOf(none, null, "short").isErr(), "a password under 8 characters")?;
+    var trust = Vector<StringView>.create();
+    trust.push("--trust")!;
+    let s = settingsOf(trust.view(), null, null)!;
+    Check.isTrue(s.password.isNull(), "--trust: no password")?;
+    var unknown = Vector<StringView>.create();
+    unknown.push("--verbose")!;
+    return Check.isTrue(settingsOf(unknown.view(), null, "a-long-secret").isErr(), "an unknown argument");
+}

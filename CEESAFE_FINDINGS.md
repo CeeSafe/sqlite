@@ -226,3 +226,33 @@ builder (read, write, create, truncate, exclusive) would cover this and `O_EXCL`
 reference can be borrowed"), so a lookup by a constant key needs a local first (`let first: u32 = 1;`,
 `WritablePager.commit` in `src/pagerw.cee`). Borrowing a temporary for the length of the call, as Rust's `&1`
 does, would remove the extra line.
+
+### 29. No way to tell whether standard input is a terminal
+
+There is no `isatty` (`Console.isTerminal()` or the like). The sqlite3 shell prints a banner and prompts when a
+person types at it, and reads a script silently when its input is a pipe or a file; without the test, `cli/`
+cannot tell the two apart.
+
+Workaround: the shell always reads standard input as a script, without prompts (README.md, "Front ends").
+
+### 30. A finished thread cannot be reaped
+
+A `Thread<T>` has only `join()`, which waits; there is no `tryJoin` or `isFinished`. A server that starts a thread
+for each client and runs for days cannot keep the handles (the vector would only grow) nor join them as their
+clients leave. `Thread.service` starts a thread that is never joined, which fits, but then nothing tells the
+program when the thread is done: `ceesafec test` reports a test as "leaked" when a client's service thread is
+still freeing its session as the test ends.
+
+Workaround: `pgwire/src/server.cee` serves each client on a service thread and counts the clients in an
+`AtomicUSize`; the tests, and the daemon when it stops, poll the count down to zero (`PgServer.waitForClients`,
+spinning against `Timer.now()` for want of a sleep: finding 23).
+
+### 31. N0245's suggested fix does not fit a result that holds a slice
+
+A method `fn span(borrow mut this, bytes: Slice<u8>, n: usize) -> Result<Slice<u8>, E>` is N0245 ("several
+reference parameters: name the ones the result is borrowed from, e.g. 'borrow(a, b) T'"). Following it,
+`-> borrow(bytes) Result<Slice<u8>, E>` makes the whole `Result` a reference (N0205, "expected 'borrow Result<…>'").
+What works is a region parameter, `fn span<region r>(…, bytes: Slice<r, u8>, …) -> Result<Slice<r, u8>, E>`,
+which the message does not mention.
+
+Workaround: `Cursor.skip` in `pgwire/src/wire.cee` returns the index where the bytes start, and the caller slices.

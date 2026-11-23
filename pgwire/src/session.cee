@@ -1,0 +1,1120 @@
+// One client's session: the startup handshake, then the simple and extended query protocols, over a connection
+// from the database's pool.
+//
+// The SQL is SQLite's: statements run as they do in SQLite, each in a transaction of its own outside BEGIN …
+// COMMIT, and an error inside BEGIN undoes only its statement (so ReadyForQuery reports 'T', never 'E'). A few
+// statements PostgreSQL clients send are translated (`translate`).
+//
+// Differences from the C# (README.md, "PostgreSQL wire front end"): a result column's type is decided from all its
+// values, not the first row's; the rows of a statement executed without Describe are sent, not dropped; a portal
+// suspended by Execute's row limit resumes; bytea parameters are blobs; constraint errors carry their own SQLSTATE;
+// a prepared statement or portal name in use is an error; the connection comes from a pool per database.
+
+import sqlite;
+
+const PROTOCOL_3: u32 = 196608;
+const SSL_REQUEST: u32 = 80877103;
+const GSSENC_REQUEST: u32 = 80877104;
+const CANCEL_REQUEST: u32 = 80877102;
+
+/// What can make a statement fail: an error to report to the client (a statement's failure is not the session's).
+enum Failure {
+    @from Alloc(AllocError),
+    @from Pg(PgError),
+    @from Sqlite(SqliteError),
+    /// The client broke the protocol, or went away: this ends the session.
+    @from Wire(WireError),
+}
+
+/// The SQLSTATE for an engine error. The C# matched a few messages and called every constraint failure a
+/// unique violation (23505).
+fn sqlState(e: borrow SqliteError) -> StringView {
+    match (e) {
+        SqliteError.Alloc(_) => { return "53200"; }
+        SqliteError.Io(_) => { return "58030"; }
+        SqliteError.Corrupt(_) => { return "XX001"; }
+        SqliteError.NotADatabase(_) => { return "XX001"; }
+        SqliteError.Unsupported(_) => { return "0A000"; }
+        SqliteError.Busy(_) => { return "55P03"; }
+        SqliteError.RaiseIgnore => { return "XX000"; }
+        SqliteError.Constraint(m) => {
+            let message = m.view();
+            return if (message.startsWith("UNIQUE") || message.startsWith("PRIMARY KEY")) "23505"
+                else if (message.startsWith("NOT NULL")) "23502"
+                else if (message.startsWith("FOREIGN KEY")) "23503"
+                else if (message.startsWith("CHECK")) "23514"
+                else "23000";
+        }
+        SqliteError.Sql(m) => {
+            let message = m.view();
+            return if (message.contains("syntax error") || message.startsWith("incomplete input") ||
+                message.startsWith("unrecognized token")) "42601"
+                else if (message.startsWith("no such table") || message.startsWith("no such view")) "42P01"
+                else if (message.startsWith("no such column")) "42703"
+                else if (message.startsWith("ambiguous column name")) "42702"
+                else if (message.startsWith(
+                    "no such function",
+                ) || message.startsWith("wrong number of arguments")) "42883"
+                else if (message.startsWith("no such index")) "42704"
+                else if (message.contains("already exists")) "42P07"
+                else if (message.startsWith("misuse of aggregate")) "42803"
+                else if (message.startsWith("cannot commit") || message.startsWith("cannot rollback")) "25P01"
+                else if (message.startsWith("cannot start a transaction within a transaction")) "25001"
+                else if (message.startsWith("no such savepoint")) "3B001"
+                else if (message.startsWith("integer overflow")) "22003"
+                else if (message.startsWith("datatype mismatch")) "42804"
+                else if (message.startsWith("too many")) "54000"
+                else "42000";
+        }
+    }
+}
+
+fn toPgError(failure: Failure) -> PgError => match (failure) {
+    Failure.Alloc(_) => pgError("53200", "out of memory"),
+    Failure.Pg(e) => e,
+    Failure.Wire(_) => pgError("08P01", "invalid message"),
+    Failure.Sqlite(e) => pgError(sqlState(borrow e), e.message()),
+};
+
+/// A statement made by Parse.
+struct Prepared {
+    name: String;
+    /// The statement, without its semicolon; empty for an empty query.
+    sql: String;
+    /// The parameter types Parse gave (0 for one the client left to the server).
+    types: Vector<u32>;
+    /// How many parameters Bind must give.
+    parameters: usize;
+    /// Whether Describe has announced its columns: as text, since nothing has run yet.
+    described: bool;
+}
+
+/// A statement's result, kept by its portal until Execute has sent every row.
+struct Outcome {
+    result: QueryResult;
+    tag: String;
+    /// The type each column is sent as.
+    types: Vector<u32>;
+}
+
+/// A statement bound to parameter values by Bind.
+struct Portal {
+    name: String;
+    sql: String;
+    values: Vector<SqliteValue>;
+    /// Bind's result-column format codes: none (all text), one (for all), or one a column.
+    formats: Vector<i16>;
+    /// Whether the statement's own Describe announced its columns as text.
+    statementDescribed: bool;
+    /// Whether Describe announced the portal's columns.
+    described: bool;
+    outcome: Outcome?;
+    /// How many rows Execute has sent.
+    sent: usize;
+}
+
+/// The first word of `sql`, after spaces and comments.
+fn firstWord(sql: StringView) -> StringView {
+    var i: usize = 0;
+    let n = sql.length;
+    while (i < n) {
+        let c = sql[i];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '(') {
+            i += 1;
+        } else if (c == '-' && i + 1 < n && sql[i + 1] == '-') {
+            while (i < n && sql[i] != '\n') {
+                i += 1;
+            }
+        } else if (c == '/' && i + 1 < n && sql[i + 1] == '*') {
+            i += 2;
+            while (i < n && !(sql[i] == '*' && i + 1 < n && sql[i + 1] == '/')) {
+                i += 1;
+            }
+            i = (i + 2).min(n);
+        } else {
+            break;
+        }
+    }
+    let start = i;
+    while (i < n && ((sql[i] >= 'a' && sql[i] <= 'z') || (sql[i] >= 'A' && sql[i] <= 'Z') || sql[i] == '_')) {
+        i += 1;
+    }
+    return sql[start..i];
+}
+
+/// The words of `sql` outside quotes and parentheses, upper-cased: enough to tell what a statement does.
+fn topWords(sql: StringView) -> Result<Vector<String>, AllocError> {
+    var words = Vector<String>.create();
+    var depth: usize = 0;
+    var i: usize = 0;
+    let n = sql.length;
+    while (i < n) {
+        let c = sql[i];
+        if (c == '\'' || c == '"' || c == '`' || c == '[') {
+            let close = if (c == '[') ']' else c;
+            i += 1;
+            while (i < n && sql[i] != close) {
+                i += 1;
+            }
+            i += 1;
+        } else if (c == '(') {
+            depth += 1;
+            i += 1;
+        } else if (c == ')') {
+            depth = if (depth == 0) 0 else depth - 1;
+            i += 1;
+        } else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+            let start = i;
+            while (i < n && ((sql[i] >= 'a' && sql[i] <= 'z') || (sql[i] >= 'A' && sql[i] <= 'Z') ||
+                (sql[i] >= '0' && sql[i] <= '9') || sql[i] == '_')) {
+                i += 1;
+            }
+            if (depth == 0) {
+                var word = String.create();
+                let piece = sql[start..i].bytes();
+                for (k in 0..piece.length) {
+                    let b = piece[k];
+                    let _ = word.appendChar((if (b >= 'a' && b <= 'z') b - 32 else b) as u32)?;
+                }
+                words.push(word)?;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    return Ok(words);
+}
+
+fn wordIs(words: borrow Vector<String>, at: usize, word: StringView) -> bool =>
+    at < words.length && words[at].view() == word;
+
+/// What a statement is called in its CommandComplete tag, as PostgreSQL names it: `INSERT`, `CREATE TABLE`, …
+/// For a statement that starts with WITH, the verb after the common table expressions.
+fn verbOf(words: borrow Vector<String>) -> Result<String, AllocError> {
+    if (words.length == 0) {
+        return Ok(String.create());
+    }
+    let first = words[0].view();
+    if (first == "WITH") {
+        for (k in 1..words.length) {
+            let w = words[k].view();
+            if (w == "SELECT" || w == "VALUES" || w == "INSERT" || w == "REPLACE" || w == "UPDATE" || w == "DELETE") {
+                return String.from(w);
+            }
+        }
+        return String.from("SELECT");
+    }
+    if (first == "CREATE" || first == "DROP" || first == "ALTER") {
+        var k: usize = 1;
+        while (wordIs(words, k, "TEMP") || wordIs(words, k, "TEMPORARY") || wordIs(words, k, "UNIQUE") ||
+            wordIs(words, k, "VIRTUAL")) {
+            k += 1;
+        }
+        var verb = String.from(first)?;
+        if (k < words.length) {
+            verb.append(" ")?;
+            verb.append(words[k].view())?;
+        }
+        return Ok(verb);
+    }
+    if (first == "END") {
+        return String.from("COMMIT");
+    }
+    if (first == "ABORT") {
+        return String.from("ROLLBACK");
+    }
+    return String.from(first);
+}
+
+/// The CommandComplete tag of a statement whose words are `words`.
+fn tagOf(words: borrow Vector<String>, result: borrow QueryResult, changes: i64) -> Result<String, AllocError> {
+    let verb = verbOf(words)?;
+    var tag = String.create();
+    let v = verb.view();
+    if (v == "INSERT" || v == "REPLACE") {
+        tag.append("INSERT 0 ")?;
+        tag.appendNumber(changes)?;
+    } else if (v == "UPDATE" || v == "DELETE") {
+        tag.append(v)?;
+        tag.append(" ")?;
+        tag.appendNumber(changes)?;
+    } else if (v == "SELECT" || v == "VALUES" || result.columns.length != 0) {
+        tag.append("SELECT ")?;
+        tag.appendNumber(result.rows.length)?;
+    } else {
+        tag.append(v)?;
+    }
+    return Ok(tag);
+}
+
+/// A PostgreSQL statement that SQLite does not take, as this server runs it.
+struct Translation {
+    /// What to run instead; null to run nothing.
+    sql: String?;
+    /// The CommandComplete tag to give.
+    tag: String;
+}
+
+/// PostgreSQL's transaction statements as SQLite's (`START TRANSACTION`, `BEGIN ISOLATION LEVEL …`, `COMMIT AND
+/// CHAIN`, `ABORT`), and the session statements drivers send that mean nothing here (`SET`, `RESET`, `DISCARD`),
+/// which succeed without effect. Null for a statement that runs as it is.
+fn translate(words: borrow Vector<String>) -> Result<Translation?, AllocError> {
+    if (words.length == 0) {
+        return Ok(null);
+    }
+    let first = words[0].view();
+    if (first == "START" || first == "BEGIN") {
+        // SQLite's own: BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE] [TRANSACTION].
+        var k: usize = 1;
+        if (first == "BEGIN" && (wordIs(words, k, "DEFERRED") || wordIs(words, k, "IMMEDIATE") ||
+            wordIs(words, k, "EXCLUSIVE"))) {
+            k += 1;
+        }
+        if (first == "BEGIN" && wordIs(words, k, "TRANSACTION")) {
+            k += 1;
+        }
+        if (first == "BEGIN" && k == words.length) {
+            return Ok(null);
+        }
+        return Ok(Translation { sql: String.from("BEGIN")?, tag: String.from("BEGIN")? });
+    }
+    if (first == "COMMIT" || first == "END") {
+        if (words.length == 1 || (words.length == 2 && wordIs(words, 1, "TRANSACTION"))) {
+            return Ok(null);
+        }
+        return Ok(Translation { sql: String.from("COMMIT")?, tag: String.from("COMMIT")? });
+    }
+    if (first == "ROLLBACK" || first == "ABORT") {
+        let toSavepoint = wordIs(words, 1, "TO") || (wordIs(words, 1, "TRANSACTION") && wordIs(words, 2, "TO"));
+        if (first == "ROLLBACK" && (toSavepoint || words.length == 1 ||
+            (words.length == 2 && wordIs(words, 1, "TRANSACTION")))) {
+            return Ok(null);
+        }
+        return Ok(Translation { sql: String.from("ROLLBACK")?, tag: String.from("ROLLBACK")? });
+    }
+    if (first == "SET" || first == "RESET") {
+        return Ok(Translation { sql: null, tag: String.from(first)? });
+    }
+    if (first == "DISCARD") {
+        var tag = String.from("DISCARD")?;
+        if (words.length > 1) {
+            tag.append(" ")?;
+            tag.append(words[1].view())?;
+        }
+        return Ok(Translation { sql: null, tag: tag });
+    }
+    return Ok(null);
+}
+
+/// How many parameters a statement takes as PostgreSQL counts them: the highest `$n` it names, or, for a
+/// statement written with SQLite's `?`, the number SQLite gives its last parameter.
+fn parameterCount(sql: StringView) -> usize {
+    let parameters = match (statementParameters(sql)) {
+        Ok(p) => p,
+        Err(_) => { return 0; }
+    };
+    var highest: usize = 0;
+    var dollars = false;
+    for (i in 0..parameters.names.length) {
+        let name = parameters.names[i].name.view();
+        if (name.startsWith("$")) {
+            if (name[1..].parseInt<usize>() is Some(n)) {
+                dollars = true;
+                highest = highest.max(n);
+            }
+        }
+    }
+    return if (dollars) highest else parameters.count;
+}
+
+/// The values of `values` (`$1` first) as the engine's parameters of `sql`: each `$n` by its name (SQLite numbers
+/// `$2` before `$1` when it comes first), else by its number.
+fn paramsFor(sql: StringView, values: borrow Vector<SqliteValue>) -> Result<Params, AllocError> {
+    var params = Params.create();
+    let parameters = match (statementParameters(sql)) {
+        Ok(p) => p,
+        Err(_) => { return Ok(params); }
+    };
+    for (i in 0..values.length) {
+        var name = String.from("$")?;
+        name.appendNumber(i + 1)?;
+        if (parameters.indexOf(name.view()).isSome()) {
+            params.bind(name.view(), values[i].clone()?)?;
+        } else if (i < parameters.count) {
+            params.set(i + 1, values[i].clone()?)?;
+        }
+    }
+    return Ok(params);
+}
+
+/// Bind's format code for item `i` of `count`: none given is text, one is for all.
+fn formatAt(formats: borrow Vector<i16>, i: usize) -> i16 =>
+    if (formats.length == 0) 0 else if (formats.length == 1) formats[0] else if (i < formats.length) formats[i] else 0;
+
+/// Compares two texts in a time that does not depend on where they differ.
+fn sameSecret(a: StringView, b: StringView) -> bool {
+    let x = a.bytes();
+    let y = b.bytes();
+    var difference: u32 = if (x.length == y.length) 0 else 1;
+    let n = x.length.max(y.length);
+    for (i in 0..n) {
+        let p: u8 = if (i < x.length) x[i] else 0;
+        let q: u8 = if (i < y.length) y[i] else 0;
+        difference |= (p ^ q) as u32;
+    }
+    return difference == 0;
+}
+
+// ── backend messages ─────────────────────────────────────────────────────────────────────────────────────────
+
+fn putError(out: borrow mut Vector<u8>, severity: StringView, e: borrow PgError) -> Result<void, AllocError> {
+    let b = begin(mut out, 'E')?;
+    out.push('S')?;
+    putText(mut out, severity)?;
+    out.push('V')?;
+    putText(mut out, severity)?;
+    out.push('C')?;
+    putText(mut out, e.state.view())?;
+    out.push('M')?;
+    putText(mut out, e.message.view())?;
+    out.push(0)?;
+    end(mut out, b);
+    return Ok();
+}
+
+fn putParameterStatus(out: borrow mut Vector<u8>, name: StringView, value: StringView) -> Result<void, AllocError> {
+    let b = begin(mut out, 'S')?;
+    putText(mut out, name)?;
+    putText(mut out, value)?;
+    end(mut out, b);
+    return Ok();
+}
+
+fn putRowDescription(
+    out: borrow mut Vector<u8>,
+    columns: borrow Vector<String>,
+    types: borrow Vector<u32>,
+    formats: borrow Vector<i16>,
+) -> Result<void, AllocError> {
+    let b = begin(mut out, 'T')?;
+    putI16(mut out, truncate<i16>(columns.length))?;
+    for (c in 0..columns.length) {
+        putText(mut out, columns[c].view())?;
+        putI32(mut out, 0)?; // no table
+        putI16(mut out, 0)?; // no column of one
+        let oid = if (c < types.length) types[c] else OID_TEXT;
+        putU32(mut out, oid)?;
+        putI16(mut out, typeSize(oid))?;
+        putI32(mut out, -1)?; // no type modifier
+        putI16(mut out, formatAt(formats, c))?;
+    }
+    end(mut out, b);
+    return Ok();
+}
+
+fn putDataRow(
+    out: borrow mut Vector<u8>,
+    row: borrow Vector<SqliteValue>,
+    types: borrow Vector<u32>,
+    formats: borrow Vector<i16>,
+) -> Result<void, AllocError> {
+    let b = begin(mut out, 'D')?;
+    putI16(mut out, truncate<i16>(row.length))?;
+    for (c in 0..row.length) {
+        if (row[c].isNull()) {
+            putI32(mut out, -1)?;
+            continue;
+        }
+        let oid = if (c < types.length) types[c] else OID_TEXT;
+        let at = out.length;
+        out.pushBE(0u32)?;
+        if (formatAt(formats, c) == 1) {
+            appendBinary(mut out, borrow row[c], oid)?;
+        } else {
+            appendText(mut out, borrow row[c], oid)?;
+        }
+        let length = truncate<u32>(out.length - at - 4);
+        out.writeBE(at, length);
+    }
+    end(mut out, b);
+    return Ok();
+}
+
+fn putCommandComplete(out: borrow mut Vector<u8>, tag: StringView) -> Result<void, AllocError> {
+    let b = begin(mut out, 'C')?;
+    putText(mut out, tag)?;
+    end(mut out, b);
+    return Ok();
+}
+
+// ── the session ──────────────────────────────────────────────────────────────────────────────────────────────
+
+/// A client's session, after the handshake.
+struct Session {
+    wire: Wire;
+    pooled: PooledConnection;
+    prepared: Vector<Prepared>;
+    portals: Vector<Portal>;
+    /// An extended-protocol message failed: the rest up to Sync are passed over.
+    skipping: bool;
+
+    fn putReady(borrow mut this) -> Result<void, AllocError> {
+        let status: u8 = if (this.pooled.get().inTransaction()) 'T' else 'I';
+        let b = begin(mut this.wire.output, 'Z')?;
+        this.wire.output.push(status)?;
+        end(mut this.wire.output, b);
+        return Ok();
+    }
+
+    /// Runs one statement with the values of `values` for its `$n` parameters.
+    fn run(borrow mut this, sql: StringView, values: borrow Vector<SqliteValue>) -> Result<Outcome, Failure> {
+        let words = topWords(sql)?;
+        let empty = QueryResult { columns: Vector<String>.create(), rows: Vector<Vector<SqliteValue>>.create() };
+        if (translate(borrow words)? is Some(t)) {
+            match (borrow t.sql) {
+                Some(statement) => {
+                    let none = Params.create();
+                    let _ = this.pooled.get().query(statement.view(), borrow none)?;
+                }
+                null => {}
+            }
+            return Ok(Outcome { result: empty, tag: t.tag, types: Vector<u32>.create() });
+        }
+        let params = paramsFor(sql, values)?;
+        let connection = this.pooled.get();
+        let result = connection.query(sql, borrow params)?;
+        let tag = tagOf(borrow words, borrow result, connection.changes())?;
+        var types = Vector<u32>.create();
+        for (c in 0..result.columns.length) {
+            types.push(columnType(borrow result.rows, c))?;
+        }
+        return Ok(Outcome { result: result, tag: tag, types: types });
+    }
+
+    /// The columns a statement would give, without its effects, for Describe of a prepared statement: a query's
+    /// as a subquery with LIMIT 0, and those of a statement with RETURNING or a PRAGMA from running it in a
+    /// transaction that is then rolled back. Null when it gives none, or they cannot be known before it runs.
+    fn probeColumns(borrow mut this, sql: StringView) -> Result<Vector<String>?, AllocError> {
+        let words = topWords(sql)?;
+        if (words.length == 0) {
+            return Ok(null);
+        }
+        let first = words[0].view();
+        let none = Params.create();
+        let connection = this.pooled.get();
+        if (first == "SELECT" || first == "VALUES" || (first == "WITH" && verbOf(borrow words)?.view() == "SELECT")) {
+            var probe = String.from("SELECT * FROM (\n")?;
+            probe.append(sql)?;
+            probe.append("\n) LIMIT 0")?;
+            return match (connection.query(probe.view(), borrow none)) {
+                Ok(r) => Ok(r.columns),
+                Err(_) => Ok(null),
+            };
+        }
+        var returning = false;
+        for (k in 0..words.length) {
+            if (words[k].view() == "RETURNING") {
+                returning = true;
+            }
+        }
+        if (!returning && first != "PRAGMA") {
+            return Ok(null);
+        }
+        // The engine has no SAVEPOINT yet, so the statement is tried in a transaction of its own, and not inside the
+        // client's: there its columns are not known until it runs.
+        if (connection.inTransaction() || connection.query("BEGIN", borrow none).isErr()) {
+            return Ok(null);
+        }
+        let probed = connection.query(sql, borrow none);
+        let _ = connection.query("ROLLBACK", borrow none);
+        return match (probed) {
+            Ok(r) => if (r.columns.length == 0) Ok(null) else Ok(r.columns),
+            Err(_) => Ok(null),
+        };
+    }
+
+    fn sendError(borrow mut this, e: borrow PgError) -> Result<void, AllocError> =>
+        putError(mut this.wire.output, "ERROR", e);
+
+    // ── simple query ─────────────────────────────────────────────────────────────────────────────────────────
+
+    fn simpleQuery(borrow mut this, payload: borrow Vector<u8>) -> Result<void, WireError> {
+        var cursor = Cursor.start();
+        let sql = cursor.text(payload.view())?;
+        // A simple query ends the unnamed statement and portal.
+        this.removePrepared("");
+        this.removePortal("");
+        let spans = splitScript(sql.view())?;
+        if (spans.length == 0) {
+            putEmpty(mut this.wire.output, 'I')?;
+        }
+        let none = Vector<SqliteValue>.create();
+        let text = Vector<i16>.create();
+        for (i in 0..spans.length) {
+            let statement = sql.view()[spans[i].start..spans[i].end];
+            match (this.run(statement, borrow none)) {
+                Ok(outcome) => {
+                    if (outcome.result.columns.length != 0) {
+                        putRowDescription(
+                            mut this.wire.output,
+                            borrow outcome.result.columns,
+                            borrow outcome.types,
+                            borrow text,
+                        )?;
+                        for (r in 0..outcome.result.rows.length) {
+                            putDataRow(
+                                mut this.wire.output,
+                                borrow outcome.result.rows[r],
+                                borrow outcome.types,
+                                borrow text,
+                            )?;
+                        }
+                    }
+                    putCommandComplete(mut this.wire.output, outcome.tag.view())?;
+                }
+                Err(f) => {
+                    let e = toPgError(f);
+                    this.sendError(borrow e)?;
+                    break;
+                }
+            }
+            if (this.wire.output.length > 65536) {
+                this.wire.flush()?;
+            }
+        }
+        this.putReady()?;
+        return this.wire.flush();
+    }
+
+    // ── extended query ───────────────────────────────────────────────────────────────────────────────────────
+
+    fn findPrepared(borrow this, name: StringView) -> usize? {
+        for (i in 0..this.prepared.length) {
+            if (this.prepared[i].name.view() == name) {
+                return i;
+            }
+        }
+        return null;
+    }
+
+    fn findPortal(borrow this, name: StringView) -> usize? {
+        for (i in 0..this.portals.length) {
+            if (this.portals[i].name.view() == name) {
+                return i;
+            }
+        }
+        return null;
+    }
+
+    fn removePrepared(borrow mut this, name: StringView) {
+        if (this.findPrepared(name) is Some(i)) {
+            let _ = this.prepared.remove(i);
+        }
+    }
+
+    fn removePortal(borrow mut this, name: StringView) {
+        if (this.findPortal(name) is Some(i)) {
+            let _ = this.portals.remove(i);
+        }
+    }
+
+    fn parse(borrow mut this, payload: borrow Vector<u8>) -> Result<void, Failure> {
+        let bytes = payload.view();
+        var cursor = Cursor.start();
+        let name = cursor.text(bytes)?;
+        let sql = cursor.text(bytes)?;
+        let count = cursor.i16(bytes)?;
+        var types = Vector<u32>.create();
+        for (i in 0..(count.max(0))) {
+            types.push(truncate<u32>(cursor.i32(bytes)?))?;
+        }
+        if (name.length != 0 && this.findPrepared(name.view()).isSome()) {
+            var message = String.from("prepared statement \"")?;
+            message.append(name.view())?;
+            message.append("\" already exists")?;
+            return Err(Failure.Pg(PgError { state: String.from("42P05")?, message: message }));
+        }
+        let spans = splitScript(sql.view())?;
+        if (spans.length > 1) {
+            return Err(Failure.Pg(pgError("42601", "cannot insert multiple commands into a prepared statement")));
+        }
+        let statement = if (spans.length == 0) String.create() else String.from(
+            sql.view()[spans[0].start..spans[0].end],
+        )?;
+        let parameters = parameterCount(statement.view()).max(types.length);
+        this.removePrepared("");
+        this.prepared.push(
+            Prepared { name: name, sql: statement, types: types, parameters: parameters, described: false },
+        )?;
+        putEmpty(mut this.wire.output, '1')?;
+        return Ok();
+    }
+
+    fn bind(borrow mut this, payload: borrow Vector<u8>) -> Result<void, Failure> {
+        let bytes = payload.view();
+        var cursor = Cursor.start();
+        let portalName = cursor.text(bytes)?;
+        let statementName = cursor.text(bytes)?;
+        let p = this.findPrepared(statementName.view()) ?? {
+            var message = String.from("prepared statement \"")?;
+            message.append(statementName.view())?;
+            message.append("\" does not exist")?;
+            return Err(Failure.Pg(PgError { state: String.from("26000")?, message: message }));
+        };
+        if (portalName.length != 0 && this.findPortal(portalName.view()).isSome()) {
+            var message = String.from("portal \"")?;
+            message.append(portalName.view())?;
+            message.append("\" already exists")?;
+            return Err(Failure.Pg(PgError { state: String.from("42P03")?, message: message }));
+        }
+        let formatCount = truncate<usize>(cursor.i16(bytes)?.max(0));
+        var formats = Vector<i16>.create();
+        for (i in 0..formatCount) {
+            formats.push(cursor.i16(bytes)?)?;
+        }
+        let valueCount = truncate<usize>(cursor.i16(bytes)?.max(0));
+        let required = this.prepared[p].parameters;
+        if (valueCount != required) {
+            var message = String.from("bind message supplies ")?;
+            message.appendNumber(valueCount)?;
+            message.append(" parameters, but prepared statement \"")?;
+            message.append(statementName.view())?;
+            message.append("\" requires ")?;
+            message.appendNumber(required)?;
+            return Err(Failure.Pg(PgError { state: String.from("08P01")?, message: message }));
+        }
+        if (formatCount > 1 && formatCount != valueCount) {
+            var message = String.from("bind message has ")?;
+            message.appendNumber(formatCount)?;
+            message.append(" parameter formats but ")?;
+            message.appendNumber(valueCount)?;
+            message.append(" parameters")?;
+            return Err(Failure.Pg(PgError { state: String.from("08P01")?, message: message }));
+        }
+        var values = Vector<SqliteValue>.create();
+        for (i in 0..valueCount) {
+            let length = cursor.i32(bytes)?;
+            if (length < 0) {
+                values.push(SqliteValue.Null)?;
+                continue;
+            }
+            let start = cursor.skip(bytes, truncate<usize>(length))?;
+            let data = bytes[start..start + (truncate<usize>(length))];
+            let oid = if (i < this.prepared[p].types.length) this.prepared[p].types[i] else 0;
+            let value = if (formatAt(borrow formats, i) == 1) parseBinaryValue(
+                data,
+                oid,
+                i + 1,
+            )? else parseTextValue(data, oid)?;
+            values.push(value)?;
+        }
+        let resultCount = truncate<usize>(cursor.i16(bytes)?.max(0));
+        var resultFormats = Vector<i16>.create();
+        for (i in 0..resultCount) {
+            resultFormats.push(cursor.i16(bytes)?)?;
+        }
+        let portal = Portal {
+            name: portalName,
+            sql: this.prepared[p].sql.clone()?,
+            values: values,
+            formats: resultFormats,
+            statementDescribed: this.prepared[p].described,
+            described: false,
+            outcome: null,
+            sent: 0,
+        };
+        this.removePortal("");
+        this.portals.push(portal)?;
+        putEmpty(mut this.wire.output, '2')?;
+        return Ok();
+    }
+
+    /// Runs portal `i`'s statement, if it has not run.
+    fn runPortal(borrow mut this, i: usize) -> Result<void, Failure> {
+        if (this.portals[i].outcome.isSome() || this.portals[i].sql.length == 0) {
+            return Ok();
+        }
+        let sql = this.portals[i].sql.clone()?;
+        let values = replace(mut this.portals[i].values, Vector<SqliteValue>.create());
+        let outcome = this.run(sql.view(), borrow values)?;
+        let columns = outcome.result.columns.length;
+        let formats = this.portals[i].formats.length;
+        if (formats > 1 && formats != columns) {
+            var message = String.from("bind message has ")?;
+            message.appendNumber(formats)?;
+            message.append(" result formats but query has ")?;
+            message.appendNumber(columns)?;
+            message.append(" columns")?;
+            return Err(Failure.Pg(PgError { state: String.from("08P01")?, message: message }));
+        }
+        this.portals[i].outcome = outcome;
+        return Ok();
+    }
+
+    fn describe(borrow mut this, payload: borrow Vector<u8>) -> Result<void, Failure> {
+        let bytes = payload.view();
+        var cursor = Cursor.start();
+        let kind = cursor.byte(bytes)?;
+        let name = cursor.text(bytes)?;
+        if (kind == 'S') {
+            let p = this.findPrepared(name.view()) ?? {
+                var message = String.from("prepared statement \"")?;
+                message.append(name.view())?;
+                message.append("\" does not exist")?;
+                return Err(Failure.Pg(PgError { state: String.from("26000")?, message: message }));
+            };
+            let b = begin(mut this.wire.output, 't')?;
+            let count = this.prepared[p].parameters;
+            putI16(mut this.wire.output, truncate<i16>(count))?;
+            for (i in 0..count) {
+                let given = if (i < this.prepared[p].types.length) this.prepared[p].types[i] else 0;
+                putU32(mut this.wire.output, if (given == 0) OID_TEXT else given)?;
+            }
+            end(mut this.wire.output, b);
+            let sql = this.prepared[p].sql.clone()?;
+            match (this.probeColumns(sql.view())?) {
+                Some(columns) => {
+                    var types = Vector<u32>.create();
+                    for (c in 0..columns.length) {
+                        types.push(OID_TEXT)?;
+                    }
+                    let text = Vector<i16>.create();
+                    putRowDescription(mut this.wire.output, borrow columns, borrow types, borrow text)?;
+                    this.prepared[p].described = true;
+                }
+                null => { putEmpty(mut this.wire.output, 'n')?; }
+            }
+            return Ok();
+        }
+        if (kind != 'P') {
+            return Err(Failure.Pg(pgError("08P01", "invalid DESCRIBE message subtype")));
+        }
+        let i = this.findPortal(name.view()) ?? {
+            var message = String.from("portal \"")?;
+            message.append(name.view())?;
+            message.append("\" does not exist")?;
+            return Err(Failure.Pg(PgError { state: String.from("34000")?, message: message }));
+        };
+        // A portal's columns, and the types its values are sent as, are known once it has run: it runs now, and
+        // Execute sends the rows. (A portal described and never executed has still run.)
+        this.runPortal(i)?;
+        this.portals[i].described = true;
+        let portal = borrow this.portals[i];
+        match (borrow portal.outcome) {
+            Some(outcome) => {
+                if (outcome.result.columns.length != 0) {
+                    putRowDescription(
+                        mut this.wire.output,
+                        borrow outcome.result.columns,
+                        borrow outcome.types,
+                        borrow portal.formats,
+                    )?;
+                } else {
+                    putEmpty(mut this.wire.output, 'n')?;
+                }
+            }
+            null => { putEmpty(mut this.wire.output, 'n')?; }
+        }
+        return Ok();
+    }
+
+    fn execute(borrow mut this, payload: borrow Vector<u8>) -> Result<void, Failure> {
+        let bytes = payload.view();
+        var cursor = Cursor.start();
+        let name = cursor.text(bytes)?;
+        let limit = cursor.i32(bytes)?;
+        let i = this.findPortal(name.view()) ?? {
+            var message = String.from("portal \"")?;
+            message.append(name.view())?;
+            message.append("\" does not exist")?;
+            return Err(Failure.Pg(PgError { state: String.from("34000")?, message: message }));
+        };
+        if (this.portals[i].sql.length == 0) {
+            putEmpty(mut this.wire.output, 'I')?;
+            return Ok();
+        }
+        this.runPortal(i)?;
+        let portal = borrow mut this.portals[i];
+        let textOnly = portal.statementDescribed && !portal.described;
+        let outcome = match (borrow mut portal.outcome) {
+            Some(o) => o,
+            null => { return Ok(); }
+        };
+        if (textOnly) {
+            // The client was told the columns are text when it described the statement.
+            var c: usize = 0;
+            while (c < outcome.types.length) {
+                outcome.types[c] = OID_TEXT;
+                c += 1;
+            }
+        }
+        let total = outcome.result.rows.length;
+        let stop = if (limit > 0) (portal.sent + truncate<usize>(limit)).min(total) else total;
+        for (r in portal.sent..stop) {
+            putDataRow(
+                mut this.wire.output,
+                borrow outcome.result.rows[r],
+                borrow outcome.types,
+                borrow portal.formats,
+            )?;
+            if (this.wire.output.length > 65536) {
+                // Rows go out as they are made; a send that fails ends the session at its next read.
+                let _ = this.wire.flush();
+            }
+        }
+        portal.sent = stop;
+        if (stop < total) {
+            putEmpty(mut this.wire.output, 's')?;
+        } else {
+            putCommandComplete(mut this.wire.output, outcome.tag.view())?;
+        }
+        return Ok();
+    }
+
+    fn close(borrow mut this, payload: borrow Vector<u8>) -> Result<void, Failure> {
+        let bytes = payload.view();
+        var cursor = Cursor.start();
+        let kind = cursor.byte(bytes)?;
+        let name = cursor.text(bytes)?;
+        if (kind == 'S') {
+            this.removePrepared(name.view());
+        } else if (kind == 'P') {
+            this.removePortal(name.view());
+        } else {
+            return Err(Failure.Pg(pgError("08P01", "invalid CLOSE message subtype")));
+        }
+        putEmpty(mut this.wire.output, '3')?;
+        return Ok();
+    }
+
+    /// Handles an extended-protocol message: after one fails, the rest up to Sync are passed over.
+    fn extended(borrow mut this, message: borrow Message) -> Result<void, WireError> {
+        if (this.skipping) {
+            return Ok();
+        }
+        let done = match (message.kind) {
+            'P' => this.parse(borrow message.payload),
+            'B' => this.bind(borrow message.payload),
+            'D' => this.describe(borrow message.payload),
+            'E' => this.execute(borrow message.payload),
+            _ => this.close(borrow message.payload),
+        };
+        match (done) {
+            Ok() => {}
+            Err(Failure.Wire(w)) => { return Err(w); }
+            Err(f) => {
+                let e = toPgError(f);
+                this.sendError(borrow e)?;
+                this.skipping = true;
+            }
+        }
+        return Ok();
+    }
+
+    /// Serves messages until the client terminates or goes away.
+    fn serve(borrow mut this) -> Result<void, WireError> {
+        loop {
+            let message = this.wire.readMessage()? ?? { return Ok(); };
+            match (message.kind) {
+                'X' => { return Ok(); }
+                'Q' => {
+                    this.skipping = false;
+                    this.simpleQuery(borrow message.payload)?;
+                }
+                'P' => { this.extended(borrow message)?; }
+                'B' => { this.extended(borrow message)?; }
+                'D' => { this.extended(borrow message)?; }
+                'E' => { this.extended(borrow message)?; }
+                'C' => { this.extended(borrow message)?; }
+                'S' => {
+                    this.skipping = false;
+                    // Sync ends the implicit transaction, and with it the portals; inside BEGIN they last.
+                    if (!this.pooled.get().inTransaction()) {
+                        this.portals.clear();
+                    }
+                    this.putReady()?;
+                    this.wire.flush()?;
+                }
+                'H' => { this.wire.flush()?; }
+                'F' => {
+                    let e = pgError("0A000", "the function call protocol is not supported");
+                    this.sendError(borrow e)?;
+                    this.putReady()?;
+                    this.wire.flush()?;
+                }
+                _ => {
+                    var text = String.from("invalid frontend message type ")?;
+                    text.appendNumber(message.kind)?;
+                    return Err(WireError.Protocol(text));
+                }
+            }
+        }
+    }
+}
+
+/// Where the value of startup parameter `name` is in `pairs`.
+fn startupParameter(pairs: borrow Vector<String>, name: StringView) -> usize? {
+    var i: usize = 0;
+    while (i + 1 < pairs.length) {
+        if (pairs[i].view() == name) {
+            return i + 1;
+        }
+        i += 2;
+    }
+    return null;
+}
+
+fn sendFatal(wire: borrow mut Wire, state: StringView, message: StringView) -> Result<void, WireError> {
+    let e = pgError(state, message);
+    putError(mut wire.output, "FATAL", borrow e)?;
+    return wire.flush();
+}
+
+/// The startup handshake, then the session. A protocol error ends the connection with a FATAL error.
+fn serveClient(server: borrow PgServer, stream: TcpStream) {
+    let _ = stream.setNoDelay(true);
+    var wire = Wire.over(stream);
+    match (handshake(server, mut wire)) {
+        Ok(Some(pooled)) => {
+            var session = Session {
+                wire: wire,
+                pooled: pooled,
+                prepared: Vector<Prepared>.create(),
+                portals: Vector<Portal>.create(),
+                skipping: false,
+            };
+            match (session.serve()) {
+                Err(WireError.Protocol(m)) => { let _ = sendFatal(mut session.wire, "08P01", m.view()); }
+                _ => {}
+            }
+        }
+        Ok(null) => {}
+        Err(WireError.Protocol(m)) => { let _ = sendFatal(mut wire, "08P01", m.view()); }
+        Err(_) => {}
+    }
+}
+
+/// Reads the startup packet, authenticates and opens the database; null when the connection ended instead.
+fn handshake(server: borrow PgServer, wire: borrow mut Wire) -> Result<PooledConnection?, WireError> {
+    var pairs = Vector<String>.create();
+    var unknownOptions = Vector<String>.create();
+    var minor: u32 = 0;
+    loop {
+        let startup = wire.readStartup()? ?? { return Ok(null); };
+        let bytes = startup.payload.view();
+        let code = bytes.readBE<u32>(0);
+        if (code == SSL_REQUEST || code == GSSENC_REQUEST) {
+            // No encryption here: the client goes on in plain text, or gives up.
+            wire.output.push('N')?;
+            wire.flush()?;
+            continue;
+        }
+        if (code == CANCEL_REQUEST) {
+            // Statements run to their end here, so there is nothing to cancel.
+            return Ok(null);
+        }
+        if (code >> 16 != 3) {
+            var message = String.from("unsupported frontend protocol ")?;
+            message.appendNumber(code >> 16)?;
+            message.append(".")?;
+            message.appendNumber(code & 0xFFFF)?;
+            message.append(": server supports 3.0 to 3.0")?;
+            sendFatal(mut wire, "0A000", message.view())?;
+            return Ok(null);
+        }
+        minor = code & 0xFFFF;
+        var cursor = Cursor { at: 4 };
+        loop {
+            let key = cursor.text(bytes)?;
+            if (key.length == 0) {
+                break;
+            }
+            let value = cursor.text(bytes)?;
+            if (key.view().startsWith("_pq_.")) {
+                unknownOptions.push(key)?;
+            } else {
+                pairs.push(key)?;
+                pairs.push(value)?;
+            }
+        }
+        break;
+    }
+    if (minor != 0 || unknownOptions.length != 0) {
+        // NegotiateProtocolVersion: 3.0, and the protocol options this server does not know.
+        let b = begin(mut wire.output, 'v')?;
+        putI32(mut wire.output, 0)?;
+        putI32(mut wire.output, truncate<i32>(unknownOptions.length))?;
+        for (i in 0..unknownOptions.length) {
+            putText(mut wire.output, unknownOptions[i].view())?;
+        }
+        end(mut wire.output, b);
+    }
+    let userAt = startupParameter(borrow pairs, "user") ?? {
+        sendFatal(mut wire, "28000", "no PostgreSQL user name specified in startup packet")?;
+        return Ok(null);
+    };
+    let user = pairs[userAt].view();
+    let database = match (startupParameter(borrow pairs, "database")) {
+        Some(at) => pairs[at].view(),
+        null => user,
+    };
+
+    if (borrow server.password is Some(password)) {
+        let b = begin(mut wire.output, 'R')?;
+        putI32(mut wire.output, 3)?; // AuthenticationCleartextPassword
+        end(mut wire.output, b);
+        wire.flush()?;
+        let reply = wire.readMessage()? ?? { return Ok(null); };
+        if (reply.kind != 'p') {
+            return Err(protocolError("expected password response"));
+        }
+        var cursor = Cursor.start();
+        let given = cursor.text(reply.payload.view())?;
+        if (!sameSecret(given.view(), password.view())) {
+            var message = String.from("password authentication failed for user \"")?;
+            message.append(user)?;
+            message.append("\"")?;
+            sendFatal(mut wire, "28P01", message.view())?;
+            return Ok(null);
+        }
+    }
+    let pooled = match (server.checkout(database)) {
+        Ok(p) => p,
+        Err(e) => {
+            sendFatal(mut wire, e.state.view(), e.message.view())?;
+            return Ok(null);
+        }
+    };
+
+    let b = begin(mut wire.output, 'R')?;
+    putI32(mut wire.output, 0)?; // AuthenticationOk
+    end(mut wire.output, b);
+    putParameterStatus(mut wire.output, "server_version", "16.0")?;
+    putParameterStatus(mut wire.output, "server_encoding", "UTF8")?;
+    putParameterStatus(mut wire.output, "client_encoding", "UTF8")?;
+    putParameterStatus(mut wire.output, "DateStyle", "ISO, MDY")?;
+    putParameterStatus(mut wire.output, "TimeZone", "UTC")?;
+    putParameterStatus(mut wire.output, "integer_datetimes", "on")?;
+    putParameterStatus(mut wire.output, "standard_conforming_strings", "on")?;
+    putParameterStatus(mut wire.output, "IntervalStyle", "postgres")?;
+    putParameterStatus(mut wire.output, "is_superuser", "on")?;
+    putParameterStatus(mut wire.output, "session_authorization", user)?;
+    let application = match (startupParameter(borrow pairs, "application_name")) {
+        Some(at) => pairs[at].view(),
+        null => "",
+    };
+    putParameterStatus(mut wire.output, "application_name", application)?;
+    let b2 = begin(mut wire.output, 'K')?;
+    let key = match (Random.below(1u64 << 62)) {
+        Ok(k) => k,
+        Err(_) => 0,
+    };
+    putI32(mut wire.output, truncate<i32>(key & 0x7FFFFFFF))?; // process ID
+    putI32(mut wire.output, truncate<i32>(key >> 31))?;        // secret key
+    end(mut wire.output, b2);
+    let b3 = begin(mut wire.output, 'Z')?;
+    wire.output.push('I')?;
+    end(mut wire.output, b3);
+    wire.flush()?;
+    return Ok(pooled);
+}

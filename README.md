@@ -42,7 +42,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Connection, command, transaction | `SqliteConnection`, `SqliteCommand`, `SqliteTransaction`, `EngineGlue` | `api.cee`, `params.cee` | done: `Connection` with `execute`, `query`, `scalar`, `executeScript`, `begin`/`commit`/`rollback` and `transaction(work)`; `Params` bound by SQLite's rules; results materialised (see below) |
 | Connection pool | `SqliteConnectionPool`, `SharedStore` | `pool.cee` | done: shareable across threads (`Arc<ConnectionPool>`), transactions serialised, connections rolled back on return; no `:memory:` |
 | Scripts | `SqliteScript` | `script.cee` | done: `splitScript`/`splitStatements` end statements where sqlite3_complete does |
-| PostgreSQL wire front end, daemon, CLI | `CosmoNova.Engine.Sqlite.PgWire`, `CosmoSqliteD`, `.Cli` | | not started |
+| PostgreSQL wire front end, daemon, CLI | `CosmoNova.Engine.Sqlite.PgWire`, `CosmoSqliteD`, `.Cli` | `pgwire/`, `daemon/`, `cli/` (packages of their own) | done: a sqlite3-like shell (list, csv, line and column modes, `.headers`, `.tables`, `.schema`, `.read`, `.bail`, sqlite3's error messages and exit status), and a PostgreSQL protocol 3.0 server (simple and extended query, binary formats, portal suspension, cleartext password or trust) with a pool per database; see "Front ends" |
 
 ## Differences from the C# engine
 
@@ -273,44 +273,43 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   - `degrees(x)` was `x * 180 / pi`, rounded twice; SQLite's is `x * (180 / pi)`;
   - `asinh`, `acosh` and `atanh` were the textbook formulas, which lose every digit for large negative or small
     arguments (`asinh(-1e10)` was `ln(0)`, NULL); here they are msun's.
-
-## Known differences from SQLite in the math functions
-
-The `sqlite3` shell calls the platform's libm (macOS's here), and prints reals with 17 significant digits, so a
-difference in the last bit shows. CeeSafe has no math library and the package may not call C, so `libm.cee`
-computes them: `exp`, `ln`, `log`, `log10`, `log2`, `pow`, `sinh`, `cosh`, `tanh`, `asin`, `acos` and `atan2` in
-double-double arithmetic rounded once (correctly rounded but for arguments within ~2^-100 of a tie), the
-inverse hyperbolic functions by msun's formulas over those, and `sin`, `cos`, `tan` and `atan` as FreeBSD's msun
-(fdlibm) computes them, with its exact reduction of large arguments (`sin(1e22)` matches). macOS's libm is
-neither msun nor correctly rounded for the trigonometric functions, so on 3000 random arguments a call differs in
-the last bit (never more than 2 units) this often:
-
-| Function | Differs | Function | Differs |
-|---|---|---|---|
-| `exp`, `pow`, `ln`, `log10`, `log2` | 0–0.2% | `sin`, `cos` | 4–5% |
-| `sinh`, `cosh`, `tanh` | 0.2–0.3% | `asin` | 5% |
-| `atan2` | 1–2% | `acos` | 15% |
-| `acosh`, `asinh` of large arguments | 0–0.2% | `atan` | 5% |
-| `asinh` in (-1, 1) | 7% | `tan` | 40% |
-| `atanh` | 10% | `sqrt`, `degrees`, `radians`, `mod` | 0 |
-
-Where macOS is not correctly rounded, correct rounding would not match it either (its `tan` differs from the
-correctly rounded value on 42% of arguments, `asin(0.5)` and `atan(0.5)` are a unit off); matching it bit for bit
-would take Apple's algorithms, which are not published. The tests use arguments on which the two agree.
-
-## Known differences from SQLite in the JSON functions
-
-- **A scalar subquery drops the JSON subtype.** `json_array((SELECT json('[1]')))` is `[[1]]` in SQLite and
-  `["[1]"]` here. This engine's values carry no subtype; JSON-function arguments are evaluated by
-  `evaluateWithSubtype` (`json.cee`), which sees through CASE, coalesce, ifnull, iif, nullif, likely, unlikely,
-  the scalar min and max, unary `+`, CAST, COLLATE, `->` and the JSON aggregates, but not into a subquery.
-- **Unpaired surrogates.** SQLite decodes `"\ud800"` to the bytes ED A0 80, which are not UTF-8. Text values here
-  are valid UTF-8, so each such byte becomes U+FFFD.
-- **Window functions.** json_group_array() and json_group_object() run as window functions, but their arguments
-  lose the JSON subtype on the way through the window, so a JSON argument is quoted as text.
-- **Nesting depth.** The limit is 3.53.4's 1000 levels; the `sqlite3` shell the tests run (3.54.0 on macOS) was
-  built with 800, so the tests stay on depths where the two agree.
-
+- **The shell** (`cli/tests/shell_tests.cee`, each compared with the `sqlite3` shell):
+  - statements end where sqlite3_complete ends them; the C# ended one at the first `;` outside quotes, so it ran a
+    trigger's body a statement at a time (`statementsAsSqlite3CompleteSplitsThem`);
+  - each SQL argument runs on its own, and the first that fails ends the run; the C# joined the arguments with
+    spaces into one text, so `"SELECT 1" "SELECT 2"` was a syntax error (`argumentsRunInOrder`,
+    `anArgumentThatFailsEndsTheRun`);
+  - errors are sqlite3's ("Parse error near line 2: …", "Error in 2nd command line argument: …"), a statement that
+    cannot be prepared ends the text it is in, and any error makes the exit status 1; the C# printed "Error: …"
+    and always exited 0 (`errorsInInput`, `bailReadAndExit`);
+  - a blob prints its bytes, and control characters print as `^X`, as in sqlite3; the C# printed blobs in hex
+    (`listModeAndHeaders`);
+  - `.schema` lists `sqlite_sequence` and adds a view's columns as sqlite3 does; `.tables` sets the names in
+    columns; a dot-command is recognised only at a line's first character (the C# trimmed the line first); column
+    mode right-aligns numbers and centres headings; csv and line modes exist (`tablesAndSchema`, `columnMode`,
+    `csvMode`, `lineMode`, `dotCommandErrors`).
+- **The PostgreSQL wire front end** (`pgwire/tests/wire_tests.cee`):
+  - a result column's type comes from all of its values; the C# took the first row's, and announced bigint for a
+    column whose later rows were text (`columnTypesComeFromEveryRow`);
+  - rows of a statement executed without Describe are sent, as PostgreSQL sends them; the C# dropped them, so
+    `INSERT … RETURNING` through the extended protocol returned nothing (`extendedQueryProtocol`);
+  - Execute's row limit suspends the portal (PortalSuspended) and the next Execute resumes it; the C# ignored the
+    limit (`executeWithARowLimitSuspendsThePortal`);
+  - `$n` parameters are bound by name, so `$2 … $1` binds each to its own value (SQLite numbers `$2` first); a
+    bytea parameter is a blob (the C# made it the text of its hex digits); a wrong parameter count is PostgreSQL's
+    08P01 error (`extendedQueryProtocol`, `extendedErrorsSkipToSync`);
+  - each constraint has its SQLSTATE (23505, 23502, 23514, 23503); the C# called every constraint failure 23505
+    (`transactionsShowInReadyForQuery`);
+  - Parse of a statement name in use, or Bind of a portal name in use, is an error (42P05, 42P03), as in
+    PostgreSQL; the C# replaced it (`extendedErrorsSkipToSync`);
+  - a malformed message (a length past its end, a length word under 4, an unknown type) ends the session with
+    FATAL 08P01; the C# indexed past the payload (`malformedMessagesEndTheSession`);
+  - a startup packet asking for protocol 3.x (x > 0) or `_pq_.` options gets NegotiateProtocolVersion; the C#
+    refused it (`newerProtocolVersionsAreNegotiated`);
+  - CommandComplete tags are PostgreSQL's (`CREATE TABLE`, `DROP VIEW`, `INSERT 0 n` after `WITH … INSERT`); the
+    C# gave the first word (`simpleQueries`);
+  - databases are served from a pool per file (`ConnectionPool`), so clients of one database see each other's
+    commits and never each other's open transactions (`clientsShareTheDatabaseFile`).
 - **Window functions** follow SQLite's rules where the C# made its own (`windowFunctionsMatchSqlite`,
   `windowFunctionsInContext`): rows come out in the first window's order when there is no ORDER BY; a negative
   lag()/lead() offset looks the other way; RANGE offsets need one numeric ORDER BY term and compare in its
@@ -318,27 +317,22 @@ would take Apple's algorithms, which are not published. The tests use arguments 
   messages; DISTINCT and FILTER on non-aggregates are refused as in SQLite; window arguments in an aggregate query
   may hold aggregates (`sum(sum(v)) OVER (…)`). Frames that do not start at the partition's start are summed
   afresh for each row (no inverse step yet), so a sliding frame costs its width per row.
-
 - **RIGHT and FULL joins** run in the nested loops: each right source's rows that matched nothing come out after
   the loops, with the earlier sources NULL; a column USING or NATURAL shares is `coalesce(left, right)` in
   unqualified names, `*` and the left table's `t.*`, as in SQLite (`rightAndFullJoinsMatchSqlite`). The C# refused
   them.
-
 - **Result column names** are SQLite's (`resultColumnNamesMatchSqlite`): an expression's text as written, comments
   and spacing kept; a column's name as its table declares it, whatever case the query uses; the INTEGER PRIMARY
   KEY's name for `rowid`; `columnN` for VALUES. The C# wrote the expression again from its tree (`abc + 1` for
   `abc  +  1`) and used the name as the query spelled it.
-
 - **Index seeks** use an index only where it finds every row the comparison can be true for: the index column's
   collation must be the comparison's, and the comparison's affinity must leave the stored values unchanged; the key
   is converted as the comparison converts it (`indexSeeksGiveTheSameRows`, `writesThroughIndexSeeks`). WHERE
   still runs on every row the index gives.
-
 - **CREATE TABLE … AS SELECT** writes its statement as SQLite's createTableStmt does: columns typed `INT`,
   `TEXT`, `NUM`, `REAL` or nothing by their affinities, repeated names made unique with `:N`, names quoted where
   SQLite quotes them, and a column a line once the statement is long (`createTableAsSelectLikeSqlite`). The C#
   refused it.
-
 - **DROP COLUMN** follows SQLite: the definition leaves the statement with its own constraints, a PRIMARY KEY or
   UNIQUE column or the last column is refused, a CHECK, generated column or index still naming it is "error in
   table/index X after drop column", and every row loses the value (`dropColumnLikeSqlite`).
@@ -379,21 +373,74 @@ would take Apple's algorithms, which are not published. The tests use arguments 
   rather than a deadlock.
 - **`:memory:` is refused**, with `file:` URIs and the empty name, rather than made into a file of that name: this
   engine keeps databases in files only.
-
 - **Index cells take at least 4 bytes**, as SQLite counts them: a WITHOUT ROWID table of small keys made 3-byte
   cells, which sqlite3 calls out of range (`tinyIndexCellsTakeFourBytes`).
-
 - **INSTEAD OF triggers** make views writable as in SQLite (`insteadOfTriggersOnViews`): the rows are the view's
   rows WHERE selects (joined with FROM for UPDATE … FROM), UPDATE OF counts, RETURNING gives NEW (OLD for DELETE),
   changes() stays 0, and DROP VIEW drops the view's triggers. A trigger body's changes count in
   total_changes(), as in SQLite; this engine had left them out.
-
 - **Target aliases, RETURNING names, ordered aggregates** (`targetAliasesAndReturningNames`,
   `returningColumnNamesMatchSqlite`, `orderedAggregatesMatchSqlite`): `UPDATE t AS x`, `DELETE FROM t AS x` and
   `INSERT INTO t AS x … DO UPDATE` name the row by the alias in SET, WHERE and DO UPDATE (RETURNING keeps the
   table's name, as in SQLite); RETURNING's columns are named from the statement's text; `group_concat(x ORDER BY
   y)` and the JSON aggregates take their rows in order, the other aggregates accept and ignore ORDER BY, and a
   non-aggregate is "ORDER BY may not be used with non-aggregate f()". The C# refused all three.
+- **ON CONFLICT on constraints** applies as in SQLite (`constraintConflictClausesApply`): a statement's OR action
+  overrides it; IGNORE and REPLACE on NOT NULL, PRIMARY KEY and UNIQUE work, REPLACE constraints are resolved after
+  the others, and two constraints that share an index with different actions are "conflicting ON CONFLICT clauses
+  specified". The C# read the clauses and ignored them.
+- **SAVEPOINT, RELEASE and ROLLBACK TO** nest as in SQLite (`savepointsNestAsInSqlite`): a SAVEPOINT outside a
+  transaction begins one, which releasing it commits; ROLLBACK TO keeps the savepoint and closes those inside it;
+  names repeat, the innermost answering. The pager keeps a stack of undo levels, the running statement's on top.
+  The C# refused savepoints.
+- **ANALYZE and REINDEX** (`analyzeAndReindexLikeSqlite`): ANALYZE writes sqlite_stat1 as SQLite does, row for
+  row (index columns under their collations, partial indexes over their rows, a WITHOUT ROWID key under the
+  table's name, nothing for an empty table); REINDEX rebuilds every index. The planner does not use the
+  statistics yet. The C# refused both.
+- **VACUUM** (`vacuumPacksTheFile`) builds every b-tree again into packed pages within one transaction, records
+  as they are stored, header settings kept, freelist empty; the file comes out the size sqlite3's VACUUM gives.
+  Refused: VACUUM inside a transaction (as in SQLite), VACUUM INTO, UTF-16 databases and pages with reserved
+  bytes. The C# refused VACUUM.
+- **OR FAIL and OR ROLLBACK** (`failAndRollbackActions`), from a statement, a constraint's ON CONFLICT or a
+  trigger's RAISE: FAIL keeps the rows the statement changed before the failing one (indexes it left to rebuild
+  are rebuilt then), ROLLBACK ends the whole transaction. changes() does not count the rows FAIL kept.
+
+## Known differences from SQLite in the math functions
+
+The `sqlite3` shell calls the platform's libm (macOS's here), and prints reals with 17 significant digits, so a
+difference in the last bit shows. CeeSafe has no math library and the package may not call C, so `libm.cee`
+computes them: `exp`, `ln`, `log`, `log10`, `log2`, `pow`, `sinh`, `cosh`, `tanh`, `asin`, `acos` and `atan2` in
+double-double arithmetic rounded once (correctly rounded but for arguments within ~2^-100 of a tie), the
+inverse hyperbolic functions by msun's formulas over those, and `sin`, `cos`, `tan` and `atan` as FreeBSD's msun
+(fdlibm) computes them, with its exact reduction of large arguments (`sin(1e22)` matches). macOS's libm is
+neither msun nor correctly rounded for the trigonometric functions, so on 3000 random arguments a call differs in
+the last bit (never more than 2 units) this often:
+
+| Function | Differs | Function | Differs |
+|---|---|---|---|
+| `exp`, `pow`, `ln`, `log10`, `log2` | 0–0.2% | `sin`, `cos` | 4–5% |
+| `sinh`, `cosh`, `tanh` | 0.2–0.3% | `asin` | 5% |
+| `atan2` | 1–2% | `acos` | 15% |
+| `acosh`, `asinh` of large arguments | 0–0.2% | `atan` | 5% |
+| `asinh` in (-1, 1) | 7% | `tan` | 40% |
+| `atanh` | 10% | `sqrt`, `degrees`, `radians`, `mod` | 0 |
+
+Where macOS is not correctly rounded, correct rounding would not match it either (its `tan` differs from the
+correctly rounded value on 42% of arguments, `asin(0.5)` and `atan(0.5)` are a unit off); matching it bit for bit
+would take Apple's algorithms, which are not published. The tests use arguments on which the two agree.
+
+## Known differences from SQLite in the JSON functions
+
+- **A scalar subquery drops the JSON subtype.** `json_array((SELECT json('[1]')))` is `[[1]]` in SQLite and
+  `["[1]"]` here. This engine's values carry no subtype; JSON-function arguments are evaluated by
+  `evaluateWithSubtype` (`json.cee`), which sees through CASE, coalesce, ifnull, iif, nullif, likely, unlikely,
+  the scalar min and max, unary `+`, CAST, COLLATE, `->` and the JSON aggregates, but not into a subquery.
+- **Unpaired surrogates.** SQLite decodes `"\ud800"` to the bytes ED A0 80, which are not UTF-8. Text values here
+  are valid UTF-8, so each such byte becomes U+FFFD.
+- **Window functions.** json_group_array() and json_group_object() run as window functions, but their arguments
+  lose the JSON subtype on the way through the window, so a JSON argument is quoted as text.
+- **Nesting depth.** The limit is 3.53.4's 1000 levels; the `sqlite3` shell the tests run (3.54.0 on macOS) was
+  built with 800, so the tests stay on depths where the two agree.
 
 ## The API
 
@@ -445,29 +492,70 @@ Choices where the C# concept does not fit CeeSafe:
 - **Configuration.** There is no connection string; a path is given. `:memory:`, the empty name and `file:` URIs
   are refused.
 
-- **ON CONFLICT on constraints** applies as in SQLite (`constraintConflictClausesApply`): a statement's OR action
-  overrides it; IGNORE and REPLACE on NOT NULL, PRIMARY KEY and UNIQUE work, REPLACE constraints are resolved after
-  the others, and two constraints that share an index with different actions are "conflicting ON CONFLICT clauses
-  specified". The C# read the clauses and ignored them.
+## Front ends
 
-- **SAVEPOINT, RELEASE and ROLLBACK TO** nest as in SQLite (`savepointsNestAsInSqlite`): a SAVEPOINT outside a
-  transaction begins one, which releasing it commits; ROLLBACK TO keeps the savepoint and closes those inside it;
-  names repeat, the innermost answering. The pager keeps a stack of undo levels, the running statement's on top.
-  The C# refused savepoints.
+Three packages beside the library, each depending on it by path, each built and tested in its own directory
+(`ceesafec build`, `ceesafec test`). The library gained one public method for them, `SqliteValue.toText()` (the
+text SQLite gives a value, `src/frontend.cee`).
 
-- **ANALYZE and REINDEX** (`analyzeAndReindexLikeSqlite`): ANALYZE writes sqlite_stat1 as SQLite does, row for
-  row (index columns under their collations, partial indexes over their rows, a WITHOUT ROWID key under the
-  table's name, nothing for an empty table); REINDEX rebuilds every index. The planner does not use the
-  statistics yet. The C# refused both.
+### The shell (`cli/`)
 
-- **VACUUM** (`vacuumPacksTheFile`) builds every b-tree again into packed pages within one transaction, records
-  as they are stored, header settings kept, freelist empty; the file comes out the size sqlite3's VACUUM gives.
-  Refused: VACUUM inside a transaction (as in SQLite), VACUUM INTO, UTF-16 databases and pages with reserved
-  bytes. The C# refused VACUUM.
+```
+cd cli && ceesafec build
+out/sqlite_shell app.db "SELECT * FROM t"            # each argument a text of SQL or a dot-command
+out/sqlite_shell -csv -header app.db < script.sql    # or statements and dot-commands from standard input
+```
 
-- **OR FAIL and OR ROLLBACK** (`failAndRollbackActions`), from a statement, a constraint's ON CONFLICT or a
-  trigger's RAISE: FAIL keeps the rows the statement changed before the failing one (indexes it left to rebuild
-  are rebuilt then), ROLLBACK ends the whole transaction. changes() does not count the rows FAIL kept.
+It behaves as the `sqlite3` shell (3.54) for what it has: options `-header`, `-noheader`, `-list`, `-csv`,
+`-line`, `-column`, `-bail`; dot-commands `.headers`, `.mode list|csv|line|column`, `.tables`, `.schema`, `.read`,
+`.bail`, `.quit`, `.exit N`, `.help`; output byte for byte as sqlite3 prints it, errors as sqlite3 words them, and
+exit status 1 after an error. The tests run the same arguments and input through both shells on copies of one
+database and compare everything printed, then check the file with `PRAGMA integrity_check`. Differences:
+
+- no caret line under a statement's error ("^--- error here"): the engine does not report where in the text an
+  error is; and the engine does not say whether a statement failed when it was prepared or when it ran, so "Parse
+  error" or "Error" is chosen by the kind of error (`isPrepareError`);
+- without a file, sqlite3 opens an in-memory database; the engine has none, so the shell uses a temporary file,
+  removed at the end;
+- no prompt or line editing (standard input is read as a script), and none of sqlite3's other dot-commands and
+  options (`.import`, `.dump`, `.separator`, box and table modes, …);
+- `.tables` with more names than fit on one line sets them in columns of sqlite3's widths but does not fold the
+  line at 60 characters as sqlite3 3.54 does.
+
+### The PostgreSQL wire server (`pgwire/`) and the daemon (`daemon/`)
+
+```
+cd daemon && ceesafec build
+SQLITED_PASSWORD=a-long-secret out/sqlited --bind 127.0.0.1:5432 --data ./data
+psql "host=127.0.0.1 port=5432 user=me dbname=shop"   # ./data/shop/main.db, made on first use
+out/sqlited --trust                                   # no password: every client is let in
+```
+
+`pgwire` is the library (`PgServer`, `serve(server, listener)`): protocol 3.0, with SSLRequest and GSSENCRequest
+answered 'N', NegotiateProtocolVersion for later minor versions, cleartext password authentication (or trust),
+the simple query protocol, the extended one (Parse, Bind, Describe, Execute with row limits, Close, Sync, Flush),
+text and binary formats, ErrorResponse with SQLSTATEs, and ReadyForQuery's transaction status. Each client has a
+thread and a connection from its database's `ConnectionPool` for its whole session. `daemon` is the C#'s
+CosmoSqliteD: a bind address, a data directory with one directory a database (the C#'s layout), a password from
+`SQLITED_PASSWORD` (it refuses to start without one unless `--trust`), and a clean stop on Ctrl+C or SIGTERM.
+The tests drive the server over TCP with a raw client, and with `psql` when it is installed. Differences from
+PostgreSQL:
+
+- the SQL is SQLite's. Outside BEGIN each statement is its own transaction (PostgreSQL runs a multi-statement
+  simple query, and an extended-protocol batch up to Sync, as one), and an error inside BEGIN undoes its
+  statement only, so the status stays 'T' and is never 'E';
+- PostgreSQL's `START TRANSACTION`, `BEGIN ISOLATION LEVEL …`, `COMMIT AND CHAIN`, `ABORT` become SQLite's
+  BEGIN, COMMIT and ROLLBACK, and `SET`, `RESET` and `DISCARD` succeed and do nothing; there is no `pg_catalog`,
+  so `psql`'s `\d` and drivers' metadata queries fail;
+- result types are bigint, double precision, bytea or text, decided from a column's values (SQLite's columns have
+  no fixed type); a column of a prepared statement described before it runs is text; a parameter of no stated
+  type is text, and SQLite's affinity converts it;
+- a portal runs when it is first described or executed, and keeps its rows for later Executes: a portal described
+  and never executed has still run. Describe of a prepared `INSERT … RETURNING` or PRAGMA finds its columns by
+  running it in a transaction that is rolled back, and gives NoData inside the client's own transaction (the
+  engine has no SAVEPOINT yet);
+- no cancel requests (statements run to the end), no COPY, no function calls, no notices, no SSL (put a TLS
+  proxy in front), and cleartext passwords only (no MD5 or SCRAM).
 
 ## Known differences from SQLite in PRAGMA integrity_check
 
@@ -523,4 +611,5 @@ Collations other than BINARY, NOCASE and RTRIM are refused.
 ## Tests
 
 `ceesafec test` needs the `sqlite3` shell on the path: fixtures are made with it, and answers are compared with
-what it prints.
+what it prints. The front ends have their own: `ceesafec test` in `cli/`, `pgwire/` and `daemon/` (`pgwire`'s
+`psqlTalksToTheServer` runs `psql` when it is installed and is skipped otherwise).
