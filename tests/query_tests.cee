@@ -264,3 +264,33 @@ fn windowFunctionsInContext() -> Result<void, TestFailure> {
         SELECT 1, row_number() OVER () UNION ALL SELECT 2, rank() OVER (ORDER BY 1)
         """);
 }
+
+@test
+fn rightAndFullJoinsMatchSqlite() -> Result<void, TestFailure> {
+    let path = "out/query-right-joins.db";
+    makeDatabase(path, """
+        CREATE TABLE a(id INTEGER PRIMARY KEY, k INT, av TEXT);
+        CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, bv TEXT);
+        CREATE TABLE c(k INT, cv TEXT);
+        INSERT INTO a VALUES (1, 1, 'a1'), (2, 2, 'a2'), (3, 2, 'a3'), (4, NULL, 'a4');
+        INSERT INTO b VALUES (1, 2, 'b2'), (2, 3, 'b3'), (3, NULL, 'bn'), (4, 5, 'b5');
+        INSERT INTO c VALUES (3, 'c3'), (5, 'c5'), (9, 'c9');
+        """)?;
+    return sameAnswers(path, """
+        SELECT av, bv FROM a RIGHT JOIN b ON a.k = b.k ORDER BY bv, av
+        SELECT av, bv FROM a FULL JOIN b ON a.k = b.k ORDER BY av, bv
+        SELECT av, bv FROM a FULL OUTER JOIN b USING (k) ORDER BY av, bv
+        SELECT k, av, bv FROM a NATURAL FULL JOIN b ORDER BY 2, 3
+        SELECT av, bv, cv FROM a RIGHT JOIN b ON a.k = b.k RIGHT JOIN c ON c.k = b.k ORDER BY cv, av
+        SELECT av, bv, cv FROM a FULL JOIN b ON a.k = b.k LEFT JOIN c ON c.k = b.k ORDER BY av, bv
+        SELECT av, bv, cv FROM a LEFT JOIN b ON a.k = b.k FULL JOIN c ON c.k = coalesce(b.k, a.k) ORDER BY av, bv, cv
+        SELECT av, bv FROM a RIGHT JOIN b ON a.k = b.k WHERE av IS NULL ORDER BY bv
+        SELECT count(*), count(av), count(bv) FROM a FULL JOIN b ON a.k = b.k
+        SELECT b.id, av FROM a RIGHT JOIN b ON a.k = b.k AND b.id = 1 ORDER BY b.id, av
+        SELECT av, x FROM a RIGHT JOIN (SELECT 2 AS x UNION ALL SELECT 7) ON a.k = x ORDER BY x, av
+        SELECT av, bv FROM a RIGHT JOIN b ON a.k = b.k ORDER BY bv LIMIT 2
+        SELECT * FROM a RIGHT JOIN b ON a.k = b.k WHERE b.id = 2
+        SELECT * FROM a FULL JOIN b USING (k) ORDER BY av, bv
+        SELECT a.*, b.k FROM a NATURAL RIGHT JOIN b ORDER BY bv
+        """);
+}

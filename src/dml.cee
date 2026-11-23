@@ -142,7 +142,7 @@ fn tableScope(table: borrow TableSchema, slot: usize) -> Result<Scope, AllocErro
             slot: slot,
             hasRowid: !table.withoutRowid,
             rowidAlias: table.rowidAlias,
-            merged: Vector<String>.create(),
+            merged: Vector<String>.create(), coalesceMerged: false,
         },
     )?;
     return Ok(scope);
@@ -1676,7 +1676,7 @@ fn compileUpserts(
                 slot: excludedSlot,
                 hasRowid: true,
                 rowidAlias: table.rowidAlias,
-                merged: hidden,
+                merged: hidden, coalesceMerged: false,
             },
         )?;
         compiler.scopes.push(scope)?;

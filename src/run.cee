@@ -11,6 +11,8 @@ struct CoreSink {
     stopAfter: usize?;
     /// A core with window functions: its rows, kept until the windows are computed.
     windowRows: Vector<WindowRow>;
+    /// For each RIGHT JOIN source: which of its rows (by their place in its scan) matched.
+    rightMatched: Vector<Vector<bool>>;
 }
 
 struct GroupState {
@@ -262,6 +264,7 @@ fn joinLevel(
                 };
                 cursor = RowCursor.Rows(TableCursor.range(table.root, rowId, rowId));
             }
+            var ordinal: usize = 0;
             loop {
                 if (sink.stopAfter is Some(n) && sink.rows.length >= n) {
                     return Ok();
@@ -269,6 +272,7 @@ fn joinLevel(
                 let Some(row) = cursor.next(mut db.pager)? else {
                     break;
                 };
+                ordinal += 1;
                 loadTableRow(table, row.rowId, row.columns, mut frame.slots[source.slot])?;
                 if (table.generated.length != 0) {
                     computeGenerated(table, source.slot, frame, db)?;
@@ -280,6 +284,7 @@ fn joinLevel(
                     }
                 }
                 matched = true;
+                markRightMatch(source, level, ordinal - 1, sink)?;
                 joinLevel(core, level + 1, frame, db, sink)?;
             }
         }
@@ -300,11 +305,89 @@ fn joinLevel(
                     }
                 }
                 matched = true;
+                markRightMatch(source, level, r, sink)?;
                 joinLevel(core, level + 1, frame, db, sink)?;
             }
         }
     }
     return finishLeft(core, level, matched, frame, db, sink);
+}
+
+fn hasRightJoin(core: borrow CorePlan) -> bool {
+    for (s in 0..core.sources.length) {
+        if (core.sources[s].right) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Notes that row `ordinal` of a RIGHT JOIN source matched.
+fn markRightMatch(
+    source: borrow SourcePlan,
+    level: usize,
+    ordinal: usize,
+    sink: borrow mut CoreSink,
+) -> Result<void, AllocError> {
+    if (!source.right) {
+        return Ok();
+    }
+    let marks = borrow mut sink.rightMatched[level];
+    while (marks.length <= ordinal) {
+        marks.push(false)?;
+    }
+    marks[ordinal] = true;
+    return Ok();
+}
+
+/// RIGHT and FULL JOIN: each row of a right source that matched nothing, with every earlier source NULL, joined on
+/// to the later sources. The sources go in order, so an earlier one's rows reach a later one's matches.
+fn unmatchedRightRows(
+    core: borrow CorePlan,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+    sink: borrow mut CoreSink,
+) -> Result<void, SqliteError> {
+    for (level in 0..core.sources.length) {
+        let source = borrow core.sources[level];
+        if (!source.right) {
+            continue;
+        }
+        for (s in 0..level) {
+            frame.slots[core.sources[s].slot] = Slot { values: Vector<SqliteValue>.create(), rowId: 0, isNull: true };
+        }
+        let marks = replace(mut sink.rightMatched[level], Vector<bool>.create());
+        let wasMatched = (ordinal: usize) => ordinal < marks.length && marks[ordinal];
+        match (borrow source.kind) {
+            SourceKind.Table(table) => {
+                var cursor = RowCursor.scan(table);
+                var ordinal: usize = 0;
+                while (cursor.next(mut db.pager)? is Some(row)) {
+                    ordinal += 1;
+                    if (wasMatched(ordinal - 1)) {
+                        continue;
+                    }
+                    loadTableRow(table, row.rowId, row.columns, mut frame.slots[source.slot])?;
+                    if (table.generated.length != 0) {
+                        computeGenerated(table, source.slot, frame, db)?;
+                    }
+                    joinLevel(core, level + 1, frame, db, sink)?;
+                }
+            }
+            _ => {
+                var rows = sourceRows(borrow source.kind, frame, db)?;
+                for (r in 0..rows.length) {
+                    if (wasMatched(r)) {
+                        continue;
+                    }
+                    let values = takeRow(mut rows, r);
+                    frame.slots[source.slot] = Slot { values: values, rowId: truncate<i64>(r + 1), isNull: false };
+                    joinLevel(core, level + 1, frame, db, sink)?;
+                }
+            }
+        }
+    }
+    return Ok();
 }
 
 /// A LEFT JOIN source that matched nothing: one row of NULLs.
@@ -429,11 +512,19 @@ fn runCore(
         distinctSeen: if (core.distinct) HashMap<Vector<u8>, bool>.create() else null,
         groups: Vector<GroupState>.create(),
         groupIndex: HashMap<Vector<u8>, usize>.create(),
-        stopAfter: if (core.isAggregate || core.distinct || core.sortKeys.length != 0 || core.windows.length != 0) null
+        stopAfter: if (core.isAggregate || core.distinct ||
+            core.sortKeys.length != 0 || core.windows.length != 0 || hasRightJoin(
+            core,
+        )) null
             else stopAfter,
         windowRows: Vector<WindowRow>.create(),
+        rightMatched: Vector<Vector<bool>>.create(),
     };
+    for (s in 0..core.sources.length) {
+        sink.rightMatched.push(Vector<bool>.create())?;
+    }
     joinLevel(core, 0, frame, db, mut sink)?;
+    unmatchedRightRows(core, frame, db, mut sink)?;
     if (!core.isAggregate) {
         if (core.windows.length != 0) {
             finishWindows(core, frame, db, mut sink)?;

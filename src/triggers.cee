@@ -67,7 +67,7 @@ fn copyScope(scope: borrow Scope) -> Result<Scope, AllocError> {
                 slot: s.slot,
                 hasRowid: s.hasRowid,
                 rowidAlias: s.rowidAlias,
-                merged: cloneStrings(borrow s.merged)?,
+                merged: cloneStrings(borrow s.merged)?, coalesceMerged: false,
             },
         )?;
     }
@@ -86,7 +86,7 @@ fn newCompiler(db: borrow Session) -> Result<Compiler, AllocError> {
                 slot: 0,
                 hasRowid: true,
                 rowidAlias: context.rowidAlias,
-                merged: Vector<String>.create(),
+                merged: Vector<String>.create(), coalesceMerged: false,
             },
         )?;
         scope.sources.push(
@@ -96,7 +96,7 @@ fn newCompiler(db: borrow Session) -> Result<Compiler, AllocError> {
                 slot: 1,
                 hasRowid: true,
                 rowidAlias: context.rowidAlias,
-                merged: Vector<String>.create(),
+                merged: Vector<String>.create(), coalesceMerged: false,
             },
         )?;
         compiler.triggerScope = copyScope(borrow scope)?;

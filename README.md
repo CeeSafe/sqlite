@@ -27,7 +27,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Date and time functions | `Exec/Functions` (date/time part) | `datetime.cee` | done: a port of SQLite's date.c; 'localtime' and 'utc' are an error where they need the time zone, which CeeSafe lacks |
 | printf() and format() | `Exec/Functions` (`Printf`) | `printf.cee` | done: a port of SQLite's `sqlite3_str_vappendf`, every conversion and flag of the SQL path |
 | JSON functions | `Exec/Json`, `Functions` (JSON1) | `json.cee` | done: SQLite 3.53.4's text JSON functions, `->`, `->>`, `json_group_array` and `json_group_object`, JSON5 input, JSONB blobs as input; the `jsonb_*` functions and the table-valued `json_each` and `json_tree` are not ported and are "no such function" |
-| SELECT: joins, subqueries, views, CTEs, grouping, compounds | `Exec/QueryExecutor` | `select.cee`, `run.cee` | done but RIGHT/FULL joins, table functions, index seeks (rowid seeks done) |
+| SELECT: joins, subqueries, views, CTEs, grouping, compounds | `Exec/QueryExecutor` | `select.cee`, `run.cee` | done but table functions and index seeks (rowid seeks done); RIGHT and FULL joins done |
 | Window functions | `Exec/WindowEvaluator` | `window.cee` | done: every built-in window function, aggregates over frames, ROWS/RANGE/GROUPS, EXCLUDE, named windows |
 | INSERT, UPDATE, DELETE | `Exec/QueryExecutor` (DML), `InMemoryDatabase` | `dml.cee` | done: constraints, conflict actions, RETURNING, AUTOINCREMENT, upserts, triggers, foreign keys, UPDATE … FROM; WITHOUT ROWID tables read and written |
 | CREATE and DROP of tables, indexes and views | `Exec/QueryExecutor` (DDL) | `ddl.cee` | done |
@@ -256,6 +256,11 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   messages; DISTINCT and FILTER on non-aggregates are refused as in SQLite; window arguments in an aggregate query
   may hold aggregates (`sum(sum(v)) OVER (…)`). Frames that do not start at the partition's start are summed
   afresh for each row (no inverse step yet), so a sliding frame costs its width per row.
+
+- **RIGHT and FULL joins** run in the nested loops: each right source's rows that matched nothing come out after
+  the loops, with the earlier sources NULL; a column USING or NATURAL shares is `coalesce(left, right)` in
+  unqualified names, `*` and the left table's `t.*`, as in SQLite (`rightAndFullJoinsMatchSqlite`). The C# refused
+  them.
 
 ## Known gaps (inherited from the C# engine, refused by name rather than misparsed)
 

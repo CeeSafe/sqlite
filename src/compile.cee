@@ -195,6 +195,43 @@ impl Compiler {
     }
 
     /// Finds a column in the scopes, innermost first.
+    /// RIGHT and FULL joins: a column USING or NATURAL shares is whichever side is not NULL.
+    fn withMergedSides(
+        scope: borrow Scope,
+        sourceAt: usize,
+        name: StringView,
+        compiled: Compiled,
+    ) -> Result<Compiled, AllocError> {
+        var result = compiled;
+        for (s in sourceAt + 1..scope.sources.length) {
+            let source = borrow scope.sources[s];
+            if (!source.coalesceMerged || !Compiler.isMerged(source, name)) {
+                continue;
+            }
+            let Some(at) = Compiler.findColumn(source, name) else {
+                continue;
+            };
+            var args = Vector<XExpr>.create();
+            args.push(result.expr)?;
+            args.push(Compiler.columnOf(source, at).expr)?;
+            result = Compiled {
+                expr: XExpr.Call(
+                    Box.create(
+                        XCall {
+                            function: ScalarFunction.Coalesce,
+                            args: args,
+                            collation: result.collation ?? Collation.Binary,
+                        },
+                    )?,
+                ),
+                affinity: result.affinity,
+                collation: result.collation,
+                explicit: result.explicit,
+            };
+        }
+        return Ok(result);
+    }
+
     private fn resolveInScopes(borrow mut this, column: borrow ColumnRef) -> Result<Resolved?, SqliteError> {
         let name = column.name.view();
         var depth = this.scopes.length;
@@ -202,6 +239,7 @@ impl Compiler {
             depth -= 1;
             let scope = borrow this.scopes[depth];
             var found: Compiled? = null;
+            var foundSource: usize = 0;
             var matches: usize = 0;
             for (s in 0..scope.sources.length) {
                 let source = borrow scope.sources[s];
@@ -216,6 +254,7 @@ impl Compiler {
                     matches += 1;
                     if (found.isNull()) {
                         found = Compiler.columnOf(source, at);
+                        foundSource = s;
                     }
                 }
             }
@@ -229,7 +268,11 @@ impl Compiler {
                 return Err(SqliteError.Sql(text));
             }
             if (found is Some(compiled)) {
-                return Ok(Resolved { scope: depth, compiled: compiled });
+                var result = compiled;
+                if (column.table.isNull()) {
+                    result = Compiler.withMergedSides(scope, foundSource, name, result)?;
+                }
+                return Ok(Resolved { scope: depth, compiled: result });
             }
             // rowid, _rowid_ and oid, when no column has the name.
             if (isRowidName(name)) {

@@ -571,6 +571,9 @@ struct ScopeSource {
     rowidAlias: usize?;
     /// Columns joined by USING or NATURAL to an earlier source: an unqualified name finds the earlier one.
     merged: Vector<String>;
+    /// In a RIGHT or FULL join, an unqualified merged column is the first non-NULL of the earlier source's and
+    /// this one's.
+    coalesceMerged: bool;
 }
 
 struct Scope {

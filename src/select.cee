@@ -54,6 +54,9 @@ struct SourcePlan {
     columnCount: usize;
     /// LEFT JOIN: a row of NULLs when nothing matches.
     left: bool;
+    /// RIGHT JOIN (and FULL): each of this source's rows that matched nothing comes out with the earlier sources
+    /// NULL.
+    right: bool;
     on: XExpr?;
     /// The rowid this source's row must have, from earlier sources: a seek instead of a scan.
     rowidSeek: XExpr?;
@@ -366,7 +369,7 @@ fn tablePlan(
                     slot: slot,
                     hasRowid: !table.withoutRowid,
                     rowidAlias: table.rowidAlias,
-                    merged: Vector<String>.create(),
+                    merged: Vector<String>.create(), coalesceMerged: false,
                 },
             )?;
             let saved = replace(mut compiler.scopes, Vector<Scope>.create());
@@ -674,7 +677,7 @@ fn compileFromItem(
                             slot: slot,
                             hasRowid: false,
                             rowidAlias: null,
-                            merged: Vector<String>.create(),
+                            merged: Vector<String>.create(), coalesceMerged: false,
                         },
                     )?;
                     sources.push(
@@ -683,6 +686,7 @@ fn compileFromItem(
                             slot: slot,
                             columnCount: count,
                             left: false,
+                            right: false,
                             on: null,
                             rowidSeek: null,
                         },
@@ -707,7 +711,7 @@ fn compileFromItem(
                         slot: slot,
                         hasRowid: true,
                         rowidAlias: null,
-                        merged: Vector<String>.create(),
+                        merged: Vector<String>.create(), coalesceMerged: false,
                     },
                 )?;
                 sources.push(
@@ -716,6 +720,7 @@ fn compileFromItem(
                         slot: slot,
                         columnCount: 5,
                         left: false,
+                        right: false,
                         on: null,
                         rowidSeek: null,
                     },
@@ -734,7 +739,7 @@ fn compileFromItem(
                         slot: slot,
                         hasRowid: !tableCopy.withoutRowid,
                         rowidAlias: tableCopy.rowidAlias,
-                        merged: Vector<String>.create(),
+                        merged: Vector<String>.create(), coalesceMerged: false,
                     },
                 )?;
                 sources.push(
@@ -743,6 +748,7 @@ fn compileFromItem(
                         slot: slot,
                         columnCount: count,
                         left: false,
+                        right: false,
                         on: null,
                         rowidSeek: null,
                     },
@@ -769,7 +775,7 @@ fn compileFromItem(
                         slot: slot,
                         hasRowid: false,
                         rowidAlias: null,
-                        merged: Vector<String>.create(),
+                        merged: Vector<String>.create(), coalesceMerged: false,
                     },
                 )?;
                 sources.push(
@@ -778,6 +784,7 @@ fn compileFromItem(
                         slot: slot,
                         columnCount: count,
                         left: false,
+                        right: false,
                         on: null,
                         rowidSeek: null,
                     },
@@ -802,7 +809,7 @@ fn compileFromItem(
                     slot: slot,
                     hasRowid: false,
                     rowidAlias: null,
-                    merged: Vector<String>.create(),
+                    merged: Vector<String>.create(), coalesceMerged: false,
                 },
             )?;
             sources.push(
@@ -811,6 +818,7 @@ fn compileFromItem(
                     slot: slot,
                     columnCount: count,
                     left: false,
+                    right: false,
                     on: null,
                     rowidSeek: null,
                 },
@@ -858,7 +866,7 @@ fn compileFromItem(
                     slot: slot,
                     hasRowid: false,
                     rowidAlias: null,
-                    merged: Vector<String>.create(),
+                    merged: Vector<String>.create(), coalesceMerged: false,
                 },
             )?;
             sources.push(
@@ -867,6 +875,7 @@ fn compileFromItem(
                     slot: slot,
                     columnCount: count,
                     left: false,
+                    right: false,
                     on: null,
                     rowidSeek: null,
                 },
@@ -961,12 +970,10 @@ fn compileCoreInner(
         compileFromItem(compiler, borrow from.source, mut scope, mut sources, db)?;
         for (j in 0..from.joins.length) {
             let join = borrow from.joins[j];
-            if (join.kind == JoinKind.Right || join.kind == JoinKind.Full) {
-                return Err(unsupported("RIGHT and FULL joins are not supported yet"));
-            }
             compileFromItem(compiler, borrow join.item, mut scope, mut sources, db)?;
             let at = sources.length - 1;
-            sources[at].left = join.kind == JoinKind.Left;
+            sources[at].left = join.kind == JoinKind.Left || join.kind == JoinKind.Full;
+            sources[at].right = join.kind == JoinKind.Right || join.kind == JoinKind.Full;
             // NATURAL and USING: equality on the shared columns, which the right side then hides.
             var shared = Vector<String>.create();
             if (join.natural) {
@@ -1000,6 +1007,7 @@ fn compileCoreInner(
             }
             sources[at].on = condition;
             scope.sources[at].merged = shared;
+            scope.sources[at].coalesceMerged = sources[at].right;
         }
     }
     compiler.scopes.push(scope)?;
@@ -1088,7 +1096,12 @@ fn compileCoreBody(
                         if (col.hidden || Compiler.isMerged(source, col.name.view())) {
                             continue;
                         }
-                        let compiled = Compiler.columnOf(source, k);
+                        let compiled = Compiler.withMergedSides(
+                            scope,
+                            s,
+                            col.name.view(),
+                            Compiler.columnOf(source, k),
+                        )?;
                         outputExprsIn.push(compiled.expr)?;
                         outputs.push(
                             OutputColumn {
@@ -1114,7 +1127,10 @@ fn compileCoreBody(
                         if (col.hidden) {
                             continue;
                         }
-                        let compiled = Compiler.columnOf(source, k);
+                        var compiled = Compiler.columnOf(source, k);
+                        if (!Compiler.isMerged(source, col.name.view())) {
+                            compiled = Compiler.withMergedSides(scope, s, col.name.view(), compiled)?;
+                        }
                         outputExprsIn.push(compiled.expr)?;
                         outputs.push(
                             OutputColumn {
@@ -1227,13 +1243,14 @@ fn compileCoreBody(
     // sources.
     if (borrow filter is Some(f)) {
         for (s in 0..sources.length) {
-            if (sources[s].kind is SourceKind.Table(TablePlan { withoutRowid: false, .. })) {
+            // A RIGHT JOIN source is scanned whole: its rows are known by their place in the scan.
+            if (!sources[s].right && sources[s].kind is SourceKind.Table(TablePlan { withoutRowid: false, .. })) {
                 sources[s].rowidSeek = rowidEqualityFor(f, sources[s].slot)?;
             }
         }
     }
     for (s in 1..sources.length) {
-        if (sources[s].rowidSeek.isNull() && sources[s].kind is SourceKind.Table(TablePlan {
+        if (sources[s].rowidSeek.isNull() && !sources[s].right && sources[s].kind is SourceKind.Table(TablePlan {
             withoutRowid: false,
             ..
         })) {
