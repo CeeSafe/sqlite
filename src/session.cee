@@ -199,6 +199,10 @@ public struct Session {
                 return Ok(emptyResult());
             }
             Stmt.Pragma(s) => { return executePragma(s, this); }
+            Stmt.AlterTable(s) => {
+                executeAlterTable(s, sql, this)?;
+                return Ok(emptyResult());
+            }
             Stmt.Drop(s) => {
                 executeDrop(s, this)?;
                 return Ok(emptyResult());

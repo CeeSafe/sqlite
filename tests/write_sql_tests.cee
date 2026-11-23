@@ -243,3 +243,30 @@ fn pragmasDescribeTheSchema() -> Result<void, TestFailure> {
         PRAGMA no_such_pragma
         """);
 }
+
+@test
+fn alterTableRewritesDefinitions() -> Result<void, TestFailure> {
+    return sameScript("alter", """
+        CREATE TABLE t(a INT, b TEXT CHECK (b <> a), UNIQUE (a, b))
+        CREATE INDEX t_b ON t(b) WHERE a > 0
+        CREATE TABLE child(id INTEGER PRIMARY KEY, ref INT REFERENCES t(a))
+        INSERT INTO t VALUES (1, 'x'), (2, 'y')
+        ALTER TABLE t RENAME COLUMN a TO x
+        ALTER TABLE t RENAME COLUMN nope TO z
+        ALTER TABLE t RENAME COLUMN b TO x
+        ALTER TABLE t RENAME TO u
+        ALTER TABLE u ADD COLUMN c REAL DEFAULT 1.5
+        ALTER TABLE u ADD d TEXT
+        ALTER TABLE u ADD COLUMN e NOT NULL
+        ALTER TABLE u ADD COLUMN p INTEGER PRIMARY KEY
+        ALTER TABLE u ADD COLUMN q UNIQUE
+        ALTER TABLE u ADD COLUMN r DEFAULT CURRENT_TIME
+        ALTER TABLE u ADD COLUMN s INT NOT NULL DEFAULT 7
+        SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY name
+        SELECT * FROM u ORDER BY x
+        INSERT INTO u(x, b) VALUES (3, 'z')
+        SELECT * FROM u ORDER BY x
+        ALTER TABLE nosuch RENAME TO v
+        ALTER TABLE u RENAME TO child
+        """);
+}

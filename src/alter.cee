@@ -1,0 +1,481 @@
+// ALTER TABLE: RENAME TO, RENAME COLUMN and ADD COLUMN, done as SQLite does them: by editing the statements
+// stored in sqlite_schema, token by token, and leaving the rows as they are.
+//
+// Differences from the C# engine, which this replaces:
+// - the stored statements are edited where the names stand, so the rest of each definition stays as written; the
+//   C# stored its renderer's version of the whole statement;
+// - RENAME TO renames the table's automatic indexes, the indexes' ON clauses, other tables' REFERENCES and the
+//   table's sqlite_sequence row, as SQLite does;
+// - ADD COLUMN refuses what SQLite refuses (PRIMARY KEY, UNIQUE, NOT NULL with a NULL default, STORED, a default
+//   that is not constant) with SQLite's messages, and puts the column after the last column definition.
+//
+// Not yet supported, and refused by name: renaming a table or column that a view or a trigger refers to (SQLite
+// rewrites those too), and DROP COLUMN.
+
+/// A replacement of `[start, end)` in a text.
+struct TextEdit {
+    start: usize;
+    end: usize;
+    text: String;
+}
+
+/// `text` with `edits` (in any order, not overlapping) applied.
+fn applyEdits(text: StringView, edits: borrow mut Vector<TextEdit>) -> Result<String, AllocError> {
+    edits.sortBy((a, b) => compareUsize(a.start, b.start));
+    var out = String.create();
+    var at: usize = 0;
+    for (i in 0..edits.length) {
+        out.append(text[at..edits[i].start])?;
+        out.append(edits[i].text.view())?;
+        at = edits[i].end;
+    }
+    out.append(text[at..])?;
+    return Ok(out);
+}
+
+/// A name in double quotes, as SQLite writes a renamed table.
+fn quotedName(name: StringView) -> Result<String, AllocError> {
+    var out = String.create();
+    SqlWriter.appendIdentifier(mut out, name)?;
+    return Ok(out);
+}
+
+/// A name as it may stand in SQL: bare when it can be, else in double quotes.
+fn sqlName(name: StringView) -> Result<String, AllocError> {
+    var bare = name.length != 0 && isSqlIdStart(name[0]) && !wordIn(name, RESERVED_NAMES[..]);
+    for (c in name.bytes()) {
+        bare = bare && isSqlIdChar(c);
+    }
+    return if (bare) String.from(name) else quotedName(name);
+}
+
+fn isName(token: borrow Token, name: StringView) -> bool =>
+    (token.kind == TokenKind.Word || token.kind == TokenKind.QuotedId) && token.text.view().equalsIgnoreAsciiCase(name);
+
+/// The edits that rename the identifiers naming column `old` in a CREATE TABLE or CREATE INDEX statement: every
+/// matching name except function names, collation and constraint names, and what REFERENCES names (another table).
+fn columnRenameEdits(
+    sql: StringView,
+    old: StringView,
+    new: StringView,
+    isIndex: bool,
+    edits: borrow mut Vector<TextEdit>,
+) -> Result<void, SqliteError> {
+    let tokens = Tokenizer.tokenize(sql)?;
+    // Skip the statement's head: CREATE … name, and for an index, ON table.
+    var i: usize = 0;
+    var depth: usize = 0;
+    var started = false;
+    var inReferences = false;
+    while (i < tokens.length) {
+        let t = borrow tokens[i];
+        if (t.isOp("(")) {
+            if (!started) {
+                started = true;
+            }
+            depth += 1;
+        } else if (t.isOp(")")) {
+            depth = depth.saturatingSub(1);
+            if (inReferences && depth <= 1) {
+                inReferences = false;
+            }
+        }
+        if (!started && !(isIndex && t.isWord("WHERE"))) {
+            i += 1;
+            continue;
+        }
+        started = true;
+        if (t.isWord("REFERENCES")) {
+            inReferences = true;
+            i += 1;
+            continue;
+        }
+        if (inReferences && depth <= 1 && t.isOp(",")) {
+            inReferences = false;
+        }
+        let previous = if (i > 0) borrow tokens[i - 1] else borrow tokens[i];
+        let next = borrow tokens[(i + 1).min(tokens.length - 1)];
+        let skip = inReferences || next.isOp("(") || previous.isWord("COLLATE") || previous.isWord("CONSTRAINT");
+        if (!skip && isName(t, old)) {
+            edits.push(TextEdit { start: t.offset, end: t.end, text: sqlName(new)? })?;
+        }
+        i += 1;
+    }
+    return Ok();
+}
+
+/// The edit that renames the object a CREATE statement makes (the name after TABLE/INDEX/VIEW [IF NOT EXISTS]),
+/// or with `afterOn`, the table after ON.
+fn nameEdit(sql: StringView, afterOn: bool, newName: StringView) -> Result<TextEdit?, SqliteError> {
+    let tokens = Tokenizer.tokenize(sql)?;
+    for (i in 0..tokens.length) {
+        let t = borrow tokens[i];
+        let found = if (afterOn) t.isWord("ON") else (t.isWord("TABLE") || t.isWord("INDEX") || t.isWord("VIEW"));
+        if (!found) {
+            continue;
+        }
+        var at = i + 1;
+        if (!afterOn && tokens[at].isWord("IF")) {
+            at += 3;
+        }
+        // A schema-qualified name: the part after the dot.
+        if (at + 2 < tokens.length && tokens[at + 1].isOp(".")) {
+            at += 2;
+        }
+        return Ok(TextEdit { start: tokens[at].offset, end: tokens[at].end, text: quotedName(newName)? });
+    }
+    return Ok(null);
+}
+
+/// The edits that rename `old` after REFERENCES in a CREATE TABLE statement.
+fn referenceEdits(
+    sql: StringView,
+    old: StringView,
+    new: StringView,
+    edits: borrow mut Vector<TextEdit>,
+) -> Result<void, SqliteError> {
+    let tokens = Tokenizer.tokenize(sql)?;
+    for (i in 0..tokens.length - 1) {
+        if (tokens[i].isWord("REFERENCES") && isName(borrow tokens[i + 1], old)) {
+            edits.push(TextEdit { start: tokens[i + 1].offset, end: tokens[i + 1].end, text: quotedName(new)? })?;
+        }
+    }
+    return Ok();
+}
+
+/// A row of sqlite_schema with its rowid.
+struct SchemaRow {
+    rowId: i64;
+    values: Vector<SqliteValue>;
+}
+
+fn schemaRows(db: borrow mut Session) -> Result<Vector<SchemaRow>, SqliteError> {
+    var rows = Vector<SchemaRow>.create();
+    var cursor = TableCursor.scan(1);
+    while (cursor.next(mut db.pager)? is Some(row)) {
+        rows.push(SchemaRow { rowId: row.rowId, values: row.columns })?;
+    }
+    return Ok(rows);
+}
+
+fn writeSchemaRow(db: borrow mut Session, row: borrow SchemaRow) -> Result<void, SqliteError> {
+    var op = Vector<TableOp>.create();
+    op.push(TableOp { rowId: row.rowId, record: Record.encode(row.values.view())? })?;
+    TableMutator.applyBatch(mut db.pager, 1, op.view())?;
+    return Ok();
+}
+
+/// Refuses a rename that a view or a trigger refers to: SQLite would rewrite them, this engine cannot yet.
+fn refuseIfReferenced(db: borrow Session, table: StringView) -> Result<void, SqliteError> {
+    for (i in 0..db.entries.length) {
+        let entry = borrow db.entries[i];
+        let kind = entry.kind.view();
+        if (kind != "view" && kind != "trigger") {
+            continue;
+        }
+        let Some(sql) = borrow entry.sql else {
+            continue;
+        };
+        let tokens = Tokenizer.tokenize(sql.view())?;
+        for (k in 0..tokens.length) {
+            if (isName(borrow tokens[k], table)) {
+                return Err(unsupported("renaming a table that a view or trigger refers to is not supported yet"));
+            }
+        }
+    }
+    return Ok();
+}
+
+fn valueTextOf(value: borrow SqliteValue) -> StringView => match (value) {
+    SqliteValue.Text(s) => s.view(),
+    _ => "",
+};
+
+/// ALTER TABLE.
+fn executeAlterTable(
+    stmt: borrow AlterTableStmt,
+    sql: StringView,
+    db: borrow mut Session,
+) -> Result<void, SqliteError> {
+    let tableName = stmt.table.name.view();
+    let table = db.catalog.table(tableName)? ?? {
+        return Err(namedError("no such table: ", tableName));
+    };
+    let name = table.name.clone()?;
+    if (isReservedName(name.view())) {
+        var message = String.from("table ")?;
+        message.append(name.view())?;
+        message.append(" may not be altered")?;
+        return Err(SqliteError.Sql(message));
+    }
+    match (borrow stmt.action) {
+        AlterAction.RenameTo(newName) => { renameTable(name.view(), newName.view(), db)?; }
+        AlterAction.RenameColumn(from, to) => { renameColumn(name.view(), from.view(), to.view(), db)?; }
+        AlterAction.AddColumn(column) => { addColumn(name.view(), column, sql, db)?; }
+    }
+    db.pager.bumpSchemaCookie()?;
+    return db.reloadSchema();
+}
+
+fn renameTable(old: StringView, new: StringView, db: borrow mut Session) -> Result<void, SqliteError> {
+    if (objectExists(db, new)) {
+        return Err(namedError("there is already another table or index with this name: ", new));
+    }
+    if (isReservedName(new)) {
+        return Err(namedError("object name reserved for internal use: ", new));
+    }
+    refuseIfReferenced(db, old)?;
+    var oldPrefix = String.from("sqlite_autoindex_")?;
+    oldPrefix.append(old)?;
+    oldPrefix.append("_")?;
+    var rows = schemaRows(db)?;
+    for (r in 0..rows.length) {
+        let kind = String.from(valueTextOf(borrow rows[r].values[0]))?;
+        let objectName = String.from(valueTextOf(borrow rows[r].values[1]))?;
+        let ofTable = valueTextOf(borrow rows[r].values[2]).equalsIgnoreAsciiCase(old);
+        let sqlText = String.from(valueTextOf(borrow rows[r].values[4]))?;
+        var edits = Vector<TextEdit>.create();
+        var changed = false;
+        if (kind.view() == "table" && objectName.view().equalsIgnoreAsciiCase(old)) {
+            if (nameEdit(sqlText.view(), false, new)? is Some(edit)) {
+                edits.push(edit)?;
+            }
+            rows[r].values[1] = SqliteValue.text(new)?;
+            rows[r].values[2] = SqliteValue.text(new)?;
+            changed = true;
+        } else if (kind.view() == "index" && ofTable) {
+            if (!rows[r].values[4].isNull()) {
+                if (nameEdit(sqlText.view(), true, new)? is Some(edit)) {
+                    edits.push(edit)?;
+                }
+            } else if (objectName.view().length > oldPrefix.length &&
+                objectName.view()[0..oldPrefix.length].equalsIgnoreAsciiCase(
+                    oldPrefix.view(),
+                )) {
+                var renamed = String.from("sqlite_autoindex_")?;
+                renamed.append(new)?;
+                renamed.append("_")?;
+                renamed.append(objectName.view()[oldPrefix.length..])?;
+                rows[r].values[1] = SqliteValue.Text(renamed);
+            }
+            rows[r].values[2] = SqliteValue.text(new)?;
+            changed = true;
+        } else if (kind.view() == "table" && db.foreignKeys) {
+            // Another table's REFERENCES: SQLite follows the rename only while foreign keys are on.
+            referenceEdits(sqlText.view(), old, new, mut edits)?;
+            changed = edits.length != 0;
+        }
+        if (edits.length != 0) {
+            rows[r].values[4] = SqliteValue.Text(applyEdits(sqlText.view(), mut edits)?);
+        }
+        if (changed) {
+            writeSchemaRow(db, borrow rows[r])?;
+        }
+    }
+    if (db.catalog.table("sqlite_sequence")?.isSome()) {
+        var params = Vector<SqliteValue>.create();
+        params.push(SqliteValue.text(new)?)?;
+        params.push(SqliteValue.text(old)?)?;
+        let _ = db.runInternal("UPDATE sqlite_sequence SET name = ?1 WHERE name = ?2", params.view())?;
+    }
+    return Ok();
+}
+
+fn renameColumn(
+    tableName: StringView,
+    from: StringView,
+    to: StringView,
+    db: borrow mut Session,
+) -> Result<void, SqliteError> {
+    let table = db.catalog.tableCopy(tableName)?;
+    if (table.indexOf(from).isNull()) {
+        var message = String.from("no such column: \"")?;
+        message.append(from)?;
+        message.append("\"")?;
+        return Err(SqliteError.Sql(message));
+    }
+    if (!from.equalsIgnoreAsciiCase(to) && table.indexOf(to).isSome()) {
+        var message = String.from("error in table ")?;
+        message.append(tableName)?;
+        message.append(" after rename: duplicate column name: ")?;
+        message.append(to)?;
+        return Err(SqliteError.Sql(message));
+    }
+    refuseIfReferenced(db, tableName)?;
+    var rows = schemaRows(db)?;
+    for (r in 0..rows.length) {
+        let kind = String.from(valueTextOf(borrow rows[r].values[0]))?;
+        let ofTable = valueTextOf(borrow rows[r].values[2]).equalsIgnoreAsciiCase(tableName);
+        if (rows[r].values[4].isNull() || (kind.view() != "table" && kind.view() != "index")) {
+            continue;
+        }
+        let sqlText = String.from(valueTextOf(borrow rows[r].values[4]))?;
+        var edits = Vector<TextEdit>.create();
+        if (ofTable) {
+            columnRenameEdits(sqlText.view(), from, to, kind.view() == "index", mut edits)?;
+        }
+        if (kind.view() == "table") {
+            // REFERENCES table(column) in any table, this one included.
+            referencedColumnEdits(sqlText.view(), tableName, from, to, mut edits)?;
+        }
+        if (edits.length == 0) {
+            continue;
+        }
+        rows[r].values[4] = SqliteValue.Text(applyEdits(sqlText.view(), mut edits)?);
+        writeSchemaRow(db, borrow rows[r])?;
+    }
+    return Ok();
+}
+
+/// Where a new column's definition goes in a CREATE TABLE statement: after the last column definition.
+fn columnInsertPoint(sql: StringView) -> Result<usize?, SqliteError> {
+    let tokens = Tokenizer.tokenize(sql)?;
+    var depth: usize = 0;
+    var lastColumnEnd: usize? = null;
+    var itemStart = false;
+    var inConstraints = false;
+    for (i in 0..tokens.length) {
+        let t = borrow tokens[i];
+        let before = depth;
+        if (t.isOp("(")) {
+            depth += 1;
+            if (before == 0) {
+                // The column list opens.
+                itemStart = true;
+                continue;
+            }
+        } else if (t.isOp(")")) {
+            depth = depth.saturatingSub(1);
+            if (before == 1) {
+                // The column list closes.
+                return Ok(lastColumnEnd);
+            }
+        } else if (before == 1 && t.isOp(",")) {
+            itemStart = true;
+            continue;
+        }
+        if (before == 0) {
+            continue;
+        }
+        if (itemStart) {
+            itemStart = false;
+            inConstraints = inConstraints || t.isWord(
+                "CONSTRAINT",
+            ) || t.isWord("PRIMARY") || t.isWord("UNIQUE") || t.isWord("CHECK") || t.isWord("FOREIGN");
+        }
+        if (!inConstraints) {
+            lastColumnEnd = t.end;
+        }
+    }
+    return Ok(lastColumnEnd);
+}
+
+fn addColumn(
+    tableName: StringView,
+    column: borrow ColumnDef,
+    alterSql: StringView,
+    db: borrow mut Session,
+) -> Result<void, SqliteError> {
+    let table = db.catalog.tableCopy(tableName)?;
+    if (table.indexOf(column.name.view()).isSome()) {
+        return Err(namedError("duplicate column name: ", column.name.view()));
+    }
+    // The new column's definition, as written: what follows ADD [COLUMN].
+    let tokens = Tokenizer.tokenize(alterSql)?;
+    var at: usize = 0;
+    for (i in 0..tokens.length) {
+        if (tokens[i].isWord("ADD")) {
+            at = i + 1;
+            if (tokens[at].isWord("COLUMN")) {
+                at += 1;
+            }
+            break;
+        }
+    }
+    let definition = alterSql[tokens[at].offset..];
+    let schema = buildColumnSchema(column, false, alterSql)?;
+    if (schema.primaryKey) {
+        return Err(sqlError("Cannot add a PRIMARY KEY column"));
+    }
+    if (schema.unique) {
+        return Err(sqlError("Cannot add a UNIQUE column"));
+    }
+    if (schema.generated.isSome() && schema.generatedStored) {
+        return Err(sqlError("cannot add a STORED column"));
+    }
+    var defaultIsNull = true;
+    if (borrow schema.defaultValue is Some(d)) {
+        match (borrow d.expr) {
+            Expr.Literal(Literal {
+                kind: LiteralKind.CurrentTime,
+                ..
+            }) | Expr.Literal(Literal {
+                kind: LiteralKind.CurrentDate,
+                ..
+            }) | Expr.Literal(Literal {
+                kind: LiteralKind.CurrentTimestamp,
+                ..
+            }) | Expr.Column(_) | Expr.Subquery(_) => {
+                return Err(sqlError("Cannot add a column with non-constant default"));
+            }
+            _ => {}
+        }
+        defaultIsNull = d.expr is Expr.Literal(Literal { kind: LiteralKind.Null, .. });
+    }
+    if (schema.notNull && defaultIsNull && schema.generated.isNull()) {
+        return Err(sqlError("Cannot add a NOT NULL column with default value NULL"));
+    }
+    var rows = schemaRows(db)?;
+    for (r in 0..rows.length) {
+        let isTable = valueTextOf(
+            borrow rows[r].values[0],
+        ) == "table" && valueTextOf(borrow rows[r].values[1]).equalsIgnoreAsciiCase(tableName);
+        if (!isTable) {
+            continue;
+        }
+        let sqlText = String.from(valueTextOf(borrow rows[r].values[4]))?;
+        let point = columnInsertPoint(sqlText.view())? ?? {
+            return Err(corrupt("a table's definition has no column list"));
+        };
+        var edits = Vector<TextEdit>.create();
+        var inserted = String.from(", ")?;
+        inserted.append(definition)?;
+        edits.push(TextEdit { start: point, end: point, text: inserted })?;
+        rows[r].values[4] = SqliteValue.Text(applyEdits(sqlText.view(), mut edits)?);
+        writeSchemaRow(db, borrow rows[r])?;
+    }
+    return Ok();
+}
+
+/// The edits that rename `column` in `REFERENCES table(… column …)` clauses.
+fn referencedColumnEdits(
+    sql: StringView,
+    table: StringView,
+    column: StringView,
+    new: StringView,
+    edits: borrow mut Vector<TextEdit>,
+) -> Result<void, SqliteError> {
+    let tokens = Tokenizer.tokenize(sql)?;
+    var i: usize = 0;
+    while (i + 2 < tokens.length) {
+        if (tokens[i].isWord("REFERENCES") && isName(borrow tokens[i + 1], table) && tokens[i + 2].isOp("(")) {
+            var k = i + 3;
+            while (k < tokens.length && !tokens[k].isOp(")")) {
+                if (isName(borrow tokens[k], column)) {
+                    // Not already renamed by the table's own edits.
+                    var seen = false;
+                    for (e in 0..edits.length) {
+                        seen = seen || edits[e].start == tokens[k].offset;
+                    }
+                    if (!seen) {
+                        edits.push(TextEdit { start: tokens[k].offset, end: tokens[k].end, text: sqlName(new)? })?;
+                    }
+                }
+                k += 1;
+            }
+            i = k;
+        }
+        i += 1;
+    }
+    return Ok();
+}
