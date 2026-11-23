@@ -637,3 +637,56 @@ fn constraintConflictClausesApply() -> Result<void, TestFailure> {
         CREATE TABLE fine(a UNIQUE ON CONFLICT IGNORE, UNIQUE (a))
         """);
 }
+
+@test
+fn savepointsNestAsInSqlite() -> Result<void, TestFailure> {
+    return sameSession("savepoints", """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, v)
+        CREATE INDEX t_v ON t(v)
+        SAVEPOINT a
+        INSERT INTO t VALUES (1, 'a')
+        SAVEPOINT b
+        INSERT INTO t VALUES (2, 'b')
+        WITH RECURSIVE n(i) AS (SELECT 10 UNION ALL SELECT i + 1 FROM n WHERE i < 600) INSERT INTO t SELECT i, printf('%.*c', i % 40, 'x') FROM n
+        SELECT count(*) FROM t
+        ROLLBACK TO b
+        SELECT count(*) FROM t
+        INSERT INTO t VALUES (3, 'c')
+        SAVEPOINT c
+        CREATE TABLE inner_t(x)
+        INSERT INTO inner_t VALUES (1)
+        RELEASE c
+        SELECT name FROM sqlite_schema ORDER BY name
+        ROLLBACK TO a
+        SELECT count(*) FROM t
+        SELECT name FROM sqlite_schema ORDER BY name
+        INSERT INTO t VALUES (4, 'd')
+        RELEASE a
+        SELECT * FROM t
+        RELEASE nope
+        ROLLBACK TO nope
+        BEGIN
+        INSERT INTO t VALUES (5, 'e')
+        SAVEPOINT s1
+        INSERT INTO t VALUES (6, 'f')
+        SAVEPOINT s1
+        INSERT INTO t VALUES (7, 'g')
+        ROLLBACK TO s1
+        SELECT * FROM t ORDER BY id
+        RELEASE s1
+        RELEASE s1
+        INSERT INTO t VALUES (8, 'h')
+        ROLLBACK TO s1
+        COMMIT
+        SELECT * FROM t ORDER BY id
+        SAVEPOINT x
+        INSERT INTO t VALUES (9, 'i')
+        ROLLBACK
+        SELECT count(*) FROM t
+        SAVEPOINT y
+        INSERT INTO t VALUES (10, 'j')
+        COMMIT
+        SELECT count(*) FROM t
+        PRAGMA integrity_check
+        """);
+}

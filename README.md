@@ -448,6 +448,11 @@ Choices where the C# concept does not fit CeeSafe:
   the others, and two constraints that share an index with different actions are "conflicting ON CONFLICT clauses
   specified". The C# read the clauses and ignored them.
 
+- **SAVEPOINT, RELEASE and ROLLBACK TO** nest as in SQLite (`savepointsNestAsInSqlite`): a SAVEPOINT outside a
+  transaction begins one, which releasing it commits; ROLLBACK TO keeps the savepoint and closes those inside it;
+  names repeat, the innermost answering. The pager keeps a stack of undo levels, the running statement's on top.
+  The C# refused savepoints.
+
 ## Known differences from SQLite in PRAGMA integrity_check
 
 The report matches the `sqlite3` shell's row for row on the tests' damaged files, with these exceptions:

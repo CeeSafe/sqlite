@@ -25,6 +25,10 @@ public struct Session {
     synchronous: i64;
     cacheSize: i64;
     busyTimeout: i64;
+    /// SAVEPOINT names open, innermost last, each with its level in the pager; and whether the outermost began
+    /// the transaction (so that releasing it commits).
+    savepoints: Vector<NamedSavepoint>;
+    savepointBegan: bool;
     /// PRAGMA legacy_alter_table: RENAME TO leaves views and trigger bodies alone (SQLite before 3.26).
     legacyAlterTable: bool;
     /// The trigger firing now, and the names of those running.
@@ -53,6 +57,8 @@ public struct Session {
             cacheSize: -2000,
             busyTimeout: 0,
             legacyAlterTable: false,
+            savepoints: Vector<NamedSavepoint>.create(),
+            savepointBegan: false,
             trigger: null,
             activeTriggers: Vector<String>.create(),
         });
@@ -261,6 +267,8 @@ public struct Session {
                 }
                 this.pager.commit()?;
                 this.inTransaction = false;
+                this.savepoints.clear();
+                this.savepointBegan = false;
                 return Ok(emptyResult());
             }
             Stmt.Rollback(null) => {
@@ -269,11 +277,66 @@ public struct Session {
                 }
                 this.pager.rollback();
                 this.inTransaction = false;
+                this.savepoints.clear();
+                this.savepointBegan = false;
+                this.reloadSchema()?;
+                return Ok(emptyResult());
+            }
+            Stmt.Savepoint(name) => {
+                // The statement's own level becomes the savepoint's; a fresh one is the statement's.
+                if (!this.inTransaction) {
+                    this.inTransaction = true;
+                    this.savepointBegan = true;
+                }
+                let level = this.pager.savepointDepth() - 1;
+                this.savepoints.push(NamedSavepoint { name: name.clone()?, level: level })?;
+                this.pager.beginStatement();
+                return Ok(emptyResult());
+            }
+            Stmt.Release(name) => {
+                let at = this.savepointNamed(name.view())?;
+                let level = this.savepoints[at].level;
+                this.savepoints.truncate(at);
+                this.pager.releaseLevels(level);
+                if (this.savepoints.length == 0 && this.savepointBegan) {
+                    // Releasing the savepoint that began the transaction commits it.
+                    this.pager.commit()?;
+                    this.inTransaction = false;
+                    this.savepointBegan = false;
+                }
+                return Ok(emptyResult());
+            }
+            Stmt.Rollback(Some(name)) => {
+                let at = this.savepointNamed(name.view())?;
+                let level = this.savepoints[at].level;
+                // The savepoint stays; those inside it go.
+                this.savepoints.truncate(at + 1);
+                this.pager.rollbackToLevel(level)?;
                 this.reloadSchema()?;
                 return Ok(emptyResult());
             }
             _ => { return Err(unsupported("this statement is not supported yet")); }
         }
+    }
+}
+
+/// A SAVEPOINT in progress: its name and its level in the pager.
+struct NamedSavepoint {
+    name: String;
+    level: usize;
+}
+
+impl Session {
+    /// The innermost open savepoint called `name`.
+    fn savepointNamed(borrow this, name: StringView) -> Result<usize, SqliteError> {
+        var i = this.savepoints.length;
+        while (i > 0) {
+            i -= 1;
+            if (this.savepoints[i].name.view().equalsIgnoreAsciiCase(name)) {
+                return Ok(i);
+            }
+        }
+        return Err(namedError("no such savepoint: ", name));
     }
 }
 

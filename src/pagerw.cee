@@ -47,8 +47,9 @@ struct WritablePager {
     private pages: Vector<Vector<u8>>;
     private preImages: HashMap<u32, Vector<u8>>;
     private dirty: HashMap<u32, bool>;
-    /// A statement in progress: each page's content when it began, saved before its first change.
-    private statement: StatementUndo?;
+    /// Savepoints in progress, innermost last (a statement's own is the top one): each holds the content pages had
+    /// when it began, saved before their first change while it was the innermost.
+    private levels: Vector<StatementUndo>;
 
     /// Opens the database at `path` for changes, first undoing a commit that was interrupted.
     fn open(path: StringView) -> Result<WritablePager, SqliteError> {
@@ -113,7 +114,7 @@ struct WritablePager {
             pages: Vector<Vector<u8>>.create(),
             preImages: HashMap<u32, Vector<u8>>.create(),
             dirty: HashMap<u32, bool>.create(),
-            statement: null,
+            levels: Vector<StatementUndo>.create(),
         });
     }
 
@@ -182,7 +183,9 @@ struct WritablePager {
     /// Page `number`, to change. Its old image is kept for the journal.
     fn write(borrow mut this, number: u32) -> Result<SliceMut<u8>, SqliteError> {
         this.load(number)?;
-        if (borrow mut this.statement is Some(undo)) {
+        if (this.levels.length != 0) {
+            let top = this.levels.length - 1;
+            let undo = borrow mut this.levels[top];
             if (!undo.saved.contains(borrow number)) {
                 let image = this.pages[*this.slots.get(borrow number)!].clone()?;
                 let wasDirty = this.dirty.contains(borrow number);
@@ -283,26 +286,102 @@ struct WritablePager {
         return Ok();
     }
 
-    /// Starts a statement: `rollbackStatement` can then undo its changes alone.
+    /// Starts a statement (or a savepoint): `rollbackStatement` can then undo its changes alone.
     fn beginStatement(borrow mut this) {
-        this.statement = StatementUndo {
+        let level = StatementUndo {
             saved: HashMap<u32, SavedPage>.create(),
             pageCount: this.pageCount,
             freeTrunk: this.freeTrunk,
             freeCount: this.freeCount,
         };
+        if (this.levels.push(level).isErr()) {
+            // Without room for the level its changes cannot be undone alone; the transaction still can be.
+        }
     }
 
-    /// Keeps the statement's changes in the transaction.
+    /// How many savepoints are open, the statement's own included.
+    fn savepointDepth(borrow this) -> usize => this.levels.length;
+
+    /// Keeps the statement's changes in the savepoint around it (or the transaction).
     fn endStatement(borrow mut this) {
-        this.statement = null;
+        if (this.levels.length == 0) {
+            return;
+        }
+        let top = this.levels.pop()!;
+        this.mergeDown(top);
+    }
+
+    /// Hands a closed level's saved pages to the level below, which keeps its own older ones.
+    private fn mergeDown(borrow mut this, closed: StatementUndo) {
+        if (this.levels.length == 0) {
+            return;
+        }
+        let below = this.levels.length - 1;
+        var saved = closed.saved;
+        for (i in 0..saved.length()) {
+            let number = *saved.keyAt(i);
+            if (this.levels[below].saved.contains(borrow number)) {
+                continue;
+            }
+            let page = replace(mut saved.getMut(borrow number)!.image, Vector<u8>.create());
+            let wasDirty = saved.get(borrow number)!.wasDirty;
+            if (this.levels[below].saved.put(number, SavedPage { image: page, wasDirty: wasDirty }).isErr()) {
+                return;
+            }
+        }
+    }
+
+    /// Releases savepoint level `level` and those inside it, except the innermost (the running statement's):
+    /// their changes join the level below `level`, or the transaction.
+    fn releaseLevels(borrow mut this, level: usize) {
+        if (level + 1 >= this.levels.length) {
+            return;
+        }
+        let statement = this.levels.pop()!;
+        // Inner levels first, each into the one below: a lower level's image of a page is the older, and stays.
+        while (this.levels.length > level) {
+            let closed = this.levels.pop()!;
+            this.mergeDown(closed);
+        }
+        let _ = this.levels.push(statement);
+    }
+
+    /// Undoes the changes since savepoint level `level` began; the level stays open, emptied, and those inside
+    /// it except the innermost (the running statement's) are closed.
+    fn rollbackToLevel(borrow mut this, level: usize) -> Result<void, SqliteError> {
+        if (level + 1 >= this.levels.length) {
+            return Ok();
+        }
+        let statement = this.levels.pop()!;
+        // Fold the inner levels into `level`, keeping the oldest image of each page, then undo it.
+        while (this.levels.length > level + 1) {
+            let closed = this.levels.pop()!;
+            this.mergeDown(closed);
+        }
+        let undo = this.levels.pop()!;
+        let restored = StatementUndo {
+            saved: HashMap<u32, SavedPage>.create(),
+            pageCount: undo.pageCount,
+            freeTrunk: undo.freeTrunk,
+            freeCount: undo.freeCount,
+        };
+        this.undoLevel(undo)?;
+        this.levels.push(restored)?;
+        this.levels.push(statement)?;
+        return Ok();
     }
 
     /// Undoes the statement's changes, leaving the transaction as it was before it.
     fn rollbackStatement(borrow mut this) -> Result<void, SqliteError> {
-        let Some(undo) = replace(mut this.statement, null) else {
+        if (this.levels.length == 0) {
             return Ok();
-        };
+        }
+        let undo = this.levels.pop()!;
+        return this.undoLevel(undo);
+    }
+
+    /// Puts back the pages a level saved, and the page count and freelist it began with.
+    private fn undoLevel(borrow mut this, undo: StatementUndo) -> Result<void, SqliteError> {
         var saved = undo.saved;
         for (i in 0..saved.length()) {
             let number = *saved.keyAt(i);
@@ -316,7 +395,7 @@ struct WritablePager {
                 let _ = this.dirty.remove(borrow number);
             }
         }
-        // Pages added by the statement are gone again.
+        // Pages added since the level began are gone again.
         var gone = Vector<u32>.create();
         for (i in 0..this.dirty.length()) {
             let number = *this.dirty.keyAt(i);
@@ -336,7 +415,7 @@ struct WritablePager {
 
     /// Forgets everything the transaction changed.
     fn rollback(borrow mut this) {
-        this.statement = null;
+        this.levels.clear();
         this.slots.clear();
         this.pages.clear();
         this.preImages.clear();
@@ -349,6 +428,8 @@ struct WritablePager {
     /// Makes the transaction's changes durable, as one step: after a crash the database holds all of them or
     /// none.
     fn commit(borrow mut this) -> Result<void, SqliteError> {
+        // Savepoints end with the transaction.
+        this.levels.clear();
         if (this.dirty.length() == 0) {
             return Ok();
         }
