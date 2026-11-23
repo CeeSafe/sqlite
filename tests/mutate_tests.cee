@@ -1,0 +1,368 @@
+// Changing b-trees in place, judged by the sqlite3 shell's integrity check and its answers.
+
+fn mutateFixture(path: StringView, pageSize: StringView, rows: StringView) -> Result<void, TestFailure> {
+    var sql = String.from("PRAGMA page_size = ")!;
+    sql.append(pageSize)!;
+    sql.append("; CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER, label TEXT COLLATE NOCASE); WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < ")!;
+    sql.append(rows)!;
+    sql.append(") INSERT INTO t SELECT i, i * 2, 'label ' || i FROM c;")!;
+    return makeDatabase(path, sql.view());
+}
+
+fn rootOfTable(path: StringView, name: StringView) -> u32 {
+    let reader = DatabaseReader.open(path)!;
+    return reader.findTable(name)!!.rootPage;
+}
+
+fn rootOfIndex(path: StringView, name: StringView) -> u32 {
+    let reader = DatabaseReader.open(path)!;
+    return reader.findIndex(name)!!.rootPage;
+}
+
+fn labelOf(id: i64) -> String => numbered("label ", id);
+
+/// The record of a row of `t`: the rowid's alias as NULL, then n and the label.
+fn recordOfT(n: i64, label: StringView) -> Vector<u8> {
+    let row = rowOf3(SqliteValue.Null, SqliteValue.Integer(n), SqliteValue.text(label)!);
+    return Record.encode(row.view())!;
+}
+
+fn upsert(ops: borrow mut Vector<TableOp>, id: i64, n: i64, label: StringView) {
+    ops.push(TableOp { rowId: id, record: recordOfT(n, label) })!;
+}
+
+fn removal(ops: borrow mut Vector<TableOp>, id: i64) {
+    ops.push(TableOp { rowId: id, record: null })!;
+}
+
+@test
+fn changesATableInPlace() -> Result<void, TestFailure> {
+    let path = "out/mutate-table.db";
+    mutateFixture(path, "4096", "5000")?;
+    let root = rootOfTable(path, "t");
+    var pager = WritablePager.open(path)!;
+    var ops = Vector<TableOp>.create();
+    var big = String.create();
+    for (k in 0..2500) {
+        big.append("overflowing ")!;
+    }
+    for (id in 1i64..6001) {
+        if (id > 5000) {
+            upsert(mut ops, id, id * 2, labelOf(id).view()); // appended
+        } else if (id % 7 == 0) {
+            removal(mut ops, id);
+        } else if (id % 500 == 1) {
+            upsert(mut ops, id, -id, big.view()); // grows onto overflow pages
+        } else if (id % 11 == 0) {
+            upsert(mut ops, id, id * 3, "changed"); // shrinks
+        }
+    }
+    removal(mut ops, 999999); // a rowid that is not there
+    TableMutator.applyBatch(mut pager, root, ops.view())!;
+    pager.commit()!;
+    expectIntact(path)?;
+    // 5000 rows, less the 714 multiples of 7, plus 1000 new ones.
+    Check.equalText("5286\n", askSqlite(path, "SELECT count(*) FROM t")?.view())?;
+    Check.equalText("30000\n", askSqlite(path, "SELECT length(label) FROM t WHERE id = 501")?.view())?;
+    Check.equalText("0\n", askSqlite(path, "SELECT count(*) FROM t WHERE id % 7 = 0 AND id <= 5000")?.view())?;
+    Check.equalText("33|changed\n", askSqlite(path, "SELECT n, label FROM t WHERE id = 11")?.view())?;
+    Check.equalText("12000|label 6000\n", askSqlite(path, "SELECT n, label FROM t WHERE id = 6000")?.view())?;
+
+    // The rows on overflow pages shrink again: their pages go to the freelist and the file does not grow.
+    var second = Vector<TableOp>.create();
+    for (id in 1i64..5001) {
+        if (id % 500 == 1) {
+            upsert(mut second, id, id, "small again");
+        }
+    }
+    let pagesBefore = pager.pageCount;
+    TableMutator.applyBatch(mut pager, root, second.view())!;
+    pager.commit()!;
+    expectIntact(path)?;
+    let freed = askSqlite(path, "SELECT freelist_count FROM pragma_freelist_count")?.view().trim().parseInt<u64>()!;
+    // Eight rows of 30000 bytes (two of the ten were deleted as multiples of 7), seven overflow pages each.
+    Check.equalU64(56, freed)?;
+    // New rows take pages from the freelist before the file grows.
+    var third = Vector<TableOp>.create();
+    for (id in 6001i64..6021) {
+        upsert(mut third, id, id, big.view()[0..3000]);
+    }
+    TableMutator.applyBatch(mut pager, root, third.view())!;
+    pager.commit()!;
+    Check.isTrue(pager.pageCount == pagesBefore, "freed pages are used again before the file grows")?;
+    expectIntact(path)?;
+    let left = askSqlite(path, "SELECT freelist_count FROM pragma_freelist_count")?.view().trim().parseInt<u64>()!;
+    Check.isTrue(left < freed, "the freelist shrank")?;
+    // The second batch put back rows 1001 and 4501, which the first had deleted.
+    Check.equalText("5308\n", askSqlite(path, "SELECT count(*) FROM t")?.view())?;
+    return Ok();
+}
+
+@test
+fn deletingEveryRowOfASmallTable() -> Result<void, TestFailure> {
+    // The C# engine's batch wrote nothing when a root leaf lost all its rows.
+    let path = "out/mutate-small.db";
+    mutateFixture(path, "4096", "20")?;
+    let root = rootOfTable(path, "t");
+    var pager = WritablePager.open(path)!;
+    var ops = Vector<TableOp>.create();
+    for (id in 1i64..21) {
+        removal(mut ops, id);
+    }
+    TableMutator.applyBatch(mut pager, root, ops.view())!;
+    pager.commit()!;
+    expectIntact(path)?;
+    Check.equalText("0\n", askSqlite(path, "SELECT count(*) FROM t")?.view())?;
+    return Ok();
+}
+
+fn deleteWhere(path: StringView, root: u32, rows: i64, keepEvery: i64) -> Result<void, TestFailure> {
+    var pager = WritablePager.open(path)!;
+    var ops = Vector<TableOp>.create();
+    for (id in 1i64..rows + 1) {
+        if (keepEvery == 0 || id % keepEvery != 0) {
+            removal(mut ops, id);
+        }
+    }
+    TableMutator.applyBatch(mut pager, root, ops.view())!;
+    pager.commit()!;
+    return expectIntact(path);
+}
+
+@test
+fn deletesThatEmptyWholeSubtrees() -> Result<void, TestFailure> {
+    // 512-byte pages make a deep tree. The C# engine gave up ("not yet supported") when a delete left an
+    // interior page with one child.
+    let path = "out/mutate-deep.db";
+    mutateFixture(path, "512", "30000")?;
+    let root = rootOfTable(path, "t");
+    deleteWhere(path, root, 30000, 997)?;
+    Check.equalText("30|463605\n", askSqlite(path, "SELECT count(*), sum(id) FROM t")?.view())?;
+
+    // Each remaining row alone, one at a time, down to nothing; then the table fills again.
+    for (k in 1i64..31) {
+        var pager = WritablePager.open(path)!;
+        var one = Vector<TableOp>.create();
+        removal(mut one, k * 997);
+        TableMutator.applyBatch(mut pager, root, one.view())!;
+        pager.commit()!;
+    }
+    expectIntact(path)?;
+    Check.equalText("0\n", askSqlite(path, "SELECT count(*) FROM t")?.view())?;
+    var pager = WritablePager.open(path)!;
+    let pagesBefore = pager.pageCount;
+    var ops = Vector<TableOp>.create();
+    for (id in 1i64..20001) {
+        upsert(mut ops, id, id, labelOf(id).view());
+    }
+    TableMutator.applyBatch(mut pager, root, ops.view())!;
+    pager.commit()!;
+    Check.isTrue(pager.pageCount <= pagesBefore, "the emptied table's pages are used again")?;
+    expectIntact(path)?;
+    Check.equalText("20000|200010000\n", askSqlite(path, "SELECT count(*), sum(id) FROM t")?.view())?;
+    return Ok();
+}
+
+@test
+fn deletesFromTheMiddleAndTheEnds() -> Result<void, TestFailure> {
+    let path = "out/mutate-ranges.db";
+    mutateFixture(path, "512", "20000")?;
+    let root = rootOfTable(path, "t");
+    var pager = WritablePager.open(path)!;
+    var ops = Vector<TableOp>.create();
+    // The first third, a band in the middle, and the last tenth.
+    for (id in 1i64..20001) {
+        if (id <= 6666 || (id > 9000 && id <= 15000) || id > 18000) {
+            removal(mut ops, id);
+        }
+    }
+    TableMutator.applyBatch(mut pager, root, ops.view())!;
+    pager.commit()!;
+    expectIntact(path)?;
+    Check.equalText("5334|6667|18000\n", askSqlite(path, "SELECT count(*), min(id), max(id) FROM t")?.view())?;
+    return Ok();
+}
+
+fn schemaRecord(kind: StringView, name: StringView, sql: StringView) -> Vector<u8> {
+    var row = Vector<SqliteValue>.create();
+    row.push(SqliteValue.text(kind)!)!;
+    row.push(SqliteValue.text(name)!)!;
+    row.push(SqliteValue.text(name)!)!;
+    row.push(SqliteValue.Integer(0))!;
+    row.push(SqliteValue.text(sql)!)!;
+    return Record.encode(row.view())!;
+}
+
+@test
+fn changesSqliteSchemaOnPageOne() -> Result<void, TestFailure> {
+    // The C# mutator took every page's b-tree header to be at offset 0, which is not so on page 1.
+    let path = "out/mutate-schema.db";
+    mutateFixture(path, "4096", "100")?;
+    var pager = WritablePager.open(path)!;
+    var ops = Vector<TableOp>.create();
+    for (i in 2i64..502) {
+        let name = numbered("view_", i);
+        var sql = String.from("CREATE VIEW ")!;
+        sql.append(name.view())!;
+        sql.append(" AS SELECT id, n, label FROM t WHERE id = ")!;
+        sql.appendNumber(i)!;
+        ops.push(TableOp { rowId: i, record: schemaRecord("view", name.view(), sql.view()) })!;
+    }
+    TableMutator.applyBatch(mut pager, 1, ops.view())!;
+    pager.bumpSchemaCookie()!;
+    pager.commit()!;
+    expectIntact(path)?;
+    Check.equalText("501\n", askSqlite(path, "SELECT count(*) FROM sqlite_schema")?.view())?;
+    Check.equalText("77|154\n", askSqlite(path, "SELECT id, n FROM view_77")?.view())?;
+
+    // Back to the one table: the tree shrinks into page 1 again.
+    var removals = Vector<TableOp>.create();
+    for (i in 2i64..502) {
+        removal(mut removals, i);
+    }
+    TableMutator.applyBatch(mut pager, 1, removals.view())!;
+    pager.bumpSchemaCookie()!;
+    pager.commit()!;
+    expectIntact(path)?;
+    Check.equalText("table|t\n", askSqlite(path, "SELECT type, name FROM sqlite_schema")?.view())?;
+    Check.equalText("100\n", askSqlite(path, "SELECT count(*) FROM t")?.view())?;
+    return Ok();
+}
+
+fn entryOf(key: SqliteValue, rowId: i64) -> Vector<SqliteValue> {
+    var entry = Vector<SqliteValue>.create();
+    entry.push(key)!;
+    entry.push(SqliteValue.Integer(rowId))!;
+    return entry;
+}
+
+@test
+fn keepsIndexesInStepWithTheirTable() -> Result<void, TestFailure> {
+    let path = "out/mutate-index.db";
+    mutateFixture(path, "1024", "4000")?;
+    Check.equalText("", askSqlite(path, "CREATE INDEX t_n ON t(n); CREATE INDEX t_label ON t(label);")?.view())?;
+    let table = rootOfTable(path, "t");
+    let byN = rootOfIndex(path, "t_n");
+    let byLabel = rootOfIndex(path, "t_label");
+    var pager = WritablePager.open(path)!;
+    var tableOps = Vector<TableOp>.create();
+    var nOps = Vector<IndexOp>.create();
+    var labelOps = Vector<IndexOp>.create();
+    for (id in 1i64..7001) {
+        if (id > 4000) {
+            // New rows; their labels differ from the old ones only in case, which NOCASE ignores.
+            let label = numbered("LABEL ", id - 4000);
+            upsert(mut tableOps, id, id * 2, label.view());
+            nOps.push(IndexOp { entry: entryOf(SqliteValue.Integer(id * 2), id), remove: false })!;
+            labelOps.push(IndexOp { entry: entryOf(SqliteValue.Text(label), id), remove: false })!;
+        } else if (id % 3 == 0) {
+            removal(mut tableOps, id);
+            nOps.push(IndexOp { entry: entryOf(SqliteValue.Integer(id * 2), id), remove: true })!;
+            labelOps.push(IndexOp { entry: entryOf(SqliteValue.Text(labelOf(id)), id), remove: true })!;
+        }
+    }
+    TableMutator.applyBatch(mut pager, table, tableOps.view())!;
+    let plain = IndexOrder.plain();
+    let inPlaceN = IndexMutator.applyBatch(mut pager, byN, nOps.view(), plain)!;
+    let noCase = orderOf(Collation.NoCase, false);
+    let inPlaceLabel = IndexMutator.applyBatch(mut pager, byLabel, labelOps.view(), noCase)!;
+    // A removal that would reshape the tree is declined; the index is then rebuilt from the table's rows.
+    if (!inPlaceN || !inPlaceLabel) {
+        var nEntries = Vector<Vector<SqliteValue>>.create();
+        var labelEntries = Vector<Vector<SqliteValue>>.create();
+        for (id in 1i64..7001) {
+            if (id > 4000) {
+                nEntries.push(entryOf(SqliteValue.Integer(id * 2), id))!;
+                labelEntries.push(entryOf(SqliteValue.Text(numbered("LABEL ", id - 4000)), id))!;
+            } else if (id % 3 != 0) {
+                nEntries.push(entryOf(SqliteValue.Integer(id * 2), id))!;
+                labelEntries.push(entryOf(SqliteValue.Text(labelOf(id)), id))!;
+            }
+        }
+        if (!inPlaceN) {
+            rebuildFrom(mut pager, byN, mut nEntries, plain);
+        }
+        if (!inPlaceLabel) {
+            rebuildFrom(mut pager, byLabel, mut labelEntries, noCase);
+        }
+    }
+    pager.commit()!;
+    // integrity_check compares every index with its table.
+    expectIntact(path)?;
+    Check.equalText("5667\n", askSqlite(path, "SELECT count(*) FROM t")?.view())?;
+    Check.equalText("2\n", askSqlite(path, "SELECT count(*) FROM t INDEXED BY t_label WHERE label = 'label 100'")?.view())?;
+    Check.equalText("1\n", askSqlite(path, "SELECT count(*) FROM t INDEXED BY t_label WHERE label = 'label 300'")?.view())?;
+    Check.equalText("6000\n", askSqlite(path, "SELECT id FROM t INDEXED BY t_n WHERE n = 12000")?.view())?;
+    return Ok();
+}
+
+fn rebuildFrom(pager: borrow mut WritablePager, root: u32, entries: borrow mut Vector<Vector<SqliteValue>>, order: borrow IndexOrder) {
+    entries.sortBy((a, b) => order.comparePrefix(a.view(), b.view()));
+    var records = Vector<Vector<u8>>.create();
+    for (i in 0..entries.length) {
+        records.push(Record.encode(entries[i].view())!)!;
+    }
+    IndexMutator.rebuild(pager, root, records.view())!;
+}
+
+@test
+fn insertsIntoAnIndexSplitItsPages() -> Result<void, TestFailure> {
+    let path = "out/mutate-index-grow.db";
+    makeDatabase(path, "PRAGMA page_size = 512; CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER, label TEXT COLLATE NOCASE); CREATE INDEX t_label ON t(label);")?;
+    let table = rootOfTable(path, "t");
+    let index = rootOfIndex(path, "t_label");
+    var pager = WritablePager.open(path)!;
+    let order = orderOf(Collation.NoCase, false);
+    // Entries of very different sizes, some on overflow pages, arriving in no order.
+    for (step in 0i64..3000) {
+        let id = (step * 7919) % 3000 + 1;
+        var label = numbered(if (id % 2 == 0) "Label " else "label ", id);
+        if (id % 5 == 0) {
+            for (k in 0..truncate<usize>(id % 90)) {
+                label.append(" padding")!;
+            }
+        }
+        var one = Vector<TableOp>.create();
+        upsert(mut one, id, id, label.view());
+        TableMutator.applyBatch(mut pager, table, one.view())!;
+        var ops = Vector<IndexOp>.create();
+        ops.push(IndexOp { entry: entryOf(SqliteValue.Text(label), id), remove: false })!;
+        Check.isTrue(IndexMutator.applyBatch(mut pager, index, ops.view(), order)!, "an insertion is always done in place")?;
+    }
+    pager.commit()!;
+    expectIntact(path)?;
+    Check.equalText("3000|4501500\n", askSqlite(path, "SELECT count(*), sum(id) FROM t INDEXED BY t_label WHERE label > ''")?.view())?;
+    return Ok();
+}
+
+@test
+fn rollbackForgetsAndUnsupportedFilesAreRefused() -> Result<void, TestFailure> {
+    let path = "out/mutate-rollback.db";
+    mutateFixture(path, "4096", "1000")?;
+    let original = wholeFile(path);
+    let root = rootOfTable(path, "t");
+    {
+        var pager = WritablePager.open(path)!;
+        var ops = Vector<TableOp>.create();
+        for (id in 1i64..901) {
+            removal(mut ops, id);
+        }
+        TableMutator.applyBatch(mut pager, root, ops.view())!;
+        Check.isTrue(pager.hasChanges(), "the transaction has changes")?;
+        pager.rollback();
+        pager.commit()!;
+        Check.equalBytes(original.view(), wholeFile(path).view())?;
+        // After a rollback the pager is at the committed state again.
+        var one = Vector<TableOp>.create();
+        removal(mut one, 500);
+        TableMutator.applyBatch(mut pager, root, one.view())!;
+        pager.commit()!;
+    }
+    expectIntact(path)?;
+    Check.equalText("999\n", askSqlite(path, "SELECT count(*) FROM t")?.view())?;
+
+    let vacuumed = "out/mutate-autovacuum.db";
+    makeDatabase(vacuumed, "PRAGMA auto_vacuum = FULL; CREATE TABLE a(x); INSERT INTO a VALUES (1);")?;
+    Check.isTrue(WritablePager.open(vacuumed) is Err(SqliteError.Unsupported(_)), "a database with pointer-map pages is not written")?;
+    return Ok();
+}

@@ -1,0 +1,293 @@
+// The writable pager: a transaction's view of a database's pages. Pages are changed in memory; `commit` journals
+// the old ones, writes the new, and removes the journal. Freed pages go to SQLite's freelist and are used again.
+// https://www.sqlite.org/fileformat2.html#the_freelist
+//
+// Differences from the C# engine, which this replaces:
+// - a database that keeps pointer-map pages (auto-vacuum or incremental vacuum) is refused. The C# changed its
+//   b-trees without updating the pointer map, which SQLite then finds in disagreement with the file;
+// - a database in WAL mode is refused until the WAL writer is ported, rather than written behind its log;
+// - page numbers and counts read from the freelist are checked, so a damaged freelist is `Corrupt` instead of a
+//   page handed out twice;
+// - a freed page becomes a leaf of the first trunk page while that has room. The C# made every freed page a
+//   trunk of its own, which is a valid freelist but touches the header for each page;
+// - the page that holds SQLite's lock bytes is never allocated;
+// - `rollback` forgets a transaction's changes. The C# pager could only be thrown away.
+
+struct WritablePager {
+    private file: File;
+    private path: String;
+    pageSize: usize;
+    usable: usize;
+    textEncoding: TextEncoding;
+    /// The number of pages the database has in this transaction.
+    pageCount: u32;
+    // The state at the last commit, which `rollback` returns to and the journal restores.
+    private committedPageCount: u32;
+    private committedFreeTrunk: u32;
+    private committedFreeCount: u32;
+    private changeCounter: u32;
+    private freeTrunk: u32;
+    private freeCount: u32;
+    // The pages the transaction has looked at: `slots` says where in `pages` each one is.
+    private slots: HashMap<u32, usize>;
+    private pages: Vector<Vector<u8>>;
+    private preImages: HashMap<u32, Vector<u8>>;
+    private dirty: HashMap<u32, bool>;
+
+    /// Opens the database at `path` for changes, first undoing a commit that was interrupted.
+    fn open(path: StringView) -> Result<WritablePager, SqliteError> {
+        let _ = Journal.recover(path)?;
+        let wal = withSuffix(path, "-wal")?;
+        if ((fileLength(wal.view())? ?? 0) > 0) {
+            return Err(unsupported("the database has a write-ahead log, which this build cannot write yet"));
+        }
+        var file = File.openReadWrite(path)?;
+        var bytes = [0u8; 100];
+        if (!readFully(mut file, mut bytes[..], 0)?) {
+            return Err(notADatabase("file is too small to be a SQLite database"));
+        }
+        let header = DatabaseHeader.parse(bytes[..])?;
+        if (bytes[18] > 2 || bytes[19] > 2) {
+            return Err(unsupported("the database's file format is newer than this engine"));
+        }
+        if (bytes[18] == 2 || bytes[19] == 2) {
+            return Err(unsupported("the database is in WAL mode, which this build cannot write yet"));
+        }
+        if (bytes[..].readBE<u32>(52) != 0) {
+            return Err(unsupported("databases with auto-vacuum or incremental vacuum cannot be written"));
+        }
+        if (header.schemaFormat > 4) {
+            return Err(unsupported("the database's schema format is newer than this engine"));
+        }
+        let pages = file.length()? / (header.pageSize as u64);
+        let pageCount = checkedTruncate<u32>(pages) ?? {
+            return Err(corrupt("database file has more pages than the format allows"));
+        };
+        return Ok(WritablePager {
+            file: file,
+            path: String.from(path)?,
+            pageSize: header.pageSize,
+            usable: header.usableSize(),
+            textEncoding: header.textEncoding,
+            pageCount: pageCount,
+            committedPageCount: pageCount,
+            committedFreeTrunk: header.firstFreelistTrunkPage,
+            committedFreeCount: header.freelistPageCount,
+            changeCounter: header.fileChangeCounter,
+            freeTrunk: header.firstFreelistTrunkPage,
+            freeCount: header.freelistPageCount,
+            slots: HashMap<u32, usize>.create(),
+            pages: Vector<Vector<u8>>.create(),
+            preImages: HashMap<u32, Vector<u8>>.create(),
+            dirty: HashMap<u32, bool>.create(),
+        });
+    }
+
+    /// Whether the transaction has changed anything.
+    fn hasChanges(borrow this) -> bool => this.dirty.length() != 0;
+
+    /// The number of pages the transaction has changed.
+    fn changedPages(borrow this) -> usize => this.dirty.length();
+
+    /// The page that holds SQLite's lock bytes, which no b-tree may use.
+    private fn pendingPage(borrow this) -> u32 => truncate<u32>(PENDING_BYTE / (this.pageSize as u64)) + 1;
+
+    private fn load(borrow mut this, number: u32) -> Result<void, SqliteError> {
+        if (number < 1 || number > this.pageCount) {
+            return Err(corrupt("a page pointer leads outside the database file"));
+        }
+        if (this.slots.contains(borrow number)) {
+            return Ok();
+        }
+        var bytes = Vector<u8>.create();
+        bytes.resize(this.pageSize, 0)?;
+        if (number <= this.committedPageCount) {
+            let offset = ((number - 1) as u64) * (this.pageSize as u64);
+            if (!readFully(mut this.file, bytes.viewMut(), offset)?) {
+                return Err(corrupt("database file ends inside a page"));
+            }
+        }
+        let slot = this.pages.length;
+        this.pages.push(bytes)?;
+        let _ = this.slots.put(number, slot)?;
+        return Ok();
+    }
+
+    /// Where page `number`, which is loaded, is in `pages`.
+    private fn slotOf(borrow this, number: u32) -> usize => *this.slots.get(borrow number)!;
+
+    /// Page `number` as the transaction sees it.
+    fn read(borrow mut this, number: u32) -> Result<Slice<u8>, SqliteError> {
+        this.load(number)?;
+        return Ok(this.pages[this.slotOf(number)].view());
+    }
+
+    /// A copy of page `number`, for code that reads other pages while it looks at this one.
+    fn copy(borrow mut this, number: u32) -> Result<Vector<u8>, SqliteError> {
+        this.load(number)?;
+        return Ok(this.pages[this.slotOf(number)].clone()?);
+    }
+
+    /// Page `number`, to change. Its old image is kept for the journal.
+    fn write(borrow mut this, number: u32) -> Result<SliceMut<u8>, SqliteError> {
+        this.load(number)?;
+        if (number <= this.committedPageCount && !this.preImages.contains(borrow number)) {
+            let image = this.pages[this.slotOf(number)].clone()?;
+            let _ = this.preImages.put(number, image)?;
+        }
+        let _ = this.dirty.put(number, true)?;
+        let slot = this.slotOf(number);
+        return Ok(this.pages[slot].viewMut());
+    }
+
+    /// The number of page numbers a freelist trunk page can hold. SQLite keeps six slots unused, for the sake
+    /// of old versions of itself.
+    private fn trunkCapacity(borrow this) -> usize => this.usable / 4 - 8;
+
+    /// A zeroed page: one from the freelist if it has any, else a new one at the end of the file.
+    fn allocatePage(borrow mut this) -> Result<u32, SqliteError> {
+        if (this.freeTrunk != 0) {
+            let trunkNumber = this.freeTrunk;
+            let mostLeaves = this.usable / 4 - 2;
+            let next = this.read(trunkNumber)?.readBE<u32>(0);
+            let leaves = this.read(trunkNumber)?.readBE<u32>(4) as usize;
+            if (leaves > mostLeaves) {
+                return Err(corrupt("a freelist trunk page claims more leaves than fit in it"));
+            }
+            var taken = trunkNumber;
+            if (leaves > 0) {
+                taken = this.read(trunkNumber)?.readBE<u32>(8 + (leaves - 1) * 4);
+                if (taken < 2 || taken > this.pageCount || taken == trunkNumber) {
+                    return Err(corrupt("the freelist names a page outside the database file"));
+                }
+                this.write(trunkNumber)?.writeBE(4, truncate<u32>(leaves - 1));
+            } else {
+                // A trunk without leaves is itself the page to use; the next trunk heads the list.
+                if (next > this.pageCount || next == trunkNumber) {
+                    return Err(corrupt("the freelist names a page outside the database file"));
+                }
+                this.freeTrunk = next;
+            }
+            this.freeCount = this.freeCount.saturatingSub(1);
+            this.write(taken)?.fill(0);
+            return Ok(taken);
+        }
+        var number = this.pageCount;
+        loop {
+            if (number >= 4294967294) {
+                return Err(unsupported("the database would have more pages than the file format allows"));
+            }
+            number += 1;
+            var bytes = Vector<u8>.create();
+            bytes.resize(this.pageSize, 0)?;
+            let slot = this.pages.length;
+            this.pages.push(bytes)?;
+            let _ = this.slots.put(number, slot)?;
+            let _ = this.dirty.put(number, true)?;
+            this.pageCount = number;
+            if (number != this.pendingPage()) {
+                return Ok(number);
+            }
+        }
+    }
+
+    /// Puts page `number` on the freelist: nothing refers to it any more.
+    fn freePage(borrow mut this, number: u32) -> Result<void, SqliteError> {
+        if (number < 2 || number > this.pageCount) {
+            return Err(corrupt("a page to free is outside the database file"));
+        }
+        if (this.freeTrunk != 0) {
+            let trunkNumber = this.freeTrunk;
+            let leaves = this.read(trunkNumber)?.readBE<u32>(4) as usize;
+            if (leaves < this.trunkCapacity()) {
+                let trunk = this.write(trunkNumber)?;
+                trunk.writeBE(8 + leaves * 4, number);
+                trunk.writeBE(4, truncate<u32>(leaves + 1));
+                this.freeCount += 1;
+                return Ok();
+            }
+        }
+        // The page becomes a trunk, at the head of the list.
+        let previous = this.freeTrunk;
+        let page = this.write(number)?;
+        page.fill(0);
+        page.writeBE(0, previous);
+        this.freeTrunk = number;
+        this.freeCount += 1;
+        return Ok();
+    }
+
+    /// Adds one to the schema cookie, so that other connections read the schema again.
+    fn bumpSchemaCookie(borrow mut this) -> Result<void, SqliteError> {
+        let header = this.write(1)?;
+        let cookie = header.readBE<u32>(40);
+        header.writeBE(40, cookie.wrappingAdd(1));
+        return Ok();
+    }
+
+    /// Forgets everything the transaction changed.
+    fn rollback(borrow mut this) {
+        this.slots.clear();
+        this.pages.clear();
+        this.preImages.clear();
+        this.dirty.clear();
+        this.pageCount = this.committedPageCount;
+        this.freeTrunk = this.committedFreeTrunk;
+        this.freeCount = this.committedFreeCount;
+    }
+
+    /// Makes the transaction's changes durable, as one step: after a crash the database holds all of them or
+    /// none.
+    fn commit(borrow mut this) -> Result<void, SqliteError> {
+        if (this.dirty.length() == 0) {
+            return Ok();
+        }
+        let counter = this.changeCounter.wrappingAdd(1);
+        let pageCount = this.pageCount;
+        let freeTrunk = this.freeTrunk;
+        let freeCount = this.freeCount;
+        let header = this.write(1)?;
+        header.writeBE(24, counter);
+        header.writeBE(28, pageCount);
+        header.writeBE(32, freeTrunk);
+        header.writeBE(36, freeCount);
+        // The version-valid-for number says the in-header size is current.
+        header.writeBE(92, counter);
+        header.writeBE(96, WRITER_SQLITE_VERSION);
+
+        var journal = JournalWriter.begin(this.path.view(), this.pageSize, this.committedPageCount)?;
+        for (i in 0..this.preImages.length()) {
+            journal.add(*this.preImages.keyAt(i), this.preImages.valueAt(i).view())?;
+        }
+        journal.finish()?;
+        for (i in 0..this.dirty.length()) {
+            let number = *this.dirty.keyAt(i);
+            let offset = ((number - 1) as u64) * (this.pageSize as u64);
+            let slot = this.slotOf(number);
+            this.file.writeAt(this.pages[slot].view(), offset)?;
+        }
+        this.file.setLength((pageCount as u64) * (this.pageSize as u64))?;
+        this.file.syncAll()?;
+        Journal.remove(this.path.view())?;
+
+        this.changeCounter = counter;
+        this.committedPageCount = pageCount;
+        this.committedFreeTrunk = freeTrunk;
+        this.committedFreeCount = freeCount;
+        this.preImages.clear();
+        this.dirty.clear();
+        return Ok();
+    }
+}
+
+impl PageSink for WritablePager {
+    fn usableSize(borrow this) -> usize => this.usable;
+
+    fn allocate(borrow mut this) -> Result<u32, SqliteError> => this.allocatePage();
+
+    fn pageMut(borrow mut this, number: u32) -> Result<SliceMut<u8>, SqliteError> {
+        let usable = this.usable;
+        let page = this.write(number)?;
+        return Ok(borrow mut page[0..usable]);
+    }
+}

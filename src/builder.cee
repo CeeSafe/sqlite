@@ -7,6 +7,18 @@
 //   "Page N: never used"). Here a leaf's records are chosen before any cell is built;
 // - rows with the same rowid, and more pages than the format holds, are errors rather than a damaged file.
 
+/// Where b-tree pages are built: pages in memory for a new file, or the pages of a database being changed.
+interface PageSink {
+    /// The bytes of each page that b-trees use.
+    fn usableSize(borrow this) -> usize;
+
+    /// A zeroed page to build in, and its number.
+    fn allocate(borrow mut this) -> Result<u32, SqliteError>;
+
+    /// The usable bytes of page `number`, to write.
+    fn pageMut(borrow mut this, number: u32) -> Result<SliceMut<u8>, SqliteError>;
+}
+
 /// The pages of a database being built: page `n` is `pages[n - 1]`.
 struct PageStore {
     pageSize: usize;
@@ -15,7 +27,7 @@ struct PageStore {
     fn create(pageSize: usize) -> PageStore => PageStore { pageSize: pageSize, pages: Vector<Vector<u8>>.create() };
 
     /// Adds a zeroed page and returns its number.
-    fn allocate(borrow mut this) -> Result<u32, SqliteError> {
+    fn allocatePage(borrow mut this) -> Result<u32, SqliteError> {
         // SQLite's largest page number.
         if (this.pages.length >= 4294967294) {
             return Err(unsupported("the database would have more pages than the file format allows"));
@@ -31,6 +43,15 @@ struct PageStore {
     fn count(borrow this) -> u32 => truncate<u32>(this.pages.length);
 }
 
+impl PageSink for PageStore {
+    // A file written whole has no reserved space.
+    fn usableSize(borrow this) -> usize => this.pageSize;
+
+    fn allocate(borrow mut this) -> Result<u32, SqliteError> => this.allocatePage();
+
+    fn pageMut(borrow mut this, number: u32) -> Result<SliceMut<u8>, SqliteError> => Ok(this.page(number));
+}
+
 /// A page of one level and the largest rowid under it.
 struct TableNode {
     page: u32;
@@ -44,25 +65,25 @@ struct EncodedRow {
 }
 
 struct BTreeBuilder {
-    // The builder writes pages with no reserved space, so a page's usable size is its size.
-    fn tableLeafMaxLocal(store: borrow PageStore) -> usize => store.pageSize - 35;
+    // Sizes are of a page's usable part, which is all of a page the sink lends.
+    fn tableLeafMaxLocal<S: PageSink>(store: borrow S) -> usize => store.usableSize() - 35;
 
-    fn indexMaxLocal(store: borrow PageStore) -> usize => (store.pageSize - 12) * 64 / 255 - 23;
+    fn indexMaxLocal<S: PageSink>(store: borrow S) -> usize => (store.usableSize() - 12) * 64 / 255 - 23;
 
     /// The bytes of a payload of `length` kept in its cell when it spills to overflow pages.
-    fn localSize(store: borrow PageStore, length: usize, maxLocal: usize) -> usize {
-        let minLocal = (store.pageSize - 12) * 32 / 255 - 23;
-        let k = minLocal + (length - minLocal) % (store.pageSize - 4);
+    fn localSize<S: PageSink>(store: borrow S, length: usize, maxLocal: usize) -> usize {
+        let minLocal = (store.usableSize() - 12) * 32 / 255 - 23;
+        let k = minLocal + (length - minLocal) % (store.usableSize() - 4);
         return if (k <= maxLocal) k else minLocal;
     }
 
     /// The bytes a payload of `length` takes in its cell: all of it, or its local part and an overflow pointer.
-    fn portionSize(store: borrow PageStore, length: usize, maxLocal: usize) -> usize =>
+    fn portionSize<S: PageSink>(store: borrow S, length: usize, maxLocal: usize) -> usize =>
         if (length <= maxLocal) length else BTreeBuilder.localSize(store, length, maxLocal) + 4;
 
     /// Appends the payload's part of a cell to `cell`, writing overflow pages for what does not fit.
-    fn appendPayload(
-        store: borrow mut PageStore,
+    fn appendPayload<S: PageSink>(
+        store: borrow mut S,
         cell: borrow mut Vector<u8>,
         record: Slice<u8>,
         maxLocal: usize,
@@ -73,7 +94,7 @@ struct BTreeBuilder {
         }
         let local = BTreeBuilder.localSize(store, record.length, maxLocal);
         cell.extend(record[0..local])?;
-        let chunkSize = store.pageSize - 4;
+        let chunkSize = store.usableSize() - 4;
         var position = local;
         var first: u32 = 0;
         var previous: u32 = 0;
@@ -83,10 +104,10 @@ struct BTreeBuilder {
                 first = page;
             }
             if (previous != 0) {
-                store.page(previous).writeBE(0, page);
+                store.pageMut(previous)?.writeBE(0, page);
             }
             let chunk = chunkSize.min(record.length - position);
-            store.page(page)[4..4 + chunk].copyFrom(record[position..position + chunk]);
+            store.pageMut(page)?[4..4 + chunk].copyFrom(record[position..position + chunk]);
             position += chunk;
             previous = page;
         }
@@ -95,7 +116,11 @@ struct BTreeBuilder {
     }
 
     /// A table leaf cell: the payload's length, the rowid, the payload.
-    fn tableLeafCell(store: borrow mut PageStore, rowId: i64, record: Slice<u8>) -> Result<Vector<u8>, SqliteError> {
+    fn tableLeafCell<S: PageSink>(
+        store: borrow mut S,
+        rowId: i64,
+        record: Slice<u8>,
+    ) -> Result<Vector<u8>, SqliteError> {
         var cell = Vector<u8>.create();
         Varint.append(truncate<i64>(record.length), mut cell)?;
         Varint.append(rowId, mut cell)?;
@@ -104,7 +129,7 @@ struct BTreeBuilder {
     }
 
     /// An index cell: for an interior page the child before it, then the payload's length and the payload.
-    fn indexCell(store: borrow mut PageStore, child: u32?, record: Slice<u8>) -> Result<Vector<u8>, SqliteError> {
+    fn indexCell<S: PageSink>(store: borrow mut S, child: u32?, record: Slice<u8>) -> Result<Vector<u8>, SqliteError> {
         var cell = Vector<u8>.create();
         if (child is Some(page)) {
             cell.pushBE(page)?;
@@ -115,7 +140,7 @@ struct BTreeBuilder {
     }
 
     /// The room an index cell takes in its page, its 2-byte pointer included.
-    fn indexCellSize(store: borrow PageStore, length: usize, interior: bool) -> usize =>
+    fn indexCellSize<S: PageSink>(store: borrow S, length: usize, interior: bool) -> usize =>
         (if (interior) 4 else 0) + Varint.length(truncate<i64>(length)) + BTreeBuilder.portionSize(
             store,
             length,
@@ -147,7 +172,7 @@ struct BTreeBuilder {
     // ── table b-trees ────────────────────────────────────────────────────────────────────────────────────────
 
     /// Builds a table b-tree from rows in rowid order, and returns its root page.
-    fn buildTable(store: borrow mut PageStore, rows: Slice<EncodedRow>) -> Result<u32, SqliteError> {
+    fn buildTable<S: PageSink>(store: borrow mut S, rows: Slice<EncodedRow>) -> Result<u32, SqliteError> {
         var level = BTreeBuilder.tableLeaves(store, rows)?;
         while (level.length > 1) {
             level = BTreeBuilder.tableInteriorLevel(store, level.view())?;
@@ -155,8 +180,8 @@ struct BTreeBuilder {
         return Ok(level[0].page);
     }
 
-    private fn tableLeaves(
-        store: borrow mut PageStore,
+    private fn tableLeaves<S: PageSink>(
+        store: borrow mut S,
         rows: Slice<EncodedRow>,
     ) -> Result<Vector<TableNode>, SqliteError> {
         var leaves = Vector<TableNode>.create();
@@ -168,9 +193,9 @@ struct BTreeBuilder {
                 return Err(SqliteError.Constraint(ownedMessage("two rows of a table have the same rowid")));
             }
             let cell = BTreeBuilder.tableLeafCell(store, rows[i].rowId, rows[i].record.view())?;
-            if (cells.length != 0 && footprint + cell.length + 2 > store.pageSize) {
+            if (cells.length != 0 && footprint + cell.length + 2 > store.usableSize()) {
                 let page = store.allocate()?;
-                BTreeBuilder.fillPage(store.page(page), 0, PAGE_LEAF_TABLE, cells.view(), null);
+                BTreeBuilder.fillPage(store.pageMut(page)?, 0, PAGE_LEAF_TABLE, cells.view(), null);
                 leaves.push(TableNode { page: page, maxKey: lastKey })?;
                 cells.clear();
                 footprint = 8;
@@ -181,7 +206,7 @@ struct BTreeBuilder {
         }
         // The last leaf; an empty table is one empty leaf.
         let page = store.allocate()?;
-        BTreeBuilder.fillPage(store.page(page), 0, PAGE_LEAF_TABLE, cells.view(), null);
+        BTreeBuilder.fillPage(store.pageMut(page)?, 0, PAGE_LEAF_TABLE, cells.view(), null);
         leaves.push(TableNode { page: page, maxKey: lastKey })?;
         return Ok(leaves);
     }
@@ -198,12 +223,12 @@ struct BTreeBuilder {
         return Ok(cells);
     }
 
-    private fn tableInteriorLevel(
-        store: borrow mut PageStore,
+    private fn tableInteriorLevel<S: PageSink>(
+        store: borrow mut S,
         children: Slice<TableNode>,
     ) -> Result<Vector<TableNode>, SqliteError> {
         // A cell is at most a 4-byte child, a 9-byte key and its 2-byte pointer.
-        let maxChildren = ((store.pageSize - 12) / 15).max(2);
+        let maxChildren = ((store.usableSize() - 12) / 15).max(2);
         let groups = (children.length + maxChildren - 1) / maxChildren;
         let baseSize = children.length / groups;
         let remainder = children.length % groups;
@@ -215,7 +240,7 @@ struct BTreeBuilder {
             index += size;
             let page = store.allocate()?;
             let cells = BTreeBuilder.tableInteriorCells(group)?;
-            BTreeBuilder.fillPage(store.page(page), 0, PAGE_INTERIOR_TABLE, cells.view(), group[size - 1].page);
+            BTreeBuilder.fillPage(store.pageMut(page)?, 0, PAGE_INTERIOR_TABLE, cells.view(), group[size - 1].page);
             parents.push(TableNode { page: page, maxKey: group[size - 1].maxKey })?;
         }
         return Ok(parents);
@@ -223,8 +248,8 @@ struct BTreeBuilder {
 
     /// Builds sqlite_schema, whose root is page 1, after the database header: one leaf when its cells fit, an
     /// interior page over leaves when they do not.
-    fn buildRootOnPage1(
-        store: borrow mut PageStore,
+    fn buildRootOnPage1<S: PageSink>(
+        store: borrow mut S,
         cells: Slice<Vector<u8>>,
         rowIds: Slice<i64>,
     ) -> Result<void, SqliteError> {
@@ -232,8 +257,8 @@ struct BTreeBuilder {
         for (i in 0..cells.length) {
             footprint += cells[i].length + 2;
         }
-        if (footprint <= store.pageSize) {
-            BTreeBuilder.fillPage(store.page(1), DATABASE_HEADER_SIZE, PAGE_LEAF_TABLE, cells, null);
+        if (footprint <= store.usableSize()) {
+            BTreeBuilder.fillPage(store.pageMut(1)?, DATABASE_HEADER_SIZE, PAGE_LEAF_TABLE, cells, null);
             return Ok();
         }
         var leaves = Vector<TableNode>.create();
@@ -241,12 +266,13 @@ struct BTreeBuilder {
         var used: usize = 8;
         // Cells that would fit one ordinary leaf are still put in two, so that the root has a cell: SQLite
         // leaves a root without cells only when a single cell is all there is.
-        let fitsOneLeaf = footprint - DATABASE_HEADER_SIZE <= store.pageSize && cells.length >= 2;
+        let fitsOneLeaf = footprint - DATABASE_HEADER_SIZE <= store.usableSize() && cells.length >= 2;
         let forcedSplit = if (fitsOneLeaf) (cells.length + 1) / 2 else cells.length + 1;
         for (i in 0..cells.length + 1) {
-            if (i == cells.length || (i > start && (i == forcedSplit || used + cells[i].length + 2 > store.pageSize))) {
+            if (i == cells.length ||
+                (i > start && (i == forcedSplit || used + cells[i].length + 2 > store.usableSize()))) {
                 let page = store.allocate()?;
-                BTreeBuilder.fillPage(store.page(page), 0, PAGE_LEAF_TABLE, cells[start..i], null);
+                BTreeBuilder.fillPage(store.pageMut(page)?, 0, PAGE_LEAF_TABLE, cells[start..i], null);
                 leaves.push(TableNode { page: page, maxKey: rowIds[i - 1] })?;
                 start = i;
                 used = 8;
@@ -256,13 +282,13 @@ struct BTreeBuilder {
             }
         }
         // Page 1 has 100 bytes less room; build levels until the top one fits in it.
-        let maxRootChildren = ((store.pageSize - DATABASE_HEADER_SIZE - 12) / 15).max(2);
+        let maxRootChildren = ((store.usableSize() - DATABASE_HEADER_SIZE - 12) / 15).max(2);
         while (leaves.length > maxRootChildren) {
             leaves = BTreeBuilder.tableInteriorLevel(store, leaves.view())?;
         }
         let rootCells = BTreeBuilder.tableInteriorCells(leaves.view())?;
         BTreeBuilder.fillPage(
-            store.page(1),
+            store.pageMut(1)?,
             DATABASE_HEADER_SIZE,
             PAGE_INTERIOR_TABLE,
             rootCells.view(),
@@ -274,7 +300,7 @@ struct BTreeBuilder {
     // ── index b-trees ────────────────────────────────────────────────────────────────────────────────────────
 
     /// Builds an index b-tree from entries' records in index order, and returns its root page.
-    fn buildIndex(store: borrow mut PageStore, records: Slice<Vector<u8>>) -> Result<u32, SqliteError> {
+    fn buildIndex<S: PageSink>(store: borrow mut S, records: Slice<Vector<u8>>) -> Result<u32, SqliteError> {
         // Between two neighbouring pages of a level stands one record, the divider, which goes to their parent:
         // `dividers[i]` is the index of the record between `children[i]` and `children[i + 1]`.
         var children = Vector<u32>.create();
@@ -287,7 +313,7 @@ struct BTreeBuilder {
             var footprint: usize = 8;
             while (i < n) {
                 let size = BTreeBuilder.indexCellSize(store, records[i].length, false);
-                if (i > start && footprint + size > store.pageSize) {
+                if (i > start && footprint + size > store.usableSize()) {
                     break;
                 }
                 footprint += size;
@@ -324,7 +350,7 @@ struct BTreeBuilder {
             for (d in 0..dividers.length) {
                 maxCell = maxCell.max(BTreeBuilder.indexCellSize(store, records[dividers[d]].length, true));
             }
-            let maxChildren = (1 + (store.pageSize - 12) / maxCell).max(2);
+            let maxChildren = (1 + (store.usableSize() - 12) / maxCell).max(2);
             let groups = (children.length + maxChildren - 1) / maxChildren;
             let baseSize = children.length / groups;
             let remainder = children.length % groups;
@@ -342,7 +368,7 @@ struct BTreeBuilder {
                 }
                 let page = store.allocate()?;
                 BTreeBuilder.fillPage(
-                    store.page(page),
+                    store.pageMut(page)?,
                     0,
                     PAGE_INTERIOR_INDEX,
                     cells.view(),
@@ -363,13 +389,13 @@ struct BTreeBuilder {
         return Ok(children[0]);
     }
 
-    private fn indexLeaf(store: borrow mut PageStore, records: Slice<Vector<u8>>) -> Result<u32, SqliteError> {
+    private fn indexLeaf<S: PageSink>(store: borrow mut S, records: Slice<Vector<u8>>) -> Result<u32, SqliteError> {
         var cells = Vector<Vector<u8>>.withCapacity(records.length)?;
         for (i in 0..records.length) {
             cells.push(BTreeBuilder.indexCell(store, null, records[i].view())?)?;
         }
         let page = store.allocate()?;
-        BTreeBuilder.fillPage(store.page(page), 0, PAGE_LEAF_INDEX, cells.view(), null);
+        BTreeBuilder.fillPage(store.pageMut(page)?, 0, PAGE_LEAF_INDEX, cells.view(), null);
         return Ok(page);
     }
 }

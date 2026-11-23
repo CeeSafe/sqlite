@@ -1,0 +1,826 @@
+// Changing b-trees in place, in a transaction of the writable pager: only the pages on a change's path are
+// rewritten.
+//
+// Differences from the C# engine, which this replaces:
+// - a batch that deleted every row of a table whose root is a leaf wrote nothing: the rows stayed in the file,
+//   pointing at overflow pages that had been freed. The root is now always rewritten;
+// - a delete that left an interior page with one child stopped with "not yet supported", after it had already
+//   freed the emptied leaf. Here the children of that page and its siblings are shared out again among them, so
+//   every leaf stays at the same depth, whatever is deleted;
+// - a table whose root is page 1 (sqlite_schema) can be changed: the C# read and wrote every page as if its
+//   b-tree header were at offset 0;
+// - an index page that fills up is split where its cells' bytes divide evenly. The C# split by the number of
+//   cells, so a page of large entries followed by small ones could be split into a half that did not fit;
+// - index entries are compared in the index's own order, and decoded in the database's text encoding. The C#
+//   compared with BINARY ascending-or-descending only and decoded as UTF-8, so an index with a NOCASE column, or
+//   in a UTF-16 database, was changed in the wrong place;
+// - rebuilding an index uses the one b-tree builder. The C# had a second copy for this, which sized interior
+//   pages as if index cells were as small as table cells and overflowed them;
+// - chains of overflow pages and trees with cycles end in `Corrupt` rather than a loop.
+
+/// A child of an interior table page, and the largest rowid under it. The last child's key is not stored.
+struct ChildRef {
+    page: u32;
+    key: i64;
+}
+
+const ROWID_MAX: i64 = 9223372036854775807;
+
+/// A change to a table: a row to store under its rowid, or (without a record) a rowid to delete.
+struct TableOp {
+    rowId: i64;
+    record: Vector<u8>?;
+}
+
+/// The cells of a table leaf: `rowIds[i]` is the rowid of `cells[i]`.
+struct LeafCells {
+    rowIds: Vector<i64>;
+    cells: Vector<Vector<u8>>;
+}
+
+/// The way from a table's root to a leaf: the pages, and at each interior page the child that was taken.
+struct TablePath {
+    pages: Vector<u32>;
+    slots: Vector<usize>;
+    /// The largest rowid that belongs in the leaf.
+    upper: i64;
+}
+
+fn pageHeaderOffset(page: u32) -> usize => if (page == 1) DATABASE_HEADER_SIZE else 0;
+
+/// The bytes a payload of `total` takes inside its cell: all of it, or its local part and an overflow pointer.
+fn cellPayloadSize(usable: usize, total: usize, maxLocal: usize) -> usize {
+    if (total <= maxLocal) {
+        return total;
+    }
+    let minLocal = (usable - 12) * 32 / 255 - 23;
+    let k = minLocal + (total - minLocal) % (usable - 4);
+    return (if (k <= maxLocal) k else minLocal) + 4;
+}
+
+/// Frees the overflow pages a chain starts at `first`.
+fn freeOverflowChain(pager: borrow mut WritablePager, first: u32) -> Result<void, SqliteError> {
+    var page = first;
+    var freed: u32 = 0;
+    while (page != 0) {
+        freed += 1;
+        if (freed > pager.pageCount) {
+            return Err(corrupt("an overflow chain forms a cycle"));
+        }
+        let next = pager.read(page)?.readBE<u32>(0);
+        pager.freePage(page)?;
+        page = next;
+    }
+    return Ok();
+}
+
+struct TableMutator {
+    private fn interiorCapacity(pager: borrow WritablePager, page: u32) -> usize =>
+        ((pager.usable - pageHeaderOffset(page) - 12) / 15).max(2);
+
+    private fn leafFootprint(cells: Slice<Vector<u8>>) -> usize {
+        var total: usize = 8;
+        for (i in 0..cells.length) {
+            total += cells[i].length + 2;
+        }
+        return total;
+    }
+
+    private fn descend(pager: borrow mut WritablePager, root: u32, rowId: i64) -> Result<TablePath, SqliteError> {
+        var path = TablePath { pages: Vector<u32>.create(), slots: Vector<usize>.create(), upper: ROWID_MAX };
+        var page = root;
+        loop {
+            if (path.pages.length >= BTREE_MAX_DEPTH) {
+                return Err(corrupt("a table b-tree's pages form a cycle"));
+            }
+            path.pages.push(page)?;
+            let bytes = pager.read(page)?;
+            let header = BTreePageHeader.parse(bytes, page)?;
+            if (header.kind == PAGE_LEAF_TABLE) {
+                return Ok(path);
+            }
+            if (header.kind != PAGE_INTERIOR_TABLE) {
+                return Err(corrupt("a page in a table b-tree is not a table page"));
+            }
+            // The first cell whose key is not below the rowid leads to it; past them all, the right-most child.
+            var low: usize = 0;
+            var high = header.cellCount;
+            while (low < high) {
+                let middle = low + (high - low) / 2;
+                let key = Varint.read(bytes, header.cellOffset(bytes, middle)? + 4)?.value;
+                if (key < rowId) {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            var child = header.rightMost;
+            if (low < header.cellCount) {
+                let offset = header.cellOffset(bytes, low)?;
+                child = bytes.readBE<u32>(offset);
+                path.upper = path.upper.min(Varint.read(bytes, offset + 4)?.value);
+            }
+            path.slots.push(low)?;
+            page = child;
+        }
+    }
+
+    private fn readLeaf(pager: borrow mut WritablePager, page: u32) -> Result<LeafCells, SqliteError> {
+        let usable = pager.usable;
+        let bytes = pager.read(page)?;
+        let header = BTreePageHeader.parse(bytes, page)?;
+        if (header.kind != PAGE_LEAF_TABLE) {
+            return Err(corrupt("a page in a table b-tree is not a table page"));
+        }
+        var leaf = LeafCells {
+            rowIds: Vector<i64>.withCapacity(header.cellCount + 1)?,
+            cells: Vector<Vector<u8>>.withCapacity(header.cellCount + 1)?,
+        };
+        for (i in 0..header.cellCount) {
+            let offset = header.cellOffset(bytes, i)?;
+            let cell = TableLeafCell.parse(bytes, offset)?;
+            let total = checkedTruncate<usize>(cell.payloadLength) ?? {
+                return Err(corrupt("a cell's payload length is negative"));
+            };
+            let end = cell.payloadOffset + cellPayloadSize(usable, total, usable - 35);
+            if (end > usable) {
+                return Err(corrupt("a cell runs past the end of its page"));
+            }
+            var copy = Vector<u8>.withCapacity(end - offset)?;
+            copy.extend(bytes[offset..end])?;
+            leaf.rowIds.push(cell.rowId)?;
+            leaf.cells.push(copy)?;
+        }
+        return Ok(leaf);
+    }
+
+    /// Frees the overflow pages of a table leaf cell, if it has any.
+    private fn freeCellOverflow(pager: borrow mut WritablePager, cell: Slice<u8>) -> Result<void, SqliteError> {
+        let length = Varint.read(cell, 0)?;
+        if (length.value > truncate<i64>(pager.usable - 35)) {
+            return freeOverflowChain(pager, cell.readBE<u32>(cell.length - 4));
+        }
+        return Ok();
+    }
+
+    private fn readChildren(pager: borrow mut WritablePager, page: u32) -> Result<Vector<ChildRef>, SqliteError> {
+        let bytes = pager.read(page)?;
+        let header = BTreePageHeader.parse(bytes, page)?;
+        if (header.kind != PAGE_INTERIOR_TABLE) {
+            return Err(corrupt("a page in a table b-tree is not a table page"));
+        }
+        var children = Vector<ChildRef>.withCapacity(header.cellCount + 2)?;
+        for (i in 0..header.cellCount) {
+            let offset = header.cellOffset(bytes, i)?;
+            children.push(ChildRef { page: bytes.readBE<u32>(offset), key: Varint.read(bytes, offset + 4)?.value })?;
+        }
+        children.push(ChildRef { page: header.rightMost, key: ROWID_MAX })?;
+        return Ok(children);
+    }
+
+    private fn writeLeaf(
+        pager: borrow mut WritablePager,
+        page: u32,
+        cells: Slice<Vector<u8>>,
+    ) -> Result<void, SqliteError> {
+        let start = pageHeaderOffset(page);
+        let bytes = pager.pageMut(page)?;
+        bytes[start..].fill(0);
+        BTreeBuilder.fillPage(bytes, start, PAGE_LEAF_TABLE, cells, null);
+        return Ok();
+    }
+
+    private fn writeInterior(
+        pager: borrow mut WritablePager,
+        page: u32,
+        children: Slice<ChildRef>,
+    ) -> Result<void, SqliteError> {
+        var cells = Vector<Vector<u8>>.withCapacity(children.length)?;
+        for (i in 0..children.length - 1) {
+            var cell = Vector<u8>.create();
+            cell.pushBE(children[i].page)?;
+            Varint.append(children[i].key, mut cell)?;
+            cells.push(cell)?;
+        }
+        let start = pageHeaderOffset(page);
+        let bytes = pager.pageMut(page)?;
+        bytes[start..].fill(0);
+        BTreeBuilder.fillPage(bytes, start, PAGE_INTERIOR_TABLE, cells.view(), children[children.length - 1].page);
+        return Ok();
+    }
+
+    /// Writes `cells` into leaves, the first of them `reuse` unless that is 0, and returns the leaves.
+    private fn writeLeafChunks(
+        pager: borrow mut WritablePager,
+        reuse: u32,
+        leaf: borrow LeafCells,
+    ) -> Result<Vector<ChildRef>, SqliteError> {
+        var nodes = Vector<ChildRef>.create();
+        var start: usize = 0;
+        var footprint: usize = 8;
+        for (i in 0..leaf.cells.length + 1) {
+            if (i == leaf.cells.length || (i > start && footprint + leaf.cells[i].length + 2 > pager.usable)) {
+                let page = if (nodes.length == 0 && reuse != 0) reuse else pager.allocatePage()?;
+                TableMutator.writeLeaf(pager, page, leaf.cells.view()[start..i])?;
+                nodes.push(ChildRef { page: page, key: leaf.rowIds[i - 1] })?;
+                start = i;
+                footprint = 8;
+            }
+            if (i < leaf.cells.length) {
+                footprint += leaf.cells[i].length + 2;
+            }
+        }
+        return Ok(nodes);
+    }
+
+    /// Writes `children` into interior pages of the same level, the first of them `reuse` unless that is 0, and
+    /// returns those pages.
+    private fn writeInteriorChunks(
+        pager: borrow mut WritablePager,
+        reuse: u32,
+        children: Slice<ChildRef>,
+    ) -> Result<Vector<ChildRef>, SqliteError> {
+        let most = ((pager.usable - 12) / 15).max(2);
+        let groups = (children.length + most - 1) / most;
+        let baseSize = children.length / groups;
+        let remainder = children.length % groups;
+        var nodes = Vector<ChildRef>.create();
+        var index: usize = 0;
+        for (g in 0..groups) {
+            let size = baseSize + (if (g < remainder) 1 else 0);
+            let page = if (g == 0 && reuse != 0) reuse else pager.allocatePage()?;
+            TableMutator.writeInterior(pager, page, children[index..index + size])?;
+            nodes.push(ChildRef { page: page, key: children[index + size - 1].key })?;
+            index += size;
+        }
+        return Ok(nodes);
+    }
+
+    /// Makes the root an interior page over `children`, with more levels between when they are too many for it.
+    private fn writeRootOver(
+        pager: borrow mut WritablePager,
+        root: u32,
+        children: Vector<ChildRef>,
+    ) -> Result<void, SqliteError> {
+        var level = children;
+        while (level.length > TableMutator.interiorCapacity(pager, root)) {
+            level = TableMutator.writeInteriorChunks(pager, 0, level.view())?;
+        }
+        return TableMutator.writeInterior(pager, root, level.view());
+    }
+
+    /// Replaces the child at `slot` by `replacements` (none, to remove it). The last replacement keeps the key
+    /// the child had.
+    private fn splice(
+        children: borrow mut Vector<ChildRef>,
+        slot: usize,
+        replacements: Slice<ChildRef>,
+    ) -> Result<void, SqliteError> {
+        let key = children[slot].key;
+        let _ = children.remove(slot);
+        for (i in 0..replacements.length) {
+            let last = i + 1 == replacements.length;
+            children.insert(
+                slot + i,
+                ChildRef { page: replacements[i].page, key: if (last) key else replacements[i].key },
+            )?;
+        }
+        return Ok();
+    }
+
+    /// The root has one child left: the tree loses a level. The child's content moves into the root, unless the
+    /// root is page 1 and too small for it.
+    private fn pullUp(pager: borrow mut WritablePager, root: u32, child: u32) -> Result<void, SqliteError> {
+        let kind = BTreePageHeader.parse(pager.read(child)?, child)?.kind;
+        if (kind == PAGE_LEAF_TABLE) {
+            let leaf = TableMutator.readLeaf(pager, child)?;
+            if (TableMutator.leafFootprint(leaf.cells.view()) + pageHeaderOffset(root) <= pager.usable) {
+                TableMutator.writeLeaf(pager, root, leaf.cells.view())?;
+                return pager.freePage(child);
+            }
+        } else {
+            let grandchildren = TableMutator.readChildren(pager, child)?;
+            if (grandchildren.length <= TableMutator.interiorCapacity(pager, root)) {
+                TableMutator.writeInterior(pager, root, grandchildren.view())?;
+                return pager.freePage(child);
+            }
+        }
+        var only = Vector<ChildRef>.create();
+        only.push(ChildRef { page: child, key: ROWID_MAX })?;
+        return TableMutator.writeInterior(pager, root, only.view());
+    }
+
+    /// The interior page at `level` of the path now has `children`: writes it, and whatever that changes above.
+    private fn settle(
+        pager: borrow mut WritablePager,
+        path: borrow TablePath,
+        startLevel: usize,
+        startChildren: Vector<ChildRef>,
+    ) -> Result<void, SqliteError> {
+        var level = startLevel;
+        var children = startChildren;
+        loop {
+            let page = path.pages[level];
+            if (children.length != 0) {
+                children[children.length - 1].key = ROWID_MAX;
+            }
+            if (level == 0) {
+                if (children.length == 0) {
+                    return TableMutator.writeLeaf(pager, page, []);
+                }
+                if (children.length == 1) {
+                    return TableMutator.pullUp(pager, page, children[0].page);
+                }
+                return TableMutator.writeRootOver(pager, page, children);
+            }
+            if (children.length == 0) {
+                // The page has nothing under it: it leaves its parent.
+                pager.freePage(page)?;
+                children = TableMutator.readChildren(pager, path.pages[level - 1])?;
+                TableMutator.splice(mut children, path.slots[level - 1], [])?;
+                level -= 1;
+                continue;
+            }
+            if (children.length == 1) {
+                // One child is too few for an interior page, and removing the page would leave its subtree a
+                // level short. Its parent's children share all their children out again.
+                var siblings = TableMutator.readChildren(pager, path.pages[level - 1])?;
+                if (siblings.length < 2) {
+                    return TableMutator.writeInterior(pager, page, children.view());
+                }
+                var all = Vector<ChildRef>.create();
+                for (s in 0..siblings.length) {
+                    var theirs = if (s == path.slots[level - 1]) children.clone()? else TableMutator.readChildren(
+                        pager,
+                        siblings[s].page,
+                    )?;
+                    theirs[theirs.length - 1].key = siblings[s].key;
+                    all.extend(theirs.view())?;
+                }
+                let most = ((pager.usable - 12) / 15).max(2);
+                let groups = (all.length + most - 1) / most;
+                let baseSize = all.length / groups;
+                let remainder = all.length % groups;
+                var regrouped = Vector<ChildRef>.create();
+                var index: usize = 0;
+                for (g in 0..groups) {
+                    let size = baseSize + (if (g < remainder) 1 else 0);
+                    let target = if (g < siblings.length) siblings[g].page else pager.allocatePage()?;
+                    TableMutator.writeInterior(pager, target, all.view()[index..index + size])?;
+                    regrouped.push(ChildRef { page: target, key: all[index + size - 1].key })?;
+                    index += size;
+                }
+                for (s in groups..siblings.length) {
+                    pager.freePage(siblings[s].page)?;
+                }
+                level -= 1;
+                children = regrouped;
+                continue;
+            }
+            let nodes = TableMutator.writeInteriorChunks(pager, page, children.view())?;
+            if (nodes.length == 1) {
+                return Ok();
+            }
+            children = TableMutator.readChildren(pager, path.pages[level - 1])?;
+            TableMutator.splice(mut children, path.slots[level - 1], nodes.view())?;
+            level -= 1;
+        }
+    }
+
+    /// Writes a leaf's new cells, and whatever that changes above it.
+    private fn finishLeaf(
+        pager: borrow mut WritablePager,
+        path: borrow TablePath,
+        leaf: borrow LeafCells,
+    ) -> Result<void, SqliteError> {
+        let depth = path.pages.length;
+        let page = path.pages[depth - 1];
+        if (depth == 1) {
+            if (TableMutator.leafFootprint(leaf.cells.view()) + pageHeaderOffset(page) <= pager.usable) {
+                return TableMutator.writeLeaf(pager, page, leaf.cells.view());
+            }
+            // The root keeps its page number: its rows move to new leaves, and it becomes their parent.
+            let leaves = TableMutator.writeLeafChunks(pager, 0, leaf)?;
+            return TableMutator.writeRootOver(pager, page, leaves);
+        }
+        var nodes = Vector<ChildRef>.create();
+        if (leaf.cells.length == 0) {
+            // A leaf without rows may not stay in the tree.
+            pager.freePage(page)?;
+        } else {
+            nodes = TableMutator.writeLeafChunks(pager, page, leaf)?;
+            if (nodes.length == 1) {
+                return Ok();
+            }
+        }
+        var children = TableMutator.readChildren(pager, path.pages[depth - 2])?;
+        TableMutator.splice(mut children, path.slots[depth - 2], nodes.view())?;
+        return TableMutator.settle(pager, path, depth - 2, children);
+    }
+
+    /// Applies `ops`, which are in rowid order with no rowid twice, to the table rooted at `root`.
+    fn applyBatch(pager: borrow mut WritablePager, root: u32, ops: Slice<TableOp>) -> Result<void, SqliteError> {
+        var next: usize = 0;
+        while (next < ops.length) {
+            let path = TableMutator.descend(pager, root, ops[next].rowId)?;
+            var leaf = TableMutator.readLeaf(pager, path.pages[path.pages.length - 1])?;
+            // Every op whose rowid belongs in this leaf is applied before the leaf is written once.
+            while (next < ops.length && ops[next].rowId <= path.upper) {
+                let rowId = ops[next].rowId;
+                if (next != 0 && rowId <= ops[next - 1].rowId) {
+                    return Err(sqlError("the changes to a table must be in rowid order"));
+                }
+                var low: usize = 0;
+                var high = leaf.rowIds.length;
+                while (low < high) {
+                    let middle = low + (high - low) / 2;
+                    if (leaf.rowIds[middle] < rowId) {
+                        low = middle + 1;
+                    } else {
+                        high = middle;
+                    }
+                }
+                let found = low < leaf.rowIds.length && leaf.rowIds[low] == rowId;
+                if (found) {
+                    TableMutator.freeCellOverflow(pager, leaf.cells[low].view())?;
+                }
+                if (borrow ops[next].record is Some(record)) {
+                    let cell = BTreeBuilder.tableLeafCell(pager, rowId, record.view())?;
+                    if (found) {
+                        leaf.cells[low] = cell;
+                    } else {
+                        leaf.rowIds.insert(low, rowId)?;
+                        leaf.cells.insert(low, cell)?;
+                    }
+                } else if (found) {
+                    let _ = leaf.rowIds.remove(low);
+                    let _ = leaf.cells.remove(low);
+                }
+                next += 1;
+            }
+            TableMutator.finishLeaf(pager, path, leaf)?;
+        }
+        return Ok();
+    }
+}
+
+/// A change to an index: an entry (its columns, then what names its row) to add or to remove.
+struct IndexOp {
+    entry: Vector<SqliteValue>;
+    remove: bool;
+}
+
+/// What an index page that split hands its parent: the entry between the two halves, as the cell bytes that
+/// follow a child pointer, and the new page to the right of it.
+struct IndexSplit {
+    promoted: Vector<u8>;
+    rightPage: u32;
+}
+
+struct IndexMutator {
+    /// The whole entry of the cell whose payload length is at `offset` of `page`.
+    private fn entryAt(
+        pager: borrow mut WritablePager,
+        page: Slice<u8>,
+        offset: usize,
+    ) -> Result<Vector<SqliteValue>, SqliteError> {
+        let usable = pager.usable;
+        let length = Varint.read(page, offset)?;
+        let total = checkedTruncate<usize>(length.value) ?? {
+            return Err(corrupt("a cell's payload length is negative"));
+        };
+        let start = offset + length.length;
+        let maxLocal = (usable - 12) * 64 / 255 - 23;
+        let inCell = cellPayloadSize(usable, total, maxLocal);
+        if (start + inCell > usable) {
+            return Err(corrupt("a cell runs past the end of its page"));
+        }
+        if (total <= maxLocal) {
+            return Record.decode(page[start..start + total], pager.textEncoding);
+        }
+        if ((total as u64) > (pager.pageCount as u64) * (usable as u64)) {
+            return Err(corrupt("a cell's payload is larger than the database"));
+        }
+        var payload = Vector<u8>.withCapacity(total)?;
+        payload.extend(page[start..start + inCell - 4])?;
+        var next = page.readBE<u32>(start + inCell - 4);
+        while (payload.length < total) {
+            if (next == 0) {
+                return Err(corrupt("an overflow chain ends before its payload does"));
+            }
+            let overflow = pager.read(next)?;
+            let chunk = (usable - 4).min(total - payload.length);
+            payload.extend(overflow[4..4 + chunk])?;
+            next = overflow.readBE<u32>(0);
+        }
+        return Record.decode(payload.view(), pager.textEncoding);
+    }
+
+    /// The bytes of each cell of an index page.
+    private fn rawCells(
+        usable: usize,
+        page: Slice<u8>,
+        header: borrow BTreePageHeader,
+    ) -> Result<Vector<Vector<u8>>, SqliteError> {
+        let lead: usize = if (header.isLeaf()) 0 else 4;
+        var cells = Vector<Vector<u8>>.withCapacity(header.cellCount + 1)?;
+        for (i in 0..header.cellCount) {
+            let offset = header.cellOffset(page, i)?;
+            let length = Varint.read(page, offset + lead)?;
+            let total = checkedTruncate<usize>(length.value) ?? {
+                return Err(corrupt("a cell's payload length is negative"));
+            };
+            let end = offset + lead + length.length + cellPayloadSize(usable, total, (usable - 12) * 64 / 255 - 23);
+            if (end > usable) {
+                return Err(corrupt("a cell runs past the end of its page"));
+            }
+            var cell = Vector<u8>.withCapacity(end - offset)?;
+            cell.extend(page[offset..end])?;
+            cells.push(cell)?;
+        }
+        return Ok(cells);
+    }
+
+    private fn fits(usable: usize, cells: Slice<Vector<u8>>, interior: bool) -> bool {
+        var footprint: usize = if (interior) 12 else 8;
+        for (i in 0..cells.length) {
+            footprint += cells[i].length + 2;
+        }
+        return footprint <= usable;
+    }
+
+    private fn writePage(
+        pager: borrow mut WritablePager,
+        page: u32,
+        kind: u8,
+        cells: Slice<Vector<u8>>,
+        rightMost: u32?,
+    ) -> Result<void, SqliteError> {
+        let bytes = pager.pageMut(page)?;
+        bytes.fill(0);
+        BTreeBuilder.fillPage(bytes, 0, kind, cells, rightMost);
+        return Ok();
+    }
+
+    /// The cell at which to split `cells`: it goes up to the parent, those before it stay, those after it move.
+    /// The bytes on either side are as even as the cells allow.
+    private fn splitPoint(cells: Slice<Vector<u8>>) -> usize {
+        var total: usize = 0;
+        for (i in 0..cells.length) {
+            total += cells[i].length + 2;
+        }
+        var before: usize = 0;
+        var at: usize = 0;
+        while (at + 2 < cells.length && before + cells[at].length + 2 <= total / 2) {
+            before += cells[at].length + 2;
+            at += 1;
+        }
+        return at.max(1);
+    }
+
+    /// The first cell of the page whose entry is not before `entry`, and whether that cell's entry equals it.
+    private fn search(
+        pager: borrow mut WritablePager,
+        page: Slice<u8>,
+        header: borrow BTreePageHeader,
+        entry: Slice<SqliteValue>,
+        order: borrow IndexOrder,
+        equal: borrow mut bool,
+    ) -> Result<usize, SqliteError> {
+        let lead: usize = if (header.isLeaf()) 0 else 4;
+        var low: usize = 0;
+        var high = header.cellCount;
+        equal = false;
+        while (low < high) {
+            let middle = low + (high - low) / 2;
+            let there = IndexMutator.entryAt(pager, page, header.cellOffset(page, middle)? + lead)?;
+            let c = order.comparePrefix(there.view(), entry);
+            if (c == 0 && there.length == entry.length) {
+                equal = true;
+                return Ok(middle);
+            }
+            if (c < 0) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        return Ok(low);
+    }
+
+    private fn readIndexPage(pager: borrow mut WritablePager, number: u32) -> Result<Vector<u8>, SqliteError> {
+        var page = pager.copy(number)?;
+        page.truncate(pager.usable);
+        return Ok(page);
+    }
+
+    private fn indexHeader(page: Slice<u8>, number: u32) -> Result<BTreePageHeader, SqliteError> {
+        let header = BTreePageHeader.parse(page, number)?;
+        if (header.kind != PAGE_LEAF_INDEX && header.kind != PAGE_INTERIOR_INDEX) {
+            return Err(corrupt("a page in an index b-tree is not an index page"));
+        }
+        return Ok(header);
+    }
+
+    /// Adds `entry` under page `number`. When the page had to split, returns what its parent must add.
+    private fn insert(
+        pager: borrow mut WritablePager,
+        number: u32,
+        entry: Slice<SqliteValue>,
+        record: Slice<u8>,
+        order: borrow IndexOrder,
+        depth: usize,
+    ) -> Result<IndexSplit?, SqliteError> {
+        if (depth >= BTREE_MAX_DEPTH) {
+            return Err(corrupt("an index b-tree's pages form a cycle"));
+        }
+        let usable = pager.usable;
+        let page = IndexMutator.readIndexPage(pager, number)?;
+        let header = IndexMutator.indexHeader(page.view(), number)?;
+        var equal = false;
+        let at = IndexMutator.search(pager, page.view(), header, entry, order, mut equal)?;
+        if (equal) {
+            // The entry is there already: an index holds each row once.
+            return Ok(null);
+        }
+        var cells = IndexMutator.rawCells(usable, page.view(), header)?;
+        if (header.isLeaf()) {
+            cells.insert(at, BTreeBuilder.indexCell(pager, null, record)?)?;
+            if (IndexMutator.fits(usable, cells.view(), false)) {
+                IndexMutator.writePage(pager, number, PAGE_LEAF_INDEX, cells.view(), null)?;
+                return Ok(null);
+            }
+            let middle = IndexMutator.splitPoint(cells.view());
+            let rightPage = pager.allocatePage()?;
+            IndexMutator.writePage(pager, rightPage, PAGE_LEAF_INDEX, cells.view()[middle + 1..], null)?;
+            IndexMutator.writePage(pager, number, PAGE_LEAF_INDEX, cells.view()[0..middle], null)?;
+            return Ok(IndexSplit { promoted: cells[middle].clone()?, rightPage: rightPage });
+        }
+        let child = if (at < header.cellCount) cells[at].readBE<u32>(0) else header.rightMost;
+        let split = IndexMutator.insert(pager, child, entry, record, order, depth + 1)? ?? {
+            return Ok(null);
+        };
+        // The child keeps its page as the left half; what was right of it is now right of the new page.
+        var rightMost = header.rightMost;
+        var divider = Vector<u8>.withCapacity(split.promoted.length + 4)?;
+        divider.pushBE(child)?;
+        divider.extend(split.promoted.view())?;
+        if (at < cells.length) {
+            cells[at].writeBE(0, split.rightPage);
+        } else {
+            rightMost = split.rightPage;
+        }
+        cells.insert(at, divider)?;
+        if (IndexMutator.fits(usable, cells.view(), true)) {
+            IndexMutator.writePage(pager, number, PAGE_INTERIOR_INDEX, cells.view(), rightMost)?;
+            return Ok(null);
+        }
+        let middle = IndexMutator.splitPoint(cells.view());
+        let rightPage = pager.allocatePage()?;
+        IndexMutator.writePage(pager, rightPage, PAGE_INTERIOR_INDEX, cells.view()[middle + 1..], rightMost)?;
+        // The left half's right-most child is the one that was before the promoted cell.
+        IndexMutator.writePage(
+            pager,
+            number,
+            PAGE_INTERIOR_INDEX,
+            cells.view()[0..middle],
+            cells[middle].readBE<u32>(0),
+        )?;
+        var promoted = Vector<u8>.withCapacity(cells[middle].length - 4)?;
+        promoted.extend(cells[middle].view()[4..])?;
+        return Ok(IndexSplit { promoted: promoted, rightPage: rightPage });
+    }
+
+    /// Removes `entry` from a leaf under page `number`. False when the removal needs the tree reshaped: the
+    /// entry is in an interior page, or is the last of its leaf, or is not there.
+    private fn remove(
+        pager: borrow mut WritablePager,
+        root: u32,
+        entry: Slice<SqliteValue>,
+        order: borrow IndexOrder,
+    ) -> Result<bool, SqliteError> {
+        var number = root;
+        var depth: usize = 0;
+        loop {
+            if (depth >= BTREE_MAX_DEPTH) {
+                return Err(corrupt("an index b-tree's pages form a cycle"));
+            }
+            depth += 1;
+            let usable = pager.usable;
+            let page = IndexMutator.readIndexPage(pager, number)?;
+            let header = IndexMutator.indexHeader(page.view(), number)?;
+            var equal = false;
+            let at = IndexMutator.search(pager, page.view(), header, entry, order, mut equal)?;
+            if (!header.isLeaf()) {
+                if (equal) {
+                    return Ok(false);
+                }
+                number = if (at < header.cellCount) page.readBE<u32>(
+                    header.cellOffset(page.view(), at)?,
+                ) else header.rightMost;
+                continue;
+            }
+            if (!equal || (header.cellCount == 1 && number != root)) {
+                return Ok(false);
+            }
+            var cells = IndexMutator.rawCells(usable, page.view(), header)?;
+            let removed = cells.remove(at);
+            let length = Varint.read(removed.view(), 0)?;
+            if (length.value > truncate<i64>((usable - 12) * 64 / 255 - 23)) {
+                freeOverflowChain(pager, removed.readBE<u32>(removed.length - 4))?;
+            }
+            IndexMutator.writePage(pager, number, PAGE_LEAF_INDEX, cells.view(), null)?;
+            return Ok(true);
+        }
+    }
+
+    /// Applies `ops` to the index rooted at `root`, whose entries are in `order` (the order of whole entries:
+    /// the indexed columns, then what names the row). False when a removal could not be done in place: the
+    /// index must then be rebuilt from its table with `rebuild`, which makes up for whatever was applied.
+    fn applyBatch(
+        pager: borrow mut WritablePager,
+        root: u32,
+        ops: Slice<IndexOp>,
+        order: borrow IndexOrder,
+    ) -> Result<bool, SqliteError> {
+        for (i in 0..ops.length) {
+            let entry = ops[i].entry.view();
+            if (ops[i].remove) {
+                if (!IndexMutator.remove(pager, root, entry, order)?) {
+                    return Ok(false);
+                }
+                continue;
+            }
+            let record = Record.encode(entry)?;
+            if (IndexMutator.insert(pager, root, entry, record.view(), order, 0)? is Some(split)) {
+                // The root split: its left half moves to a new page, and the root becomes their parent.
+                let left = pager.allocatePage()?;
+                let content = pager.copy(root)?;
+                pager.write(left)?.copyFrom(content.view());
+                var cells = Vector<Vector<u8>>.create();
+                var divider = Vector<u8>.withCapacity(split.promoted.length + 4)?;
+                divider.pushBE(left)?;
+                divider.extend(split.promoted.view())?;
+                cells.push(divider)?;
+                IndexMutator.writePage(pager, root, PAGE_INTERIOR_INDEX, cells.view(), split.rightPage)?;
+            }
+        }
+        return Ok(true);
+    }
+
+    /// Replaces the index rooted at `root` by one holding `records`, which are in the index's order. The root
+    /// keeps its page number; the other pages of the old tree are freed.
+    fn rebuild(pager: borrow mut WritablePager, root: u32, records: Slice<Vector<u8>>) -> Result<void, SqliteError> {
+        // Every page of the old tree, overflow pages included, found without recursion.
+        let usable = pager.usable;
+        let maxLocal = (usable - 12) * 64 / 255 - 23;
+        var pending = Vector<u32>.create();
+        var old = Vector<u32>.create();
+        pending.push(root)?;
+        while (pending.pop() is Some(number)) {
+            if (old.length > pager.pageCount as usize) {
+                return Err(corrupt("an index b-tree's pages form a cycle"));
+            }
+            old.push(number)?;
+            let page = IndexMutator.readIndexPage(pager, number)?;
+            let header = IndexMutator.indexHeader(page.view(), number)?;
+            let lead: usize = if (header.isLeaf()) 0 else 4;
+            for (i in 0..header.cellCount) {
+                let offset = header.cellOffset(page.view(), i)?;
+                if (!header.isLeaf()) {
+                    pending.push(page.readBE<u32>(offset))?;
+                }
+                let length = Varint.read(page.view(), offset + lead)?;
+                let total = checkedTruncate<usize>(length.value) ?? {
+                    return Err(corrupt("a cell's payload length is negative"));
+                };
+                if (total > maxLocal) {
+                    let end = offset + lead + length.length + cellPayloadSize(usable, total, maxLocal);
+                    if (end > usable) {
+                        return Err(corrupt("a cell runs past the end of its page"));
+                    }
+                    var overflow = page.readBE<u32>(end - 4);
+                    while (overflow != 0) {
+                        if (old.length > pager.pageCount as usize) {
+                            return Err(corrupt("an overflow chain forms a cycle"));
+                        }
+                        old.push(overflow)?;
+                        overflow = pager.read(overflow)?.readBE<u32>(0);
+                    }
+                }
+            }
+            if (!header.isLeaf()) {
+                pending.push(header.rightMost)?;
+            }
+        }
+        for (i in 0..old.length) {
+            if (old[i] != root) {
+                pager.freePage(old[i])?;
+            }
+        }
+        let built = BTreeBuilder.buildIndex(pager, records)?;
+        let content = pager.copy(built)?;
+        pager.write(root)?.copyFrom(content.view());
+        return pager.freePage(built);
+    }
+}

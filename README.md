@@ -19,9 +19,9 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Schema catalog, affinity | `Engine/Schema`, `Exec/Affinity` | `schema.cee` | done |
 | Database writer, b-tree builder | `Storage/DatabaseWriter`, `BTreeBuilder`, `PageStore` | `writer.cee`, `builder.cee` | done: files pass `PRAGMA integrity_check` in `sqlite3` |
 | Rollback journal, commit of a page image | `Storage/JournaledFile` | `journal.cee` | done: either engine undoes the other's interrupted commit |
-| Writable pager, b-tree mutators | `Storage/WritablePager`, `BTreeMutator`, `IndexMutator`, `IndexRebuilder` | | next |
+| Writable pager, b-tree mutators | `Storage/WritablePager`, `BTreeMutator`, `IndexMutator`, `IndexRebuilder` | `pagerw.cee`, `mutate.cee` | done |
+| Executor, functions, JSON | `Engine/Exec` | | next |
 | WAL | `Storage/Wal*`, `Shm*` | | until then a database with a non-empty `-wal` file is refused |
-| Executor, functions, JSON | `Engine/Exec` | | |
 | Connection, command, pool | `SqliteConnection`, `SqliteCommand`, `SqliteConnectionPool` | | |
 | PostgreSQL wire front end, daemon, CLI | `CosmoNova.Engine.Sqlite.PgWire`, `CosmoSqliteD`, `.Cli` | | not started |
 
@@ -117,6 +117,26 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   the journal is written a record at a time rather than held in memory.
 - **Reading beside a hot journal.** A database with a journal is not read as it is: the interrupted commit is
   undone first.
+
+- **Deleting every row of a small table.** A C# batch that emptied a table whose root is a leaf wrote nothing,
+  leaving the rows in the file pointing at overflow pages it had freed (`deletingEveryRowOfASmallTable`).
+- **Deletes that empty subtrees.** When a delete left an interior page with one child, the C# stopped with "not
+  yet supported" after it had already freed the emptied leaf. Here that page's siblings share their children out
+  again, so every leaf stays at one depth whatever is deleted (`deletesThatEmptyWholeSubtrees`,
+  `deletesFromTheMiddleAndTheEnds`).
+- **sqlite_schema.** The C# mutator read every page as if its b-tree header were at offset 0, which is wrong for
+  page 1, so it could not change `sqlite_schema` in place (`changesSqliteSchemaOnPageOne`).
+- **Index pages that split.** The C# split an index page by the number of its cells, so a page of large entries
+  and small ones could be split into a half that did not fit. Pages split where their bytes divide evenly, and
+  entries are compared in the index's own order and decoded in the database's encoding
+  (`insertsIntoAnIndexSplitItsPages`, `keepsIndexesInStepWithTheirTable`).
+- **Rebuilding an index.** The C# had a second copy of the index builder for this, which sized interior pages as if
+  index cells were as small as table cells. The one builder serves both here.
+- **The freelist.** A freed page becomes a leaf of the first trunk while it has room, rather than a trunk of its
+  own; freelist pointers are checked; the page of SQLite's lock bytes is never allocated.
+- **Files the mutators cannot keep sound.** A database with pointer-map pages (auto-vacuum) or in WAL mode is
+  refused for writing; the C# wrote it, leaving the pointer map or the log out of step.
+- **Rolling back.** A transaction's changes can be forgotten; the C# pager could only be thrown away.
 
 ## Known gaps (inherited from the C# engine, refused by name rather than misparsed)
 
