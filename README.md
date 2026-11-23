@@ -371,8 +371,9 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   then fails with `SqliteError.Busy`, "database is locked", as SQLite does; so does a checkout when every
   connection is out. A thread that holds one transaction and asks a second connection for the file gets the error
   rather than a deadlock.
-- **`:memory:` is refused**, with `file:` URIs and the empty name, rather than made into a file of that name: this
-  engine keeps databases in files only.
+- **`:memory:` is a database of the connection's own**, as in SQLite, not a file of that name: here a private file
+  removed when the connection closes (the C# shared one in-memory database among every `:memory:` connection);
+  `file:` URIs are refused.
 - **Index cells take at least 4 bytes**, as SQLite counts them: a WITHOUT ROWID table of small keys made 3-byte
   cells, which sqlite3 calls out of range (`tinyIndexCellsTakeFourBytes`).
 - **INSTEAD OF triggers** make views writable as in SQLite (`insteadOfTriggersOnViews`): the rows are the view's
