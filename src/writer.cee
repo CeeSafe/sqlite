@@ -91,7 +91,7 @@ struct DatabaseWriter {
         let Stmt.CreateTable(stmt) = Parser.parseStatement(sql)? else {
             return Err(sqlError("not a CREATE TABLE statement"));
         };
-        let schema = buildTableSchema(stmt, stmt.name.name.view(), 0)?;
+        let schema = buildTableSchema(stmt, stmt.name.name.view(), 0, sql)?;
         if (this.findTable(schema.name.view()).isSome()) {
             return Err(constraintError("there is already a table named ", schema.name.view()));
         }

@@ -172,7 +172,7 @@ fn executeCreateTable(
     if (isReservedName(name)) {
         return Err(namedError("object name reserved for internal use: ", name));
     }
-    let table = buildTableSchema(stmt, name, 0)?;
+    let table = buildTableSchema(stmt, name, 0, sql)?;
     if (table.withoutRowid && table.primaryKey.length == 0) {
         return Err(namedError("PRIMARY KEY missing on table ", name));
     }

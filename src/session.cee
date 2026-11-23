@@ -20,6 +20,11 @@ public struct Session {
     lastInsertRowid: i64;
     /// Inside BEGIN … COMMIT: statements do not commit on their own.
     inTransaction: bool;
+    /// PRAGMA foreign_keys, synchronous, cache_size and busy_timeout.
+    foreignKeys: bool;
+    synchronous: i64;
+    cacheSize: i64;
+    busyTimeout: i64;
 
     /// Opens the database file at `path`, making an empty database if there is none.
     public fn open(path: StringView) -> Result<Session, SqliteError> {
@@ -38,6 +43,10 @@ public struct Session {
             totalChanges: 0,
             lastInsertRowid: 0,
             inTransaction: false,
+            foreignKeys: false,
+            synchronous: 2,
+            cacheSize: -2000,
+            busyTimeout: 0,
         });
     }
 
@@ -139,12 +148,12 @@ public struct Session {
 
     /// Runs one SQL statement with positional parameters (?, ?N, :name in order of first use).
     public fn query(borrow mut this, sql: StringView, params: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> {
-        let stmt = Parser.parseStatement(sql)?;
-        // The statement's text, as sqlite_schema keeps a definition.
+        // The statement's text, as sqlite_schema keeps a definition; token offsets are into it.
         var text = sql.trim();
         while (text.endsWith(";")) {
             text = text[0..text.length - 1].trimEnd();
         }
+        let stmt = Parser.parseStatement(text)?;
         this.pager.beginStatement();
         let result = this.run(borrow stmt, text, params);
         if (result.isOk()) {
@@ -189,6 +198,7 @@ public struct Session {
                 executeCreateView(s, sql, this)?;
                 return Ok(emptyResult());
             }
+            Stmt.Pragma(s) => { return executePragma(s, this); }
             Stmt.Drop(s) => {
                 executeDrop(s, this)?;
                 return Ok(emptyResult());

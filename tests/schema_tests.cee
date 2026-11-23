@@ -57,14 +57,14 @@ fn catalogReadsTables() -> Result<void, TestFailure> {
     // A table-level PRIMARY KEY on an INTEGER column is the rowid, DESC or not.
     Check.isTrue(child.rowidAlias == Some(0) && child.columns[0].isRowidAlias, "PRIMARY KEY (id DESC) is the rowid")?;
     Check.equalText("unique", child.columns[1].name.view())?;
-    Check.equalText("VARCHAR(10)", child.columns[1].declaredType.view())?;
+    Check.equalText("VARCHAR ( 10 )", child.columns[1].declaredType.view())?;
     Check.isTrue(child.columns[1].notNull && !child.columns[1].unique, "a column named \"unique\" is not UNIQUE")?;
     Check.equalText("'x'", exprTextOf(child.columns[1].defaultValue))?;
     Check.equalText("DECIMAL(10, 2)", child.columns[2].declaredType.view())?;
     Check.isTrue(child.columns[2].affinity == Affinity.Numeric, "DECIMAL is NUMERIC")?;
-    // The C# engine recorded this default as "-".
-    Check.equalText("- 1", exprTextOf(child.columns[2].defaultValue))?;
-    Check.equalText("(1 + 1)", exprTextOf(child.columns[3].defaultValue))?;
+    // The C# engine recorded this default as "-"; SQLite shows definitions as written.
+    Check.equalText("-1", exprTextOf(child.columns[2].defaultValue))?;
+    Check.equalText("1 + 1", exprTextOf(child.columns[3].defaultValue))?;
     match (borrow child.columns[4].defaultValue) {
         Some(value) => { Check.isTrue(value.expr is Expr.Literal(Literal { kind: LiteralKind.String, .. }), "DEFAULT abc is the string 'abc'")?; }
         null => { return Check.fail("the column has a default"); }
@@ -80,7 +80,7 @@ fn catalogReadsTables() -> Result<void, TestFailure> {
     Check.isTrue(child.columns[9].affinity == Affinity.Real, "DOUBLE PRECISION is REAL")?;
 
     Check.equalU64(2, child.checks.length as u64)?;
-    Check.equalText("amount >= - 1", child.checks[0].text.view())?;
+    Check.equalText("amount >= -1", child.checks[0].text.view())?;
     Check.equalText("id > 0", child.checks[1].text.view())?;
     Check.equalU64(1, child.keys.length as u64)?;
     Check.isTrue(!child.keys[0].primaryKey, "the rowid's PRIMARY KEY needs no index; UNIQUE does")?;

@@ -86,6 +86,9 @@ struct WritablePager {
         });
     }
 
+    /// The file's path, as it was opened.
+    fn filePath(borrow this) -> StringView => this.path.view();
+
     /// Whether the transaction has changed anything.
     fn hasChanges(borrow this) -> bool => this.dirty.length() != 0;
 

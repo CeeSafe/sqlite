@@ -97,6 +97,19 @@ fn sourceRows(
             }
             return Ok(copy);
         }
+        SourceKind.Pragma(name, argument) => {
+            var text: String? = null;
+            if (argument is Some(a)) {
+                let v = evaluate(a, frame, db)?;
+                text = valueText(borrow v)?;
+            }
+            var rows = pragmaRows(name.view(), text, db)?;
+            // The hidden argument column.
+            for (i in 0..rows.length) {
+                rows[i].push(SqliteValue.Null)?;
+            }
+            return Ok(rows);
+        }
         SourceKind.Table(_) => { return Ok(Vector<Vector<SqliteValue>>.create()); }
     }
 }

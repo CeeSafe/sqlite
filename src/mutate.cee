@@ -818,6 +818,19 @@ struct IndexMutator {
                 pager.freePage(old[i])?;
             }
         }
+        // Entries that fit in one page go straight into the root: no page is used and freed again.
+        var footprint: usize = 8;
+        for (i in 0..records.length) {
+            footprint += BTreeBuilder.indexCellSize(pager, records[i].length, false);
+        }
+        if (footprint <= pager.usable) {
+            var cells = Vector<Vector<u8>>.withCapacity(records.length)?;
+            for (i in 0..records.length) {
+                cells.push(BTreeBuilder.indexCell(pager, null, records[i].view())?)?;
+            }
+            IndexMutator.writePage(pager, root, PAGE_LEAF_INDEX, cells.view(), null)?;
+            return Ok();
+        }
         let built = BTreeBuilder.buildIndex(pager, records)?;
         let content = pager.copy(built)?;
         pager.write(root)?.copyFrom(content.view());

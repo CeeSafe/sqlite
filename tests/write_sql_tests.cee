@@ -211,3 +211,35 @@ fn transactionsUndoWhatTheyShould() -> Result<void, TestFailure> {
         SELECT v FROM t ORDER BY v
         """);
 }
+
+@test
+fn pragmasDescribeTheSchema() -> Result<void, TestFailure> {
+    return sameScript("pragma", """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT NOT NULL DEFAULT 'x', b INT DEFAULT (1+2) UNIQUE, c REAL DEFAULT -1.5, d AS (a||'!'), e INT REFERENCES u(id) ON DELETE CASCADE, UNIQUE(a,b))
+        CREATE TABLE u(id INTEGER PRIMARY KEY)
+        CREATE INDEX t_c ON t(c DESC, a COLLATE NOCASE)
+        CREATE INDEX t_p ON t(b) WHERE b > 0
+        CREATE INDEX t_x ON t(lower(a))
+        PRAGMA table_info(t)
+        PRAGMA table_xinfo(t)
+        PRAGMA index_list(t)
+        PRAGMA index_info(t_c)
+        PRAGMA index_xinfo(t_c)
+        PRAGMA index_info(t_x)
+        PRAGMA foreign_key_list(t)
+        PRAGMA table_info(nosuch)
+        PRAGMA encoding
+        PRAGMA journal_mode
+        PRAGMA user_version
+        PRAGMA user_version = 42
+        PRAGMA user_version
+        PRAGMA application_id = -7
+        PRAGMA application_id
+        PRAGMA foreign_keys
+        PRAGMA page_size
+        PRAGMA freelist_count
+        SELECT name, type FROM pragma_table_info('t') ORDER BY cid
+        SELECT count(*) FROM pragma_index_list('t') WHERE "unique"
+        PRAGMA no_such_pragma
+        """);
+}

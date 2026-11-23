@@ -1,0 +1,459 @@
+// PRAGMA statements, and the pragma_* table-valued functions that give the same rows.
+//
+// Differences from the C# engine, which this replaces (each checked against sqlite3 3.54):
+// - table_info shows each column's type and default as written in CREATE TABLE ('x', 1 + 2), and leaves out
+//   generated columns, which table_xinfo shows with hidden 2 (VIRTUAL) or 3 (STORED);
+// - index_list orders the indexes as SQLite does (the latest first) and gives each one's origin (c, u, pk) and
+//   whether it is partial; index_info gives -2 and no name for an expression column;
+// - user_version and application_id are stored in the database header, so they persist and other programs see
+//   them.
+//
+// Not yet supported, and refused by name: integrity_check and quick_check, and pragmas this engine does not have.
+
+fn intRow(n: i64) -> Result<Vector<SqliteValue>, AllocError> {
+    var row = Vector<SqliteValue>.create();
+    row.push(SqliteValue.Integer(n))?;
+    return Ok(row);
+}
+
+fn textRow(text: StringView) -> Result<Vector<SqliteValue>, AllocError> {
+    var row = Vector<SqliteValue>.create();
+    row.push(SqliteValue.text(text)?)?;
+    return Ok(row);
+}
+
+fn namesOf(names: Slice<StringView>) -> Result<Vector<String>, AllocError> {
+    var out = Vector<String>.withCapacity(names.length)?;
+    for (n in names) {
+        out.push(String.from(n)?)?;
+    }
+    return Ok(out);
+}
+
+static PRAGMA_COLUMNS_0: [StringView; 6] = ["cid", "name", "type", "notnull", "dflt_value", "pk"];
+static PRAGMA_COLUMNS_1: [StringView; 7] = ["cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"];
+static PRAGMA_COLUMNS_2: [StringView; 5] = ["seq", "name", "unique", "origin", "partial"];
+static PRAGMA_COLUMNS_3: [StringView; 3] = ["seqno", "cid", "name"];
+static PRAGMA_COLUMNS_4: [StringView; 6] = ["seqno", "cid", "name", "desc", "coll", "key"];
+static PRAGMA_COLUMNS_5: [StringView; 8] = ["id", "seq", "table", "from", "to", "on_update", "on_delete", "match"];
+static PRAGMA_COLUMNS_6: [StringView; 3] = ["seq", "name", "file"];
+static PRAGMA_COLUMNS_7: [StringView; 6] = ["schema", "name", "type", "ncol", "wr", "strict"];
+static PRAGMA_COLUMNS_8: [StringView; 2] = ["seq", "name"];
+
+/// The column names of the pragmas that give tables.
+fn pragmaColumns(name: StringView) -> Slice<StringView>? {
+    if (name.equalsIgnoreAsciiCase("table_info")) {
+        return PRAGMA_COLUMNS_0[..];
+    }
+    if (name.equalsIgnoreAsciiCase("table_xinfo")) {
+        return PRAGMA_COLUMNS_1[..];
+    }
+    if (name.equalsIgnoreAsciiCase("index_list")) {
+        return PRAGMA_COLUMNS_2[..];
+    }
+    if (name.equalsIgnoreAsciiCase("index_info")) {
+        return PRAGMA_COLUMNS_3[..];
+    }
+    if (name.equalsIgnoreAsciiCase("index_xinfo")) {
+        return PRAGMA_COLUMNS_4[..];
+    }
+    if (name.equalsIgnoreAsciiCase("foreign_key_list")) {
+        return PRAGMA_COLUMNS_5[..];
+    }
+    if (name.equalsIgnoreAsciiCase("database_list")) {
+        return PRAGMA_COLUMNS_6[..];
+    }
+    if (name.equalsIgnoreAsciiCase("table_list")) {
+        return PRAGMA_COLUMNS_7[..];
+    }
+    if (name.equalsIgnoreAsciiCase("collation_list")) {
+        return PRAGMA_COLUMNS_8[..];
+    }
+    return null;
+}
+
+fn actionName(action: ForeignKeyAction) -> StringView => match (action) {
+    ForeignKeyAction.NoAction => "NO ACTION",
+    ForeignKeyAction.Restrict => "RESTRICT",
+    ForeignKeyAction.SetNull => "SET NULL",
+    ForeignKeyAction.SetDefault => "SET DEFAULT",
+    ForeignKeyAction.Cascade => "CASCADE",
+};
+
+/// A header field of page 1, as a big-endian u32.
+fn headerField(db: borrow mut Session, offset: usize) -> Result<u32, SqliteError> =>
+    Ok(db.pager.read(1)?.readBE<u32>(offset));
+
+fn setHeaderField(db: borrow mut Session, offset: usize, value: u32) -> Result<void, SqliteError> {
+    db.pager.write(1)?.writeBE(offset, value);
+    return Ok();
+}
+
+/// The value of a pragma's argument as an integer: a number, or ON/TRUE/YES and OFF/FALSE/NO.
+fn pragmaInteger(value: StringView) -> i64? {
+    if (value.equalsIgnoreAsciiCase(
+        "on",
+    ) || value.equalsIgnoreAsciiCase("true") || value.equalsIgnoreAsciiCase("yes")) {
+        return 1;
+    }
+    if (value.equalsIgnoreAsciiCase(
+        "off",
+    ) || value.equalsIgnoreAsciiCase("false") || value.equalsIgnoreAsciiCase("no")) {
+        return 0;
+    }
+    return value.parseInt<i64>();
+}
+
+/// The rows a pragma gives for `argument` (a table or index name, where it takes one).
+fn pragmaRows(
+    name: StringView,
+    argument: String?,
+    db: borrow mut Session,
+) -> Result<Vector<Vector<SqliteValue>>, SqliteError> {
+    var rows = Vector<Vector<SqliteValue>>.create();
+    let arg = match (borrow argument) {
+        Some(a) => a.view(),
+        null => "",
+    };
+    if (name.equalsIgnoreAsciiCase("table_info") || name.equalsIgnoreAsciiCase("table_xinfo")) {
+        let extended = name.equalsIgnoreAsciiCase("table_xinfo");
+        let table = if (arg.equalsIgnoreAsciiCase(
+            "sqlite_schema",
+        ) || arg.equalsIgnoreAsciiCase("sqlite_master")) schemaTableSchema()? else match (db.catalog.table(arg)?) {
+            Some(t) => t.copy()?,
+            null => { return Ok(rows); },
+        };
+        var cid: i64 = 0;
+        for (c in 0..table.columns.length) {
+            let column = borrow table.columns[c];
+            let hidden: i64 = if (column.generated.isNull()) 0 else if (column.generatedStored) 3 else 2;
+            if (hidden != 0 && !extended) {
+                continue;
+            }
+            var pk: i64 = 0;
+            for (k in 0..table.primaryKey.length) {
+                if (table.primaryKey[k].name.view().equalsIgnoreAsciiCase(column.name.view())) {
+                    pk = truncate<i64>(k) + 1;
+                }
+            }
+            var row = Vector<SqliteValue>.create();
+            row.push(SqliteValue.Integer(if (extended) truncate<i64>(c) else cid))?;
+            row.push(SqliteValue.text(column.name.view())?)?;
+            row.push(SqliteValue.text(column.declaredType.view())?)?;
+            row.push(SqliteValue.Integer(if (column.notNull) 1 else 0))?;
+            row.push(
+                if (borrow column.defaultValue is Some(d)) SqliteValue.text(d.text.view())? else SqliteValue.Null,
+            )?;
+            row.push(SqliteValue.Integer(pk))?;
+            if (extended) {
+                row.push(SqliteValue.Integer(hidden))?;
+            }
+            rows.push(row)?;
+            cid += 1;
+        }
+        return Ok(rows);
+    }
+    if (name.equalsIgnoreAsciiCase("index_list")) {
+        let Some(table) = db.catalog.table(arg)? else {
+            return Ok(rows);
+        };
+        let tableName = table.name.clone()?;
+        let withoutRowid = table.withoutRowid;
+        let keys = table.copy()?;
+        // The latest first, as SQLite keeps them.
+        var seq: i64 = 0;
+        var e = db.entries.length;
+        while (e > 0) {
+            e -= 1;
+            let entry = borrow db.entries[e];
+            if (entry.kind.view() != "index" || !entry.tableName.view().equalsIgnoreAsciiCase(tableName.view())) {
+                continue;
+            }
+            var origin: StringView = "c";
+            var unique = false;
+            var partial = false;
+            if (borrow entry.sql is Some(sql)) {
+                if (Parser.parseStatement(sql.view()).ok() is Some(Stmt.CreateIndex(stmt))) {
+                    unique = stmt.unique;
+                    partial = stmt.filter.isSome();
+                }
+            } else {
+                // sqlite_autoindex_T_N: the N-th key constraint.
+                unique = true;
+                origin = "u";
+                let n = match (entry.name.view().lastIndexOf("_")) {
+                    Some(at) => entry.name.view()[at + 1..].parseInt<usize>() ?? 0,
+                    null => 0,
+                };
+                var number: usize = 0;
+                for (k in 0..keys.keys.length) {
+                    if (keys.keys[k].primaryKey && withoutRowid) {
+                        continue;
+                    }
+                    number += 1;
+                    if (number == n && keys.keys[k].primaryKey) {
+                        origin = "pk";
+                    }
+                }
+            }
+            var row = Vector<SqliteValue>.create();
+            row.push(SqliteValue.Integer(seq))?;
+            row.push(SqliteValue.text(entry.name.view())?)?;
+            row.push(SqliteValue.Integer(if (unique) 1 else 0))?;
+            row.push(SqliteValue.text(origin)?)?;
+            row.push(SqliteValue.Integer(if (partial) 1 else 0))?;
+            rows.push(row)?;
+            seq += 1;
+        }
+        return Ok(rows);
+    }
+    if (name.equalsIgnoreAsciiCase("index_info") || name.equalsIgnoreAsciiCase("index_xinfo")) {
+        let extended = name.equalsIgnoreAsciiCase("index_xinfo");
+        var compiler = Compiler.create();
+        var indexTable: String? = null;
+        for (e in 0..db.entries.length) {
+            if (db.entries[e].kind.view() == "index" && db.entries[e].name.view().equalsIgnoreAsciiCase(arg)) {
+                indexTable = db.entries[e].tableName.clone()?;
+            }
+        }
+        let Some(tableName) = indexTable else {
+            return Ok(rows);
+        };
+        let table = db.catalog.tableCopy(tableName.view())?;
+        let indexes = tableIndexes(mut compiler, borrow table, 0, db)?;
+        for (i in 0..indexes.length) {
+            let index = borrow indexes[i];
+            if (!index.name.view().equalsIgnoreAsciiCase(arg)) {
+                continue;
+            }
+            for (c in 0..index.columns.length) {
+                var row = Vector<SqliteValue>.create();
+                row.push(SqliteValue.Integer(truncate<i64>(c)))?;
+                if (index.columns[c].column is Some(at)) {
+                    row.push(SqliteValue.Integer(truncate<i64>(at)))?;
+                    row.push(SqliteValue.text(table.columns[at].name.view())?)?;
+                } else {
+                    row.push(SqliteValue.Integer(-2))?;
+                    row.push(SqliteValue.Null)?;
+                }
+                if (extended) {
+                    row.push(SqliteValue.Integer(if (index.order.descending[c]) 1 else 0))?;
+                    row.push(SqliteValue.text(index.order.collations[c].name())?)?;
+                    row.push(SqliteValue.Integer(1))?;
+                }
+                rows.push(row)?;
+            }
+            if (extended) {
+                // The rowid that ends every entry.
+                var row = Vector<SqliteValue>.create();
+                row.push(SqliteValue.Integer(truncate<i64>(index.columns.length)))?;
+                row.push(SqliteValue.Integer(-1))?;
+                row.push(SqliteValue.Null)?;
+                row.push(SqliteValue.Integer(0))?;
+                row.push(SqliteValue.text("BINARY")?)?;
+                row.push(SqliteValue.Integer(0))?;
+                rows.push(row)?;
+            }
+        }
+        return Ok(rows);
+    }
+    if (name.equalsIgnoreAsciiCase("foreign_key_list")) {
+        let Some(table) = db.catalog.table(arg)? else {
+            return Ok(rows);
+        };
+        // The last declared first, as SQLite numbers them.
+        var id: i64 = 0;
+        var k = table.foreignKeys.length;
+        while (k > 0) {
+            k -= 1;
+            let key = borrow table.foreignKeys[k];
+            for (c in 0..key.columns.length) {
+                var row = Vector<SqliteValue>.create();
+                row.push(SqliteValue.Integer(id))?;
+                row.push(SqliteValue.Integer(truncate<i64>(c)))?;
+                row.push(SqliteValue.text(key.refTable.view())?)?;
+                row.push(SqliteValue.text(key.columns[c].view())?)?;
+                row.push(
+                    if (c < key.refColumns.length) SqliteValue.text(key.refColumns[c].view())? else SqliteValue.Null,
+                )?;
+                row.push(SqliteValue.text(actionName(key.onUpdate))?)?;
+                row.push(SqliteValue.text(actionName(key.onDelete))?)?;
+                row.push(SqliteValue.text("NONE")?)?;
+                rows.push(row)?;
+            }
+            id += 1;
+        }
+        return Ok(rows);
+    }
+    if (name.equalsIgnoreAsciiCase("database_list")) {
+        var row = Vector<SqliteValue>.create();
+        row.push(SqliteValue.Integer(0))?;
+        row.push(SqliteValue.text("main")?)?;
+        row.push(SqliteValue.text(db.pager.filePath())?)?;
+        rows.push(row)?;
+        return Ok(rows);
+    }
+    if (name.equalsIgnoreAsciiCase("table_list")) {
+        var e = db.entries.length;
+        while (e > 0) {
+            e -= 1;
+            let entry = borrow db.entries[e];
+            let kind = entry.kind.view();
+            if (kind != "table" && kind != "view") {
+                continue;
+            }
+            var columns: i64 = 0;
+            var strict = false;
+            var withoutRowid = false;
+            if (kind == "table") {
+                if (db.catalog.table(entry.name.view())? is Some(t)) {
+                    columns = truncate<i64>(t.columns.length);
+                    strict = t.strict;
+                    withoutRowid = t.withoutRowid;
+                }
+            }
+            var row = Vector<SqliteValue>.create();
+            row.push(SqliteValue.text("main")?)?;
+            row.push(SqliteValue.text(entry.name.view())?)?;
+            row.push(SqliteValue.text(kind)?)?;
+            row.push(SqliteValue.Integer(columns))?;
+            row.push(SqliteValue.Integer(if (withoutRowid) 1 else 0))?;
+            row.push(SqliteValue.Integer(if (strict) 1 else 0))?;
+            rows.push(row)?;
+        }
+        for (pair in [["main", "sqlite_schema"], ["temp", "sqlite_temp_schema"]]) {
+            var row = Vector<SqliteValue>.create();
+            row.push(SqliteValue.text(pair[0])?)?;
+            row.push(SqliteValue.text(pair[1])?)?;
+            row.push(SqliteValue.text("table")?)?;
+            row.push(SqliteValue.Integer(5))?;
+            row.push(SqliteValue.Integer(0))?;
+            row.push(SqliteValue.Integer(0))?;
+            rows.push(row)?;
+        }
+        return Ok(rows);
+    }
+    if (name.equalsIgnoreAsciiCase("collation_list")) {
+        let names = ["RTRIM", "NOCASE", "BINARY"];
+        for (i in 0..names.length) {
+            var row = Vector<SqliteValue>.create();
+            row.push(SqliteValue.Integer(truncate<i64>(i)))?;
+            row.push(SqliteValue.text(names[i])?)?;
+            rows.push(row)?;
+        }
+        return Ok(rows);
+    }
+    return Err(namedError("no such pragma table: ", name));
+}
+
+/// PRAGMA.
+fn executePragma(stmt: borrow PragmaStmt, db: borrow mut Session) -> Result<QueryResult, SqliteError> {
+    if (borrow stmt.name.schema is Some(schema)) {
+        if (!schema.view().equalsIgnoreAsciiCase("main")) {
+            return Err(namedError("unknown database ", schema.view()));
+        }
+    }
+    let name = stmt.name.name.view();
+    if (pragmaColumns(name) is Some(columns)) {
+        var argument: String? = null;
+        if (borrow stmt.value is Some(v)) {
+            argument = v.clone()?;
+        }
+        return Ok(QueryResult { columns: namesOf(columns)?, rows: pragmaRows(name, argument, db)? });
+    }
+    var setTo: i64? = null;
+    var setText: StringView = "";
+    if (borrow stmt.value is Some(v)) {
+        setText = v.view();
+        setTo = pragmaInteger(v.view());
+    }
+    var columns = Vector<String>.create();
+    columns.push(String.from(name)?)?;
+    var rows = Vector<Vector<SqliteValue>>.create();
+    let lower = asciiLower(name)?;
+    match (lower.view()) {
+        "user_version" | "application_id" => {
+            let offset: usize = if (lower.view() == "user_version") 60 else 68;
+            if (stmt.value.isSome()) {
+                let n = setTo ?? 0;
+                setHeaderField(db, offset, truncate<u32>(truncate<u64>(n)))?;
+                return Ok(emptyResult());
+            }
+            rows.push(intRow(truncate<i32>(headerField(db, offset)?) as i64)?)?;
+        }
+        "schema_version" => {
+            if (stmt.value.isSome()) {
+                setHeaderField(db, 40, truncate<u32>(truncate<u64>(setTo ?? 0)))?;
+                return Ok(emptyResult());
+            }
+            rows.push(intRow(headerField(db, 40)? as i64)?)?;
+        }
+        "page_size" => {
+            if (stmt.value.isNull()) {
+                rows.push(intRow(truncate<i64>(db.pager.pageSize))?)?;
+            }
+        }
+        "page_count" => { rows.push(intRow(db.pager.pageCount as i64)?)?; }
+        "freelist_count" => { rows.push(intRow(headerField(db, 36)? as i64)?)?; }
+        "encoding" => {
+            if (stmt.value.isNull()) {
+                rows.push(textRow(match (db.pager.textEncoding) {
+                    TextEncoding.Utf8 => "UTF-8",
+                    TextEncoding.Utf16LE => "UTF-16le",
+                    TextEncoding.Utf16BE => "UTF-16be",
+                })?)?;
+            }
+        }
+        "journal_mode" => {
+            // Rollback journals only, for now: asked to change, the answer is the mode in force.
+            rows.push(textRow("delete")?)?;
+        }
+        "foreign_keys" => {
+            if (stmt.value.isSome()) {
+                db.foreignKeys = (setTo ?? 0) != 0;
+                return Ok(emptyResult());
+            }
+            rows.push(intRow(if (db.foreignKeys) 1 else 0)?)?;
+        }
+        "synchronous" => {
+            if (stmt.value.isSome()) {
+                db.synchronous = match (asciiLower(setText)?.view()) {
+                    "off" => 0,
+                    "normal" => 1,
+                    "full" => 2,
+                    "extra" => 3,
+                    _ => setTo ?? 2,
+                };
+                return Ok(emptyResult());
+            }
+            rows.push(intRow(db.synchronous)?)?;
+        }
+        "cache_size" => {
+            if (stmt.value.isSome()) {
+                db.cacheSize = setTo ?? db.cacheSize;
+                return Ok(emptyResult());
+            }
+            rows.push(intRow(db.cacheSize)?)?;
+        }
+        "busy_timeout" => {
+            if (stmt.value.isSome()) {
+                db.busyTimeout = setTo ?? 0;
+            }
+            columns = namesOf(["timeout"][..])?;
+            rows.push(intRow(db.busyTimeout)?)?;
+        }
+        "recursive_triggers" | "defer_foreign_keys" | "case_sensitive_like" | "reverse_unordered_selects" => {
+            if (stmt.value.isSome()) {
+                return Ok(emptyResult());
+            }
+            rows.push(intRow(0)?)?;
+        }
+        "data_version" => { rows.push(intRow(1)?)?; }
+        "integrity_check" | "quick_check" => { return Err(unsupported("PRAGMA integrity_check is not supported yet")); }
+        _ => {
+            // SQLite ignores a pragma it does not know.
+            return Ok(emptyResult());
+        }
+    }
+    return Ok(QueryResult { columns: columns, rows: rows });
+}

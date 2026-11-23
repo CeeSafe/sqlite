@@ -44,6 +44,8 @@ enum SourceKind {
     Cte(usize),
     /// A recursive CTE's current step.
     Working(usize),
+    /// A pragma_* table-valued function: the pragma's name and its argument.
+    Pragma(String, XExpr?),
 }
 
 struct SourcePlan {
@@ -813,7 +815,60 @@ fn compileFromItem(
             return Ok();
         }
         FromItem.TableFunction(f) => {
-            return Err(namedError("table-valued functions are not supported yet: ", f.name.view()));
+            let name = f.name.view();
+            let isPragma = name.length > 7 && name[0..7].equalsIgnoreAsciiCase("pragma_");
+            let columnNames = (if (isPragma) pragmaColumns(name[7..]) else null) ?? {
+                return Err(namedError("no such table: ", name));
+            };
+            var argument: XExpr? = null;
+            if (f.args.length > 1) {
+                return Err(namedError("too many arguments on ", name));
+            }
+            if (f.args.length == 1) {
+                argument = compiler.compile(borrow f.args[0], db)?;
+            }
+            var columns = Vector<ScopeColumn>.create();
+            for (c in columnNames) {
+                columns.push(
+                    ScopeColumn {
+                        name: String.from(c)?,
+                        affinity: Affinity.Blob,
+                        collation: Collation.Binary,
+                        hidden: false,
+                    },
+                )?;
+            }
+            columns.push(
+                ScopeColumn {
+                    name: String.from("arg")?,
+                    affinity: Affinity.Blob,
+                    collation: Collation.Binary,
+                    hidden: true,
+                },
+            )?;
+            let count = columns.length;
+            let alias = if (borrow f.alias is Some(a)) a.clone()? else String.from(name)?;
+            scope.sources.push(
+                ScopeSource {
+                    name: alias,
+                    columns: columns,
+                    slot: slot,
+                    hasRowid: false,
+                    rowidAlias: null,
+                    merged: Vector<String>.create(),
+                },
+            )?;
+            sources.push(
+                SourcePlan {
+                    kind: SourceKind.Pragma(String.from(name[7..])?, argument),
+                    slot: slot,
+                    columnCount: count,
+                    left: false,
+                    on: null,
+                    rowidSeek: null,
+                },
+            )?;
+            return Ok();
         }
     }
 }
@@ -1350,10 +1405,9 @@ fn withoutCollate(e: borrow Expr) -> borrow Expr {
 
 /// sqlite_schema's definition: the table whose root is page 1.
 fn schemaTableSchema() -> Result<TableSchema, SqliteError> {
-    let Stmt.CreateTable(stmt) = Parser.parseStatement(
-        "CREATE TABLE sqlite_schema(type text, name text, tbl_name text, rootpage int, sql text)",
-    )? else {
+    let definition = "CREATE TABLE sqlite_schema(type text, name text, tbl_name text, rootpage int, sql text)";
+    let Stmt.CreateTable(stmt) = Parser.parseStatement(definition)? else {
         return Err(corrupt("sqlite_schema's definition"));
     };
-    return buildTableSchema(stmt, "sqlite_schema", 1);
+    return buildTableSchema(stmt, "sqlite_schema", 1, definition);
 }

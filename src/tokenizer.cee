@@ -35,6 +35,8 @@ struct Token {
     text: String;
     /// Where the token starts in the SQL text, for error messages.
     offset: usize;
+    /// Where the token ends in the SQL text.
+    end: usize;
     /// A QuotedId written in double quotes, which SQLite takes as a string when no column has its name.
     doubleQuoted: bool;
 
@@ -88,7 +90,13 @@ struct Tokenizer<region r> {
         offset: usize,
     ) -> Result<void, SqliteError> {
         this.tokens.push(
-            Token { kind: kind, text: String.from(this.text[start..end])?, offset: offset, doubleQuoted: false },
+            Token {
+                kind: kind,
+                text: String.from(this.text[start..end])?,
+                offset: offset,
+                end: if (kind == TokenKind.BlobLit || kind == TokenKind.QuotedId) end + 1 else end,
+                doubleQuoted: false,
+            },
         )?;
         return Ok();
     }
@@ -186,7 +194,7 @@ struct Tokenizer<region r> {
             this.add(TokenKind.Op, start, start + length, start)?;
             this.at += length;
         }
-        this.tokens.push(Token { kind: TokenKind.Eof, text: String.create(), offset: n, doubleQuoted: false })?;
+        this.tokens.push(Token { kind: TokenKind.Eof, text: String.create(), offset: n, end: n, doubleQuoted: false })?;
         return Ok();
     }
 
@@ -292,7 +300,7 @@ struct Tokenizer<region r> {
             }
         }
         text.append(this.text[from..this.at])?;
-        this.tokens.push(Token { kind: kind, text: text, offset: start, doubleQuoted: false })?;
+        this.tokens.push(Token { kind: kind, text: text, offset: start, end: this.at, doubleQuoted: false })?;
         return Ok();
     }
 
@@ -319,7 +327,7 @@ struct Tokenizer<region r> {
             }
             break;
         }
-        this.tokens.push(Token { kind: kind, text: text, offset: start, doubleQuoted: delimiter == '"' })?;
+        this.tokens.push(Token { kind: kind, text: text, offset: start, end: i + 1, doubleQuoted: delimiter == '"' })?;
         this.at = i + 1;
         return Ok();
     }

@@ -26,7 +26,8 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Scalar functions, aggregates | `Exec/Functions`, `LikeMatcher` | `functions.cee`, `aggregate.cee` | core functions done; date/time, printf, JSON and transcendental math next |
 | SELECT: joins, subqueries, views, CTEs, grouping, compounds | `Exec/QueryExecutor` | `select.cee`, `run.cee` | done but RIGHT/FULL joins, window functions, table functions, index seeks (rowid seeks done) |
 | INSERT, UPDATE, DELETE | `Exec/QueryExecutor` (DML), `InMemoryDatabase` | `dml.cee` | done for rowid tables: constraints, conflict actions, RETURNING, AUTOINCREMENT; triggers, foreign keys, upserts, UPDATE … FROM next |
-| CREATE and DROP of tables, indexes and views | `Exec/QueryExecutor` (DDL) | `ddl.cee` | done; ALTER TABLE, triggers and pragmas next |
+| CREATE and DROP of tables, indexes and views | `Exec/QueryExecutor` (DDL) | `ddl.cee` | done; ALTER TABLE and triggers next |
+| PRAGMAs, pragma_* table functions | `Exec/QueryExecutor` (`ExecutePragma`) | `pragma.cee` | schema pragmas and header fields done; integrity_check next |
 | Connection, transactions | `SqliteConnection`, `EngineGlue` | `session.cee` | done: statements commit on their own outside BEGIN, and a failed statement undoes only itself inside it |
 | WAL | `Storage/Wal*`, `Shm*` | | until then a database with a non-empty `-wal` file is refused |
 | Connection, command, pool | `SqliteConnection`, `SqliteCommand`, `SqliteConnectionPool` | | |
@@ -154,6 +155,12 @@ The port fixes what was wrong in the source instead of copying it. Each item has
 - **Index upkeep during a statement.** An index that cannot take a removal in place is rebuilt when the statement
   ends, from the rows as they then are; rebuilding it mid-statement would read rows not yet changed
   (`manyRowsAndIndexes`).
+
+- **Definitions as written.** The catalog keeps a column's type, default and CHECK as their text in the statement
+  (`VARCHAR ( 10 )`, `1 + 2`), as SQLite does; `PRAGMA table_info` and CHECK failure messages show them so. The
+  C# rebuilt the text from tokens (`VARCHAR ( 10 )` became `VARCHAR(10)`, `DEFAULT -1` became `-`).
+- **Pragmas.** `table_info` leaves out generated columns; `index_list` gives SQLite's order, origins and partial
+  flags; `user_version` and `application_id` live in the database header (`pragmasDescribeTheSchema`).
 
 ## Known gaps (inherited from the C# engine, refused by name rather than misparsed)
 

@@ -1002,6 +1002,7 @@ struct Parser {
                     kind: token.kind,
                     text: token.text.clone()?,
                     offset: token.offset,
+                    end: token.end,
                     doubleQuoted: token.doubleQuoted,
                 },
             )?;
