@@ -169,6 +169,9 @@ fn executeCreateTable(
             ),
         );
     }
+    if (borrow stmt.asSelect is Some(query)) {
+        return executeCreateTableAs(name, query, db);
+    }
     if (isReservedName(name)) {
         return Err(namedError("object name reserved for internal use: ", name));
     }
@@ -359,4 +362,145 @@ fn executeDrop(stmt: borrow DropStmt, db: borrow mut Session) -> Result<void, Sq
     }
     db.pager.bumpSchemaCookie()?;
     return db.reloadSchema();
+}
+
+/// SQLite's keywords: a name that is one is written in double quotes.
+const SQL_KEYWORDS: [StringView; 147] = [
+    "ABORT", "ACTION", "ADD", "AFTER", "ALL", "ALTER", "ALWAYS", "ANALYZE", "AND", "AS", "ASC", "ATTACH",
+    "AUTOINCREMENT", "BEFORE", "BEGIN", "BETWEEN", "BY", "CASCADE", "CASE", "CAST", "CHECK", "COLLATE", "COLUMN",
+    "COMMIT", "CONFLICT", "CONSTRAINT", "CREATE", "CROSS", "CURRENT", "CURRENT_DATE", "CURRENT_TIME",
+    "CURRENT_TIMESTAMP", "DATABASE", "DEFAULT", "DEFERRABLE", "DEFERRED", "DELETE", "DESC", "DETACH", "DISTINCT",
+    "DO", "DROP", "EACH", "ELSE", "END", "ESCAPE", "EXCEPT", "EXCLUDE", "EXCLUSIVE", "EXISTS", "EXPLAIN", "FAIL",
+    "FILTER", "FIRST", "FOLLOWING", "FOR", "FOREIGN", "FROM", "FULL", "GENERATED", "GLOB", "GROUP", "GROUPS",
+    "HAVING", "IF", "IGNORE", "IMMEDIATE", "IN", "INDEX", "INDEXED", "INITIALLY", "INNER", "INSERT", "INSTEAD",
+    "INTERSECT", "INTO", "IS", "ISNULL", "JOIN", "KEY", "LAST", "LEFT", "LIKE", "LIMIT", "MATCH", "MATERIALIZED",
+    "NATURAL", "NO", "NOT", "NOTHING", "NOTNULL", "NULL", "NULLS", "OF", "OFFSET", "ON", "OR", "ORDER", "OTHERS",
+    "OUTER", "OVER", "PARTITION", "PLAN", "PRAGMA", "PRECEDING", "PRIMARY", "QUERY", "RAISE", "RANGE", "RECURSIVE",
+    "REFERENCES", "REGEXP", "REINDEX", "RELEASE", "RENAME", "REPLACE", "RESTRICT", "RETURNING", "RIGHT",
+    "ROLLBACK", "ROW", "ROWS", "SAVEPOINT", "SELECT", "SET", "TABLE", "TEMP", "TEMPORARY", "THEN", "TIES", "TO",
+    "TRANSACTION", "TRIGGER", "UNBOUNDED", "UNION", "UNIQUE", "UPDATE", "USING", "VACUUM", "VALUES", "VIEW",
+    "VIRTUAL", "WHEN", "WHERE", "WINDOW", "WITH", "WITHOUT",
+];
+
+/// A name as SQLite's createTableStmt writes it (identPut): in double quotes when it is not all letters, digits and
+/// `_`, starts with a digit, is empty, or is a keyword.
+fn appendIdentPut(out: borrow mut String, name: StringView) -> Result<void, AllocError> {
+    var plain = name.length != 0 && !(name[0] >= '0' && name[0] <= '9');
+    for (c in name.bytes()) {
+        plain = plain && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_');
+    }
+    plain = plain && !wordIn(name, SQL_KEYWORDS[..]);
+    if (plain) {
+        out.append(name)?;
+        return Ok();
+    }
+    out.append("\"")?;
+    var first = true;
+    for (part in name.split("\"")) {
+        if (!first) {
+            out.append("\"\"")?;
+        }
+        first = false;
+        out.append(part)?;
+    }
+    out.append("\"")?;
+    return Ok();
+}
+
+/// The number of bytes SQLite counts for a name (identLength): its length with each `"` doubled, plus 2.
+fn identLength(name: StringView) -> usize {
+    var n: usize = 2;
+    for (c in name.bytes()) {
+        n += if (c == '"') 2 else 1;
+    }
+    return n;
+}
+
+/// CREATE TABLE … AS SELECT: a table with the query's result columns (named as SQLite names them, typed by their
+/// affinities), written as SQLite writes its statement, then filled with the query's rows.
+fn executeCreateTableAs(
+    name: StringView,
+    query: borrow SelectStmt,
+    db: borrow mut Session,
+) -> Result<void, SqliteError> {
+    if (isReservedName(name)) {
+        return Err(namedError("object name reserved for internal use: ", name));
+    }
+    var compiler = newCompiler(db)?;
+    let plan = compileSelect(mut compiler, query, db)?;
+    // Unique names: a repeated one gets ":N" (sqlite3ColumnsFromExprList).
+    var names = Vector<String>.withCapacity(plan.columnNames.length)?;
+    for (i in 0..plan.columnNames.length) {
+        var candidate = plan.columnNames[i].clone()?;
+        if (candidate.length == 0) {
+            candidate = String.from("column")?;
+            candidate.appendNumber(i + 1)?;
+        }
+        var count: u64 = 0;
+        loop {
+            var taken = false;
+            for (k in 0..names.length) {
+                taken = taken || names[k].view().equalsIgnoreAsciiCase(candidate.view());
+            }
+            if (!taken) {
+                break;
+            }
+            // Without a ":digits" ending it already has.
+            var stem = candidate.length;
+            var j = candidate.length - 1;
+            while (j > 0 && candidate.view()[j] >= '0' && candidate.view()[j] <= '9') {
+                j -= 1;
+            }
+            if (j > 0 && candidate.view()[j] == ':') {
+                stem = j;
+            }
+            count += 1;
+            var next = String.from(candidate.view()[0..stem])?;
+            next.append(":")?;
+            next.appendNumber(count)?;
+            candidate = next;
+        }
+        names.push(candidate)?;
+    }
+    // The statement, as createTableStmt writes it: on one line when short, else a column a line.
+    var length: usize = identLength(name);
+    for (i in 0..names.length) {
+        length += identLength(names[i].view()) + 5;
+    }
+    let short = length < 50;
+    var sql = String.from("CREATE TABLE ")?;
+    appendIdentPut(mut sql, name)?;
+    sql.append("(")?;
+    for (i in 0..names.length) {
+        sql.append(if (i == 0) (if (short) "" else "\n  ") else (if (short) "," else ",\n  "))?;
+        appendIdentPut(mut sql, names[i].view())?;
+        sql.append(match (plan.columnAffinities[i]) {
+            ExprAffinity.Text => " TEXT",
+            ExprAffinity.Numeric => " NUM",
+            ExprAffinity.Integer => " INT",
+            ExprAffinity.Real => " REAL",
+            _ => "",
+        })?;
+    }
+    sql.append(if (short) ")" else "\n)")?;
+    let Stmt.CreateTable(created) = Parser.parseStatement(sql.view())? else {
+        return Err(sqlError("CREATE TABLE … AS SELECT made a statement that is not CREATE TABLE"));
+    };
+    executeCreateTable(borrow created, sql.view(), db)?;
+    // The rows.
+    let insert = InsertStmt {
+        with: null,
+        conflict: null,
+        table: QualifiedName { schema: null, name: String.from(name)? },
+        columns: Vector<String>.create(),
+        source: InsertSource.Select(cloneSelect(query)?),
+        upserts: Vector<UpsertClause>.create(),
+        returning: Vector<ResultColumn>.create(),
+    };
+    let changes = db.changes;
+    let total = db.totalChanges;
+    let _ = executeInsert(borrow insert, [], db)?;
+    db.changes = changes;
+    db.totalChanges = total;
+    return Ok();
 }

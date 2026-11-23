@@ -314,7 +314,7 @@ fn syntaxErrorsAreReported() -> Result<void, TestFailure> {
     // SQLite words this one "unknown join type: NATURAL b"; the place is the same.
     Check.equalText("near \"b\": syntax error", parseError("SELECT * FROM a NATURAL b JOIN c").view())?;
     Check.equalText("near \"WHERE\": syntax error", parseError("SELECT * FROM a LEFT WHERE 1").view())?;
-    Check.isTrue(Parser.parseStatement("CREATE TABLE t AS SELECT 1") is Err(SqliteError.Unsupported(_)), "CREATE TABLE AS is refused by name")?;
+    Check.isTrue(Parser.parseStatement("CREATE TABLE t AS SELECT 1") is Ok(Stmt.CreateTable(_)), "CREATE TABLE AS parses")?;
     return Ok();
 }
 

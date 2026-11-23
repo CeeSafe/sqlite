@@ -403,6 +403,8 @@ struct CreateTableStmt {
     constraints: Vector<Vector<Token>>;
     withoutRowid: bool;
     strict: bool;
+    /// `CREATE TABLE … AS SELECT`: the query whose result columns and rows make the table.
+    asSelect: Box<SelectStmt>?;
 }
 
 struct IndexedColumn {

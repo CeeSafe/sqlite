@@ -273,9 +273,14 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   is converted as the comparison converts it (`indexSeeksGiveTheSameRows`, `writesThroughIndexSeeks`). WHERE
   still runs on every row the index gives.
 
+- **CREATE TABLE … AS SELECT** writes its statement as SQLite's createTableStmt does: columns typed `INT`,
+  `TEXT`, `NUM`, `REAL` or nothing by their affinities, repeated names made unique with `:N`, names quoted where
+  SQLite quotes them, and a column a line once the statement is long (`createTableAsSelectLikeSqlite`). The C#
+  refused it.
+
 ## Known gaps (inherited from the C# engine, refused by name rather than misparsed)
 
-`CREATE TABLE … AS SELECT`, `CREATE VIRTUAL TABLE`, `ALTER TABLE … DROP COLUMN`, `EXPLAIN`, parenthesized joins
+`CREATE VIRTUAL TABLE`, `ALTER TABLE … DROP COLUMN`, `EXPLAIN`, parenthesized joins
 in FROM, aliases on the target of INSERT, UPDATE and DELETE, and `ORDER BY` inside an aggregate's arguments.
 `ON CONFLICT` clauses on column and table constraints are read and not applied, and collations other than
 BINARY, NOCASE and RTRIM are refused.

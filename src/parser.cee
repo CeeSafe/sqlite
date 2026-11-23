@@ -1046,9 +1046,11 @@ struct Parser {
             constraints: Vector<Vector<Token>>.create(),
             withoutRowid: false,
             strict: false,
+            asSelect: null,
         };
-        if (this.isWord("AS")) {
-            return Err(unsupported("CREATE TABLE … AS SELECT is not supported"));
+        if (this.acceptWord("AS")) {
+            stmt.asSelect = Box.create(this.select(null)?)?;
+            return Ok(stmt);
         }
         this.expectOp("(")?;
         loop {

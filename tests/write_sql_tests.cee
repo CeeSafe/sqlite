@@ -452,3 +452,26 @@ fn writesThroughIndexSeeks() -> Result<void, TestFailure> {
         SELECT count(*), sum(k) FROM t
         """);
 }
+
+@test
+fn createTableAsSelectLikeSqlite() -> Result<void, TestFailure> {
+    return sameScript("create-as", """
+        CREATE TABLE src(a INTEGER, b TEXT, c REAL, d BLOB, e NUMERIC, f, g VARCHAR(5))
+        INSERT INTO src VALUES (1, 'x', 2.5, x'41', 3, 'f', 'g'), (2, '7', 3, NULL, '4.0', 5, 6)
+        CREATE TABLE t AS SELECT a, b, c, d, e, f, g, a + 1, b || 'y' AS "odd name", 1 AS select_, a AS a FROM src
+        CREATE TABLE "q t" AS SELECT 1 AS x
+        CREATE TABLE IF NOT EXISTS t AS SELECT 1
+        CREATE TABLE t AS SELECT 1
+        CREATE TABLE u AS SELECT * FROM src WHERE 0
+        CREATE TABLE w AS VALUES (1, 'a'), (2, 'b')
+        CREATE TABLE k AS SELECT 1 AS "select", 2 AS "a""b", 3 AS "9x", 4 AS a, 5 AS A, 6 AS "a:1"
+        CREATE TABLE s AS SELECT b, typeof(b) AS tb, e + 0 AS en FROM src ORDER BY a DESC
+        SELECT type, name, sql FROM sqlite_schema ORDER BY name
+        SELECT * FROM t
+        SELECT typeof(a), typeof("a+1"), typeof(e) FROM t
+        SELECT * FROM "q t"
+        SELECT * FROM w
+        SELECT * FROM k
+        SELECT rowid, * FROM s
+        """);
+}
