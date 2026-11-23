@@ -1,0 +1,595 @@
+// PRAGMA integrity_check and quick_check, compared with the sqlite3 shell's verdict on the same file: clean
+// databases, databases damaged by writing bytes into them or through PRAGMA writable_schema, and random damage
+// that must give errors, never a panic or a hang.
+
+/// What this engine's pragma gives, a row a line, from a fresh connection; an error as "error: " and its message.
+fn ourVerdict(path: StringView, sql: StringView) -> String {
+    var out = String.create();
+    match (Session.open(path)) {
+        Ok(session) => {
+            var s = session;
+            let none = Vector<SqliteValue>.create();
+            match (s.query(sql, none.view())) {
+                Ok(result) => {
+                    for (r in 0..result.rows.length) {
+                        appendValueText(mut out, borrow result.rows[r][0])!;
+                        out.append("\n")!;
+                    }
+                }
+                Err(e) => {
+                    out.append("error: ")!;
+                    out.append(e.message())!;
+                    out.append("\n")!;
+                }
+            }
+        }
+        Err(e) => {
+            out.append("error: ")!;
+            out.append(e.message())!;
+            out.append("\n")!;
+        }
+    }
+    return out;
+}
+
+/// What the sqlite3 shell prints. When the statement fails after its rows (a cursor that meets a damaged page),
+/// the rows are kept and "database disk image is malformed" ends them, as this engine reports it; any other
+/// failure is "error: " and the shell's message.
+fn shellVerdict(path: StringView, sql: StringView) -> String {
+    var arguments = Vector<StringView>.create();
+    arguments.push(path)!;
+    arguments.push(sql)!;
+    let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
+    var out = textFromBytesLossy(output.stdout.view())!;
+    if (output.status != 0) {
+        let errors = textFromBytesLossy(output.stderr.view())!;
+        if (out.length != 0 && errors.view().contains("database disk image is malformed")) {
+            out.append("database disk image is malformed\n")!;
+        } else {
+            let firstLine = errors.view().splitOnce("\n") ?? TextHalves { left: errors.view(), right: "" };
+            var message = match (firstLine.left.splitOnce("argument: ")) {
+                Some(halves) => halves.right,
+                null => firstLine.left,
+            };
+            // The shell adds the error's code.
+            if (message.endsWith(" (11)")) {
+                message = message[0..message.length - 5];
+            }
+            out.append("error: ")!;
+            out.append(message)!;
+            out.append("\n")!;
+        }
+    }
+    return out;
+}
+
+/// Runs each pragma (one a line) in both engines and compares.
+fn sameVerdicts(path: StringView, pragmas: StringView) -> Result<void, TestFailure> {
+    var lines = pragmas.split("\n");
+    while (lines.next() is Some(line)) {
+        let sql = line.trim();
+        if (sql.length == 0) {
+            continue;
+        }
+        let theirs = shellVerdict(path, sql);
+        let mine = ourVerdict(path, sql);
+        if (theirs.view() != mine.view()) {
+            var message = String.from(path)!;
+            message.append(": ")!;
+            message.append(sql)!;
+            message.append("\n  sqlite3:\n")!;
+            message.append(theirs.view())!;
+            message.append("  this engine:\n")!;
+            message.append(mine.view())!;
+            return Check.fail(message.view());
+        }
+    }
+    return Ok();
+}
+
+/// Compares the b-tree check's report alone (the first row), for damage that SQLite's cursors read through
+/// and this engine's refuse, so that the row checks after it differ (README.md says why).
+fn sameTreeReport(path: StringView) -> Result<void, TestFailure> {
+    let theirs = shellVerdict(path, "PRAGMA integrity_check");
+    var session = Session.open(path)!;
+    let none = Vector<SqliteValue>.create();
+    let result = session.query("PRAGMA integrity_check", none.view())!;
+    var mine = String.create();
+    appendValueText(mut mine, borrow result.rows[0][0])!;
+    mine.append("\n")!;
+    Check.isTrue(mine.view().startsWith("*** in database main ***"), "the b-tree check reports the damage")?;
+    if (!theirs.view().startsWith(mine.view())) {
+        var message = String.from(path)!;
+        message.append("\n  sqlite3:\n")!;
+        message.append(theirs.view())!;
+        message.append("  this engine's first row:\n")!;
+        message.append(mine.view())!;
+        return Check.fail(message.view());
+    }
+    return Ok();
+}
+
+const EVERY_FORM: StringView = """
+    PRAGMA integrity_check
+    PRAGMA quick_check
+    PRAGMA integrity_check(1)
+    PRAGMA integrity_check(2)
+    PRAGMA integrity_check(3)
+    PRAGMA quick_check(2)
+    """;
+
+/// Writes `bytes` into the file at `offset`.
+fn patchFile(path: StringView, offset: usize, bytes: Slice<u8>) {
+    var file = File.openReadWrite(path)!;
+    file.writeAt(bytes, offset as u64)!;
+}
+
+fn patchU32(path: StringView, offset: usize, value: u32) {
+    var bytes = [0u8; 4];
+    bytes[..].writeBE(0, value);
+    patchFile(path, offset, bytes[..]);
+}
+
+fn patchU16(path: StringView, offset: usize, value: u16) {
+    var bytes = [0u8; 2];
+    bytes[..].writeBE(0, value);
+    patchFile(path, offset, bytes[..]);
+}
+
+/// A number the sqlite3 shell answers.
+fn shellNumber(path: StringView, sql: StringView) -> Result<usize, TestFailure> {
+    let text = askSqlite(path, sql)?;
+    return Ok(text.view().trim().parseInt<usize>() ?? 0);
+}
+
+const PAGE: usize = 1024;
+
+const CLEAN_SQL: StringView = """
+    PRAGMA page_size = 1024;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER NOT NULL, label TEXT UNIQUE, note BLOB, CHECK (n >= 0));
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 600)
+    INSERT INTO t SELECT i, i * 3, 'label ' || i, CASE WHEN i % 50 = 0 THEN randomblob(3000) END FROM c;
+    CREATE INDEX t_n ON t(n DESC);
+    CREATE INDEX t_odd ON t(label COLLATE NOCASE) WHERE n % 2 = 1;
+    CREATE INDEX t_expr ON t(n % 7, id);
+    CREATE TABLE w(a TEXT, b INTEGER, c REAL, PRIMARY KEY (a, b)) WITHOUT ROWID;
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 300)
+    INSERT INTO w SELECT 'k' || (i % 17), i, i / 3.0 FROM c;
+    CREATE INDEX w_c ON w(c);
+    CREATE TABLE s(x INT, y TEXT, z ANY) STRICT;
+    INSERT INTO s VALUES (1, 'a', 2.5), (2, 'b', x'00');
+    CREATE TABLE gone(x);
+    INSERT INTO gone SELECT randomblob(900) FROM t LIMIT 40;
+    DROP TABLE gone;
+    CREATE VIEW v AS SELECT id FROM t;
+    """;
+
+@test
+fn cleanDatabasesAreOk() -> Result<void, TestFailure> {
+    let path = "out/integrity-clean.db";
+    makeDatabase(path, CLEAN_SQL)?;
+    sameVerdicts(path, EVERY_FORM)?;
+    sameVerdicts(path, """
+        PRAGMA integrity_check(t)
+        PRAGMA integrity_check(w)
+        PRAGMA quick_check(sqlite_schema)
+        PRAGMA integrity_check(v)
+        PRAGMA integrity_check(nosuch)
+        PRAGMA integrity_check(0)
+        PRAGMA integrity_check = -4
+        """)?;
+    Check.equalText("ok\n", ourVerdict(path, "PRAGMA integrity_check").view())?;
+    return Ok();
+}
+
+/// Changes a definition in sqlite_schema behind SQLite's back, so that rows already stored break it.
+fn redefine(path: StringView, setup: StringView, name: StringView, sql: StringView) -> Result<void, TestFailure> {
+    makeDatabase(path, setup)?;
+    var script = String.from("PRAGMA writable_schema = ON; UPDATE sqlite_schema SET sql = '")!;
+    script.append(sql)!;
+    script.append("' WHERE name = '")!;
+    script.append(name)!;
+    script.append("';")!;
+    var arguments = Vector<StringView>.create();
+    arguments.push(path)!;
+    arguments.push(script.view())!;
+    let status = Process.run("sqlite3", borrow arguments)!;
+    return Check.isTrue(status == 0, "sqlite3 changes the schema");
+}
+
+const ROWS_SQL: StringView = """
+    PRAGMA page_size = 1024;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b, c);
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 40)
+    INSERT INTO t SELECT i, CASE WHEN i % 9 = 0 THEN NULL ELSE i END, 'text ' || i,
+        CASE i % 4 WHEN 0 THEN '12' WHEN 1 THEN 7 WHEN 2 THEN 'x' ELSE 2.5 END FROM c;
+    """;
+
+@test
+fn rowsThatBreakTheirTablesDefinition() -> Result<void, TestFailure> {
+    let path = "out/integrity-rows.db";
+    redefine(path, ROWS_SQL, "t", "CREATE TABLE t(id INTEGER PRIMARY KEY, a NOT NULL, b, c)")?;
+    sameVerdicts(path, EVERY_FORM)?;
+    redefine(path, ROWS_SQL, "t", "CREATE TABLE t(id INTEGER PRIMARY KEY, a CHECK (a < 30), b CHECK (b <> 7), c)")?;
+    sameVerdicts(path, EVERY_FORM)?;
+    redefine(path, ROWS_SQL, "t", "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER, c TEXT)")?;
+    sameVerdicts(path, EVERY_FORM)?;
+    redefine(path, ROWS_SQL, "t", "CREATE TABLE t(id INTEGER PRIMARY KEY, a REAL, b NUMERIC, c INT)")?;
+    sameVerdicts(path, EVERY_FORM)?;
+    redefine(path, ROWS_SQL, "t", "CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b TEXT, c ANY) STRICT")?;
+    sameVerdicts(path, EVERY_FORM)?;
+    redefine(path, ROWS_SQL, "t", "CREATE TABLE t(id INTEGER PRIMARY KEY, a REAL, b BLOB, c INTEGER) STRICT")?;
+    sameVerdicts(path, EVERY_FORM)?;
+    redefine(
+        path, ROWS_SQL, "t",
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a, b, c, d NOT NULL DEFAULT 1, e TEXT NOT NULL)",
+    )?;
+    sameVerdicts(path, EVERY_FORM)?;
+    redefine(
+        path, ROWS_SQL, "t",
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a, b, c, v INTEGER NOT NULL AS (a + 1) VIRTUAL)",
+    )?;
+    sameVerdicts(path, EVERY_FORM)?;
+    return Ok();
+}
+
+const INDEXED_ROWS_SQL: StringView = """
+    PRAGMA page_size = 1024;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n, name TEXT);
+    CREATE TABLE u(id INTEGER PRIMARY KEY, n, name TEXT);
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 200)
+    INSERT INTO t SELECT i, i % 50, 'Name ' || (i % 60) FROM c;
+    INSERT INTO u SELECT * FROM t WHERE id NOT IN (5, 77);
+    INSERT INTO u VALUES (500, 1, 'extra'), (501, 2, 'NAME 3');
+    CREATE INDEX t_n ON t(n);
+    CREATE INDEX u_n ON u(n);
+    CREATE INDEX t_name ON t(name COLLATE NOCASE);
+    CREATE INDEX u_name ON u(name COLLATE NOCASE);
+    """;
+
+@test
+fn indexesThatDisagreeWithTheirTables() -> Result<void, TestFailure> {
+    let path = "out/integrity-indexes.db";
+    makeDatabase(path, INDEXED_ROWS_SQL)?;
+    // Each index of t takes u's tree, and the other way round.
+    var arguments = Vector<StringView>.create();
+    arguments.push(path)!;
+    arguments.push("""
+        PRAGMA writable_schema = ON;
+        UPDATE sqlite_schema SET rootpage = CASE name
+            WHEN 't_n' THEN (SELECT rootpage FROM sqlite_schema WHERE name = 'u_n')
+            WHEN 'u_n' THEN (SELECT rootpage FROM sqlite_schema WHERE name = 't_n')
+            WHEN 't_name' THEN (SELECT rootpage FROM sqlite_schema WHERE name = 'u_name')
+            WHEN 'u_name' THEN (SELECT rootpage FROM sqlite_schema WHERE name = 't_name')
+            ELSE rootpage END;
+        """)!;
+    Check.isTrue(Process.run("sqlite3", borrow arguments)! == 0, "sqlite3 swaps the indexes")?;
+    sameVerdicts(path, EVERY_FORM)?;
+    sameVerdicts(path, "PRAGMA integrity_check(t)\nPRAGMA integrity_check(u)\nPRAGMA integrity_check(500)")?;
+    // A UNIQUE index over duplicates.
+    redefine(path, INDEXED_ROWS_SQL, "t_n", "CREATE UNIQUE INDEX t_n ON t(n)")?;
+    sameVerdicts(path, "PRAGMA integrity_check\nPRAGMA quick_check")?;
+    return Ok();
+}
+
+const DAMAGE_SQL: StringView = """
+    PRAGMA page_size = 1024;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n, s);
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 300)
+    INSERT INTO t SELECT i, i * 7, 'row ' || i FROM c;
+    INSERT INTO t VALUES (1000, 1, randomblob(3000));
+    CREATE INDEX t_n ON t(n);
+    CREATE TABLE gone(x);
+    INSERT INTO gone SELECT randomblob(500) FROM t LIMIT 30;
+    DROP TABLE gone;
+    """;
+
+/// A page of the fixture, found with the shell's dbstat table.
+fn pageWhere(path: StringView, condition: StringView) -> Result<usize, TestFailure> {
+    var sql = String.from("SELECT pageno FROM dbstat WHERE ")!;
+    sql.append(condition)!;
+    sql.append(" ORDER BY pageno LIMIT 1")!;
+    let page = shellNumber(path, sql.view())?;
+    Check.isTrue(page != 0, condition)?;
+    return Ok(page);
+}
+
+fn fileU16(path: StringView, offset: usize) -> u16 => wholeFile(path).view().readBE<u16>(offset);
+
+fn fileU32(path: StringView, offset: usize) -> u32 => wholeFile(path).view().readBE<u32>(offset);
+
+/// Where cell `index` of `page` is in the file (pages other than the first).
+fn cellAt(path: StringView, page: usize, interior: bool, index: usize) -> usize {
+    let start = (page - 1) * PAGE;
+    let pointers = start + (if (interior) 12 else 8);
+    return start + (fileU16(path, pointers + index * 2) as usize);
+}
+
+@test
+fn damagedTreePages() -> Result<void, TestFailure> {
+    let path = "out/integrity-damaged.db";
+    // A child pointer out of the file, and one to a page another tree owns.
+    makeDatabase(path, DAMAGE_SQL)?;
+    let root = pageWhere(path, "name = 't' AND path = '/'")?;
+    patchU32(path, cellAt(path, root, true, 0), 9999);
+    sameVerdicts(path, EVERY_FORM)?;
+    makeDatabase(path, DAMAGE_SQL)?;
+    let indexRoot = pageWhere(path, "name = 't_n' AND path = '/'")?;
+    patchU32(path, cellAt(path, root, true, 1), truncate<u32>(indexRoot));
+    sameVerdicts(path, EVERY_FORM)?;
+    // A leaf's cell pointer into its header, its fragment count, and two of its cells out of order.
+    makeDatabase(path, DAMAGE_SQL)?;
+    let leaf = pageWhere(path, "name = 't' AND path = '/001/'")?;
+    patchU16(path, (leaf - 1) * PAGE + 8, 5);
+    sameTreeReport(path)?;
+    makeDatabase(path, DAMAGE_SQL)?;
+    patchFile(path, (leaf - 1) * PAGE + 7, [3u8][..]);
+    sameVerdicts(path, EVERY_FORM)?;
+    makeDatabase(path, DAMAGE_SQL)?;
+    let first = fileU16(path, (leaf - 1) * PAGE + 8);
+    let second = fileU16(path, (leaf - 1) * PAGE + 10);
+    patchU16(path, (leaf - 1) * PAGE + 8, second);
+    patchU16(path, (leaf - 1) * PAGE + 10, first);
+    sameVerdicts(path, EVERY_FORM)?;
+    // Two cells that share their bytes.
+    makeDatabase(path, DAMAGE_SQL)?;
+    patchU16(path, (leaf - 1) * PAGE + 10, first);
+    sameVerdicts(path, EVERY_FORM)?;
+    // A page that is no b-tree page.
+    makeDatabase(path, DAMAGE_SQL)?;
+    patchFile(path, (leaf - 1) * PAGE, [7u8][..]);
+    sameVerdicts(path, EVERY_FORM)?;
+    // An index leaf that has lost its last entries.
+    makeDatabase(path, DAMAGE_SQL)?;
+    let indexLeaf = pageWhere(path, "name = 't_n' AND pagetype = 'leaf'")?;
+    let cells = fileU16(path, (indexLeaf - 1) * PAGE + 3);
+    patchU16(path, (indexLeaf - 1) * PAGE + 3, cells - 2);
+    sameVerdicts(path, EVERY_FORM)?;
+    return Ok();
+}
+
+@test
+fn damagedChainsAndHeader() -> Result<void, TestFailure> {
+    let path = "out/integrity-chains.db";
+    // An overflow chain cut short, and one that runs into page 1.
+    makeDatabase(path, DAMAGE_SQL)?;
+    let overflow = pageWhere(path, "pagetype = 'overflow'")?;
+    patchU32(path, (overflow - 1) * PAGE, 0);
+    sameVerdicts(path, EVERY_FORM)?;
+    makeDatabase(path, DAMAGE_SQL)?;
+    patchU32(path, (overflow - 1) * PAGE, 1);
+    sameVerdicts(path, EVERY_FORM)?;
+    // The freelist: a count that disagrees, a list nobody points to, a trunk that claims too many leaves.
+    makeDatabase(path, DAMAGE_SQL)?;
+    let free = fileU32(path, 36);
+    Check.isTrue(free > 3, "the fixture has a freelist")?;
+    patchU32(path, 36, free + 1);
+    sameVerdicts(path, EVERY_FORM)?;
+    makeDatabase(path, DAMAGE_SQL)?;
+    patchU32(path, 32, 0);
+    patchU32(path, 36, 0);
+    sameVerdicts(path, EVERY_FORM)?;
+    makeDatabase(path, DAMAGE_SQL)?;
+    let trunk = fileU32(path, 32) as usize;
+    patchU32(path, (trunk - 1) * PAGE + 4, 9999);
+    sameVerdicts(path, EVERY_FORM)?;
+    makeDatabase(path, DAMAGE_SQL)?;
+    patchU32(path, (trunk - 1) * PAGE + 8, 2);
+    sameVerdicts(path, EVERY_FORM)?;
+    // A page the header counts that nothing uses.
+    makeDatabase(path, DAMAGE_SQL)?;
+    let pages = fileU32(path, 28);
+    {
+        var file = File.openReadWrite(path)!;
+        file.setLength(((pages as u64) + 1) * (PAGE as u64))!;
+    }
+    patchU32(path, 28, pages + 1);
+    sameVerdicts(path, EVERY_FORM)?;
+    // A header that counts more pages than the file has.
+    patchU32(path, 28, pages + 9);
+    sameVerdicts(path, "PRAGMA integrity_check")?;
+    return Ok();
+}
+
+/// `count` tables, each with a row whose NULL its definition then forbids: SQLite reports them in the order of
+/// its schema hash table.
+fn manyTablesSql(count: i64) -> String {
+    var sql = String.from("CREATE VIEW first_view AS SELECT 1;")!;
+    for (i in 0..count) {
+        let name = numbered(if (i % 3 == 0) "Table_" else if (i % 3 == 1) "x" else "longer_table_name_", i * 7);
+        sql.append("CREATE TABLE ")!;
+        sql.append(name.view())!;
+        sql.append("(a, b); INSERT INTO ")!;
+        sql.append(name.view())!;
+        sql.append(" VALUES (NULL, 1), (2, NULL);")!;
+        if (i % 4 == 0) {
+            sql.append("CREATE INDEX ")!;
+            sql.append(name.view())!;
+            sql.append("_b ON ")!;
+            sql.append(name.view())!;
+            sql.append("(b);")!;
+        }
+    }
+    sql.append("""
+        PRAGMA writable_schema = ON;
+        UPDATE sqlite_schema SET sql = replace(sql, '(a, b)', '(a NOT NULL, b NOT NULL)') WHERE type = 'table';
+        """)!;
+    return sql;
+}
+
+@test
+fn tablesComeInSqlitesHashOrder() -> Result<void, TestFailure> {
+    let path = "out/integrity-order.db";
+    for (count in [3i64, 4, 5, 9, 11, 22, 40]) {
+        let sql = manyTablesSql(count);
+        makeDatabase(path, sql.view())?;
+        sameVerdicts(path, "PRAGMA integrity_check\nPRAGMA quick_check(7)")?;
+    }
+    return Ok();
+}
+
+const KEYED_SQL: StringView = """
+    PRAGMA page_size = 1024;
+    CREATE TABLE w(a TEXT, b INTEGER NOT NULL, c, d AS (b * 2) VIRTUAL, PRIMARY KEY (a, b)) WITHOUT ROWID;
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 400)
+    INSERT INTO w(a, b, c) SELECT 'key ' || (i % 37), i, CASE WHEN i % 5 = 0 THEN NULL ELSE i * 1.5 END FROM c;
+    CREATE INDEX w_c ON w(c);
+    CREATE UNIQUE INDEX w_bd ON w(b, d);
+    CREATE INDEX w_expr ON w(lower(a), b + 1) WHERE b % 2 = 0;
+    """;
+
+@test
+fn withoutRowidTablesAndTheirIndexes() -> Result<void, TestFailure> {
+    let path = "out/integrity-keyed.db";
+    makeDatabase(path, KEYED_SQL)?;
+    sameVerdicts(path, EVERY_FORM)?;
+    // Two records of a leaf in the wrong order.
+    let leaf = pageWhere(path, "name = 'w' AND pagetype = 'leaf'")?;
+    let first = fileU16(path, (leaf - 1) * PAGE + 8);
+    let second = fileU16(path, (leaf - 1) * PAGE + 10);
+    patchU16(path, (leaf - 1) * PAGE + 8, second);
+    patchU16(path, (leaf - 1) * PAGE + 10, first);
+    sameVerdicts(path, EVERY_FORM)?;
+    // An index leaf that lost entries, and an expression index's.
+    makeDatabase(path, KEYED_SQL)?;
+    let indexLeaf = pageWhere(path, "name = 'w_c' AND pagetype = 'leaf'")?;
+    let cells = fileU16(path, (indexLeaf - 1) * PAGE + 3);
+    patchU16(path, (indexLeaf - 1) * PAGE + 3, cells - 3);
+    let expressionLeaf = pageWhere(path, "name = 'w_expr' AND pagetype = 'leaf'")?;
+    let more = fileU16(path, (expressionLeaf - 1) * PAGE + 3);
+    patchU16(path, (expressionLeaf - 1) * PAGE + 3, more - 1);
+    sameVerdicts(path, EVERY_FORM)?;
+    return Ok();
+}
+
+@test
+fn whatThisEngineWritesIsIntact() -> Result<void, TestFailure> {
+    let path = "out/integrity-written.db";
+    freshPath(path);
+    var session = Session.open(path)!;
+    let none = Vector<SqliteValue>.create();
+    var script = """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER NOT NULL, label TEXT UNIQUE, note, CHECK (n >= 0))
+        CREATE INDEX t_n ON t(n)
+        CREATE INDEX t_part ON t(note) WHERE note IS NOT NULL
+        CREATE TABLE k(a TEXT, b INT, c REAL, PRIMARY KEY (a, b)) WITHOUT ROWID
+        CREATE INDEX k_c ON k(c)
+        CREATE TABLE s(x INT, y TEXT) STRICT
+        WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 700) INSERT INTO t SELECT i, i % 13, 'label ' || i, CASE WHEN i % 40 = 0 THEN randomblob(2500) WHEN i % 3 = 0 THEN i END FROM c
+        WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 300) INSERT INTO k SELECT 'k' || (i % 11), i, i / 7.0 FROM c
+        INSERT INTO s VALUES (1, 'one'), (2, 'two')
+        UPDATE t SET n = n + 1, note = NULL WHERE id % 5 = 0
+        DELETE FROM t WHERE id % 7 = 0 OR id > 600
+        DELETE FROM k WHERE b % 4 = 1
+        UPDATE k SET c = c * 2 WHERE b % 3 = 0
+        CREATE TABLE scratch(x)
+        INSERT INTO scratch SELECT randomblob(800) FROM t
+        DROP TABLE scratch
+        """.split("\n");
+    while (script.next() is Some(line)) {
+        let sql = line.trim();
+        if (sql.length != 0) {
+            let _ = session.query(sql, none.view())!;
+        }
+    }
+    Check.equalText("ok\n", ourVerdict(path, "PRAGMA integrity_check").view())?;
+    sameVerdicts(path, EVERY_FORM)?;
+    // Inside a transaction, the check sees its changes.
+    session.query("BEGIN", none.view())!;
+    session.query("INSERT INTO t(n, label) VALUES (3, 'inside')", none.view())!;
+    session.query("DELETE FROM k WHERE b < 100", none.view())!;
+    let inside = session.query("PRAGMA integrity_check", none.view())!;
+    Check.isTrue(inside.rows.length == 1, "one row inside the transaction")?;
+    var verdict = String.create();
+    appendValueText(mut verdict, borrow inside.rows[0][0])!;
+    Check.equalText("ok", verdict.view())?;
+    session.query("COMMIT", none.view())!;
+    sameVerdicts(path, "PRAGMA integrity_check")?;
+    return Ok();
+}
+
+/// The databases the other tests leave in out/, judged by both engines alike.
+@test
+fn databasesOtherTestsWroteAreJudgedAlike() -> Result<void, TestFailure> {
+    var arguments = Vector<StringView>.create();
+    arguments.push("out")!;
+    let listing = Process.capture("ls", borrow arguments, "".bytes())!;
+    let names = textFromBytesLossy(listing.stdout.view())!;
+    var lines = names.view().split("\n");
+    var checked: usize = 0;
+    while (lines.next() is Some(name)) {
+        if (!name.endsWith(".db") || name.startsWith("integrity-")) {
+            continue;
+        }
+        var path = String.from("out/")!;
+        path.append(name)!;
+        var journal = path.clone()!;
+        journal.append("-journal")!;
+        if ((fileLength(journal.view())! ?? 0) != 0) {
+            continue;
+        }
+        // Files this engine refuses to open (auto-vacuum, WAL, not a database) are not its to judge.
+        if (Session.open(path.view()).isErr()) {
+            continue;
+        }
+        sameVerdicts(path.view(), "PRAGMA integrity_check")?;
+        checked += 1;
+    }
+    let _ = checked;
+    return Ok();
+}
+
+/// A small generator of the same numbers every run (xorshift64).
+struct Shuffle {
+    state: u64;
+
+    fn next(borrow mut this) -> u64 {
+        var x = this.state;
+        x = x ^ (x << 13);
+        x = x ^ (x >> 7);
+        x = x ^ (x << 17);
+        this.state = x;
+        return x;
+    }
+
+    fn below(borrow mut this, n: usize) -> usize => truncate<usize>(this.next() % (n as u64));
+}
+
+@test
+fn randomDamageNeverPanicsOrHangs() -> Result<void, TestFailure> {
+    let path = "out/integrity-fuzz.db";
+    let original = "out/integrity-fuzz-original.db";
+    makeDatabase(original, """
+        PRAGMA page_size = 512;
+        CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER NOT NULL, s TEXT UNIQUE, b, CHECK (n < 1000));
+        WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 120)
+        INSERT INTO t SELECT i, i * 3, 'text ' || i, CASE WHEN i % 30 = 0 THEN randomblob(1200) END FROM c;
+        CREATE INDEX t_n ON t(n DESC);
+        CREATE TABLE w(k TEXT PRIMARY KEY, v) WITHOUT ROWID;
+        INSERT INTO w SELECT 'k' || id, n FROM t;
+        CREATE TABLE gone(x);
+        INSERT INTO gone SELECT randomblob(400) FROM t LIMIT 10;
+        DROP TABLE gone;
+        """)?;
+    let bytes = wholeFile(original);
+    var random = Shuffle { state: 0x9e3779b97f4a7c15 };
+    for (round in 0..400) {
+        var damaged = bytes.clone()!;
+        let changes = 1 + random.below(6);
+        for (c in 0..changes) {
+            // Mostly the b-tree headers and cell pointers at the starts of pages, sometimes anywhere.
+            let page = random.below(damaged.length / 512);
+            let at = if (random.below(3) == 0) random.below(damaged.length) else page * 512 + random.below(40);
+            damaged[at] = truncate<u8>(random.next());
+        }
+        freshPath(path);
+        {
+            var file = File.create(path)!;
+            file.writeAt(damaged.view(), 0)!;
+        }
+        let _ = ourVerdict(path, "PRAGMA integrity_check");
+        let _ = ourVerdict(path, "PRAGMA quick_check");
+        let _ = ourVerdict(path, "PRAGMA integrity_check(t)");
+    }
+    return Ok();
+}

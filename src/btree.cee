@@ -176,6 +176,20 @@ struct CursorFrame {
     index: usize;
 }
 
+/// A leaf cell a cursor stands on: its page, and where in the page it is.
+struct LeafCellAt {
+    page: Page;
+    offset: usize;
+}
+
+/// A row's rowid and record bytes: all `total` of them, or only those in its page when `complete` is false.
+struct RawTableRow {
+    rowId: i64;
+    payload: Vector<u8>;
+    total: usize;
+    complete: bool;
+}
+
 /// Walks a table b-tree's rows in rowid order, between two rowids (both included).
 struct TableCursor {
     private root: u32;
@@ -208,6 +222,44 @@ struct TableCursor {
 
     /// The next row, or `null` after the last.
     fn next<P: PageSource>(borrow mut this, pager: borrow mut P) -> Result<TableRow?, SqliteError> {
+        let Some(cell) = this.nextCell(pager)? else {
+            return Ok(null);
+        };
+        return Ok(readTableLeafRow(pager, cell.page.view(), cell.offset, this.wanted.view())?);
+    }
+
+    /// The next row's rowid and payload, without decoding it. When the payload's overflow chain cannot be read,
+    /// the part in the page is given and `complete` is false.
+    fn nextRaw<P: PageSource>(borrow mut this, pager: borrow mut P) -> Result<RawTableRow?, SqliteError> {
+        let Some(at) = this.nextCell(pager)? else {
+            return Ok(null);
+        };
+        let page = at.page.view();
+        let cell = TableLeafCell.parse(page, at.offset)?;
+        let shape = PayloadShape.ofTableLeaf(pager, cell.payloadLength)?;
+        if (cell.payloadOffset + shape.local > page.length) {
+            return Err(corrupt("a cell runs past the end of its page"));
+        }
+        if (shape.isLocal()) {
+            var payload = Vector<u8>.create();
+            payload.extend(page[cell.payloadOffset..cell.payloadOffset + shape.local])?;
+            return Ok(RawTableRow { rowId: cell.rowId, payload: payload, total: shape.total, complete: true });
+        }
+        match (readOverflowPayload(pager, page, cell.payloadOffset, shape)) {
+            Ok(payload) => {
+                return Ok(RawTableRow { rowId: cell.rowId, payload: payload, total: shape.total, complete: true });
+            }
+            Err(SqliteError.Corrupt(_)) => {
+                var payload = Vector<u8>.create();
+                payload.extend(page[cell.payloadOffset..cell.payloadOffset + shape.local])?;
+                return Ok(RawTableRow { rowId: cell.rowId, payload: payload, total: shape.total, complete: false });
+            }
+            Err(e) => { return Err(e); }
+        }
+    }
+
+    /// The leaf cell of the next row, or `null` after the last.
+    private fn nextCell<P: PageSource>(borrow mut this, pager: borrow mut P) -> Result<LeafCellAt?, SqliteError> {
         if (!this.started) {
             this.started = true;
             if (this.min > this.max) {
@@ -236,7 +288,7 @@ struct TableCursor {
                     this.stack.clear();
                     return Ok(null);
                 }
-                return Ok(readTableLeafRow(pager, bytes, offset, this.wanted.view())?);
+                return Ok(LeafCellAt { page: page, offset: offset });
             }
             var child = this.stack[top].header.rightMost;
             if (index < this.stack[top].header.cellCount) {
