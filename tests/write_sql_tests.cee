@@ -34,7 +34,10 @@ fn sameScript(name: StringView, script: StringView) -> Result<void, TestFailure>
             return Check.fail(message.view());
         }
         if (Environment.variable("SQLITE_STEP_CHECK").isSome()) {
-            let verdict = askSqlite(ourPath.view(), "PRAGMA integrity_check")?;
+            let verdict = match (askSqlite(ourPath.view(), "PRAGMA integrity_check")) {
+                Ok(v) => v,
+                Err(_) => String.from("sqlite3 cannot read the file")!,
+            };
             if (verdict.view() != "ok\n") {
                 var message = String.from("damaged after step ")!;
                 message.appendNumber(step)!;
@@ -371,5 +374,45 @@ fn updateFromJoinsLikeSqlite() -> Result<void, TestFailure> {
         UPDATE inv SET nope = 0 FROM sales
         WITH s AS (SELECT 'c' AS item) UPDATE inv SET qty = -1 FROM s WHERE s.item = inv.item
         SELECT * FROM inv ORDER BY id
+        """);
+}
+
+@test
+fn withoutRowidTablesChangeLikeSqlite() -> Result<void, TestFailure> {
+    return sameScript("without-rowid", """
+        CREATE TABLE kv(v TEXT, k TEXT PRIMARY KEY COLLATE NOCASE, n INT UNIQUE) WITHOUT ROWID
+        CREATE TABLE pair(a INT, b TEXT, note, PRIMARY KEY (b DESC, a)) WITHOUT ROWID
+        CREATE INDEX kv_v ON kv(v)
+        CREATE INDEX pair_note ON pair(note, a)
+        INSERT INTO kv VALUES ('one', 'x', 1), ('two', 'a', 2), ('three', 'm', 3)
+        INSERT INTO kv VALUES ('dup', 'X', 9)
+        INSERT INTO kv VALUES ('nokey', NULL, 10)
+        INSERT INTO kv VALUES ('dupn', 'q', 1)
+        INSERT OR REPLACE INTO kv VALUES ('again', 'X', 4)
+        INSERT OR IGNORE INTO kv VALUES ('ignored', 'a', 5)
+        INSERT INTO kv VALUES ('up', 'm', 0) ON CONFLICT(k) DO UPDATE SET v = v || '!', n = excluded.n + 30
+        UPDATE kv SET k = 'b' WHERE k = 'a'
+        UPDATE kv SET n = n * 10
+        SELECT * FROM kv
+        SELECT k FROM kv ORDER BY v
+        UPDATE kv SET k = 'm' WHERE k = 'b'
+        DELETE FROM kv WHERE n > 35
+        SELECT * FROM kv
+        INSERT INTO pair VALUES (1, 'x', 'p'), (2, 'x', 'q'), (1, 'y', 'p'), (3, 'a', NULL)
+        UPDATE pair SET a = a + 10 WHERE b = 'x'
+        DELETE FROM pair WHERE note IS NULL
+        SELECT * FROM pair
+        SELECT last_insert_rowid()
+        CREATE TABLE big(id INTEGER PRIMARY KEY, body TEXT, tag INT) WITHOUT ROWID
+        CREATE INDEX big_tag ON big(tag)
+        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 600) INSERT INTO big SELECT i * 7 % 601, printf('%.*c', i % 50 + 1, 'x'), i % 13 FROM n
+        DELETE FROM big WHERE tag IN (2, 5, 7)
+        UPDATE big SET id = id + 1000 WHERE id % 3 = 0
+        UPDATE big SET body = body || body WHERE tag = 4
+        SELECT count(*), sum(id), sum(length(body)), sum(tag) FROM big
+        DELETE FROM big WHERE id % 2 = 0
+        SELECT count(*), sum(id), sum(length(body)) FROM big
+        DELETE FROM big
+        SELECT count(*) FROM big
         """);
 }

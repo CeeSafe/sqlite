@@ -172,3 +172,27 @@ fn selectsFromTables() -> Result<void, TestFailure> {
         SELECT count(*) FROM emp WHERE count(*) > 1
         """);
 }
+
+@test
+fn readsWithoutRowidTables() -> Result<void, TestFailure> {
+    let path = "out/query-without-rowid.db";
+    makeDatabase(path, """
+        CREATE TABLE kv(v TEXT, k TEXT PRIMARY KEY, n REAL) WITHOUT ROWID;
+        CREATE TABLE pair(b INT, a TEXT COLLATE NOCASE, note, PRIMARY KEY (a, b DESC)) WITHOUT ROWID;
+        CREATE TABLE big(id INTEGER PRIMARY KEY, body TEXT) WITHOUT ROWID;
+        INSERT INTO kv VALUES ('one', 'x', 1), ('two', 'a', 2.5), ('three', 'm', NULL);
+        INSERT INTO pair VALUES (1, 'b', 'p'), (2, 'B', 'q'), (3, 'a', 'r'), (1, 'A', 's');
+        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400)
+        INSERT INTO big SELECT i * 7 % 401, printf('%.*c', i * 3, 'x') FROM n;
+        """)?;
+    return sameAnswers(path, """
+        SELECT * FROM kv
+        SELECT k, v, n, typeof(n) FROM kv ORDER BY v
+        SELECT * FROM pair
+        SELECT a, b FROM pair WHERE a = 'b'
+        SELECT count(*), sum(id), sum(length(body)) FROM big
+        SELECT id, length(body) FROM big WHERE id BETWEEN 100 AND 105
+        SELECT kv.k, pair.note FROM kv JOIN pair ON pair.a = kv.k ORDER BY 1, 2
+        SELECT rowid FROM kv
+        """);
+}

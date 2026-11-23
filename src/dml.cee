@@ -28,6 +28,10 @@ struct TableIndex {
     order: IndexOrder;
     /// For error messages: "t.a, t.b", or "index 'name'" for an expression index.
     keyNames: String;
+    /// In a WITHOUT ROWID table: the primary key's columns the entry holds after the indexed ones (those the index
+    /// does not already hold), and where in the entry each primary-key column is.
+    suffix: Vector<usize>;
+    keyAt: Vector<usize>;
     /// A removal could not be done in place: the index is rebuilt from the table when the statement ends, and
     /// takes no more changes until then.
     stale: Cell<bool>;
@@ -45,6 +49,88 @@ struct TableWriter {
     checks: Vector<XExpr>;
     checkNames: Vector<String>;
     triggers: Vector<TriggerPlan>;
+    /// A WITHOUT ROWID table's primary key; no columns for a rowid table.
+    primaryKey: PrimaryKeyColumns;
+}
+
+/// What names a row: its rowid, or in a WITHOUT ROWID table its primary key's values, in the key's order.
+enum RowKey {
+    Rowid(i64),
+    Key(Vector<SqliteValue>),
+}
+
+impl RowKey {
+    fn copy(borrow this) -> Result<RowKey, AllocError> => match (this) {
+        RowKey.Rowid(r) => Ok(RowKey.Rowid(r)),
+        RowKey.Key(k) => Ok(RowKey.Key(cloneValues(k.view())?)),
+    };
+}
+
+/// A WITHOUT ROWID table's primary key: its columns, their order, and their names for messages (`t.a, t.b`).
+struct PrimaryKeyColumns {
+    columns: Vector<usize>;
+    order: IndexOrder;
+    names: String;
+}
+
+fn copyOrder(order: borrow IndexOrder) -> Result<IndexOrder, AllocError> {
+    var out = IndexOrder.plain();
+    for (i in 0..order.collations.length) {
+        out.collations.push(order.collations[i])?;
+    }
+    for (i in 0..order.descending.length) {
+        out.descending.push(order.descending[i])?;
+    }
+    return Ok(out);
+}
+
+/// The primary key of a WITHOUT ROWID table (none for a rowid table).
+fn withoutRowidKey(table: borrow TableSchema) -> Result<PrimaryKeyColumns, SqliteError> {
+    var key = PrimaryKeyColumns { columns: Vector<usize>.create(), order: IndexOrder.plain(), names: String.create() };
+    if (!table.withoutRowid) {
+        return Ok(key);
+    }
+    for (k in 0..table.primaryKey.length) {
+        let kc = borrow table.primaryKey[k];
+        let at = table.indexOf(kc.name.view()) ?? {
+            return Err(corrupt("a primary key names a column its table does not have"));
+        };
+        key.columns.push(at)?;
+        key.order.collations.push(table.keyCollation(kc))?;
+        key.order.descending.push(kc.descending)?;
+        appendKeyName(mut key.names, table, at)?;
+    }
+    return Ok(key);
+}
+
+/// For an index of a WITHOUT ROWID table: adds the primary key's columns the index lacks to its entries, as
+/// SQLite does (a column the index holds with the same collation is not repeated), and records where each is.
+fn addKeySuffix(
+    table: borrow TableSchema,
+    key: borrow PrimaryKeyColumns,
+    columns: borrow Vector<IndexKeyColumn>,
+    order: borrow mut IndexOrder,
+    suffix: borrow mut Vector<usize>,
+    keyAt: borrow mut Vector<usize>,
+) -> Result<void, AllocError> {
+    for (k in 0..key.columns.length) {
+        let column = key.columns[k];
+        var found: usize? = null;
+        for (c in 0..columns.length) {
+            if (found.isNull() && columns[c].column == Some(column) && order.collations[c] == key.order.collations[k]) {
+                found = c;
+            }
+        }
+        if (found is Some(at)) {
+            keyAt.push(at)?;
+            continue;
+        }
+        keyAt.push(columns.length + suffix.length)?;
+        suffix.push(column)?;
+        order.collations.push(key.order.collations[k])?;
+        order.descending.push(key.order.descending[k])?;
+    }
+    return Ok();
 }
 
 fn tableScope(table: borrow TableSchema, slot: usize) -> Result<Scope, AllocError> {
@@ -94,6 +180,7 @@ fn tableIndexes(
     db: borrow mut Session,
 ) -> Result<Vector<TableIndex>, SqliteError> {
     var out = Vector<TableIndex>.create();
+    let primaryKey = withoutRowidKey(table)?;
     // Automatic indexes have no SQL; sqlite_autoindex_T_N is the N-th of the table's key constraints.
     var prefix = String.from("sqlite_autoindex_")?;
     prefix.append(table.name.view())?;
@@ -110,17 +197,10 @@ fn tableIndexes(
             continue;
         }
         let n = name[prefix.length..].parseInt<usize>() ?? 0;
-        // Numbering skips a WITHOUT ROWID table's primary key, which is the table itself.
-        var number: usize = 0;
+        // A WITHOUT ROWID table's primary key, which is the table itself, keeps its number.
         var key: usize? = null;
-        for (k in 0..table.keys.length) {
-            if (table.keys[k].primaryKey && table.withoutRowid) {
-                continue;
-            }
-            number += 1;
-            if (number == n) {
-                key = k;
-            }
+        if (n >= 1 && n <= table.keys.length && !(table.keys[n - 1].primaryKey && table.withoutRowid)) {
+            key = n - 1;
         }
         let Some(k) = key else {
             return Err(corrupt("an automatic index does not match its table's constraints"));
@@ -138,6 +218,9 @@ fn tableIndexes(
             order.descending.push(kc.descending)?;
             appendKeyName(mut keyNames, table, at)?;
         }
+        var suffix = Vector<usize>.create();
+        var keyAt = Vector<usize>.create();
+        addKeySuffix(table, borrow primaryKey, borrow columns, mut order, mut suffix, mut keyAt)?;
         out.push(
             TableIndex {
                 name: entry.name.clone()?,
@@ -147,6 +230,8 @@ fn tableIndexes(
                 filter: null,
                 order: order,
                 keyNames: keyNames,
+                suffix: suffix,
+                keyAt: keyAt,
                 stale: Cell<bool>.create(false),
             },
         )?;
@@ -193,6 +278,9 @@ fn tableIndexes(
         if (borrow stmt.filter is Some(f)) {
             filter = compileInTable(compiler, f, table, slot, db)?;
         }
+        var suffix = Vector<usize>.create();
+        var keyAt = Vector<usize>.create();
+        addKeySuffix(table, borrow primaryKey, borrow columns, mut order, mut suffix, mut keyAt)?;
         out.push(
             TableIndex {
                 name: name,
@@ -202,6 +290,8 @@ fn tableIndexes(
                 filter: filter,
                 order: order,
                 keyNames: keyNames,
+                suffix: suffix,
+                keyAt: keyAt,
                 stale: Cell<bool>.create(false),
             },
         )?;
@@ -242,9 +332,6 @@ impl TableWriter {
         db: borrow mut Session,
     ) -> Result<TableWriter, SqliteError> {
         let table = db.catalog.tableCopy(name)?;
-        if (table.withoutRowid) {
-            return Err(unsupported("changing WITHOUT ROWID tables is not supported yet"));
-        }
         let slot = compiler.slotsInUse;
         compiler.slotsInUse += 1;
         let read = tablePlan(borrow table, compiler, slot, db)?;
@@ -277,6 +364,7 @@ impl TableWriter {
             checkNames.push(table.checks[k].text.clone()?)?;
         }
         let triggers = tableTriggers(db, table.name.view())?;
+        let primaryKey = withoutRowidKey(borrow table)?;
         return Ok(
             TableWriter {
                 table: table,
@@ -288,8 +376,65 @@ impl TableWriter {
                 checks: checks,
                 checkNames: checkNames,
                 triggers: triggers,
+                primaryKey: primaryKey,
             },
         );
+    }
+
+    /// What names the row in the slot.
+    fn keyOf(borrow this, slot: borrow Slot) -> Result<RowKey, AllocError> {
+        if (!this.table.withoutRowid) {
+            return Ok(RowKey.Rowid(slot.rowId));
+        }
+        var key = Vector<SqliteValue>.withCapacity(this.primaryKey.columns.length)?;
+        for (k in 0..this.primaryKey.columns.length) {
+            key.push(slot.values[this.primaryKey.columns[k]].clone()?)?;
+        }
+        return Ok(RowKey.Key(key));
+    }
+
+    /// Whether two keys name the same row: equal rowids, or primary keys equal under the key's collations.
+    fn sameRow(borrow this, a: borrow RowKey, b: borrow RowKey) -> bool => match (a) {
+        RowKey.Rowid(x) => b is RowKey.Rowid(y) && x == y,
+        RowKey.Key(x) => match (b) {
+            RowKey.Key(y) => this.primaryKey.order.comparePrefix(x.view(), y.view()) == 0,
+            _ => false,
+        },
+    };
+
+    /// The stored row a key names: its rowid and record.
+    fn findRow(borrow this, key: borrow RowKey, db: borrow mut Session) -> Result<CursorRow?, SqliteError> {
+        match (key) {
+            RowKey.Rowid(rowId) => {
+                let Some(row) = seekTableRow(mut db.pager, this.read.root, rowId)? else {
+                    return Ok(null);
+                };
+                return Ok(CursorRow { rowId: row.rowId, columns: row.columns });
+            }
+            RowKey.Key(values) => {
+                let range = IndexRange.equalTo(copyOrder(borrow this.primaryKey.order)?, values.view())?;
+                var cursor = IndexCursor.create(this.read.root, range, false);
+                let Some(entry) = cursor.next(mut db.pager)? else {
+                    return Ok(null);
+                };
+                return Ok(CursorRow { rowId: 0, columns: entry });
+            }
+        }
+    }
+
+    /// The row an index entry names: its rowid, or the primary key's columns it holds.
+    fn keyInEntry(borrow this, index: borrow TableIndex, entry: Slice<SqliteValue>) -> Result<RowKey, SqliteError> {
+        if (!this.table.withoutRowid) {
+            return Ok(RowKey.Rowid(indexEntryRowId(entry)?));
+        }
+        var key = Vector<SqliteValue>.withCapacity(index.keyAt.length)?;
+        for (k in 0..index.keyAt.length) {
+            if (index.keyAt[k] >= entry.length) {
+                return Err(corrupt("an index entry is shorter than its table's primary key"));
+            }
+            key.push(entry[index.keyAt[k]].clone()?)?;
+        }
+        return Ok(RowKey.Key(key));
     }
 
     /// The index entry of the row in the slot, or `null` when a partial index leaves it out.
@@ -305,7 +450,7 @@ impl TableWriter {
                 return Ok(null);
             }
         }
-        var entry = Vector<SqliteValue>.withCapacity(index.columns.length + 1)?;
+        var entry = Vector<SqliteValue>.withCapacity(index.columns.length + index.suffix.length + 1)?;
         for (c in 0..index.columns.length) {
             if (index.columns[c].column is Some(at)) {
                 entry.push(frame.slots[this.slot].values[at].clone()?)?;
@@ -313,30 +458,45 @@ impl TableWriter {
                 entry.push(evaluate(x, frame, db)?)?;
             }
         }
-        entry.push(SqliteValue.Integer(frame.slots[this.slot].rowId))?;
+        if (this.table.withoutRowid) {
+            for (k in 0..index.suffix.length) {
+                entry.push(frame.slots[this.slot].values[index.suffix[k]].clone()?)?;
+            }
+        } else {
+            entry.push(SqliteValue.Integer(frame.slots[this.slot].rowId))?;
+        }
         return Ok(entry);
     }
 
-    /// The table's record for the row in the slot: stored columns in order, the rowid's alias as NULL, and a REAL
-    /// column's integral value as an integer, as SQLite writes them.
-    fn recordFor(borrow this, frame: borrow Frame) -> Result<Vector<u8>, SqliteError> {
+    /// The table's record for the row in the slot, as values in storage order: the rowid's alias as NULL, and a
+    /// REAL column's integral value as an integer, as SQLite writes them. A WITHOUT ROWID table's record holds
+    /// the primary key's columns first.
+    fn storedValues(borrow this, frame: borrow Frame) -> Result<Vector<SqliteValue>, SqliteError> {
         let values = borrow frame.slots[this.slot].values;
-        var stored = Vector<SqliteValue>.withCapacity(values.length)?;
+        var count: usize = 0;
         for (c in 0..this.table.columns.length) {
-            if (this.read.recordPosition[c].isNull()) {
-                continue;
+            if (this.read.recordPosition[c] is Some(at)) {
+                count = count.max(at + 1);
             }
+        }
+        var stored = Vector<SqliteValue>.withCapacity(count)?;
+        for (i in 0..count) {
+            stored.push(SqliteValue.Null)?;
+        }
+        for (c in 0..this.table.columns.length) {
+            let Some(at) = this.read.recordPosition[c] else {
+                continue;
+            };
             if (this.table.rowidAlias == Some(c)) {
-                stored.push(SqliteValue.Null)?;
                 continue;
             }
             var v = values[c].clone()?;
             if (this.read.realColumns[c] && v is SqliteValue.Real(r) && realAsExactInteger(r) is Some(i)) {
                 v = SqliteValue.Integer(i);
             }
-            stored.push(v)?;
+            stored[at] = v;
         }
-        return Record.encode(stored.view());
+        return Ok(stored);
     }
 
     /// Computes the generated columns of the row in the slot.
@@ -353,9 +513,14 @@ impl TableWriter {
         return Ok();
     }
 
-    /// Reads row `rowId` into the slot; false when there is none.
-    fn loadRow(borrow this, rowId: i64, frame: borrow mut Frame, db: borrow mut Session) -> Result<bool, SqliteError> {
-        let Some(row) = seekTableRow(mut db.pager, this.read.root, rowId)? else {
+    /// Reads the row `key` names into the slot; false when there is none.
+    fn loadRow(
+        borrow this,
+        key: borrow RowKey,
+        frame: borrow mut Frame,
+        db: borrow mut Session,
+    ) -> Result<bool, SqliteError> {
+        let Some(row) = this.findRow(key, db)? else {
             return Ok(false);
         };
         loadTableRow(borrow this.read, row.rowId, row.columns, mut frame.slots[this.slot])?;
@@ -365,16 +530,16 @@ impl TableWriter {
         return Ok(true);
     }
 
-    /// The rowids of other rows whose entry in `index` has the same key as `entry`.
+    /// The rows whose entry in `index` has the same key as `entry`, other than those `except` names.
     fn conflictsIn(
         borrow this,
         index: borrow TableIndex,
         entry: borrow Vector<SqliteValue>,
-        rowId: i64,
+        except: Slice<RowKey>,
         db: borrow mut Session,
-    ) -> Result<Vector<i64>, SqliteError> {
-        var found = Vector<i64>.create();
-        let keyLength = entry.length - 1;
+    ) -> Result<Vector<RowKey>, SqliteError> {
+        var found = Vector<RowKey>.create();
+        let keyLength = index.columns.length;
         for (k in 0..keyLength) {
             // NULLs never collide.
             if (entry[k].isNull()) {
@@ -389,9 +554,13 @@ impl TableWriter {
         let range = IndexRange.equalTo(order, entry.view()[0..keyLength])?;
         var cursor = IndexCursor.create(index.root, range, false);
         while (cursor.next(mut db.pager)? is Some(other)) {
-            let otherRowid = indexEntryRowId(other.view())?;
-            if (otherRowid != rowId) {
-                found.push(otherRowid)?;
+            let key = this.keyInEntry(index, other.view())?;
+            var excluded = false;
+            for (e in 0..except.length) {
+                excluded = excluded || this.sameRow(borrow key, borrow except[e]);
+            }
+            if (!excluded) {
+                found.push(key)?;
             }
         }
         return Ok(found);
@@ -439,7 +608,7 @@ impl TableWriter {
             Slot { values: Vector<SqliteValue>.create(), rowId: 0, isNull: false },
         );
         var entries = Vector<Vector<SqliteValue>>.create();
-        var cursor = TableCursor.scan(this.read.root);
+        var cursor = RowCursor.scan(borrow this.read);
         while (cursor.next(mut db.pager)? is Some(row)) {
             loadTableRow(borrow this.read, row.rowId, row.columns, mut frame.slots[this.slot])?;
             if (this.read.generated.length != 0) {
@@ -460,10 +629,33 @@ impl TableWriter {
         return Ok();
     }
 
-    /// Removes row `rowId` (in the slot) and its index entries.
+    /// Removes the record `key` names from a WITHOUT ROWID table's b-tree. When the tree cannot lose it in place,
+    /// the tree is built again from its other records.
+    fn removeKeyedRecord(borrow this, key: borrow RowKey, db: borrow mut Session) -> Result<void, SqliteError> {
+        let Some(row) = this.findRow(key, db)? else {
+            return Ok();
+        };
+        let order = borrow this.primaryKey.order;
+        var op = Vector<IndexOp>.create();
+        op.push(IndexOp { entry: cloneValues(row.columns.view())?, remove: true })?;
+        if (IndexMutator.applyBatch(mut db.pager, this.read.root, op.view(), order)?) {
+            return Ok();
+        }
+        var records = Vector<Vector<u8>>.create();
+        var cursor = RowCursor.scan(borrow this.read);
+        while (cursor.next(mut db.pager)? is Some(other)) {
+            if (order.comparePrefix(other.columns.view(), row.columns.view()[0..this.primaryKey.columns.length]) != 0) {
+                records.push(Record.encode(other.columns.view())?)?;
+            }
+        }
+        IndexMutator.rebuild(mut db.pager, this.read.root, records.view())?;
+        return Ok();
+    }
+
+    /// Removes the row `key` names (loaded in the slot) and its index entries.
     fn deleteRow(
         borrow this,
-        rowId: i64,
+        key: borrow RowKey,
         frame: borrow mut Frame,
         db: borrow mut Session,
     ) -> Result<void, SqliteError> {
@@ -475,18 +667,31 @@ impl TableWriter {
             }
             this.applyIndexOps(index, ops, frame, db)?;
         }
-        var op = Vector<TableOp>.create();
-        op.push(TableOp { rowId: rowId, record: null })?;
-        TableMutator.applyBatch(mut db.pager, this.read.root, op.view())?;
+        match (key) {
+            RowKey.Rowid(rowId) => {
+                var op = Vector<TableOp>.create();
+                op.push(TableOp { rowId: rowId, record: null })?;
+                TableMutator.applyBatch(mut db.pager, this.read.root, op.view())?;
+            }
+            RowKey.Key(_) => { this.removeKeyedRecord(key, db)?; }
+        }
         return Ok();
     }
 
-    /// Writes the row in the slot (new, or replacing the one with its rowid) and adds its index entries.
+    /// Writes the row in the slot (new, or replacing the one with its key) and adds its index entries.
     fn writeRow(borrow this, frame: borrow mut Frame, db: borrow mut Session) -> Result<void, SqliteError> {
-        let record = this.recordFor(frame)?;
-        var op = Vector<TableOp>.create();
-        op.push(TableOp { rowId: frame.slots[this.slot].rowId, record: record })?;
-        TableMutator.applyBatch(mut db.pager, this.read.root, op.view())?;
+        let stored = this.storedValues(frame)?;
+        if (this.table.withoutRowid) {
+            let key = this.keyOf(borrow frame.slots[this.slot])?;
+            this.removeKeyedRecord(borrow key, db)?;
+            var op = Vector<IndexOp>.create();
+            op.push(IndexOp { entry: stored, remove: false })?;
+            let _ = IndexMutator.applyBatch(mut db.pager, this.read.root, op.view(), borrow this.primaryKey.order)?;
+        } else {
+            var op = Vector<TableOp>.create();
+            op.push(TableOp { rowId: frame.slots[this.slot].rowId, record: Record.encode(stored.view())? })?;
+            TableMutator.applyBatch(mut db.pager, this.read.root, op.view())?;
+        }
         for (i in 0..this.indexes.length) {
             let index = borrow this.indexes[i];
             var ops = Vector<IndexOp>.create();
@@ -508,7 +713,14 @@ impl TableWriter {
     ) -> Result<bool, SqliteError> {
         for (c in 0..this.table.columns.length) {
             let column = borrow this.table.columns[c];
-            if (!column.notNull || this.table.rowidAlias == Some(c) || !frame.slots[this.slot].values[c].isNull()) {
+            // A WITHOUT ROWID table's primary key is NOT NULL, written or not.
+            var inKey = false;
+            for (k in 0..this.primaryKey.columns.length) {
+                inKey = inKey || this.primaryKey.columns[k] == c;
+            }
+            if (!(column.notNull || inKey) || this.table.rowidAlias == Some(
+                c,
+            ) || !frame.slots[this.slot].values[c].isNull()) {
                 continue;
             }
             if (action == ConflictAction.Ignore) {
@@ -543,34 +755,50 @@ impl TableWriter {
         return Ok(true);
     }
 
-    /// Resolves UNIQUE and PRIMARY KEY conflicts of the row in the slot before it is written. False when the row
-    /// is to be skipped (OR IGNORE). REPLACE deletes the rows it conflicts with.
+    /// The message of a PRIMARY KEY conflict on the table itself.
+    fn keyConflictMessage(borrow this) -> Result<String, AllocError> {
+        var message = String.from("UNIQUE constraint failed: ")?;
+        if (this.table.withoutRowid) {
+            message.append(this.primaryKey.names.view())?;
+            return Ok(message);
+        }
+        message.append(this.table.name.view())?;
+        message.append(".")?;
+        if (this.table.rowidAlias is Some(alias)) {
+            message.append(this.table.columns[alias].name.view())?;
+        } else {
+            message.append("rowid")?;
+        }
+        return Ok(message);
+    }
+
+    /// Resolves UNIQUE and PRIMARY KEY conflicts of the row in the slot before it is written; `old` names the row
+    /// it replaces in an UPDATE. False when the row is to be skipped (OR IGNORE). REPLACE deletes the rows it
+    /// conflicts with.
     fn resolveConflicts(
         borrow this,
         action: ConflictAction,
-        oldRowid: i64?,
+        old: borrow RowKey?,
         frame: borrow mut Frame,
         db: borrow mut Session,
     ) -> Result<bool, SqliteError> {
-        let rowId = frame.slots[this.slot].rowId;
-        // The rowid itself.
-        if (oldRowid != Some(rowId) && seekTableRow(mut db.pager, this.read.root, rowId)?.isSome()) {
+        let key = this.keyOf(borrow frame.slots[this.slot])?;
+        var except = Vector<RowKey>.create();
+        except.push(key.copy()?)?;
+        var sameAsOld = false;
+        if (old is Some(o)) {
+            except.push(o.copy()?)?;
+            sameAsOld = this.sameRow(o, borrow key);
+        }
+        // The table's own key.
+        if (!sameAsOld && this.findRow(borrow key, db)?.isSome()) {
             if (action == ConflictAction.Ignore) {
                 return Ok(false);
             }
-            if (action == ConflictAction.Replace) {
-                this.replaceRow(rowId, frame, db)?;
-            } else {
-                var message = String.from("UNIQUE constraint failed: ")?;
-                message.append(this.table.name.view())?;
-                message.append(".")?;
-                if (this.table.rowidAlias is Some(alias)) {
-                    message.append(this.table.columns[alias].name.view())?;
-                } else {
-                    message.append("rowid")?;
-                }
-                return Err(SqliteError.Constraint(message));
+            if (action != ConflictAction.Replace) {
+                return Err(SqliteError.Constraint(this.keyConflictMessage()?));
             }
+            this.replaceRow(borrow key, frame, db)?;
         }
         for (i in 0..this.indexes.length) {
             let index = borrow this.indexes[i];
@@ -587,13 +815,7 @@ impl TableWriter {
             let Some(entry) = this.entryFor(index, frame, db)? else {
                 continue;
             };
-            let others = this.conflictsIn(index, borrow entry, oldRowid ?? rowId, db)?;
-            var conflicting = Vector<i64>.create();
-            for (k in 0..others.length) {
-                if (others[k] != rowId) {
-                    conflicting.push(others[k])?;
-                }
-            }
+            let conflicting = this.conflictsIn(index, borrow entry, except.view(), db)?;
             if (conflicting.length == 0) {
                 continue;
             }
@@ -606,7 +828,7 @@ impl TableWriter {
                 return Err(SqliteError.Constraint(message));
             }
             for (k in 0..conflicting.length) {
-                this.replaceRow(conflicting[k], frame, db)?;
+                this.replaceRow(borrow conflicting[k], frame, db)?;
             }
         }
         return Ok(true);
@@ -618,9 +840,9 @@ impl TableWriter {
         frame: borrow mut Frame,
         db: borrow mut Session,
     ) -> Result<ConflictFound?, SqliteError> {
-        let rowId = frame.slots[this.slot].rowId;
-        if (seekTableRow(mut db.pager, this.read.root, rowId)?.isSome()) {
-            return Ok(ConflictFound { index: null, rowId: rowId });
+        let key = this.keyOf(borrow frame.slots[this.slot])?;
+        if (this.findRow(borrow key, db)?.isSome()) {
+            return Ok(ConflictFound { index: null, key: key });
         }
         for (i in 0..this.indexes.length) {
             let index = borrow this.indexes[i];
@@ -636,9 +858,9 @@ impl TableWriter {
             let Some(entry) = this.entryFor(index, frame, db)? else {
                 continue;
             };
-            let others = this.conflictsIn(index, borrow entry, rowId, db)?;
+            var others = this.conflictsIn(index, borrow entry, [], db)?;
             if (others.length != 0) {
-                return Ok(ConflictFound { index: i, rowId: others[0] });
+                return Ok(ConflictFound { index: i, key: others.remove(0) });
             }
         }
         return Ok(null);
@@ -647,7 +869,7 @@ impl TableWriter {
     /// OR REPLACE: deletes the row `victim` that the new row (in the slot) conflicts with.
     fn replaceRow(
         borrow this,
-        victim: i64,
+        victim: borrow RowKey,
         frame: borrow mut Frame,
         db: borrow mut Session,
     ) -> Result<void, SqliteError> {
@@ -657,7 +879,6 @@ impl TableWriter {
         );
         if (this.loadRow(victim, frame, db)?) {
             this.deleteRow(victim, frame, db)?;
-            db.changes += 0;
         }
         frame.slots[this.slot] = saved;
         return Ok();
@@ -881,6 +1102,7 @@ fn executeInsert(
         }
         var rowId: i64 = 0;
         match (rowValue) {
+            SqliteValue.Null if (table.withoutRowid) => {}
             SqliteValue.Null => { rowId = writer.newRowid(db)?; }
             SqliteValue.Integer(i) => { rowId = i; }
             _ => { return Err(sqlError("datatype mismatch")); }
@@ -924,7 +1146,7 @@ fn executeInsert(
                     }
                     // DO UPDATE: the proposed row is "excluded"; the existing one is updated.
                     frame.slots[excludedSlot] = copySlot(borrow frame.slots[writer.slot])?;
-                    if (!writer.loadRow(conflict.rowId, mut frame, db)?) {
+                    if (!writer.loadRow(borrow conflict.key, mut frame, db)?) {
                         continue;
                     }
                     if (borrow plan.filter is Some(f)) {
@@ -943,7 +1165,8 @@ fn executeInsert(
                 }
             }
         }
-        if (!writer.resolveConflicts(action, null, mut frame, db)?) {
+        let noKey: RowKey? = null;
+        if (!writer.resolveConflicts(action, borrow noKey, mut frame, db)?) {
             continue;
         }
         writer.writeRow(mut frame, db)?;
@@ -967,7 +1190,9 @@ fn executeInsert(
                 db,
             )?;
         }
-        db.lastInsertRowid = rowId;
+        if (!table.withoutRowid) {
+            db.lastInsertRowid = rowId;
+        }
         count += 1;
         if (returning.length != 0) {
             var out = Vector<SqliteValue>.withCapacity(returning.length)?;
@@ -1030,17 +1255,17 @@ fn matchingRows(
     filter: borrow XExpr?,
     frame: borrow mut Frame,
     db: borrow mut Session,
-) -> Result<Vector<i64>, SqliteError> {
-    var cursor = TableCursor.scan(writer.read.root);
-    if (filter is Some(f)) {
+) -> Result<Vector<RowKey>, SqliteError> {
+    var cursor = RowCursor.scan(borrow writer.read);
+    if (filter is Some(f) && !writer.table.withoutRowid) {
         if (rowidEqualityFor(f, writer.slot)? is Some(seek)) {
             let Some(rowId) = seekRowid(borrow seek, frame, db)? else {
-                return Ok(Vector<i64>.create());
+                return Ok(Vector<RowKey>.create());
             };
-            cursor = TableCursor.range(writer.read.root, rowId, rowId);
+            cursor = RowCursor.Rows(TableCursor.range(writer.read.root, rowId, rowId));
         }
     }
-    var rowids = Vector<i64>.create();
+    var rowids = Vector<RowKey>.create();
     while (cursor.next(mut db.pager)? is Some(row)) {
         loadTableRow(borrow writer.read, row.rowId, row.columns, mut frame.slots[writer.slot])?;
         if (writer.read.generated.length != 0) {
@@ -1052,7 +1277,7 @@ fn matchingRows(
                 continue;
             }
         }
-        rowids.push(frame.slots[writer.slot].rowId)?;
+        rowids.push(writer.keyOf(borrow frame.slots[writer.slot])?)?;
     }
     return Ok(rowids);
 }
@@ -1078,7 +1303,7 @@ fn executeDelete(
     var output = Vector<Vector<SqliteValue>>.create();
     var count: i64 = 0;
     for (i in 0..rowids.length) {
-        if (!writer.loadRow(rowids[i], mut frame, db)?) {
+        if (!writer.loadRow(borrow rowids[i], mut frame, db)?) {
             continue;
         }
         if (writer.triggers.length != 0) {
@@ -1097,7 +1322,7 @@ fn executeDelete(
                 continue;
             }
             // The trigger may have changed or removed the row.
-            if (!writer.loadRow(rowids[i], mut frame, db)?) {
+            if (!writer.loadRow(borrow rowids[i], mut frame, db)?) {
                 continue;
             }
         }
@@ -1109,7 +1334,7 @@ fn executeDelete(
             output.push(out)?;
         }
         let deleted: Slot? = if (writer.triggers.length != 0) copySlot(borrow frame.slots[writer.slot])? else null;
-        writer.deleteRow(rowids[i], mut frame, db)?;
+        writer.deleteRow(borrow rowids[i], mut frame, db)?;
         count += 1;
         if (db.foreignKeys) {
             let gone = copySlot(borrow frame.slots[writer.slot])?;
@@ -1205,6 +1430,7 @@ fn applyUpdate(
     var newValues = values;
     let table = borrow writer.table;
     let oldRowid = frame.slots[writer.slot].rowId;
+    let oldKey = writer.keyOf(borrow frame.slots[writer.slot])?;
     let oldSlot = copySlot(borrow frame.slots[writer.slot])?;
     var newRowid = oldRowid;
     for (a in 0..targets.length) {
@@ -1245,15 +1471,17 @@ fn applyUpdate(
         frame.slots[writer.slot] = oldSlot;
         return Ok(false);
     }
-    if (!writer.resolveConflicts(action, oldRowid, frame, db)?) {
+    let old: RowKey? = oldKey.copy()?;
+    if (!writer.resolveConflicts(action, borrow old, frame, db)?) {
         frame.slots[writer.slot] = oldSlot;
         return Ok(false);
     }
     // Out with the old row's entries (and the row, when its rowid changes), then in with the new.
     let oldBeforeWrite: Slot? = if (db.foreignKeys) copySlot(borrow oldSlot)? else null;
+    let newKey = writer.keyOf(borrow frame.slots[writer.slot])?;
     let newSlot = replace(mut frame.slots[writer.slot], oldSlot);
-    if (newRowid != oldRowid) {
-        writer.deleteRow(oldRowid, frame, db)?;
+    if (!writer.sameRow(borrow newKey, borrow oldKey)) {
+        writer.deleteRow(borrow oldKey, frame, db)?;
     } else {
         for (x in 0..writer.indexes.length) {
             let index = borrow writer.indexes[x];
@@ -1271,8 +1499,8 @@ fn applyUpdate(
             checkChildRow(table, borrow frame.slots[writer.slot], db)?;
         }
         let newRow: Slot? = copySlot(borrow frame.slots[writer.slot])?;
-        if (borrow oldBeforeWrite is Some(old)) {
-            parentChanged(table, old, borrow newRow, db)?;
+        if (borrow oldBeforeWrite is Some(before)) {
+            parentChanged(table, before, borrow newRow, db)?;
         }
     }
     if (writer.triggers.length != 0) {
@@ -1333,7 +1561,7 @@ fn executeUpdate(
     var output = Vector<Vector<SqliteValue>>.create();
     var count: i64 = 0;
     for (i in 0..rowids.length) {
-        if (!writer.loadRow(rowids[i], mut frame, db)?) {
+        if (!writer.loadRow(borrow rowids[i], mut frame, db)?) {
             continue;
         }
         if (!updateLoadedRow(borrow writer, borrow assignments, action, mut frame, db)?) {
@@ -1382,6 +1610,20 @@ fn compileUpserts(
         if (!any) {
             // The target must name exactly the columns of the rowid's alias or of a unique index.
             var found = false;
+            // A WITHOUT ROWID table's primary key is the table itself.
+            if (table.withoutRowid && clause.target.length == writer.primaryKey.columns.length) {
+                var all = true;
+                for (t in 0..clause.target.length) {
+                    var named = false;
+                    for (c in 0..writer.primaryKey.columns.length) {
+                        named = named || table.columns[writer.primaryKey.columns[c]].name.view().equalsIgnoreAsciiCase(
+                            clause.target[t].view(),
+                        );
+                    }
+                    all = all && named;
+                }
+                found = all;
+            }
             if (clause.target.length == 1 && table.rowidAlias.isSome() &&
                 table.columns[table.rowidAlias!].name.view().equalsIgnoreAsciiCase(
                     clause.target[0].view(),
@@ -1463,7 +1705,7 @@ fn compileUpserts(
 /// A constraint a proposed row breaks: the index (`null` for the rowid) and the row already there.
 struct ConflictFound {
     index: usize?;
-    rowId: i64;
+    key: RowKey;
 }
 
 /// UPDATE … FROM: the target joined with the FROM items, as SQLite does it. A SELECT of the target's rowid and the
@@ -1479,12 +1721,28 @@ fn executeUpdateFrom(
     for (a in 0..stmt.assignments.length) {
         targets.push(assignmentTarget(stmt.assignments[a].column.view(), borrow writer.table)?)?;
     }
-    // SELECT t.rowid, value, … FROM t, <from> WHERE <filter>
+    // SELECT <what names the row>, value, … FROM t, <from> WHERE <filter>: the rowid, or the primary key.
     var columns = Vector<ResultColumn>.withCapacity(stmt.assignments.length + 1)?;
-    let rowid = Expr.Column(
-        ColumnRef { schema: null, table: stmt.table.name.clone()?, name: String.from("rowid")?, doubleQuoted: false },
-    );
-    columns.push(ResultColumn.Expr(rowid, null))?;
+    var keyNames = Vector<String>.create();
+    if (writer.table.withoutRowid) {
+        for (k in 0..writer.primaryKey.columns.length) {
+            keyNames.push(writer.table.columns[writer.primaryKey.columns[k]].name.clone()?)?;
+        }
+    } else {
+        keyNames.push(String.from("rowid")?)?;
+    }
+    let keyLength = keyNames.length;
+    for (k in 0..keyNames.length) {
+        let named = Expr.Column(
+            ColumnRef {
+                schema: null,
+                table: stmt.table.name.clone()?,
+                name: replace(mut keyNames[k], String.create()),
+                doubleQuoted: false,
+            },
+        );
+        columns.push(ResultColumn.Expr(named, null))?;
+    }
     for (a in 0..stmt.assignments.length) {
         columns.push(ResultColumn.Expr(cloneExpr(borrow stmt.assignments[a].value)?, null))?;
     }
@@ -1528,23 +1786,41 @@ fn executeUpdateFrom(
     let returning = compileReturning(mut compiler, borrow stmt.returning, borrow writer, db)?;
     var frame = newFrame(mut compiler, params, db)?;
     let action = stmt.conflict ?? ConflictAction.Abort;
-    var done = HashMap<i64, bool>.create();
+    var done = Vector<RowKey>.create();
+    var doneRowids = HashMap<i64, bool>.create();
     var output = Vector<Vector<SqliteValue>>.create();
     var count: i64 = 0;
     for (r in 0..joined.length) {
-        let SqliteValue.Integer(rowId) = joined[r][0] else {
-            continue;
-        };
-        if (done.contains(rowId)) {
+        var key = RowKey.Rowid(0);
+        if (writer.table.withoutRowid) {
+            key = RowKey.Key(cloneValues(joined[r].view()[0..keyLength])?);
+        } else {
+            let SqliteValue.Integer(rowId) = joined[r][0] else {
+                continue;
+            };
+            key = RowKey.Rowid(rowId);
+        }
+        var seen = false;
+        if (key is RowKey.Rowid(rowId)) {
+            seen = doneRowids.contains(rowId);
+            doneRowids.put(rowId, true)?;
+        } else {
+            for (d in 0..done.length) {
+                seen = seen || writer.sameRow(borrow done[d], borrow key);
+            }
+        }
+        if (seen) {
             continue;
         }
-        done.put(rowId, true)?;
-        if (!writer.loadRow(rowId, mut frame, db)?) {
+        if (!writer.loadRow(borrow key, mut frame, db)?) {
             continue;
+        }
+        if (writer.table.withoutRowid) {
+            done.push(key)?;
         }
         var values = Vector<SqliteValue>.withCapacity(targets.length)?;
         for (a in 0..targets.length) {
-            values.push(replace(mut joined[r][a + 1], SqliteValue.Null))?;
+            values.push(replace(mut joined[r][a + keyLength], SqliteValue.Null))?;
         }
         if (!applyUpdate(borrow writer, targets.view(), values, action, mut frame, db)?) {
             continue;

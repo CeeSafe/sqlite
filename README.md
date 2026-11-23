@@ -27,7 +27,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Date and time functions | `Exec/Functions` (date/time part) | `datetime.cee` | done: a port of SQLite's date.c; 'localtime' and 'utc' are an error where they need the time zone, which CeeSafe lacks |
 | printf() and format() | `Exec/Functions` (`Printf`) | `printf.cee` | done: a port of SQLite's `sqlite3_str_vappendf`, every conversion and flag of the SQL path |
 | SELECT: joins, subqueries, views, CTEs, grouping, compounds | `Exec/QueryExecutor` | `select.cee`, `run.cee` | done but RIGHT/FULL joins, window functions, table functions, index seeks (rowid seeks done) |
-| INSERT, UPDATE, DELETE | `Exec/QueryExecutor` (DML), `InMemoryDatabase` | `dml.cee` | done for rowid tables: constraints, conflict actions, RETURNING, AUTOINCREMENT, upserts, triggers, foreign keys, UPDATE … FROM; WITHOUT ROWID tables next |
+| INSERT, UPDATE, DELETE | `Exec/QueryExecutor` (DML), `InMemoryDatabase` | `dml.cee` | done: constraints, conflict actions, RETURNING, AUTOINCREMENT, upserts, triggers, foreign keys, UPDATE … FROM; WITHOUT ROWID tables read and written |
 | CREATE and DROP of tables, indexes and views | `Exec/QueryExecutor` (DDL) | `ddl.cee` | done |
 | Triggers | `Exec/QueryExecutor` (`FireTriggers`) | `triggers.cee` | BEFORE and AFTER on tables done; INSTEAD OF on views next |
 | ALTER TABLE | `Exec/QueryExecutor` (`ExecuteAlterTable`) | `alter.cee` | RENAME TO, RENAME COLUMN, ADD COLUMN done; DROP COLUMN and renames that views or triggers refer to next |
@@ -204,6 +204,14 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   `%.Ns` or `%.Nq` precision that cuts a character in two, a blob argument that is not UTF-8) each stray byte
   becomes U+FFFD. Results longer than SQLite's default limit of 10^9 bytes are "string or blob too big"; the macOS
   `sqlite3` shell the tests use is built with a limit of 2^31 - 1, so the tests stay at sizes where both agree.
+
+- **Automatic index names of WITHOUT ROWID tables.** The primary key keeps its number in `sqlite_autoindex_T_N`
+  though it has no index of its own (`t(a UNIQUE, b PRIMARY KEY) WITHOUT ROWID` has `sqlite_autoindex_t_1` and no
+  `_2`). The C# skipped it, so the next UNIQUE got the primary key's number and sqlite3 called the file malformed
+  (`withoutRowidTablesChangeLikeSqlite`).
+- **WITHOUT ROWID tables** are read and written in place: rows are named by their primary key, a table index holds
+  the key columns it lacks after its own, as SQLite does, and the key's columns are NOT NULL. The C# loaded them
+  into memory.
 
 ## Known gaps (inherited from the C# engine, refused by name rather than misparsed)
 

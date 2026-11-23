@@ -434,10 +434,11 @@ struct DatabaseWriter {
             var sequence: u64 = 0;
             for (k in 0..schema.keys.length) {
                 let key = borrow schema.keys[k];
+                // A WITHOUT ROWID table's primary key has its number but no index of its own.
+                sequence += 1;
                 if (key.primaryKey && schema.withoutRowid) {
                     continue;
                 }
-                sequence += 1;
                 var name = String.from("sqlite_autoindex_")?;
                 name.append(schema.name.view())?;
                 name.append("_")?;

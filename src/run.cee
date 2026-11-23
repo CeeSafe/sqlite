@@ -253,15 +253,12 @@ fn joinLevel(
     var matched = false;
     match (borrow source.kind) {
         SourceKind.Table(table) => {
-            if (table.withoutRowid) {
-                return Err(unsupported("reading WITHOUT ROWID tables in queries is not supported yet"));
-            }
-            var cursor = TableCursor.scan(table.root);
+            var cursor = RowCursor.scan(table);
             if (borrow source.rowidSeek is Some(seek)) {
                 let Some(rowId) = seekRowid(seek, frame, db)? else {
                     return finishLeft(core, level, matched, frame, db, sink);
                 };
-                cursor = TableCursor.range(table.root, rowId, rowId);
+                cursor = RowCursor.Rows(TableCursor.range(table.root, rowId, rowId));
             }
             loop {
                 if (sink.stopAfter is Some(n) && sink.rows.length >= n) {
@@ -683,3 +680,41 @@ fn subqueryFirstColumn(
 /// Takes row `i` out of a list, leaving an empty one in its place.
 fn takeRow(rows: borrow mut Vector<Vector<SqliteValue>>, i: usize) -> Vector<SqliteValue> =>
     replace(mut rows[i], Vector<SqliteValue>.create());
+
+/// A walk over a table's rows: a rowid table's b-tree, or a WITHOUT ROWID table's index b-tree, whose entries
+/// are its records (in primary-key order, with no rowid).
+enum RowCursor {
+    Rows(TableCursor),
+    Keys(IndexCursor),
+}
+
+/// A row a RowCursor found: its rowid (0 in a WITHOUT ROWID table) and its record.
+struct CursorRow {
+    rowId: i64;
+    columns: Vector<SqliteValue>;
+}
+
+impl RowCursor {
+    fn scan(table: borrow TablePlan) -> RowCursor =>
+        if (table.withoutRowid) RowCursor.Keys(
+            IndexCursor.create(table.root, IndexRange.all(IndexOrder.plain()), false),
+        )
+            else RowCursor.Rows(TableCursor.scan(table.root));
+
+    fn next(borrow mut this, pager: borrow mut WritablePager) -> Result<CursorRow?, SqliteError> {
+        match (this) {
+            RowCursor.Rows(cursor) => {
+                let Some(row) = cursor.next(pager)? else {
+                    return Ok(null);
+                };
+                return Ok(CursorRow { rowId: row.rowId, columns: row.columns });
+            }
+            RowCursor.Keys(cursor) => {
+                let Some(entry) = cursor.next(pager)? else {
+                    return Ok(null);
+                };
+                return Ok(CursorRow { rowId: 0, columns: entry });
+            }
+        }
+    }
+}

@@ -182,10 +182,11 @@ fn executeCreateTable(
     // An automatic index for each PRIMARY KEY (when not the rowid, nor a WITHOUT ROWID table's) and UNIQUE.
     var sequence: u64 = 0;
     for (k in 0..table.keys.length) {
+        // A WITHOUT ROWID table's primary key has its number but no index of its own.
+        sequence += 1;
         if (table.keys[k].primaryKey && table.withoutRowid) {
             continue;
         }
-        sequence += 1;
         var indexName = String.from("sqlite_autoindex_")?;
         indexName.append(name)?;
         indexName.append("_")?;
@@ -229,9 +230,6 @@ fn executeCreateIndex(
     let table = db.catalog.table(stmt.table.view())? ?? {
         return Err(namedError("no such table: main.", stmt.table.view()));
     };
-    if (table.withoutRowid) {
-        return Err(unsupported("indexes on WITHOUT ROWID tables cannot be created yet"));
-    }
     let tableName = table.name.clone()?;
     let root = db.pager.allocatePage()?;
     initRoot(mut db.pager, root, PAGE_LEAF_INDEX)?;
@@ -248,7 +246,7 @@ fn executeCreateIndex(
         }
         writer.rebuildIndex(index, mut frame, db)?;
         if (index.unique) {
-            var cursor = TableCursor.scan(writer.read.root);
+            var cursor = RowCursor.scan(borrow writer.read);
             while (cursor.next(mut db.pager)? is Some(row)) {
                 loadTableRow(borrow writer.read, row.rowId, row.columns, mut frame.slots[writer.slot])?;
                 if (writer.read.generated.length != 0) {
@@ -257,7 +255,9 @@ fn executeCreateIndex(
                 let Some(entry) = writer.entryFor(index, mut frame, db)? else {
                     continue;
                 };
-                if (writer.conflictsIn(index, borrow entry, row.rowId, db)?.length != 0) {
+                var self = Vector<RowKey>.create();
+                self.push(writer.keyOf(borrow frame.slots[writer.slot])?)?;
+                if (writer.conflictsIn(index, borrow entry, self.view(), db)?.length != 0) {
                     var message = String.from("UNIQUE constraint failed: ")?;
                     message.append(index.keyNames.view())?;
                     return Err(SqliteError.Constraint(message));
