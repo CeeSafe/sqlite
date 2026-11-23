@@ -365,24 +365,312 @@ fn jsonChecksArgumentCounts() -> Result<void, TestFailure> {
         """);
 }
 
-/// The JSONB functions are not ported: unlike sqlite3, this engine does not know them.
+/// Every column of json_each() and json_tree(), over arrays, objects, scalars and JSON5, with and without a root.
 @test
-fn jsonbFunctionsAreNotPorted() -> Result<void, TestFailure> {
-    let path = "out/json-jsonb.db";
+fn jsonEachWalksContainers() -> Result<void, TestFailure> {
+    let path = "out/json-each.db";
+    makeDatabase(path, "CREATE TABLE t(x)")?;
+    return sameAnswers(path, """
+        SELECT * FROM json_each('[1, 2.5, "x", null, true, false, [3, 4], {"a": 5}]')
+        SELECT * FROM json_each('{"a": 1, "b": [2, 3], "c": {"d": null}, "": 4, "e f": 5, "1x": 6, "x\"y": 7, "é": 8}')
+        SELECT * FROM json_tree('{"a": 1, "b": [2, 3], "c": {"d": null}, "": 4, "e f": 5, "1x": 6, "x\"y": 7, "é": 8}')
+        SELECT * FROM json_tree('[1, [2, [3, [4, []]]], {}, {"a": {"b": {"c": [5]}}}]')
+        SELECT key, value, type, atom, id, parent, fullkey, path, json, root FROM json_each('[[1], {"a": 2}]')
+        SELECT key, value, type, atom, id, parent, fullkey, path, json, root FROM json_tree('[[1], {"a": 2}]')
+        SELECT * FROM json_each('[]')
+        SELECT * FROM json_each('{}')
+        SELECT * FROM json_tree('[]')
+        SELECT * FROM json_tree('{}')
+        SELECT * FROM json_each('5')
+        SELECT * FROM json_each('"text"')
+        SELECT * FROM json_each('null')
+        SELECT * FROM json_tree('5')
+        SELECT * FROM json_tree('null')
+        SELECT * FROM json_each(5)
+        SELECT * FROM json_each(1.5)
+        SELECT * FROM json_each('{a: 1, ''b'': [0x10, Infinity, .5, +3], c: ''q'',}')
+        SELECT * FROM json_tree('/* c */ {a: [1, 2,], b: {c: NaN}} // end')
+        SELECT * FROM json_each('[1, "é\n\t\"", "\x41"]')
+        SELECT * FROM json_each('{"a": {"b": [1, 2, {"c": 3}]}}', '$.a')
+        SELECT * FROM json_each('{"a": {"b": [1, 2, {"c": 3}]}}', '$.a.b')
+        SELECT * FROM json_each('{"a": {"b": [1, 2, {"c": 3}]}}', '$.a.b[2]')
+        SELECT * FROM json_each('{"a": {"b": [1, 2, {"c": 3}]}}', '$.a.b[2].c')
+        SELECT * FROM json_each('{"a": {"b": [1, 2, {"c": 3}]}}', '$.a.b[1]')
+        SELECT * FROM json_each('{"a": {"b": [1, 2, {"c": 3}]}}', '$.a.b[#-1]')
+        SELECT * FROM json_tree('{"a": {"b": [1, 2, {"c": 3}]}}', '$.a')
+        SELECT * FROM json_tree('{"a": {"b": [1, 2, {"c": 3}]}}', '$.a.b')
+        SELECT * FROM json_tree('{"a": {"b": [1, 2, {"c": 3}]}}', '$.a.b[2]')
+        SELECT * FROM json_tree('{"a": {"b": [1, 2, {"c": 3}]}}', '$.a.b[0]')
+        SELECT * FROM json_tree('{"a": {"b": [1, 2, {"c": 3}]}}', '$.a.b[2].c')
+        SELECT * FROM json_tree('{"a":{"b":1,"c":[2,{"d":3}]}}', '$.a.c')
+        SELECT * FROM json_tree('{"a":{"b":1,"c":[2,{"d":3}]}}', '$.a.b')
+        SELECT * FROM json_tree('{"a b":{"c.d":[1]}}', '$."a b"')
+        SELECT * FROM json_tree('{"a b":{"c.d":[1]}}', '$."a b"."c.d"')
+        SELECT * FROM json_each('{"a b":{"c.d":[1]}}', '$."a b"."c.d"[0]')
+        SELECT * FROM json_each('[1,2]', '$')
+        SELECT * FROM json_tree('[1,2]', '$')
+        SELECT * FROM json_each('{"a": 1}', '$.b')
+        SELECT * FROM json_each('[1]', '$[5]')
+        SELECT * FROM json_tree('{"a": 1}', '$.a.b')
+        SELECT * FROM json_each('[1,2]', '$.a.')
+        SELECT * FROM json_each('[1,2]', NULL)
+        SELECT * FROM json_each(NULL)
+        SELECT * FROM json_tree(NULL, '$')
+        SELECT count(*) FROM json_each()
+        SELECT * FROM json_each('[1,2]', 'a')
+        SELECT * FROM json_each('[1,2]', '$[')
+        SELECT * FROM json_each('[1,2]', '$a')
+        SELECT * FROM json_each('[1,2]', 5)
+        SELECT * FROM json_tree('{"a":1}', '$.a[')
+        SELECT * FROM json_each('[1,2')
+        SELECT * FROM json_each('')
+        SELECT * FROM json_tree('{"a" 1}')
+        SELECT * FROM json_each('[1]', '$', 3)
+        SELECT * FROM JSON_TREE('[1]', '$', 3)
+        SELECT * FROM json_eachx('[1]')
+        SELECT key, value FROM Json_Each('[10, 20]') AS e WHERE e.key = 1
+        SELECT e.value, f.value FROM json_each('[1,2]') e, json_each('["a","b"]') f ORDER BY 2 DESC, 1
+        """);
+}
+
+/// The value of an array or object has the JSON subtype: it nests in JSON functions, a scalar does not.
+@test
+fn jsonEachValueHasJsonSubtype() -> Result<void, TestFailure> {
+    let path = "out/json-each-subtype.db";
+    makeDatabase(path, "CREATE TABLE t(x)")?;
+    return sameAnswers(path, """
+        SELECT json_array(value), json_object('v', value), json_quote(value) FROM json_each('[1, "x", [2], {"a": 3}, null, "[4]"]')
+        SELECT json_group_array(value) FROM json_each('[1, "x", [2], {"a": 3}, null, "[4]"]')
+        SELECT json_group_object(key, value) FROM json_tree('{"a": [1, {"b": 2}], "c": "d"}') WHERE key IS NOT NULL
+        SELECT json_array(atom), json_array(e.value) FROM json_each('[[1], 2]') AS e
+        SELECT json_insert('{}', '$.x', value) FROM json_each('[[1], "s"]')
+        SELECT json_array(coalesce(value, 0)), json_array(CASE WHEN 1 THEN value END) FROM json_each('[[1], {"a":2}]')
+        SELECT hex(value), typeof(value), json(value) FROM jsonb_each('[[1], {"a": 2}, 3, "x"]')
+        SELECT key, hex(value), type, atom, id, parent, fullkey, path FROM jsonb_tree('{"a": [1, {"b": null}]}')
+        SELECT json_array(value) FROM jsonb_each('[[1], {"a": 2}, "x"]')
+        """);
+}
+
+const JSON_EACH_FIXTURE: StringView = """
+    CREATE TABLE docs(id INTEGER PRIMARY KEY, doc TEXT, root TEXT);
+    INSERT INTO docs VALUES (1, '{"a": [1, 2, 3], "b": {"c": "x"}}', '$.a'), (2, '{"a": [], "b": {"c": "y", "d": [4]}}', '$.b'), (3, '[10, 20]', '$'), (4, NULL, '$.a'), (5, '{"a": [5]}', NULL), (6, '{"a": {"k": 7}}', '$.z');
+    CREATE TABLE tags(name TEXT);
+    INSERT INTO tags VALUES ('x'), ('y'), ('z');
+    """;
+
+/// A JSONB blob whose element header is damaged: sqlite3's json_each() stays on the element for ever (count(*)
+/// never returns); this engine reports malformed JSON.
+@test
+fn jsonEachStopsOnDamagedJsonb() -> Result<void, TestFailure> {
+    let path = "out/json-each-damaged.db";
     makeDatabase(path, "CREATE TABLE t(x)")?;
     var session = Session.open(path)!;
-    let names = ["jsonb", "jsonb_array", "jsonb_object", "jsonb_extract", "jsonb_set", "jsonb_insert", "jsonb_replace", "jsonb_remove", "jsonb_patch", "jsonb_array_insert"];
-    for (k in 0..names.length) {
-        var sql = String.from("SELECT ")!;
-        sql.append(names[k])!;
-        sql.append("('[1]')")!;
-        let answer = ours(mut session, sql.view());
-        var expected = String.from("error: no such function: ")!;
-        expected.append(names[k])!;
-        expected.append("\n")!;
-        if (answer.view() != expected.view()) {
+    let queries = [
+        "SELECT count(*) FROM json_each(x'8BF301020304050607')",
+        "SELECT count(*) FROM json_tree(x'8BF301020304050607')",
+        "SELECT count(*) FROM json_tree(x'8B1BF3010203040506')",
+    ];
+    for (k in 0..queries.length) {
+        let answer = ours(mut session, queries[k]);
+        if (answer.view() != "error: malformed JSON\n") {
             return Check.fail(answer.view());
         }
     }
     return Ok();
+}
+
+/// json_each() and json_tree() with arguments from the rows of the tables before them, in joins, subqueries,
+/// aggregates and WHERE.
+@test
+fn jsonEachJoinsTables() -> Result<void, TestFailure> {
+    let path = "out/json-each-join.db";
+    makeDatabase(path, JSON_EACH_FIXTURE)?;
+    return sameAnswers(path, """
+        SELECT docs.id, e.key, e.value, e.type FROM docs, json_each(docs.doc) AS e ORDER BY docs.id, e.id
+        SELECT d.id, e.key, e.value, e.fullkey FROM docs d, json_each(d.doc, '$.a') e ORDER BY d.id, e.id
+        SELECT d.id, e.key, e.value, e.fullkey, e.root FROM docs d, json_each(d.doc, d.root) e ORDER BY d.id, e.id
+        SELECT d.id, t.fullkey, t.type, t.atom FROM docs d, json_tree(d.doc) t ORDER BY d.id, t.id
+        SELECT d.id, t.fullkey, t.path FROM docs d JOIN json_tree(d.doc, d.root) t ORDER BY d.id, t.id
+        SELECT d.id, count(e.key) FROM docs d LEFT JOIN json_each(d.doc, '$.a') e GROUP BY d.id ORDER BY d.id
+        SELECT d.id, e.value FROM docs d LEFT JOIN json_each(d.doc, '$.a') e ON e.value > 1 ORDER BY d.id, e.value
+        SELECT id FROM docs WHERE EXISTS (SELECT 1 FROM json_each(docs.doc, '$.a') WHERE value = 2) ORDER BY id
+        SELECT id, (SELECT sum(value) FROM json_each(docs.doc, '$.a')) FROM docs ORDER BY id
+        SELECT id, (SELECT group_concat(fullkey, ' ') FROM json_tree(docs.doc) WHERE atom IS NOT NULL) FROM docs ORDER BY id
+        SELECT d.id, e.key FROM docs d, json_each(d.doc) e WHERE e.type = 'object' ORDER BY 1, 2
+        SELECT d.id, e.key FROM docs d, json_each(d.doc) e WHERE e.key = 'a' AND json_array_length(e.value) > 0 ORDER BY 1
+        SELECT name, count(*) FROM tags, docs, json_tree(docs.doc) WHERE json_tree.atom = tags.name GROUP BY name ORDER BY name
+        SELECT sum(value), avg(value), min(value), max(value), count(*), total(value) FROM json_each('[1, 2.5, 3, "4", null]')
+        SELECT type, count(*) FROM json_tree('[1, [2, "a", {"b": null, "c": true}], 3.5]') GROUP BY type ORDER BY type
+        SELECT json_group_array(key) FROM (SELECT key FROM json_each('{"z": 1, "a": 2, "m": 3}') ORDER BY key)
+        SELECT value FROM json_each('[3, 1, 2]') ORDER BY value LIMIT 2
+        SELECT e.value FROM json_each((SELECT doc FROM docs WHERE id = 3)) e
+        SELECT x.key FROM (SELECT * FROM json_each('{"a": 1, "b": 2}')) x WHERE x.value = 2
+        WITH c(j) AS (SELECT '[1, [2]]') SELECT t.fullkey FROM c, json_tree(c.j) t
+        SELECT d.id, e.value FROM docs d, json_each(d.doc, '$.a') e WHERE d.id IN (1, 5) AND e.value IN (2, 5) ORDER BY 1
+        SELECT * FROM docs, json_each(docs.nosuch)
+        SELECT * FROM json_each(nosuch.doc), docs
+        """);
+}
+
+/// The jsonb_* functions return JSONB, byte for byte as sqlite3 does.
+@test
+fn jsonbFunctionsReturnJsonb() -> Result<void, TestFailure> {
+    let path = "out/json-jsonb.db";
+    makeDatabase(path, JSON_FIXTURE)?;
+    return sameAnswers(path, """
+        SELECT hex(jsonb('[1, 2.5, "x", null, true, false]')), hex(jsonb('{"a": {"b": [1]}}')), hex(jsonb('5')), hex(jsonb('"x"')), hex(jsonb('null')), typeof(jsonb('1'))
+        SELECT hex(jsonb('{a: 1, ''b'': 0x10, c: Infinity, d: -Infinity, e: NaN, f: .5, g: +1, h: "\x41\v", i: ''q"''}'))
+        SELECT hex(jsonb('"é\n\t\"\\\/"')), hex(jsonb('"é"')), hex(jsonb('1e999')), hex(jsonb('-0.0')), hex(jsonb('123456789012345678901234567890'))
+        SELECT hex(jsonb(x'8B133117613C176200')), hex(jsonb(x'3132')), hex(jsonb(NULL)), jsonb('[1')
+        SELECT hex(jsonb('[' || replace(hex(zeroblob(300)), '00', '1,') || '1]'))
+        SELECT hex(jsonb('"' || replace(hex(zeroblob(40000)), '00', 'ab') || '"')) = hex(jsonb(json('"' || replace(hex(zeroblob(40000)), '00', 'ab') || '"')))
+        SELECT length(jsonb('"' || replace(hex(zeroblob(40000)), '00', 'ab') || '"')), substr(hex(jsonb('"' || replace(hex(zeroblob(40000)), '00', 'ab') || '"')), 1, 12)
+        SELECT hex(jsonb_array()), hex(jsonb_array(1, 2.5, 'x', NULL, json('[1]'), '[1]', jsonb('{"a":1}'))), hex(jsonb_array(1e999, -1e999, 0.1, -0.0))
+        SELECT hex(jsonb_object()), hex(jsonb_object('a', 1, 'b', 'x', 'c', NULL, 'd', json('{"e":[]}'), 'f', jsonb('[2]'))), hex(jsonb_object('a"b', 'c\d'))
+        SELECT jsonb_object('a'), jsonb_object(1, 2), jsonb_array(x'01')
+        SELECT hex(jsonb_extract('{"a": [1, {"b": 2}], "c": "x"}', '$.a')), jsonb_extract('{"a": [1, {"b": 2}], "c": "x"}', '$.c'), typeof(jsonb_extract('{"a": 1}', '$.a')), hex(jsonb_extract('{"a": [1, {"b": 2}]}', '$.a[1]'))
+        SELECT hex(jsonb_extract('{"a": 1, "b": [2]}', '$.a', '$.b', '$.z')), jsonb_extract('{"a": 1}', '$.z'), jsonb_extract('{"a": 1}', 'a'), jsonb_extract('{"a": 1}')
+        SELECT hex(jsonb_extract(jsonb('{"a": [1, {"b": 2}]}'), '$.a')), hex(jsonb_extract(jsonb('{a:[0x1F,''x'']}'), '$.a')), jsonb_extract('[1,2]', '$[#-1]')
+        SELECT hex(jsonb_set('{"a": 1}', '$.b', 2)), hex(jsonb_set('{"a": 1}', '$.a', json('[1,2]'))), hex(jsonb_set('{"a": 1}', '$.c.d[0]', 'x')), hex(jsonb_set('[1]', '$', 2))
+        SELECT hex(jsonb_insert('[1, 2]', '$[#]', 3)), hex(jsonb_insert('{"a": 1}', '$.a', 2)), hex(jsonb_insert('{"a": 1}', '$.b', jsonb('{"c": [true]}')))
+        SELECT hex(jsonb_replace('{"a": 1, "b": 2}', '$.a', 'long text value here', '$.z', 1)), hex(jsonb_replace('[1, 2]', '$[1]', NULL))
+        SELECT hex(jsonb_remove('[1, 2, 3]', '$[1]')), hex(jsonb_remove('{"a": 1, "b": {"c": 2}}', '$.b.c', '$.a')), jsonb_remove('[1]', '$'), hex(jsonb_remove('[1]'))
+        SELECT hex(jsonb_patch('{"a": 1, "b": {"c": 2}}', '{"b": {"c": null, "d": 3}, "e": [4]}')), hex(jsonb_patch(jsonb('{"a": 1}'), jsonb('{"a": "long value"}'))), hex(jsonb_patch('[1]', '{"a": 1}'))
+        SELECT hex(jsonb_array_insert('[1, 2]', '$[1]', 9)), hex(jsonb_array_insert('[1, 2]', '$[#]', 9, '$[0]', 8)), jsonb_array_insert('[1]', '$[0]')
+        SELECT hex(jsonb_set(jsonb('{"a": 1}'), '$.a', 'a value that is longer than eleven bytes', '$.b', 2)), hex(jsonb_set(jsonb_array(1, 2), '$[0]', jsonb_object('k', 'v')))
+        SELECT hex(jsonb_set('{"a":"' || replace(hex(zeroblob(200)), '00', 'x') || '"}', '$.a', 1))
+        SELECT jsonb_set('{}', '$.a'), jsonb_insert('{}'), jsonb_replace('{}', 'a', 1), jsonb_set('{}', '$.a', x'01'), jsonb_patch('[1', '{}')
+        SELECT json(jsonb_set('{"a": 1}', '$.b', 2)), jsonb_set('{"a": 1}', '$.b', 2) -> '$.b', jsonb_object('a', 1) ->> 'a', json_type(jsonb_array(1)), json_array_length(jsonb_array(1, 2))
+        SELECT json_array(jsonb_array(1), jsonb_object('a', 2)), json_extract(jsonb_array(1, jsonb_array(2)), '$[1]'), json_valid(jsonb_array(1), 8), json_set(jsonb('{}'), '$.a', 1)
+        SELECT hex(jsonb_group_array(v)), hex(jsonb_group_object(k, v)) FROM t
+        SELECT g, hex(jsonb_group_array(v)), hex(jsonb_group_object(k, v)) FROM t GROUP BY g ORDER BY g
+        SELECT hex(jsonb_group_array(v)), hex(jsonb_group_object(k, v)), typeof(jsonb_group_array(v)) FROM t WHERE 0
+        SELECT hex(jsonb_group_array(DISTINCT g)), hex(jsonb_group_array(v ORDER BY g DESC)) FROM t
+        SELECT json(jsonb_group_array(json_array(g, v))), hex(jsonb_group_object(k, jsonb_array(g))) FROM t
+        SELECT hex(jsonb_group_array(x'01')), hex(jsonb_group_object(k, x'00')) FROM t
+        SELECT jsonb_group_array(x'1F') FROM t
+        SELECT jsonb_group_array() FROM t
+        SELECT jsonb_group_object(k) FROM t
+        SELECT jsonb(), jsonb('1', '2'), jsonb_patch('{}'), JSONB_ARRAY(1) = jsonb_array(1)
+        SELECT jsonb_set('{}'), jsonb_insert('{}', '$.a'), jsonb_replace('{}', '$.a'), jsonb_array_insert('[]', '$[0]'), jsonb_object('a', 1, 'b')
+        SELECT g, hex(jsonb_group_array(g) OVER (ORDER BY rowid)), hex(jsonb_group_object(k, g) OVER (PARTITION BY g)) FROM t ORDER BY rowid
+        SELECT hex(jsonb_group_array(g) OVER (ORDER BY rowid ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)) FROM t ORDER BY rowid
+        SELECT hex(jsonb_set(x'8B133117613C176200', '$[0]', 5, '$[2].c', 'x')), hex(jsonb_remove(x'8B133117613C176200', '$[1]')), hex(jsonb_extract(x'8B133117613C176200', '$[2]'))
+        SELECT x'8B133117613C176200' -> '$[2]', x'8B133117613C176200' ->> '$[2].b', hex(jsonb_patch(x'CC1017615B35312E3501176358785C5C6E79', '{"a":null}'))
+        """);
+}
+
+/// A generator of JSON texts for the differential tests: a linear congruential sequence, the same on every run.
+struct JsonFuzz {
+    state: u64;
+
+    fn take(borrow mut this, n: u64) -> u64 {
+        this.state = this.state.wrappingMul(6364136223846793005).wrappingAdd(1442695040888963407);
+        return (this.state >> 33) % n;
+    }
+
+    fn scalar(borrow mut this, out: borrow mut String) {
+        match (this.take(14)) {
+            0 => { out.append("null")!; }
+            1 => { out.append("true")!; }
+            2 => { out.append("false")!; }
+            3 => { out.appendNumber(truncate<i64>(this.take(1000)) - 500)!; }
+            4 => { out.append("1.5e3")!; }
+            5 => { out.append("-0.25")!; }
+            6 => { out.append("0x1F")!; }
+            7 => { out.append("\"s\"")!; }
+            8 => { out.append("\"a\\nb\\u00e9\"")!; }
+            9 => { out.append("''single''")!; }
+            10 => { out.append("Infinity")!; }
+            11 => { out.append(".5")!; }
+            12 => { out.append("\"a long string of more than twelve bytes\"")!; }
+            _ => { out.appendNumber(this.take(100000000000))!; }
+        }
+    }
+
+    fn label(borrow mut this, out: borrow mut String) {
+        match (this.take(6)) {
+            0 => { out.append("\"a\"")!; }
+            1 => { out.append("b")!; }
+            2 => { out.append("\"c d\"")!; }
+            3 => { out.append("''e''")!; }
+            4 => { out.append("\"\"")!; }
+            _ => { out.append("\"k\\\"q\"")!; }
+        }
+    }
+
+    fn value(borrow mut this, out: borrow mut String, depth: u32) {
+        // The document is an array or an object; below it, three values in five are scalars.
+        let choice = if (depth >= 4) 0 else if (depth == 0) 3 + this.take(2) else this.take(5);
+        if (choice < 3) {
+            this.scalar(out);
+            return;
+        }
+        let count = this.take(5);
+        if (choice == 3) {
+            out.append("[")!;
+            for (k in 0..count) {
+                if (k != 0) {
+                    out.append(",")!;
+                }
+                this.value(out, depth + 1);
+            }
+            out.append("]")!;
+            return;
+        }
+        out.append("{")!;
+        for (k in 0..count) {
+            if (k != 0) {
+                out.append(",")!;
+            }
+            this.label(out);
+            out.append(":")!;
+            this.value(out, depth + 1);
+        }
+        out.append("}")!;
+    }
+}
+
+/// Random JSON through jsonb(), the jsonb_* editors, json_each() and json_tree(), compared with sqlite3.
+@test
+fn jsonbMatchesSqliteOnRandomInput() -> Result<void, TestFailure> {
+    let path = "out/json-fuzz.db";
+    makeDatabase(path, "CREATE TABLE t(x)")?;
+    var fuzz = JsonFuzz { state: 20260409 };
+    // @D is the document, @O another value, @P and @Q paths.
+    let templates = [
+        "SELECT hex(jsonb('@D')), hex(jsonb_set('@D', '@P', json('@O'))), hex(jsonb_insert('@D', '@Q', 1)), hex(jsonb_remove('@D', '@Q'))",
+        "SELECT hex(jsonb_patch('@D', '@O')), hex(jsonb_extract('@D', '@P')), hex(jsonb_replace('@D', '@Q', jsonb('@O'))), hex(jsonb_array_insert('@D', '@P[0]', 'v'))",
+        "SELECT hex(jsonb_set(jsonb('@D'), '@Q', 'a text longer than twelve bytes', '@P', 1)), hex(jsonb_extract('@D', '@P', '@Q')), jsonb('@D') -> '@P', jsonb('@D') ->> '@Q'",
+        "SELECT json_group_array(json_array(key, value, type, atom, id, parent, fullkey, path)) FROM json_tree('@D')",
+        "SELECT json_group_array(json_array(key, value, type, atom, id, parent, fullkey, path, root)) FROM json_each('@D', '@P')",
+        "SELECT json_group_array(json_array(key, value, type, atom, id, parent, fullkey, path, root)) FROM json_tree('@D', '@Q')",
+        "SELECT json_group_array(json_array(key, hex(value), id, parent, fullkey, path)) FROM jsonb_tree(jsonb_set('@D', '@P', json('@O')))",
+    ];
+    let paths = ["$", "$.a", "$.b", "$[0]", "$[1].a", "$.\"c d\"", "$[#]", "$.e[0]", "$[0][1]", "$.b.\"k\\\"q\"", "$[#-1]"];
+    var queries = String.create();
+    for (k in 0..70) {
+        var doc = String.create();
+        fuzz.value(mut doc, 0);
+        var other = String.create();
+        fuzz.value(mut other, 1);
+        let p = paths[k % paths.length];
+        let q = paths[(k * 7 + 3) % paths.length];
+        for (t in 0..templates.length) {
+            let z = templates[t].bytes();
+            var i: usize = 0;
+            while (i < z.length) {
+                if (z[i] == '@' && i + 1 < z.length) {
+                    let c = z[i + 1];
+                    queries.append(if (c == 'D') doc.view() else if (c == 'O') other.view() else if (c == 'P') p else q)!;
+                    i += 2;
+                    continue;
+                }
+                queries.append(templates[t][i..i + 1])!;
+                i += 1;
+            }
+            queries.append("\n")!;
+        }
+    }
+    return sameAnswers(path, queries.view());
 }

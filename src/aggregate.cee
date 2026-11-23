@@ -149,10 +149,11 @@ struct Accumulator {
             ),
             AggregateFunction.Min | AggregateFunction.Max => AggregateState.Best(SqliteValue.Null),
             AggregateFunction.GroupConcat => AggregateState.Concat(String.create(), false),
-            AggregateFunction.JsonGroupArray | AggregateFunction.JsonGroupObject => AggregateState.Json(
-                JsonOut.create(),
-                false,
-            ),
+            AggregateFunction.JsonGroupArray | AggregateFunction.JsonGroupObject | AggregateFunction.JsonbGroupArray | AggregateFunction.JsonbGroupObject =>
+                AggregateState.Json(
+                    JsonOut.create(),
+                    false,
+                ),
         };
         return Accumulator {
             state: state,
@@ -250,7 +251,7 @@ struct Accumulator {
                 appendValueText(text, borrow value)?;
             }
             AggregateState.Json(out, started) => {
-                let isObject = spec.function == AggregateFunction.JsonGroupObject;
+                let isObject = jsonGroupIsObject(spec.function);
                 let second: JsonValue? = if (isObject) evaluateWithSubtype(borrow spec.args[1], frame, db)? else null;
                 let firstValue = JsonValue { value: value, json: firstIsJson };
                 jsonGroupStep(isObject, out, started, borrow firstValue, borrow second)?;
@@ -322,7 +323,7 @@ struct Accumulator {
                 return Ok(SqliteValue.Text(text.clone()?));
             }
             AggregateState.Json(out, started) => {
-                return jsonGroupFinish(spec.function == AggregateFunction.JsonGroupObject, out, started);
+                return jsonGroupResult(spec.function, out, started);
             }
         }
     }

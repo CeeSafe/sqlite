@@ -118,6 +118,7 @@ fn sourceRows(
             }
             return Ok(rows);
         }
+        SourceKind.JsonEach(plan) => { return jsonEachRows(plan, frame, db); }
         SourceKind.Table(_) => { return Ok(Vector<Vector<SqliteValue>>.create()); }
     }
 }

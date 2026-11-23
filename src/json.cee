@@ -4,15 +4,17 @@
 // search and edit the JSONB, and the JSON text of a result is generated from it. Keeping SQLite's intermediate form
 // keeps every output byte the same as SQLite's: a number keeps the spelling it had in the input, JSON5 forms are
 // rewritten as SQLite rewrites them, an object keeps duplicate labels, and an edit lands where SQLite's lands. A
-// blob argument that looks like JSONB is read as JSONB, as SQLite reads it; the jsonb_* functions, which return
-// JSONB, and the table-valued json_each and json_tree are not ported.
+// blob argument that looks like JSONB is read as JSONB, as SQLite reads it. The jsonb_* functions return the JSONB
+// itself: the parse's blob, or JSON text they made translated into JSONB (jsonReturnStringAsBlob). The table-valued
+// json_each and json_tree are in json_each.cee.
 //
 // SQLite marks the text a JSON function returns with a subtype, so that json_array(json('[1]')) nests the array
 // instead of quoting it as a string. A SqliteValue carries no subtype in this engine. Instead the arguments of the
 // JSON functions are evaluated by evaluateWithSubtype, which knows the expressions that give JSON: a JSON function's
 // result, and the expressions SQLite passes a subtype through (CASE, coalesce, ifnull, iif, nullif, likely,
 // unlikely, the scalar min and max, unary +, CAST and COLLATE). The result of json_group_array and
-// json_group_object is wrapped at compile time in the internal function JsonSubtype, which marks its argument. A
+// json_group_object is wrapped at compile time in the internal function JsonSubtype, which marks its argument, and
+// the `value` column of a json_each row is JSON when the row's type is an array or an object (json_each.cee). A
 // scalar subquery's result loses the mark here, where SQLite keeps it.
 //
 // Differences from the C# engine, which this replaces (each checked against sqlite3 3.54; README.md has the list):
@@ -68,6 +70,8 @@ fn jsonLookupIsError(x: usize) -> bool => x >= JSON_LOOKUP_PATHERROR;
 const JSON_JSON: u8 = 1;
 const JSON_SQL: u8 = 2;
 const JSON_ABPATH: u8 = 3;
+/// A jsonb_* function: its result is JSONB (JSON_BLOB).
+const JSON_BLOB: u8 = 0x10;
 
 /// The results of jsonMergePatch.
 const JSON_MERGE_OK: u8 = 0;
@@ -590,6 +594,15 @@ fn jsonbEdit(
 ) -> Result<void, AllocError> {
     let start = iDel.min(blob.length);
     let removed = nDel.min(blob.length - start);
+    let d = truncate<i64>(nIns) - truncate<i64>(removed);
+    if (d < 0 && d >= -8 && ins.length > 0 && nIns <= ins.length && jsonbOverwrite(
+        blob,
+        start,
+        ins[0..nIns],
+        truncate<usize>(0 - d),
+    )) {
+        return Ok();
+    }
     if (nIns > removed) {
         jsonInsertBytes(blob, start + removed, nIns - removed)?;
     } else if (nIns < removed) {
@@ -600,6 +613,61 @@ fn jsonbEdit(
         jsonCopyInto(blob, start, jsonBytes(ins, 0, nIns));
     }
     return Ok();
+}
+
+/// Writes `ins` over the `ins.length + d` bytes at `at`, with its header made `d` bytes larger so that the size of
+/// the JSONB stays the same (jsonBlobOverwrite). False when the header cannot grow by `d`.
+fn jsonbOverwrite(blob: borrow mut Vector<u8>, at: usize, ins: Slice<u8>, d: usize) -> bool {
+    let nIns = ins.length;
+    if (nIns == 0 || (ins[0] & 0x0F) <= JSONB_FALSE || at + nIns + d > blob.length) {
+        return false;
+    }
+    var i: usize = 0;
+    var szHdr: usize = 0;
+    let x = ins[0] >> 4;
+    if (x <= 11) {
+        if (d != 1 && d != 2 && d != 4 && d != 8) {
+            return false;
+        }
+        i = d + 1;
+        szHdr = 1;
+    } else if (x == 12) {
+        if (d != 1 && d != 3 && d != 7) {
+            return false;
+        }
+        i = d + 2;
+        szHdr = 2;
+    } else if (x == 13) {
+        if (d != 2 && d != 6) {
+            return false;
+        }
+        i = d + 3;
+        szHdr = 3;
+    } else if (x == 14) {
+        if (d != 4) {
+            return false;
+        }
+        i = 9;
+        szHdr = 5;
+    } else {
+        return false;
+    }
+    if (szHdr > nIns) {
+        return false;
+    }
+    let high: u8 = if (i == 2) 0xC0 else if (i == 3) 0xD0 else if (i == 5) 0xE0 else 0xF0;
+    blob[at] = (ins[0] & 0x0F) | high;
+    jsonCopyInto(blob, at + i, ins[szHdr..]);
+    var szPayload = nIns - szHdr;
+    loop {
+        i -= 1;
+        blob[at + i] = truncate<u8>(szPayload & 0xFF);
+        if (i == 1) {
+            break;
+        }
+        szPayload >>= 8;
+    }
+    return true;
 }
 
 /// The number of elements of the array at `iRoot` (jsonbArrayCount).
@@ -1368,6 +1436,8 @@ struct JsonParse {
     ins: Vector<u8>;
     /// The change in size of an edit in progress.
     delta: i64;
+    /// Where the label is when the last lookup found an object's value, else 0 (json_each needs it).
+    iLabel: usize;
 
     fn create() -> JsonParse => JsonParse {
         blob: Vector<u8>.create(),
@@ -1378,6 +1448,7 @@ struct JsonParse {
         edit: 0,
         ins: Vector<u8>.create(),
         delta: 0,
+        iLabel: 0,
     };
 
     /// Translates the JSON text element at z[start..] into JSONB, appended to the blob (jsonTranslateTextToBlob).
@@ -1980,6 +2051,7 @@ struct JsonParse {
                     jsonbEdit(mut this.blob, mut this.delta, iRoot, sz, this.ins.view(), count)?;
                 }
             }
+            this.iLabel = iLabel;
             return Ok(iRoot);
         }
         if (c0 == '.') {
@@ -2466,14 +2538,33 @@ fn jsonValueToBlob(arg: borrow JsonValue) -> Result<Vector<u8>, SqliteError> {
     return Ok(blob);
 }
 
-/// The JSON text of a parse, as a function's result (jsonReturnParse).
-fn jsonReturnParse(p: borrow mut JsonParse) -> Result<JsonValue, SqliteError> {
+/// A parse as a function's result (jsonReturnParse): its JSONB for a jsonb_* function, else its JSON text.
+fn jsonReturnParse(p: borrow mut JsonParse, blob: bool) -> Result<JsonValue, SqliteError> {
+    if (blob) {
+        return Ok(jsonPlain(SqliteValue.Blob(p.blob.clone()?)));
+    }
     var out = JsonOut.create();
     p.delta = 0;
     var depth = p.depth;
     let _ = jsonTranslateBlobToText(p.blob.view(), mut depth, 0, mut out)?;
     p.depth = depth;
     return out.finish(true);
+}
+
+/// JSON text a function made, as its result: for a jsonb_* function, translated into JSONB
+/// (jsonReturnStringAsBlob). The text is well-formed, since this engine made it.
+fn jsonReturnText(out: borrow mut JsonOut, blob: bool) -> Result<JsonValue, SqliteError> {
+    if (!blob || out.err != 0) {
+        return out.finish(true);
+    }
+    return jsonTextAsBlob(out.buf.view());
+}
+
+/// JSON text, as JSONB.
+fn jsonTextAsBlob(text: Slice<u8>) -> Result<JsonValue, SqliteError> {
+    var p = JsonParse.create();
+    let _ = p.translateText(text, 0)?;
+    return Ok(jsonPlain(SqliteValue.Blob(p.blob)));
 }
 
 /// sqlite3DecOrHexToI64's result: 0 a whole integer that fits, 1 text after it, 2 too large, 3 exactly 2^63.
@@ -2676,15 +2767,15 @@ fn jsonReturnFromBlob(blob: Slice<u8>, i: usize) -> Result<SqliteValue, SqliteEr
 // ── the functions ────────────────────────────────────────────────────────────────────────────────────────────
 
 /// json(X) (jsonRemoveFunc with one argument): X minified.
-fn jsonFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
+fn jsonFunction(args: Slice<JsonValue>, blob: bool) -> Result<JsonValue, SqliteError> {
     var p = jsonParseArgument(borrow args[0].value, false)? ?? {
         return Ok(jsonNull());
     };
-    return jsonReturnParse(mut p);
+    return jsonReturnParse(mut p, blob);
 }
 
 /// json_array(V, …).
-fn jsonArrayFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
+fn jsonArrayFunction(args: Slice<JsonValue>, blob: bool) -> Result<JsonValue, SqliteError> {
     var out = JsonOut.create();
     out.byte('[')?;
     for (k in 0..args.length) {
@@ -2692,11 +2783,11 @@ fn jsonArrayFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
         out.sqlValue(borrow args[k].value, args[k].json)?;
     }
     out.byte(']')?;
-    return out.finish(true);
+    return jsonReturnText(mut out, blob);
 }
 
 /// json_object(LABEL, VALUE, …).
-fn jsonObjectFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
+fn jsonObjectFunction(args: Slice<JsonValue>, blob: bool) -> Result<JsonValue, SqliteError> {
     if (args.length % 2 == 1) {
         return Err(sqlError("json_object() requires an even number of arguments"));
     }
@@ -2714,7 +2805,7 @@ fn jsonObjectFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> 
         k += 2;
     }
     out.byte('}')?;
-    return out.finish(true);
+    return jsonReturnText(mut out, blob);
 }
 
 /// json_quote(V).
@@ -2823,9 +2914,12 @@ fn jsonExtractFunction(args: Slice<JsonValue>, flags: u8) -> Result<JsonValue, S
                     let _ = jsonTranslateBlobToText(p.blob.view(), mut depth, j, mut one)?;
                     return one.finish(true);
                 }
-                let value = jsonReturnFromBlob(p.blob.view(), j)?;
                 let container = (p.blob[j] & 0x0F) >= JSONB_ARRAY;
-                return Ok(JsonValue { value: value, json: (flags & JSON_SQL) == 0 && container });
+                if (container && (flags & JSON_BLOB) != 0) {
+                    return Ok(jsonPlain(jsonReturnBlobFromBlob(p.blob.view(), j)?));
+                }
+                let value = jsonReturnFromBlob(p.blob.view(), j)?;
+                return Ok(JsonValue { value: value, json: (flags & (JSON_SQL | JSON_BLOB)) == 0 && container });
             }
             out.separator()?;
             var depth = p.depth;
@@ -2841,11 +2935,22 @@ fn jsonExtractFunction(args: Slice<JsonValue>, flags: u8) -> Result<JsonValue, S
         }
     }
     out.byte(']')?;
-    return out.finish(true);
+    return jsonReturnText(mut out, (flags & JSON_BLOB) != 0);
+}
+
+/// The array or object at `i` as a blob of its JSONB (jsonReturnFromBlob for a jsonb_* function).
+fn jsonReturnBlobFromBlob(blob: Slice<u8>, i: usize) -> Result<SqliteValue, SqliteError> {
+    let h = jsonbPayloadSize(blob, 0, i);
+    if (h.n == 0) {
+        return Err(sqlError("malformed JSON"));
+    }
+    var bytes = Vector<u8>.create();
+    bytes.extend(jsonBytes(blob, i, i + h.n + h.sz))?;
+    return Ok(SqliteValue.Blob(bytes));
 }
 
 /// json_insert(), json_replace(), json_set() and json_array_insert() (jsonInsertIntoBlob).
-fn jsonEditFunction(args: Slice<JsonValue>, edit: u8, name: StringView) -> Result<JsonValue, SqliteError> {
+fn jsonEditFunction(args: Slice<JsonValue>, edit: u8, name: StringView, blob: bool) -> Result<JsonValue, SqliteError> {
     if (args.length < 1) {
         return Ok(jsonNull());
     }
@@ -2893,11 +2998,11 @@ fn jsonEditFunction(args: Slice<JsonValue>, edit: u8, name: StringView) -> Resul
             return Err(jsonBadPathError(z, rc));
         }
     }
-    return jsonReturnParse(mut p);
+    return jsonReturnParse(mut p, blob);
 }
 
 /// json_remove(J, PATH, …).
-fn jsonRemoveFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
+fn jsonRemoveFunction(args: Slice<JsonValue>, blob: bool) -> Result<JsonValue, SqliteError> {
     if (args.length < 1) {
         return Ok(jsonNull());
     }
@@ -2926,7 +3031,7 @@ fn jsonRemoveFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> 
             return Err(jsonBadPathError(z, rc));
         }
     }
-    return jsonReturnParse(mut p);
+    return jsonReturnParse(mut p, blob);
 }
 
 /// json_type(J [, PATH]).
@@ -3040,7 +3145,7 @@ fn jsonErrorPositionFunction(args: Slice<JsonValue>) -> Result<JsonValue, Sqlite
 }
 
 /// json_patch(TARGET, PATCH).
-fn jsonPatchFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
+fn jsonPatchFunction(args: Slice<JsonValue>, blob: bool) -> Result<JsonValue, SqliteError> {
     var target = jsonParseArgument(borrow args[0].value, false)? ?? {
         return Ok(jsonNull());
     };
@@ -3049,7 +3154,7 @@ fn jsonPatchFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
     };
     let rc = jsonMergePatch(mut target, 0, patch.blob.view(), 0, 0)?;
     if (rc == JSON_MERGE_OK) {
-        return jsonReturnParse(mut target);
+        return jsonReturnParse(mut target, blob);
     }
     if (rc == JSON_MERGE_TOODEEP) {
         return Err(sqlError("JSON nested too deep"));
@@ -3061,29 +3166,39 @@ fn jsonPatchFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
 
 /// Whether `function` is one of the JSON functions computed here.
 fn isJsonFunction(function: ScalarFunction) -> bool => match (function) {
-    ScalarFunction.Json | ScalarFunction.JsonArray | ScalarFunction.JsonArrayInsert | ScalarFunction.JsonArrayLength | ScalarFunction.JsonErrorPosition | ScalarFunction.JsonExtract | ScalarFunction.JsonInsert | ScalarFunction.JsonObject | ScalarFunction.JsonPatch | ScalarFunction.JsonPretty | ScalarFunction.JsonQuote | ScalarFunction.JsonRemove | ScalarFunction.JsonReplace | ScalarFunction.JsonSet | ScalarFunction.JsonType | ScalarFunction.JsonValid | ScalarFunction.JsonSubtype =>
+    ScalarFunction.Json | ScalarFunction.JsonArray | ScalarFunction.JsonArrayInsert | ScalarFunction.JsonArrayLength | ScalarFunction.JsonErrorPosition | ScalarFunction.JsonExtract | ScalarFunction.JsonInsert | ScalarFunction.JsonObject | ScalarFunction.JsonPatch | ScalarFunction.JsonPretty | ScalarFunction.JsonQuote | ScalarFunction.JsonRemove | ScalarFunction.JsonReplace | ScalarFunction.JsonSet | ScalarFunction.JsonType | ScalarFunction.JsonValid | ScalarFunction.JsonSubtype | ScalarFunction.Jsonb | ScalarFunction.JsonbArray | ScalarFunction.JsonbArrayInsert | ScalarFunction.JsonbExtract | ScalarFunction.JsonbInsert | ScalarFunction.JsonbObject | ScalarFunction.JsonbPatch | ScalarFunction.JsonbRemove | ScalarFunction.JsonbReplace | ScalarFunction.JsonbSet =>
         true,
     _ => false,
 };
 
 /// A JSON function applied to its arguments.
 fn jsonCall(function: ScalarFunction, args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> => match (function) {
-    ScalarFunction.Json => jsonFunction(args),
-    ScalarFunction.JsonArray => jsonArrayFunction(args),
-    ScalarFunction.JsonArrayInsert => jsonEditFunction(args, JEDIT_AINS, "array_insert"),
+    ScalarFunction.Json => jsonFunction(args, false),
+    ScalarFunction.JsonArray => jsonArrayFunction(args, false),
+    ScalarFunction.JsonArrayInsert => jsonEditFunction(args, JEDIT_AINS, "array_insert", false),
     ScalarFunction.JsonArrayLength => jsonArrayLengthFunction(args),
     ScalarFunction.JsonErrorPosition => jsonErrorPositionFunction(args),
     ScalarFunction.JsonExtract => jsonExtractFunction(args, 0),
-    ScalarFunction.JsonInsert => jsonEditFunction(args, JEDIT_INS, "insert"),
-    ScalarFunction.JsonObject => jsonObjectFunction(args),
-    ScalarFunction.JsonPatch => jsonPatchFunction(args),
+    ScalarFunction.JsonInsert => jsonEditFunction(args, JEDIT_INS, "insert", false),
+    ScalarFunction.JsonObject => jsonObjectFunction(args, false),
+    ScalarFunction.JsonPatch => jsonPatchFunction(args, false),
     ScalarFunction.JsonPretty => jsonPrettyFunction(args),
     ScalarFunction.JsonQuote => jsonQuoteFunction(args),
-    ScalarFunction.JsonRemove => jsonRemoveFunction(args),
-    ScalarFunction.JsonReplace => jsonEditFunction(args, JEDIT_REPL, "replace"),
-    ScalarFunction.JsonSet => jsonEditFunction(args, JEDIT_SET, "set"),
+    ScalarFunction.JsonRemove => jsonRemoveFunction(args, false),
+    ScalarFunction.JsonReplace => jsonEditFunction(args, JEDIT_REPL, "replace", false),
+    ScalarFunction.JsonSet => jsonEditFunction(args, JEDIT_SET, "set", false),
     ScalarFunction.JsonType => jsonTypeFunction(args),
     ScalarFunction.JsonValid => jsonValidFunction(args),
+    ScalarFunction.Jsonb => jsonFunction(args, true),
+    ScalarFunction.JsonbArray => jsonArrayFunction(args, true),
+    ScalarFunction.JsonbArrayInsert => jsonEditFunction(args, JEDIT_AINS, "array_insert", true),
+    ScalarFunction.JsonbExtract => jsonExtractFunction(args, JSON_BLOB),
+    ScalarFunction.JsonbInsert => jsonEditFunction(args, JEDIT_INS, "insert", true),
+    ScalarFunction.JsonbObject => jsonObjectFunction(args, true),
+    ScalarFunction.JsonbPatch => jsonPatchFunction(args, true),
+    ScalarFunction.JsonbRemove => jsonRemoveFunction(args, true),
+    ScalarFunction.JsonbReplace => jsonEditFunction(args, JEDIT_REPL, "replace", true),
+    ScalarFunction.JsonbSet => jsonEditFunction(args, JEDIT_SET, "set", true),
     _ => Ok(jsonNull()),
 };
 
@@ -3142,6 +3257,10 @@ fn evaluateWithSubtype(
             let a = evaluate(left, frame, db)?;
             let b = evaluate(right, frame, db)?;
             return jsonArrowValue(borrow a, borrow b, asSql);
+        }
+        XExpr.Column(slot, column) => {
+            let v = evaluate(expr, frame, db)?;
+            return Ok(JsonValue { value: v, json: jsonEachValueIsJson(frame, slot, column) });
         }
         XExpr.Plus(operand) => { return evaluateWithSubtype(operand, frame, db); }
         XExpr.Cast(operand, affinity) => {
@@ -3275,6 +3394,34 @@ fn jsonGroupStep(
         return Err(jsonFailureError(out.failure));
     }
     return Ok();
+}
+
+/// Whether the aggregate is json_group_array, json_group_object or their jsonb_ forms.
+fn isJsonGroup(function: AggregateFunction) -> bool => match (function) {
+    AggregateFunction.JsonGroupArray | AggregateFunction.JsonGroupObject | AggregateFunction.JsonbGroupArray | AggregateFunction.JsonbGroupObject =>
+        true,
+    _ => false,
+};
+
+fn jsonGroupIsObject(function: AggregateFunction) -> bool =>
+    function == AggregateFunction.JsonGroupObject || function == AggregateFunction.JsonbGroupObject;
+
+/// The final value of a JSON aggregate: jsonb_group_array() and jsonb_group_object() give JSONB.
+fn jsonGroupResult(
+    function: AggregateFunction,
+    group: borrow JsonOut,
+    started: bool,
+) -> Result<SqliteValue, SqliteError> {
+    let isObject = jsonGroupIsObject(function);
+    let text = jsonGroupFinish(isObject, group, started)?;
+    if (function != AggregateFunction.JsonbGroupArray && function != AggregateFunction.JsonbGroupObject) {
+        return Ok(text);
+    }
+    let SqliteValue.Text(s) = text else {
+        return Ok(text);
+    };
+    let blob = jsonTextAsBlob(s.view().bytes())?;
+    return Ok(blob.value);
 }
 
 /// The final value of json_group_array() or json_group_object() (jsonArrayCompute, jsonObjectCompute).
