@@ -461,6 +461,11 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   outside the aggregates takes the group's first row (or the row of its one min() or max()). This engine had
   listed groups as it met them and taken the last row.
 
+- **Row values in IN** (`rowValuesInInMatchSqlite`): `(a, b) IN (SELECT x, y …)` and `IN ((x, y), …)` compare
+  element by element with each pair's affinity and collation, NULL elements making a row unknown; a subquery of
+  the wrong width is "sub-select returns N columns - expected M", an item of the wrong width "IN(...) element has
+  N terms - expected M", as in SQLite.
+
 ## Known differences from SQLite in the math functions
 
 The `sqlite3` shell calls the platform's libm (macOS's here), and prints reals with 17 significant digits, so a

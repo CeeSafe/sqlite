@@ -128,6 +128,10 @@ struct XIn {
     subquery: XSubquery?;
     affinity: ExprAffinity;
     collation: Collation;
+    /// A row value `(a, b, …) IN …`: how many elements, and each one's comparison affinity and collation.
+    width: usize;
+    affinities: Vector<ExprAffinity>;
+    collations: Vector<Collation>;
 }
 
 struct XWhen {
@@ -494,6 +498,9 @@ fn evaluateRowCompare(
 }
 
 fn evaluateIn(i: borrow XIn, frame: borrow mut Frame, db: borrow mut Session) -> Result<SqliteValue, SqliteError> {
+    if (i.width > 1) {
+        return evaluateRowIn(i, frame, db);
+    }
     var values = Vector<SqliteValue>.create();
     if (borrow i.subquery is Some(sub)) {
         values = subqueryFirstColumn(sub, frame, db)?;
@@ -727,4 +734,57 @@ struct ParamTable {
         this.numbers.push(this.count - 1)?;
         return Ok(this.count - 1);
     }
+}
+
+/// `(a, b, …) IN (SELECT x, y, …)` or `IN ((x, y, …), …)`: true when a row equals the operand in every element,
+/// NULL when none does but some might (a NULL element), else false.
+fn evaluateRowIn(i: borrow XIn, frame: borrow mut Frame, db: borrow mut Session) -> Result<SqliteValue, SqliteError> {
+    let XExpr.RowValue(elements) = borrow i.operand else {
+        return Err(sqlError("row value misused"));
+    };
+    var operand = Vector<SqliteValue>.withCapacity(elements.length)?;
+    for (k in 0..elements.length) {
+        operand.push(evaluate(borrow elements[k], frame, db)?)?;
+    }
+    var rows = Vector<Vector<SqliteValue>>.create();
+    if (borrow i.subquery is Some(sub)) {
+        rows = subqueryRows(sub, frame, db)?;
+    } else {
+        for (r in 0..i.items.length) {
+            let XExpr.RowValue(cells) = borrow i.items[r] else {
+                return Err(sqlError("row value misused"));
+            };
+            if (cells.length != i.width) {
+                return Err(sqlError("row value misused"));
+            }
+            var row = Vector<SqliteValue>.withCapacity(cells.length)?;
+            for (k in 0..cells.length) {
+                row.push(evaluate(borrow cells[k], frame, db)?)?;
+            }
+            rows.push(row)?;
+        }
+    }
+    var unknown = false;
+    for (r in 0..rows.length) {
+        var equal = true;
+        var rowUnknown = false;
+        for (k in 0..i.width) {
+            if (k >= rows[r].length || operand[k].isNull() || rows[r][k].isNull()) {
+                rowUnknown = true;
+                continue;
+            }
+            if (compareWithAffinity(borrow operand[k], borrow rows[r][k], i.affinities[k], i.collations[k])? != 0) {
+                equal = false;
+                break;
+            }
+        }
+        if (equal && !rowUnknown) {
+            return Ok(SqliteValue.Integer(if (i.negated) 0 else 1));
+        }
+        unknown = unknown || (equal && rowUnknown);
+    }
+    if (unknown) {
+        return Ok(SqliteValue.Null);
+    }
+    return Ok(SqliteValue.Integer(if (i.negated) 1 else 0));
 }

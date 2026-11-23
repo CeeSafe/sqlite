@@ -621,6 +621,11 @@ impl Compiler {
     }
 
     private fn inExpr(borrow mut this, inExpr: borrow InExpr, db: borrow mut Session) -> Result<Compiled, SqliteError> {
+        if (borrow inExpr.operand is Expr.RowValue(elements)) {
+            if (elements.length > 1) {
+                return this.rowInExpr(inExpr, elements, db);
+            }
+        }
         let operand = this.typed(borrow inExpr.operand, db)?;
         var items = Vector<XExpr>.create();
         var subquery: XSubquery? = null;
@@ -647,6 +652,11 @@ impl Compiler {
                 subquery = sub;
             }
         }
+        if (borrow subquery is Some(sub)) {
+            if (sub.plan.columnNames.length != 1) {
+                return Err(inColumnCount(sub.plan.columnNames.length, 1));
+            }
+        }
         let x = XIn {
             operand: operand.expr,
             negated: inExpr.negated,
@@ -654,6 +664,75 @@ impl Compiler {
             subquery: subquery,
             affinity: affinity,
             collation: collation,
+            width: 1,
+            affinities: Vector<ExprAffinity>.create(),
+            collations: Vector<Collation>.create(),
+        };
+        return Ok(plain(XExpr.In(Box.create(x)?)));
+    }
+
+    /// `(a, b, …) IN …`: each element compared with its column as a comparison would.
+    private fn rowInExpr(
+        borrow mut this,
+        inExpr: borrow InExpr,
+        elements: borrow Vector<Expr>,
+        db: borrow mut Session,
+    ) -> Result<Compiled, SqliteError> {
+        let width = elements.length;
+        var compiled = Vector<XExpr>.withCapacity(width)?;
+        var affinities = Vector<ExprAffinity>.withCapacity(width)?;
+        var collations = Vector<Collation>.withCapacity(width)?;
+        var explicit = Vector<bool>.withCapacity(width)?;
+        for (k in 0..width) {
+            let c = this.typed(borrow elements[k], db)?;
+            affinities.push(c.affinity)?;
+            collations.push(c.collation ?? Collation.Binary)?;
+            explicit.push(c.explicit || c.collation.isSome())?;
+            compiled.push(c.expr)?;
+        }
+        var items = Vector<XExpr>.create();
+        var subquery: XSubquery? = null;
+        match (borrow inExpr.source) {
+            InSource.Items(list) => {
+                for (i in 0..list.length) {
+                    let terms = if (borrow list[i] is Expr.RowValue(cells)) cells.length else 1;
+                    if (terms != width) {
+                        var message = String.from("IN(...) element has ")?;
+                        message.appendNumber(terms)?;
+                        message.append(if (terms == 1) " term - expected " else " terms - expected ")?;
+                        message.appendNumber(width)?;
+                        return Err(SqliteError.Sql(message));
+                    }
+                    items.push(this.compile(borrow list[i], db)?)?;
+                }
+            }
+            InSource.Select(select) => {
+                let sub = this.subquery(select, db)?;
+                if (sub.plan.columnNames.length != width) {
+                    return Err(inColumnCount(sub.plan.columnNames.length, width));
+                }
+                for (k in 0..width) {
+                    affinities[k] = compareAffinity(sub.plan.columnAffinities[k], affinities[k]);
+                    if (!explicit[k]) {
+                        collations[k] = sub.plan.columnCollations[k] ?? Collation.Binary;
+                    }
+                }
+                subquery = sub;
+            }
+            InSource.Table(_) => {
+                return Err(sqlError("row value misused"));
+            }
+        }
+        let x = XIn {
+            operand: XExpr.RowValue(compiled),
+            negated: inExpr.negated,
+            items: items,
+            subquery: subquery,
+            affinity: ExprAffinity.None,
+            collation: Collation.Binary,
+            width: width,
+            affinities: affinities,
+            collations: collations,
         };
         return Ok(plain(XExpr.In(Box.create(x)?)));
     }
@@ -968,4 +1047,13 @@ fn selectAllFrom(table: borrow QualifiedName) -> Result<SelectStmt, AllocError> 
             offset: null,
         },
     );
+}
+
+/// SQLite's error for an IN subquery of the wrong width.
+fn inColumnCount(found: usize, expected: usize) -> SqliteError {
+    var message = String.from("sub-select returns ").ok() ?? String.create();
+    let _ = message.appendNumber(found);
+    let _ = message.append(" columns - expected ");
+    let _ = message.appendNumber(expected);
+    return SqliteError.Sql(message);
 }

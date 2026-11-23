@@ -644,3 +644,28 @@ fn groupsComeOutAsSqliteGivesThem() -> Result<void, TestFailure> {
         SELECT s, k FROM t GROUP BY k, s % 2
         """);
 }
+
+@test
+fn rowValuesInInMatchSqlite() -> Result<void, TestFailure> {
+    let path = "out/query-row-in.db";
+    makeDatabase(path, """
+        CREATE TABLE t(a INT, b TEXT COLLATE NOCASE, c);
+        INSERT INTO t VALUES (1, 'x', 10), (2, 'Y', 20), (3, NULL, 30), (1, 'z', 40);
+        CREATE TABLE u(p, q);
+        INSERT INTO u VALUES (1, 'X'), (2, 'y'), ('3', NULL);
+        """)?;
+    return sameAnswers(path, """
+        SELECT (1,2) IN ((1,2),(3,4)), (1,2) IN ((3,4)), (1,NULL) IN ((1,2)), (1,NULL) IN ((3,4))
+        SELECT (1,NULL) IN (SELECT 1, 2), (1,NULL) IN (SELECT 3, 4), (1,2) NOT IN (SELECT 1, 2 UNION SELECT 5, 6)
+        SELECT (1,'2') IN (SELECT 1, 2), (1,2) IN (SELECT 1, 2 WHERE 0), (NULL,NULL) NOT IN (SELECT 1,2 WHERE 0)
+        SELECT ('a', 1) IN (SELECT 'A', 1)
+        SELECT c FROM t WHERE (a, b) IN (SELECT p, q FROM u) ORDER BY c
+        SELECT c FROM t WHERE (a, b) NOT IN (SELECT p, q FROM u) ORDER BY c
+        SELECT c, (a, b) IN (SELECT p, q FROM u) FROM t ORDER BY c
+        SELECT (1,2) IN (SELECT 1)
+        SELECT 1 IN (SELECT 1, 2)
+        SELECT (1,2) IN (1, 2)
+        SELECT (1,2) IN ((1,2,3))
+        SELECT c FROM t WHERE (a, c) IN (VALUES (1, 10), (2, 20)) ORDER BY c
+        """);
+}
