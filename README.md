@@ -25,7 +25,9 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Expressions: compiler and evaluator | `Exec/ExpressionEvaluator`, `Binding`, `ParameterBinder` | `expr.cee`, `compile.cee` | done |
 | Scalar functions, aggregates | `Exec/Functions`, `LikeMatcher` | `functions.cee`, `aggregate.cee` | core functions done; date/time, printf, JSON and transcendental math next |
 | SELECT: joins, subqueries, views, CTEs, grouping, compounds | `Exec/QueryExecutor` | `select.cee`, `run.cee` | done but RIGHT/FULL joins, window functions, table functions, index seeks (rowid seeks done) |
-| Connection | `SqliteConnection` | `session.cee` | SELECT and transactions; INSERT, UPDATE, DELETE, DDL and pragmas next |
+| INSERT, UPDATE, DELETE | `Exec/QueryExecutor` (DML), `InMemoryDatabase` | `dml.cee` | done for rowid tables: constraints, conflict actions, RETURNING, AUTOINCREMENT; triggers, foreign keys, upserts, UPDATE … FROM next |
+| CREATE and DROP of tables, indexes and views | `Exec/QueryExecutor` (DDL) | `ddl.cee` | done; ALTER TABLE, triggers and pragmas next |
+| Connection, transactions | `SqliteConnection`, `EngineGlue` | `session.cee` | done: statements commit on their own outside BEGIN, and a failed statement undoes only itself inside it |
 | WAL | `Storage/Wal*`, `Shm*` | | until then a database with a non-empty `-wal` file is refused |
 | Connection, command, pool | `SqliteConnection`, `SqliteCommand`, `SqliteConnectionPool` | | |
 | PostgreSQL wire front end, daemon, CLI | `CosmoNova.Engine.Sqlite.PgWire`, `CosmoSqliteD`, `.Cli` | | not started |
@@ -142,6 +144,16 @@ The port fixes what was wrong in the source instead of copying it. Each item has
 - **Files the mutators cannot keep sound.** A database with pointer-map pages (auto-vacuum) or in WAL mode is
   refused for writing; the C# wrote it, leaving the pointer map or the log out of step.
 - **Rolling back.** A transaction's changes can be forgotten; the C# pager could only be thrown away.
+
+- **Where changes live.** The C# engine loads a whole table into memory the first time a statement changes it, and
+  writes whole tables back at commit, so changing one row of a large table costs the table. Here changes go to the
+  pages they touch, in the transaction's pager; commit journals and writes those pages only. Queries stream rows
+  from cursors instead of materialising tables.
+- **A failed statement inside BEGIN.** It undoes its own changes and no others, as in SQLite
+  (`transactionsUndoWhatTheyShould`).
+- **Index upkeep during a statement.** An index that cannot take a removal in place is rebuilt when the statement
+  ends, from the rows as they then are; rebuilding it mid-statement would read rows not yet changed
+  (`manyRowsAndIndexes`).
 
 ## Known gaps (inherited from the C# engine, refused by name rather than misparsed)
 

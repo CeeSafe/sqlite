@@ -690,6 +690,33 @@ fn compileFromItem(
                     return Err(namedError("unknown database ", schema.view()));
                 }
             }
+            let tableName = t.name.name.view();
+            if (tableName.equalsIgnoreAsciiCase("sqlite_schema") || tableName.equalsIgnoreAsciiCase("sqlite_master")) {
+                let schema = schemaTableSchema()?;
+                let plan = tablePlan(borrow schema, compiler, slot, db)?;
+                let columns = tableScopeColumns(borrow schema)?;
+                scope.sources.push(
+                    ScopeSource {
+                        name: alias,
+                        columns: columns,
+                        slot: slot,
+                        hasRowid: true,
+                        rowidAlias: null,
+                        merged: Vector<String>.create(),
+                    },
+                )?;
+                sources.push(
+                    SourcePlan {
+                        kind: SourceKind.Table(plan),
+                        slot: slot,
+                        columnCount: 5,
+                        left: false,
+                        on: null,
+                        rowidSeek: null,
+                    },
+                )?;
+                return Ok();
+            }
             if (db.catalog.table(t.name.name.view())?.isSome()) {
                 let tableCopy = db.catalog.tableCopy(t.name.name.view())?;
                 let plan = tablePlan(borrow tableCopy, compiler, slot, db)?;
@@ -1319,4 +1346,14 @@ fn withoutCollate(e: borrow Expr) -> borrow Expr {
         return inner;
     }
     return e;
+}
+
+/// sqlite_schema's definition: the table whose root is page 1.
+fn schemaTableSchema() -> Result<TableSchema, SqliteError> {
+    let Stmt.CreateTable(stmt) = Parser.parseStatement(
+        "CREATE TABLE sqlite_schema(type text, name text, tbl_name text, rootpage int, sql text)",
+    )? else {
+        return Err(corrupt("sqlite_schema's definition"));
+    };
+    return buildTableSchema(stmt, "sqlite_schema", 1);
 }

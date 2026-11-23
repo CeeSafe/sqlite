@@ -33,6 +33,8 @@ struct WritablePager {
     private pages: Vector<Vector<u8>>;
     private preImages: HashMap<u32, Vector<u8>>;
     private dirty: HashMap<u32, bool>;
+    /// A statement in progress: each page's content when it began, saved before its first change.
+    private statement: StatementUndo?;
 
     /// Opens the database at `path` for changes, first undoing a commit that was interrupted.
     fn open(path: StringView) -> Result<WritablePager, SqliteError> {
@@ -80,6 +82,7 @@ struct WritablePager {
             pages: Vector<Vector<u8>>.create(),
             preImages: HashMap<u32, Vector<u8>>.create(),
             dirty: HashMap<u32, bool>.create(),
+            statement: null,
         });
     }
 
@@ -131,6 +134,13 @@ struct WritablePager {
     /// Page `number`, to change. Its old image is kept for the journal.
     fn write(borrow mut this, number: u32) -> Result<SliceMut<u8>, SqliteError> {
         this.load(number)?;
+        if (borrow mut this.statement is Some(undo)) {
+            if (!undo.saved.contains(borrow number)) {
+                let image = this.pages[*this.slots.get(borrow number)!].clone()?;
+                let wasDirty = this.dirty.contains(borrow number);
+                let _ = undo.saved.put(number, SavedPage { image: image, wasDirty: wasDirty })?;
+            }
+        }
         if (number <= this.committedPageCount && !this.preImages.contains(borrow number)) {
             let image = this.pages[this.slotOf(number)].clone()?;
             let _ = this.preImages.put(number, image)?;
@@ -225,8 +235,60 @@ struct WritablePager {
         return Ok();
     }
 
+    /// Starts a statement: `rollbackStatement` can then undo its changes alone.
+    fn beginStatement(borrow mut this) {
+        this.statement = StatementUndo {
+            saved: HashMap<u32, SavedPage>.create(),
+            pageCount: this.pageCount,
+            freeTrunk: this.freeTrunk,
+            freeCount: this.freeCount,
+        };
+    }
+
+    /// Keeps the statement's changes in the transaction.
+    fn endStatement(borrow mut this) {
+        this.statement = null;
+    }
+
+    /// Undoes the statement's changes, leaving the transaction as it was before it.
+    fn rollbackStatement(borrow mut this) -> Result<void, SqliteError> {
+        let Some(undo) = replace(mut this.statement, null) else {
+            return Ok();
+        };
+        var saved = undo.saved;
+        for (i in 0..saved.length()) {
+            let number = *saved.keyAt(i);
+            if (number > undo.pageCount) {
+                continue;
+            }
+            let slot = *this.slots.get(borrow number)!;
+            let page = saved.getMut(borrow number)!;
+            this.pages[slot] = replace(mut page.image, Vector<u8>.create());
+            if (!page.wasDirty) {
+                let _ = this.dirty.remove(borrow number);
+            }
+        }
+        // Pages added by the statement are gone again.
+        var gone = Vector<u32>.create();
+        for (i in 0..this.dirty.length()) {
+            let number = *this.dirty.keyAt(i);
+            if (number > undo.pageCount) {
+                gone.push(number)?;
+            }
+        }
+        for (i in 0..gone.length) {
+            let _ = this.dirty.remove(borrow gone[i]);
+            let _ = this.slots.remove(borrow gone[i]);
+        }
+        this.pageCount = undo.pageCount;
+        this.freeTrunk = undo.freeTrunk;
+        this.freeCount = undo.freeCount;
+        return Ok();
+    }
+
     /// Forgets everything the transaction changed.
     fn rollback(borrow mut this) {
+        this.statement = null;
         this.slots.clear();
         this.pages.clear();
         this.preImages.clear();
@@ -303,4 +365,17 @@ impl PageSink for WritablePager {
         let page = this.write(number)?;
         return Ok(borrow mut page[0..usable]);
     }
+}
+
+/// A page's content before a statement changed it.
+struct SavedPage {
+    image: Vector<u8>;
+    wasDirty: bool;
+}
+
+struct StatementUndo {
+    saved: HashMap<u32, SavedPage>;
+    pageCount: u32;
+    freeTrunk: u32;
+    freeCount: u32;
 }

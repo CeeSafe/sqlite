@@ -1,0 +1,213 @@
+// Writing through SQL: the same statements run in this engine on one file and in the sqlite3 shell on another;
+// every statement's answer must agree, and the shell must find this engine's file sound.
+
+/// Runs each statement (one a line) in both engines, each on its own file, comparing answers.
+fn sameScript(name: StringView, script: StringView) -> Result<void, TestFailure> {
+    var ourPath = String.from("out/script-ours-")!;
+    ourPath.append(name)!;
+    ourPath.append(".db")!;
+    var theirPath = String.from("out/script-theirs-")!;
+    theirPath.append(name)!;
+    theirPath.append(".db")!;
+    freshPath(ourPath.view());
+    freshPath(theirPath.view());
+    var session = Session.open(ourPath.view())!;
+    var lines = script.split("\n");
+    var step: u64 = 0;
+    while (lines.next() is Some(line)) {
+        let sql = line.trim();
+        if (sql.length == 0 || sql.startsWith("--")) {
+            continue;
+        }
+        step += 1;
+        let theirs = theirAnswer(theirPath.view(), sql);
+        let mine = ours(mut session, sql);
+        if (theirs.view() != mine.view()) {
+            var message = String.from("step ")!;
+            message.appendNumber(step)!;
+            message.append(": ")!;
+            message.append(sql)!;
+            message.append("\n  sqlite3:\n")!;
+            message.append(theirs.view())!;
+            message.append("  this engine:\n")!;
+            message.append(mine.view())!;
+            return Check.fail(message.view());
+        }
+        if (Environment.variable("SQLITE_STEP_CHECK").isSome()) {
+            let verdict = askSqlite(ourPath.view(), "PRAGMA integrity_check")?;
+            if (verdict.view() != "ok\n") {
+                var message = String.from("damaged after step ")!;
+                message.appendNumber(step)!;
+                message.append(": ")!;
+                message.append(sql)!;
+                message.append("\n")!;
+                message.append(verdict.view())!;
+                return Check.fail(message.view());
+            }
+        }
+    }
+    return expectIntact(ourPath.view());
+}
+
+@test
+fn insertsUpdatesAndDeletes() -> Result<void, TestFailure> {
+    return sameScript("dml", """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL, tag TEXT UNIQUE COLLATE NOCASE, n INT CHECK (n >= 0), d DEFAULT 'none')
+        INSERT INTO t(name, score, tag, n) VALUES ('a', 1, 'x', 1), ('b', '2.5', 'y', 2), ('c', NULL, NULL, 3)
+        INSERT INTO t VALUES (10, 'ten', 10, 'z', 10, 'given')
+        INSERT INTO t(name) VALUES ('next')
+        SELECT * FROM t ORDER BY id
+        SELECT typeof(score), score FROM t ORDER BY id
+        INSERT INTO t(name, tag) VALUES ('dup', 'X')
+        INSERT INTO t(name, n) VALUES ('neg', -1)
+        INSERT INTO t(tag) VALUES ('w')
+        INSERT INTO t(id, name) VALUES (1, 'clash')
+        INSERT INTO t(id, name) VALUES ('abc', 'bad id')
+        INSERT OR IGNORE INTO t(name, tag) VALUES ('ignored', 'x')
+        INSERT OR REPLACE INTO t(name, tag) VALUES ('replaced', 'Y')
+        SELECT id, name, tag FROM t ORDER BY id
+        UPDATE t SET score = score * 2 WHERE score IS NOT NULL
+        UPDATE t SET tag = 'x' WHERE id = 3
+        UPDATE t SET id = id + 100 WHERE id = 10
+        UPDATE t SET n = -5
+        SELECT id, name, score, tag, n FROM t ORDER BY id
+        DELETE FROM t WHERE id > 100
+        DELETE FROM t WHERE name = 'a'
+        SELECT id, name FROM t ORDER BY id
+        SELECT count(*) FROM t WHERE tag = 'Y'
+        INSERT INTO t(name, tag) VALUES ('returning', 'r') RETURNING id, upper(name)
+        DELETE FROM t RETURNING name
+        SELECT count(*) FROM t
+        """);
+}
+
+@test
+fn manyRowsAndIndexes() -> Result<void, TestFailure> {
+    return sameScript("bulk", """
+        CREATE TABLE big(id INTEGER PRIMARY KEY, k INT, s TEXT)
+        CREATE INDEX big_k ON big(k)
+        WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 3000) INSERT INTO big(k, s) SELECT i % 97, 'row ' || i FROM c
+        SELECT count(*), sum(k), max(id) FROM big
+        CREATE UNIQUE INDEX big_s ON big(s)
+        CREATE INDEX big_ks ON big(k DESC, s) WHERE k > 50
+        UPDATE big SET k = k + 1000 WHERE id % 3 = 0
+        DELETE FROM big WHERE id % 5 = 0
+        SELECT count(*), sum(k) FROM big
+        SELECT id FROM big WHERE k = 1003 ORDER BY id LIMIT 5
+        INSERT INTO big(s) VALUES ('row 7')
+        CREATE UNIQUE INDEX big_k_unique ON big(k)
+        DROP INDEX big_ks
+        SELECT name FROM sqlite_schema ORDER BY name
+        """);
+}
+
+@test
+fn schemaChanges() -> Result<void, TestFailure> {
+    return sameScript("ddl", """
+        CREATE TABLE a(x, y)
+        CREATE TABLE a(z)
+        CREATE TABLE IF NOT EXISTS a(z)
+        CREATE TABLE seq(id INTEGER PRIMARY KEY AUTOINCREMENT, v)
+        INSERT INTO seq(v) VALUES (1), (2), (3)
+        DELETE FROM seq WHERE id = 3
+        INSERT INTO seq(v) VALUES (4)
+        SELECT * FROM seq
+        SELECT * FROM sqlite_sequence
+        CREATE VIEW va AS SELECT x + 1 AS x1 FROM a
+        INSERT INTO a VALUES (1, 2), (3, 4)
+        SELECT * FROM va ORDER BY 1
+        DROP TABLE va
+        DROP VIEW va
+        DROP VIEW va
+        DROP VIEW IF EXISTS va
+        CREATE INDEX a_x ON a(x)
+        CREATE INDEX a_x ON a(y)
+        DROP TABLE a
+        SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY name
+        DROP TABLE seq
+        SELECT count(*) FROM sqlite_schema
+        CREATE TABLE sqlite_mine(x)
+        DROP TABLE nosuch
+        """);
+}
+
+/// Runs a script (one statement a line) through one sqlite3 process on standard input, and through one session;
+/// compares what both print, errors included, line by line.
+fn sameSession(name: StringView, script: StringView) -> Result<void, TestFailure> {
+    var ourPath = String.from("out/session-ours-")!;
+    ourPath.append(name)!;
+    ourPath.append(".db")!;
+    var theirPath = String.from("out/session-theirs-")!;
+    theirPath.append(name)!;
+    theirPath.append(".db")!;
+    freshPath(ourPath.view());
+    freshPath(theirPath.view());
+    // The shell's input: each line a statement; its errors go to stderr as "… near line N: message".
+    var input = String.create();
+    var lines = script.split("\n");
+    var statements = Vector<StringView>.create();
+    while (lines.next() is Some(line)) {
+        let sql = line.trim();
+        if (sql.length == 0) {
+            continue;
+        }
+        statements.push(sql)!;
+        input.append(sql)!;
+        input.append(";\n")!;
+    }
+    var arguments = Vector<StringView>.create();
+    arguments.push(theirPath.view())!;
+    let output = Process.capture("sqlite3", borrow arguments, input.view().bytes())!;
+    var theirs = textFromBytesLossy(output.stdout.view())!;
+    // Errors, in order, as "error: message".
+    let errors = textFromBytesLossy(output.stderr.view())!;
+    var errorLines = errors.view().split("\n");
+    var theirErrors = String.create();
+    while (errorLines.next() is Some(e)) {
+        if (e.splitOnce(": ") is Some(halves)) {
+            theirErrors.append("error: ")!;
+            theirErrors.append(halves.right)!;
+            theirErrors.append("\n")!;
+        }
+    }
+    var session = Session.open(ourPath.view())!;
+    var mine = String.create();
+    var myErrors = String.create();
+    for (i in 0..statements.length) {
+        let answer = ours(mut session, statements[i]);
+        if (answer.view().startsWith("error: ")) {
+            myErrors.append(answer.view())!;
+        } else {
+            mine.append(answer.view())!;
+        }
+    }
+    Check.equalText(theirs.view(), mine.view())?;
+    Check.equalText(theirErrors.view(), myErrors.view())?;
+    return expectIntact(ourPath.view());
+}
+
+@test
+fn transactionsUndoWhatTheyShould() -> Result<void, TestFailure> {
+    return sameSession("tx", """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, v UNIQUE)
+        BEGIN
+        INSERT INTO t(v) VALUES (1), (2)
+        INSERT INTO t(v) VALUES (3), (1), (4)
+        SELECT v FROM t ORDER BY v
+        COMMIT
+        SELECT v FROM t ORDER BY v
+        BEGIN
+        DELETE FROM t
+        CREATE TABLE u(x)
+        INSERT INTO u VALUES (1)
+        ROLLBACK
+        SELECT v FROM t ORDER BY v
+        SELECT count(*) FROM sqlite_schema WHERE name = 'u'
+        COMMIT
+        BEGIN
+        BEGIN
+        INSERT INTO t(v) VALUES (9)
+        COMMIT
+        SELECT v FROM t ORDER BY v
+        """);
+}

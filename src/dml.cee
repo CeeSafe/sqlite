@@ -1,0 +1,1111 @@
+// INSERT, UPDATE and DELETE on rowid tables, with their indexes, constraints and conflict actions.
+//
+// Differences from the C# engine, which this replaces:
+// - a statement that fails undoes its own changes and no others, inside BEGIN … COMMIT as outside it;
+// - rows are written to the pages they belong in; the C# rewrote whole tables at commit;
+// - UNIQUE is checked through the index, in the index's collation, so 'a' and 'A' collide in a NOCASE index;
+// - a new rowid is one past the largest, read from the b-tree's right edge, and AUTOINCREMENT keeps
+//   sqlite_sequence as SQLite does;
+// - the values of an INTEGER PRIMARY KEY must be integers ("datatype mismatch"), as in SQLite.
+//
+// Not yet supported, and refused by name: triggers, foreign key actions, upserts, UPDATE … FROM, and changes to
+// WITHOUT ROWID tables.
+
+/// A column of an index key: a table column, or an expression on the row.
+struct IndexKeyColumn {
+    column: usize?;
+    expr: XExpr?;
+}
+
+/// An index of a table, as writes keep it.
+struct TableIndex {
+    name: String;
+    root: u32;
+    unique: bool;
+    columns: Vector<IndexKeyColumn>;
+    filter: XExpr?;
+    /// The order of whole entries: the key's collations and directions, then the rowid.
+    order: IndexOrder;
+    /// For error messages: "t.a, t.b", or "index 'name'" for an expression index.
+    keyNames: String;
+    /// A removal could not be done in place: the index is rebuilt from the table when the statement ends, and
+    /// takes no more changes until then.
+    stale: Cell<bool>;
+}
+
+/// What writing rows to a table needs.
+struct TableWriter {
+    table: TableSchema;
+    read: TablePlan;
+    slot: usize;
+    indexes: Vector<TableIndex>;
+    defaults: Vector<XExpr?>;
+    /// Generated columns, VIRTUAL and STORED, computed in declaration order.
+    generated: Vector<GeneratedColumn>;
+    checks: Vector<XExpr>;
+    checkNames: Vector<String>;
+}
+
+fn tableScope(table: borrow TableSchema, slot: usize) -> Result<Scope, AllocError> {
+    var scope = Scope { sources: Vector<ScopeSource>.create() };
+    scope.sources.push(
+        ScopeSource {
+            name: table.name.clone()?,
+            columns: tableScopeColumns(table)?,
+            slot: slot,
+            hasRowid: !table.withoutRowid,
+            rowidAlias: table.rowidAlias,
+            merged: Vector<String>.create(),
+        },
+    )?;
+    return Ok(scope);
+}
+
+/// Compiles an expression in the table's own scope only.
+fn compileInTable(
+    compiler: borrow mut Compiler,
+    e: borrow Expr,
+    table: borrow TableSchema,
+    slot: usize,
+    db: borrow mut Session,
+) -> Result<XExpr, SqliteError> {
+    let saved = replace(mut compiler.scopes, Vector<Scope>.create());
+    compiler.scopes.push(tableScope(table, slot)?)?;
+    let result = compiler.compile(e, db);
+    compiler.scopes = saved;
+    return result;
+}
+
+fn appendKeyName(out: borrow mut String, table: borrow TableSchema, column: usize) -> Result<void, AllocError> {
+    if (out.length != 0) {
+        out.append(", ")?;
+    }
+    out.append(table.name.view())?;
+    out.append(".")?;
+    return out.append(table.columns[column].name.view());
+}
+
+/// The indexes of a table: its automatic ones (for PRIMARY KEY and UNIQUE) and the ones CREATE INDEX made.
+fn tableIndexes(
+    compiler: borrow mut Compiler,
+    table: borrow TableSchema,
+    slot: usize,
+    db: borrow mut Session,
+) -> Result<Vector<TableIndex>, SqliteError> {
+    var out = Vector<TableIndex>.create();
+    // Automatic indexes have no SQL; sqlite_autoindex_T_N is the N-th of the table's key constraints.
+    var prefix = String.from("sqlite_autoindex_")?;
+    prefix.append(table.name.view())?;
+    prefix.append("_")?;
+    for (e in 0..db.entries.length) {
+        let entry = borrow db.entries[e];
+        if (entry.kind.view() != "index" || entry.sql.isSome() || !entry.tableName.view().equalsIgnoreAsciiCase(
+            table.name.view(),
+        )) {
+            continue;
+        }
+        let name = entry.name.view();
+        if (name.length <= prefix.length || !name[0..prefix.length].equalsIgnoreAsciiCase(prefix.view())) {
+            continue;
+        }
+        let n = name[prefix.length..].parseInt<usize>() ?? 0;
+        // Numbering skips a WITHOUT ROWID table's primary key, which is the table itself.
+        var number: usize = 0;
+        var key: usize? = null;
+        for (k in 0..table.keys.length) {
+            if (table.keys[k].primaryKey && table.withoutRowid) {
+                continue;
+            }
+            number += 1;
+            if (number == n) {
+                key = k;
+            }
+        }
+        let Some(k) = key else {
+            return Err(corrupt("an automatic index does not match its table's constraints"));
+        };
+        var columns = Vector<IndexKeyColumn>.create();
+        var order = IndexOrder.plain();
+        var keyNames = String.create();
+        for (c in 0..table.keys[k].columns.length) {
+            let kc = borrow table.keys[k].columns[c];
+            let at = table.indexOf(kc.name.view()) ?? {
+                return Err(corrupt("a key names a column its table does not have"));
+            };
+            columns.push(IndexKeyColumn { column: at, expr: null })?;
+            order.collations.push(table.keyCollation(kc))?;
+            order.descending.push(kc.descending)?;
+            appendKeyName(mut keyNames, table, at)?;
+        }
+        out.push(
+            TableIndex {
+                name: entry.name.clone()?,
+                root: entry.rootPage,
+                unique: true,
+                columns: columns,
+                filter: null,
+                order: order,
+                keyNames: keyNames,
+                stale: Cell<bool>.create(false),
+            },
+        )?;
+    }
+    // CREATE INDEX: parsed again from its SQL, so its expressions compile against this table.
+    for (i in 0..db.catalog.indexes.length) {
+        if (!db.catalog.indexes[i].table.view().equalsIgnoreAsciiCase(table.name.view())) {
+            continue;
+        }
+        let root = db.catalog.indexes[i].rootPage;
+        let name = db.catalog.indexes[i].name.clone()?;
+        let sql = db.indexSql(name.view())? ?? {
+            continue;
+        };
+        let Stmt.CreateIndex(stmt) = Parser.parseStatement(sql.view())? else {
+            continue;
+        };
+        let schema = buildIndexSchema(cloneIndexStmt(borrow stmt)?, name.view(), root, table)?;
+        var columns = Vector<IndexKeyColumn>.create();
+        var order = IndexOrder.plain();
+        var keyNames = String.create();
+        var plainKey = true;
+        for (c in 0..schema.columns.length) {
+            let ic = borrow schema.columns[c];
+            if (borrow stmt.columns[c].expression is Some(x)) {
+                columns.push(IndexKeyColumn { column: null, expr: compileInTable(compiler, x, table, slot, db)? })?;
+                plainKey = false;
+            } else {
+                let at = table.indexOf(ic.name.view()) ?? {
+                    return Err(namedError("no such column: ", ic.name.view()));
+                };
+                columns.push(IndexKeyColumn { column: at, expr: null })?;
+                appendKeyName(mut keyNames, table, at)?;
+            }
+            order.collations.push(ic.collation)?;
+            order.descending.push(ic.descending)?;
+        }
+        if (!plainKey) {
+            keyNames = String.from("index '")?;
+            keyNames.append(name.view())?;
+            keyNames.append("'")?;
+        }
+        var filter: XExpr? = null;
+        if (borrow stmt.filter is Some(f)) {
+            filter = compileInTable(compiler, f, table, slot, db)?;
+        }
+        out.push(
+            TableIndex {
+                name: name,
+                root: root,
+                unique: schema.unique,
+                columns: columns,
+                filter: filter,
+                order: order,
+                keyNames: keyNames,
+                stale: Cell<bool>.create(false),
+            },
+        )?;
+    }
+    return Ok(out);
+}
+
+fn cloneIndexStmt(s: borrow CreateIndexStmt) -> Result<CreateIndexStmt, AllocError> {
+    var columns = Vector<IndexedColumn>.withCapacity(s.columns.length)?;
+    for (i in 0..s.columns.length) {
+        let c = borrow s.columns[i];
+        columns.push(
+            IndexedColumn {
+                name: c.name.clone()?,
+                expression: cloneOptional(borrow c.expression)?,
+                descending: c.descending,
+                collation: c.collation.clone()?,
+            },
+        )?;
+    }
+    return Ok(
+        CreateIndexStmt {
+            unique: s.unique,
+            ifNotExists: s.ifNotExists,
+            name: cloneName(borrow s.name)?,
+            table: s.table.clone()?,
+            columns: columns,
+            filter: cloneOptional(borrow s.filter)?,
+        },
+    );
+}
+
+impl TableWriter {
+    /// Everything needed to write to the table `name`.
+    fn create(
+        compiler: borrow mut Compiler,
+        name: StringView,
+        db: borrow mut Session,
+    ) -> Result<TableWriter, SqliteError> {
+        let table = db.catalog.tableCopy(name)?;
+        if (table.withoutRowid) {
+            return Err(unsupported("changing WITHOUT ROWID tables is not supported yet"));
+        }
+        if (db.hasTriggers(table.name.view())) {
+            return Err(unsupported("tables with triggers cannot be changed yet"));
+        }
+        let slot = compiler.slotsInUse;
+        compiler.slotsInUse += 1;
+        let read = tablePlan(borrow table, compiler, slot, db)?;
+        let indexes = tableIndexes(compiler, borrow table, slot, db)?;
+        var defaults = Vector<XExpr?>.withCapacity(table.columns.length)?;
+        var generated = Vector<GeneratedColumn>.create();
+        for (c in 0..table.columns.length) {
+            var d: XExpr? = null;
+            if (borrow table.columns[c].defaultValue is Some(v)) {
+                // A default sees no columns.
+                let saved = replace(mut compiler.scopes, Vector<Scope>.create());
+                let compiled = compiler.compile(borrow v.expr, db);
+                compiler.scopes = saved;
+                d = compiled?;
+            }
+            defaults.push(d)?;
+            if (borrow table.columns[c].generated is Some(g)) {
+                generated.push(
+                    GeneratedColumn {
+                        column: c,
+                        expr: compileInTable(compiler, borrow g.expr, borrow table, slot, db)?,
+                    },
+                )?;
+            }
+        }
+        var checks = Vector<XExpr>.create();
+        var checkNames = Vector<String>.create();
+        for (k in 0..table.checks.length) {
+            checks.push(compileInTable(compiler, borrow table.checks[k].expr, borrow table, slot, db)?)?;
+            checkNames.push(table.checks[k].text.clone()?)?;
+        }
+        return Ok(
+            TableWriter {
+                table: table,
+                read: read,
+                slot: slot,
+                indexes: indexes,
+                defaults: defaults,
+                generated: generated,
+                checks: checks,
+                checkNames: checkNames,
+            },
+        );
+    }
+
+    /// The index entry of the row in the slot, or `null` when a partial index leaves it out.
+    fn entryFor(
+        borrow this,
+        index: borrow TableIndex,
+        frame: borrow mut Frame,
+        db: borrow mut Session,
+    ) -> Result<Vector<SqliteValue>?, SqliteError> {
+        if (borrow index.filter is Some(f)) {
+            let keep = evaluate(f, frame, db)?;
+            if (!isTrue(borrow keep)) {
+                return Ok(null);
+            }
+        }
+        var entry = Vector<SqliteValue>.withCapacity(index.columns.length + 1)?;
+        for (c in 0..index.columns.length) {
+            if (index.columns[c].column is Some(at)) {
+                entry.push(frame.slots[this.slot].values[at].clone()?)?;
+            } else if (borrow index.columns[c].expr is Some(x)) {
+                entry.push(evaluate(x, frame, db)?)?;
+            }
+        }
+        entry.push(SqliteValue.Integer(frame.slots[this.slot].rowId))?;
+        return Ok(entry);
+    }
+
+    /// The table's record for the row in the slot: stored columns in order, the rowid's alias as NULL, and a REAL
+    /// column's integral value as an integer, as SQLite writes them.
+    fn recordFor(borrow this, frame: borrow Frame) -> Result<Vector<u8>, SqliteError> {
+        let values = borrow frame.slots[this.slot].values;
+        var stored = Vector<SqliteValue>.withCapacity(values.length)?;
+        for (c in 0..this.table.columns.length) {
+            if (this.read.recordPosition[c].isNull()) {
+                continue;
+            }
+            if (this.table.rowidAlias == Some(c)) {
+                stored.push(SqliteValue.Null)?;
+                continue;
+            }
+            var v = values[c].clone()?;
+            if (this.read.realColumns[c] && v is SqliteValue.Real(r) && realAsExactInteger(r) is Some(i)) {
+                v = SqliteValue.Integer(i);
+            }
+            stored.push(v)?;
+        }
+        return Record.encode(stored.view());
+    }
+
+    /// Computes the generated columns of the row in the slot.
+    fn computeGeneratedColumns(
+        borrow this,
+        frame: borrow mut Frame,
+        db: borrow mut Session,
+    ) -> Result<void, SqliteError> {
+        for (g in 0..this.generated.length) {
+            let v = evaluate(borrow this.generated[g].expr, frame, db)?;
+            let column = this.generated[g].column;
+            frame.slots[this.slot].values[column] = applyColumnAffinity(v, this.table.columns[column].affinity)?;
+        }
+        return Ok();
+    }
+
+    /// Reads row `rowId` into the slot; false when there is none.
+    fn loadRow(borrow this, rowId: i64, frame: borrow mut Frame, db: borrow mut Session) -> Result<bool, SqliteError> {
+        let Some(row) = seekTableRow(mut db.pager, this.read.root, rowId)? else {
+            return Ok(false);
+        };
+        loadTableRow(borrow this.read, row.rowId, row.columns, mut frame.slots[this.slot])?;
+        if (this.read.generated.length != 0) {
+            computeGenerated(borrow this.read, this.slot, frame, db)?;
+        }
+        return Ok(true);
+    }
+
+    /// The rowids of other rows whose entry in `index` has the same key as `entry`.
+    fn conflictsIn(
+        borrow this,
+        index: borrow TableIndex,
+        entry: borrow Vector<SqliteValue>,
+        rowId: i64,
+        db: borrow mut Session,
+    ) -> Result<Vector<i64>, SqliteError> {
+        var found = Vector<i64>.create();
+        let keyLength = entry.length - 1;
+        for (k in 0..keyLength) {
+            // NULLs never collide.
+            if (entry[k].isNull()) {
+                return Ok(found);
+            }
+        }
+        var order = IndexOrder.plain();
+        for (k in 0..keyLength) {
+            order.collations.push(index.order.collations[k])?;
+            order.descending.push(index.order.descending[k])?;
+        }
+        let range = IndexRange.equalTo(order, entry.view()[0..keyLength])?;
+        var cursor = IndexCursor.create(index.root, range, false);
+        while (cursor.next(mut db.pager)? is Some(other)) {
+            let otherRowid = indexEntryRowId(other.view())?;
+            if (otherRowid != rowId) {
+                found.push(otherRowid)?;
+            }
+        }
+        return Ok(found);
+    }
+
+    /// Adds or removes index entries. An index that cannot take a removal in place is marked stale: rebuilding
+    /// it now would read rows the statement has not finished changing.
+    fn applyIndexOps(
+        borrow this,
+        index: borrow TableIndex,
+        ops: Vector<IndexOp>,
+        frame: borrow mut Frame,
+        db: borrow mut Session,
+    ) -> Result<void, SqliteError> {
+        if (ops.length == 0 || index.stale.get()) {
+            return Ok();
+        }
+        if (!IndexMutator.applyBatch(mut db.pager, index.root, ops.view(), borrow index.order)?) {
+            index.stale.set(true);
+        }
+        return Ok();
+    }
+
+    /// Ends the statement: stale indexes are rebuilt from the table's rows as they now are.
+    fn finish(borrow this, frame: borrow mut Frame, db: borrow mut Session) -> Result<void, SqliteError> {
+        for (i in 0..this.indexes.length) {
+            let index = borrow this.indexes[i];
+            if (index.stale.get()) {
+                this.rebuildIndex(index, frame, db)?;
+                index.stale.set(false);
+            }
+        }
+        return Ok();
+    }
+
+    /// Builds an index again from every row of the table.
+    fn rebuildIndex(
+        borrow this,
+        index: borrow TableIndex,
+        frame: borrow mut Frame,
+        db: borrow mut Session,
+    ) -> Result<void, SqliteError> {
+        let saved = replace(
+            mut frame.slots[this.slot],
+            Slot { values: Vector<SqliteValue>.create(), rowId: 0, isNull: false },
+        );
+        var entries = Vector<Vector<SqliteValue>>.create();
+        var cursor = TableCursor.scan(this.read.root);
+        while (cursor.next(mut db.pager)? is Some(row)) {
+            loadTableRow(borrow this.read, row.rowId, row.columns, mut frame.slots[this.slot])?;
+            if (this.read.generated.length != 0) {
+                computeGenerated(borrow this.read, this.slot, frame, db)?;
+            }
+            if (this.entryFor(index, frame, db)? is Some(entry)) {
+                entries.push(entry)?;
+            }
+        }
+        frame.slots[this.slot] = saved;
+        let order = borrow index.order;
+        entries.sortBy((a, b) => order.comparePrefix(a.view(), b.view()));
+        var records = Vector<Vector<u8>>.withCapacity(entries.length)?;
+        for (i in 0..entries.length) {
+            records.push(Record.encode(entries[i].view())?)?;
+        }
+        IndexMutator.rebuild(mut db.pager, index.root, records.view())?;
+        return Ok();
+    }
+
+    /// Removes row `rowId` (in the slot) and its index entries.
+    fn deleteRow(
+        borrow this,
+        rowId: i64,
+        frame: borrow mut Frame,
+        db: borrow mut Session,
+    ) -> Result<void, SqliteError> {
+        for (i in 0..this.indexes.length) {
+            let index = borrow this.indexes[i];
+            var ops = Vector<IndexOp>.create();
+            if (this.entryFor(index, frame, db)? is Some(entry)) {
+                ops.push(IndexOp { entry: entry, remove: true })?;
+            }
+            this.applyIndexOps(index, ops, frame, db)?;
+        }
+        var op = Vector<TableOp>.create();
+        op.push(TableOp { rowId: rowId, record: null })?;
+        TableMutator.applyBatch(mut db.pager, this.read.root, op.view())?;
+        return Ok();
+    }
+
+    /// Writes the row in the slot (new, or replacing the one with its rowid) and adds its index entries.
+    fn writeRow(borrow this, frame: borrow mut Frame, db: borrow mut Session) -> Result<void, SqliteError> {
+        let record = this.recordFor(frame)?;
+        var op = Vector<TableOp>.create();
+        op.push(TableOp { rowId: frame.slots[this.slot].rowId, record: record })?;
+        TableMutator.applyBatch(mut db.pager, this.read.root, op.view())?;
+        for (i in 0..this.indexes.length) {
+            let index = borrow this.indexes[i];
+            var ops = Vector<IndexOp>.create();
+            if (this.entryFor(index, frame, db)? is Some(entry)) {
+                ops.push(IndexOp { entry: entry, remove: false })?;
+            }
+            this.applyIndexOps(index, ops, frame, db)?;
+        }
+        return Ok();
+    }
+
+    /// Checks NOT NULL and CHECK for the row in the slot. With REPLACE, a NULL in a NOT NULL column with a default
+    /// takes the default. False when the row is to be skipped (OR IGNORE).
+    fn checkRow(
+        borrow this,
+        action: ConflictAction,
+        frame: borrow mut Frame,
+        db: borrow mut Session,
+    ) -> Result<bool, SqliteError> {
+        for (c in 0..this.table.columns.length) {
+            let column = borrow this.table.columns[c];
+            if (!column.notNull || this.table.rowidAlias == Some(c) || !frame.slots[this.slot].values[c].isNull()) {
+                continue;
+            }
+            if (action == ConflictAction.Ignore) {
+                return Ok(false);
+            }
+            if (action == ConflictAction.Replace) {
+                if (borrow this.defaults[c] is Some(d)) {
+                    let v = evaluate(d, frame, db)?;
+                    frame.slots[this.slot].values[c] = applyColumnAffinity(v, column.affinity)?;
+                    if (!frame.slots[this.slot].values[c].isNull()) {
+                        continue;
+                    }
+                }
+            }
+            var message = String.from("NOT NULL constraint failed: ")?;
+            message.append(this.table.name.view())?;
+            message.append(".")?;
+            message.append(column.name.view())?;
+            return Err(SqliteError.Constraint(message));
+        }
+        for (k in 0..this.checks.length) {
+            let v = evaluate(borrow this.checks[k], frame, db)?;
+            if (truthOf(borrow v) == Some(false)) {
+                if (action == ConflictAction.Ignore) {
+                    return Ok(false);
+                }
+                var message = String.from("CHECK constraint failed: ")?;
+                message.append(this.checkNames[k].view())?;
+                return Err(SqliteError.Constraint(message));
+            }
+        }
+        return Ok(true);
+    }
+
+    /// Resolves UNIQUE and PRIMARY KEY conflicts of the row in the slot before it is written. False when the row
+    /// is to be skipped (OR IGNORE). REPLACE deletes the rows it conflicts with.
+    fn resolveConflicts(
+        borrow this,
+        action: ConflictAction,
+        oldRowid: i64?,
+        frame: borrow mut Frame,
+        db: borrow mut Session,
+    ) -> Result<bool, SqliteError> {
+        let rowId = frame.slots[this.slot].rowId;
+        // The rowid itself.
+        if (oldRowid != Some(rowId) && seekTableRow(mut db.pager, this.read.root, rowId)?.isSome()) {
+            if (action == ConflictAction.Ignore) {
+                return Ok(false);
+            }
+            if (action == ConflictAction.Replace) {
+                this.replaceRow(rowId, frame, db)?;
+            } else {
+                var message = String.from("UNIQUE constraint failed: ")?;
+                message.append(this.table.name.view())?;
+                message.append(".")?;
+                if (this.table.rowidAlias is Some(alias)) {
+                    message.append(this.table.columns[alias].name.view())?;
+                } else {
+                    message.append("rowid")?;
+                }
+                return Err(SqliteError.Constraint(message));
+            }
+        }
+        for (i in 0..this.indexes.length) {
+            let index = borrow this.indexes[i];
+            if (!index.unique) {
+                continue;
+            }
+            if (index.stale.get()) {
+                // Its entries are out of date: rebuild it from the table as it is now, before relying on it.
+                let saved = copySlot(borrow frame.slots[this.slot])?;
+                this.rebuildIndex(index, frame, db)?;
+                frame.slots[this.slot] = saved;
+                index.stale.set(false);
+            }
+            let Some(entry) = this.entryFor(index, frame, db)? else {
+                continue;
+            };
+            let others = this.conflictsIn(index, borrow entry, oldRowid ?? rowId, db)?;
+            var conflicting = Vector<i64>.create();
+            for (k in 0..others.length) {
+                if (others[k] != rowId) {
+                    conflicting.push(others[k])?;
+                }
+            }
+            if (conflicting.length == 0) {
+                continue;
+            }
+            if (action == ConflictAction.Ignore) {
+                return Ok(false);
+            }
+            if (action != ConflictAction.Replace) {
+                var message = String.from("UNIQUE constraint failed: ")?;
+                message.append(index.keyNames.view())?;
+                return Err(SqliteError.Constraint(message));
+            }
+            for (k in 0..conflicting.length) {
+                this.replaceRow(conflicting[k], frame, db)?;
+            }
+        }
+        return Ok(true);
+    }
+
+    /// OR REPLACE: deletes the row `victim` that the new row (in the slot) conflicts with.
+    fn replaceRow(
+        borrow this,
+        victim: i64,
+        frame: borrow mut Frame,
+        db: borrow mut Session,
+    ) -> Result<void, SqliteError> {
+        let saved = replace(
+            mut frame.slots[this.slot],
+            Slot { values: Vector<SqliteValue>.create(), rowId: 0, isNull: false },
+        );
+        if (this.loadRow(victim, frame, db)?) {
+            this.deleteRow(victim, frame, db)?;
+            db.changes += 0;
+        }
+        frame.slots[this.slot] = saved;
+        return Ok();
+    }
+
+    /// The rowid a new row gets: one past the largest, or past sqlite_sequence's for AUTOINCREMENT.
+    fn newRowid(borrow this, db: borrow mut Session) -> Result<i64, SqliteError> {
+        var largest = lastRowid(mut db.pager, this.read.root)? ?? 0;
+        if (this.table.autoincrement) {
+            largest = largest.max(db.sequenceValue(this.table.name.view())? ?? 0);
+        }
+        if (largest < 9223372036854775807) {
+            return Ok(largest + 1);
+        }
+        if (this.table.autoincrement) {
+            return Err(sqlError("database or disk is full"));
+        }
+        // Every rowid up to the largest is taken at the top: look for a free one at random, as SQLite does.
+        for (attempt in 0..100) {
+            let bytes = randomBytes(8)?;
+            let candidate = truncate<i64>(bytes.readLE<u64>(0) >> 1);
+            if (candidate > 0 && seekTableRow(mut db.pager, this.read.root, candidate)?.isNull()) {
+                return Ok(candidate);
+            }
+        }
+        return Err(sqlError("database or disk is full"));
+    }
+}
+
+/// The largest rowid in a table b-tree, by its right edge.
+fn lastRowid<P: PageSource>(pager: borrow mut P, root: u32) -> Result<i64?, SqliteError> {
+    var page = root;
+    for (depth in 0..BTREE_MAX_DEPTH) {
+        let bytes = pager.readPage(page)?;
+        let header = BTreePageHeader.parse(bytes.view(), page)?;
+        if (header.kind == PAGE_LEAF_TABLE) {
+            if (header.cellCount == 0) {
+                return Ok(null);
+            }
+            let offset = header.cellOffset(bytes.view(), header.cellCount - 1)?;
+            return Ok(TableLeafCell.parse(bytes.view(), offset)?.rowId);
+        }
+        if (header.kind != PAGE_INTERIOR_TABLE) {
+            return Err(corrupt("a page in a table b-tree is not a table page"));
+        }
+        page = header.rightMost;
+    }
+    return Err(corrupt("a table b-tree's pages form a cycle"));
+}
+
+/// Where an INSERT's rows come from, compiled.
+enum InsertSourcePlan {
+    DefaultValues,
+    Values(Vector<Vector<XExpr>>),
+    Select(SelectPlan),
+}
+
+fn compileInsertSource(
+    stmt: borrow InsertStmt,
+    compiler: borrow mut Compiler,
+    db: borrow mut Session,
+) -> Result<InsertSourcePlan, SqliteError> {
+    // The values see no table: not even the one they go into.
+    let saved = replace(mut compiler.scopes, Vector<Scope>.create());
+    let result = compileInsertSourceInner(stmt, compiler, db);
+    compiler.scopes = saved;
+    return result;
+}
+
+fn compileInsertSourceInner(
+    stmt: borrow InsertStmt,
+    compiler: borrow mut Compiler,
+    db: borrow mut Session,
+) -> Result<InsertSourcePlan, SqliteError> {
+    match (borrow stmt.source) {
+        InsertSource.DefaultValues => { return Ok(InsertSourcePlan.DefaultValues); }
+        InsertSource.Values(list) => {
+            var compiled = Vector<Vector<XExpr>>.withCapacity(list.length)?;
+            for (r in 0..list.length) {
+                var row = Vector<XExpr>.withCapacity(list[r].length)?;
+                for (c in 0..list[r].length) {
+                    row.push(compiler.compile(borrow list[r][c], db)?)?;
+                }
+                compiled.push(row)?;
+            }
+            return Ok(InsertSourcePlan.Values(compiled));
+        }
+        InsertSource.Select(select) => { return Ok(InsertSourcePlan.Select(compileSelect(compiler, select, db)?)); }
+    }
+}
+
+/// The rows an INSERT adds: each one's values for the named columns.
+fn insertRows(
+    source: borrow InsertSourcePlan,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<Vector<SqliteValue>>, SqliteError> {
+    var rows = Vector<Vector<SqliteValue>>.create();
+    match (source) {
+        InsertSourcePlan.DefaultValues => { rows.push(Vector<SqliteValue>.create())?; }
+        InsertSourcePlan.Values(list) => {
+            for (r in 0..list.length) {
+                var values = Vector<SqliteValue>.withCapacity(list[r].length)?;
+                for (c in 0..list[r].length) {
+                    values.push(evaluate(borrow list[r][c], frame, db)?)?;
+                }
+                rows.push(values)?;
+            }
+        }
+        InsertSourcePlan.Select(plan) => { rows = runSelect(plan, frame, db)?; }
+    }
+    return Ok(rows);
+}
+
+/// INSERT.
+fn executeInsert(
+    stmt: borrow InsertStmt,
+    params: Slice<SqliteValue>,
+    db: borrow mut Session,
+) -> Result<QueryResult, SqliteError> {
+    if (stmt.upserts.length != 0) {
+        return Err(unsupported("upserts (ON CONFLICT … DO) are not supported yet"));
+    }
+    var compiler = Compiler.create();
+    let writer = TableWriter.create(mut compiler, stmt.table.name.view(), db)?;
+    let table = borrow writer.table;
+    // Which column each value goes to.
+    var targets = Vector<usize>.create();
+    if (stmt.columns.length == 0) {
+        for (c in 0..table.columns.length) {
+            if (table.columns[c].generated.isNull()) {
+                targets.push(c)?;
+            }
+        }
+    } else {
+        for (k in 0..stmt.columns.length) {
+            let name = stmt.columns[k].view();
+            var at = table.indexOf(name);
+            if (at.isNull() && isRowidName(name) && table.rowidAlias.isNull()) {
+                at = table.columns.length;
+            }
+            let found = at ?? {
+                var message = String.from("table ")?;
+                message.append(table.name.view())?;
+                message.append(" has no column named ")?;
+                message.append(name)?;
+                return Err(SqliteError.Sql(message));
+            };
+            if (found < table.columns.length && table.columns[found].generated.isSome()) {
+                var message = String.from("cannot INSERT into generated column \"")?;
+                message.append(name)?;
+                message.append("\"")?;
+                return Err(SqliteError.Sql(message));
+            }
+            targets.push(found)?;
+        }
+    }
+    let returning = compileReturning(mut compiler, borrow stmt.returning, borrow writer, db)?;
+    if (borrow stmt.with is Some(with)) {
+        let _ = compileWith(mut compiler, with, db)?;
+    }
+    let source = compileInsertSource(stmt, mut compiler, db)?;
+    var frame = newFrame(mut compiler, params)?;
+    var rows = insertRows(borrow source, mut frame, db)?;
+    var output = Vector<Vector<SqliteValue>>.create();
+    let action = stmt.conflict ?? ConflictAction.Abort;
+    var count: i64 = 0;
+    for (r in 0..rows.length) {
+        let given = takeRow(mut rows, r);
+        if (given.length != targets.length) {
+            var message = String.create();
+            if (stmt.columns.length == 0) {
+                message.append("table ")?;
+                message.append(table.name.view())?;
+                message.append(" has ")?;
+                message.appendNumber(targets.length)?;
+                message.append(" columns but ")?;
+                message.appendNumber(given.length)?;
+                message.append(" values were supplied")?;
+            } else {
+                message.appendNumber(given.length)?;
+                message.append(" values for ")?;
+                message.appendNumber(targets.length)?;
+                message.append(" columns")?;
+            }
+            return Err(SqliteError.Sql(message));
+        }
+        // The row: defaults, then the given values with the columns' affinities.
+        var values = Vector<SqliteValue>.withCapacity(table.columns.length)?;
+        var provided = Vector<bool>.create();
+        provided.resize(table.columns.length + 1, false)?;
+        for (k in 0..targets.length) {
+            provided[targets[k]] = true;
+        }
+        for (c in 0..table.columns.length) {
+            var v = SqliteValue.Null;
+            if (!provided[c] && table.columns[c].generated.isNull()) {
+                if (borrow writer.defaults[c] is Some(d)) {
+                    v = evaluate(d, mut frame, db)?;
+                }
+            }
+            values.push(v)?;
+        }
+        var explicitRowid: SqliteValue? = null;
+        var k: usize = 0;
+        for (v in given) {
+            let at = targets[k];
+            if (at == table.columns.length) {
+                explicitRowid = v.clone()?;
+            } else {
+                values[at] = applyColumnAffinity(v.clone()?, table.columns[at].affinity)?;
+            }
+            k += 1;
+        }
+        // The rowid: the INTEGER PRIMARY KEY's value, an explicit rowid, or a new one.
+        var rowValue: SqliteValue = SqliteValue.Null;
+        if (table.rowidAlias is Some(alias)) {
+            rowValue = values[alias].clone()?;
+        } else if (explicitRowid is Some(v)) {
+            rowValue = applyColumnAffinity(v, Affinity.Integer)?;
+        }
+        var rowId: i64 = 0;
+        match (rowValue) {
+            SqliteValue.Null => { rowId = writer.newRowid(db)?; }
+            SqliteValue.Integer(i) => { rowId = i; }
+            _ => { return Err(sqlError("datatype mismatch")); }
+        }
+        if (table.rowidAlias is Some(alias)) {
+            values[alias] = SqliteValue.Integer(rowId);
+        }
+        frame.slots[writer.slot] = Slot { values: values, rowId: rowId, isNull: false };
+        writer.computeGeneratedColumns(mut frame, db)?;
+        if (!writer.checkRow(action, mut frame, db)?) {
+            continue;
+        }
+        if (!writer.resolveConflicts(action, null, mut frame, db)?) {
+            continue;
+        }
+        writer.writeRow(mut frame, db)?;
+        if (table.autoincrement) {
+            db.updateSequence(table.name.view(), rowId)?;
+        }
+        db.lastInsertRowid = rowId;
+        count += 1;
+        if (returning.length != 0) {
+            var out = Vector<SqliteValue>.withCapacity(returning.length)?;
+            for (i in 0..returning.length) {
+                out.push(evaluate(borrow returning[i], mut frame, db)?)?;
+            }
+            output.push(out)?;
+        }
+    }
+    writer.finish(mut frame, db)?;
+    db.changes = count;
+    db.totalChanges += count;
+    return Ok(QueryResult { columns: returningNames(borrow stmt.returning, borrow writer.table)?, rows: output });
+}
+
+/// RETURNING's expressions, compiled in the table's scope; `*` is every column.
+fn compileReturning(
+    compiler: borrow mut Compiler,
+    columns: borrow Vector<ResultColumn>,
+    writer: borrow TableWriter,
+    db: borrow mut Session,
+) -> Result<Vector<XExpr>, SqliteError> {
+    var out = Vector<XExpr>.create();
+    for (i in 0..columns.length) {
+        match (borrow columns[i]) {
+            ResultColumn.Expr(e, _) => {
+                out.push(compileInTable(compiler, e, borrow writer.table, writer.slot, db)?)?;
+            }
+            _ => {
+                for (c in 0..writer.table.columns.length) {
+                    out.push(XExpr.Column(writer.slot, c))?;
+                }
+            }
+        }
+    }
+    return Ok(out);
+}
+
+fn returningNames(
+    columns: borrow Vector<ResultColumn>,
+    table: borrow TableSchema,
+) -> Result<Vector<String>, AllocError> {
+    var names = Vector<String>.create();
+    for (i in 0..columns.length) {
+        match (borrow columns[i]) {
+            ResultColumn.Expr(e, alias) => { names.push(if (alias is Some(a)) a.clone()? else defaultColumnName(e)?)?; }
+            _ => {
+                for (c in 0..table.columns.length) {
+                    names.push(table.columns[c].name.clone()?)?;
+                }
+            }
+        }
+    }
+    return Ok(names);
+}
+
+/// The rowids of the table's rows a WHERE clause selects, with the rows (in the order of the table).
+fn matchingRows(
+    writer: borrow TableWriter,
+    filter: borrow XExpr?,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<i64>, SqliteError> {
+    var cursor = TableCursor.scan(writer.read.root);
+    if (filter is Some(f)) {
+        if (rowidEqualityFor(f, writer.slot)? is Some(seek)) {
+            let Some(rowId) = seekRowid(borrow seek, frame, db)? else {
+                return Ok(Vector<i64>.create());
+            };
+            cursor = TableCursor.range(writer.read.root, rowId, rowId);
+        }
+    }
+    var rowids = Vector<i64>.create();
+    while (cursor.next(mut db.pager)? is Some(row)) {
+        loadTableRow(borrow writer.read, row.rowId, row.columns, mut frame.slots[writer.slot])?;
+        if (writer.read.generated.length != 0) {
+            computeGenerated(borrow writer.read, writer.slot, frame, db)?;
+        }
+        if (filter is Some(f)) {
+            let ok = evaluate(f, frame, db)?;
+            if (!isTrue(borrow ok)) {
+                continue;
+            }
+        }
+        rowids.push(frame.slots[writer.slot].rowId)?;
+    }
+    return Ok(rowids);
+}
+
+/// DELETE.
+fn executeDelete(
+    stmt: borrow DeleteStmt,
+    params: Slice<SqliteValue>,
+    db: borrow mut Session,
+) -> Result<QueryResult, SqliteError> {
+    var compiler = Compiler.create();
+    let writer = TableWriter.create(mut compiler, stmt.table.name.view(), db)?;
+    if (borrow stmt.with is Some(with)) {
+        let _ = compileWith(mut compiler, with, db)?;
+    }
+    var filter: XExpr? = null;
+    if (borrow stmt.filter is Some(f)) {
+        filter = compileInTable(mut compiler, f, borrow writer.table, writer.slot, db)?;
+    }
+    let returning = compileReturning(mut compiler, borrow stmt.returning, borrow writer, db)?;
+    var frame = newFrame(mut compiler, params)?;
+    let rowids = matchingRows(borrow writer, borrow filter, mut frame, db)?;
+    var output = Vector<Vector<SqliteValue>>.create();
+    for (i in 0..rowids.length) {
+        if (!writer.loadRow(rowids[i], mut frame, db)?) {
+            continue;
+        }
+        if (returning.length != 0) {
+            var out = Vector<SqliteValue>.withCapacity(returning.length)?;
+            for (k in 0..returning.length) {
+                out.push(evaluate(borrow returning[k], mut frame, db)?)?;
+            }
+            output.push(out)?;
+        }
+        writer.deleteRow(rowids[i], mut frame, db)?;
+    }
+    writer.finish(mut frame, db)?;
+    db.changes = truncate<i64>(rowids.length);
+    db.totalChanges += db.changes;
+    return Ok(QueryResult { columns: returningNames(borrow stmt.returning, borrow writer.table)?, rows: output });
+}
+
+/// UPDATE.
+fn executeUpdate(
+    stmt: borrow UpdateStmt,
+    params: Slice<SqliteValue>,
+    db: borrow mut Session,
+) -> Result<QueryResult, SqliteError> {
+    if (stmt.from.isSome()) {
+        return Err(unsupported("UPDATE … FROM is not supported yet"));
+    }
+    var compiler = Compiler.create();
+    let writer = TableWriter.create(mut compiler, stmt.table.name.view(), db)?;
+    if (borrow stmt.with is Some(with)) {
+        let _ = compileWith(mut compiler, with, db)?;
+    }
+    let table = borrow writer.table;
+    var targets = Vector<usize>.create();
+    var setsRowid = false;
+    var values = Vector<XExpr>.create();
+    for (a in 0..stmt.assignments.length) {
+        let name = stmt.assignments[a].column.view();
+        var at = table.indexOf(name);
+        if (at.isNull() && isRowidName(name)) {
+            at = table.rowidAlias ?? table.columns.length;
+        }
+        let found = at ?? {
+            return Err(namedError("no such column: ", name));
+        };
+        if (found < table.columns.length && table.columns[found].generated.isSome()) {
+            var message = String.from("cannot UPDATE generated column \"")?;
+            message.append(name)?;
+            message.append("\"")?;
+            return Err(SqliteError.Sql(message));
+        }
+        setsRowid = setsRowid || found == table.columns.length || table.rowidAlias == Some(found);
+        targets.push(found)?;
+        values.push(compileInTable(mut compiler, borrow stmt.assignments[a].value, table, writer.slot, db)?)?;
+    }
+    var filter: XExpr? = null;
+    if (borrow stmt.filter is Some(f)) {
+        filter = compileInTable(mut compiler, f, table, writer.slot, db)?;
+    }
+    let returning = compileReturning(mut compiler, borrow stmt.returning, borrow writer, db)?;
+    var frame = newFrame(mut compiler, params)?;
+    let rowids = matchingRows(borrow writer, borrow filter, mut frame, db)?;
+    let action = stmt.conflict ?? ConflictAction.Abort;
+    var output = Vector<Vector<SqliteValue>>.create();
+    var count: i64 = 0;
+    for (i in 0..rowids.length) {
+        let oldRowid = rowids[i];
+        if (!writer.loadRow(oldRowid, mut frame, db)?) {
+            continue;
+        }
+        // Every new value is computed from the old row.
+        var newValues = Vector<SqliteValue>.withCapacity(values.length)?;
+        for (a in 0..values.length) {
+            newValues.push(evaluate(borrow values[a], mut frame, db)?)?;
+        }
+        let oldSlot = copySlot(borrow frame.slots[writer.slot])?;
+        var newRowid = oldRowid;
+        for (a in 0..targets.length) {
+            let at = targets[a];
+            let v = replace(mut newValues[a], SqliteValue.Null);
+            if (at == table.columns.length || table.rowidAlias == Some(at)) {
+                match (applyColumnAffinity(v, Affinity.Integer)?) {
+                    SqliteValue.Integer(n) => { newRowid = n; }
+                    _ => { return Err(sqlError("datatype mismatch")); }
+                }
+                if (at < table.columns.length) {
+                    frame.slots[writer.slot].values[at] = SqliteValue.Integer(newRowid);
+                }
+            } else {
+                frame.slots[writer.slot].values[at] = applyColumnAffinity(v, table.columns[at].affinity)?;
+            }
+        }
+        frame.slots[writer.slot].rowId = newRowid;
+        writer.computeGeneratedColumns(mut frame, db)?;
+        if (!writer.checkRow(action, mut frame, db)?) {
+            continue;
+        }
+        if (!writer.resolveConflicts(action, oldRowid, mut frame, db)?) {
+            continue;
+        }
+        // Out with the old row's entries (and the row, when its rowid changes), then in with the new.
+        let newSlot = replace(mut frame.slots[writer.slot], oldSlot);
+        if (newRowid != oldRowid) {
+            writer.deleteRow(oldRowid, mut frame, db)?;
+        } else {
+            for (x in 0..writer.indexes.length) {
+                let index = borrow writer.indexes[x];
+                var ops = Vector<IndexOp>.create();
+                if (writer.entryFor(index, mut frame, db)? is Some(entry)) {
+                    ops.push(IndexOp { entry: entry, remove: true })?;
+                }
+                writer.applyIndexOps(index, ops, mut frame, db)?;
+            }
+        }
+        frame.slots[writer.slot] = newSlot;
+        writer.writeRow(mut frame, db)?;
+        let _ = setsRowid;
+        count += 1;
+        if (returning.length != 0) {
+            var out = Vector<SqliteValue>.withCapacity(returning.length)?;
+            for (k in 0..returning.length) {
+                out.push(evaluate(borrow returning[k], mut frame, db)?)?;
+            }
+            output.push(out)?;
+        }
+    }
+    writer.finish(mut frame, db)?;
+    db.changes = count;
+    db.totalChanges += count;
+    return Ok(QueryResult { columns: returningNames(borrow stmt.returning, borrow writer.table)?, rows: output });
+}

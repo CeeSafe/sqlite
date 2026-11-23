@@ -1,0 +1,362 @@
+// CREATE and DROP of tables, indexes and views, written to the pages of the transaction.
+//
+// Differences from the C# engine, which this replaces:
+// - a definition is stored in sqlite_schema as the statement's own text, as SQLite stores it; the C# stored its
+//   renderer's version, which lost what it did not know;
+// - DROP gives the object's pages back to the freelist, and CREATE takes pages from it first;
+// - every change to the schema adds one to the schema cookie, so other connections read the schema again.
+//
+// Not yet supported, and refused by name: ALTER TABLE, CREATE TRIGGER, and TEMP objects.
+
+/// Writes an empty b-tree page: a table leaf or an index leaf.
+fn initRoot(pager: borrow mut WritablePager, page: u32, kind: u8) -> Result<void, SqliteError> {
+    let bytes = pager.pageMut(page)?;
+    bytes.fill(0);
+    BTreeBuilder.fillPage(bytes, 0, kind, [], null);
+    return Ok();
+}
+
+/// Adds a row to sqlite_schema.
+fn addSchemaRow(
+    db: borrow mut Session,
+    kind: StringView,
+    name: StringView,
+    table: StringView,
+    root: u32,
+    sql: StringView?,
+) -> Result<void, SqliteError> {
+    var values = Vector<SqliteValue>.create();
+    values.push(SqliteValue.text(kind)?)?;
+    values.push(SqliteValue.text(name)?)?;
+    values.push(SqliteValue.text(table)?)?;
+    values.push(SqliteValue.Integer(root as i64))?;
+    values.push(if (sql is Some(s)) SqliteValue.text(s)? else SqliteValue.Null)?;
+    let rowId = (lastRowid(mut db.pager, 1)? ?? 0) + 1;
+    var op = Vector<TableOp>.create();
+    op.push(TableOp { rowId: rowId, record: Record.encode(values.view())? })?;
+    TableMutator.applyBatch(mut db.pager, 1, op.view())?;
+    return Ok();
+}
+
+/// Removes the rows of sqlite_schema for which `pick` is true, and gives back their b-trees' pages.
+fn removeSchemaRows(db: borrow mut Session, name: StringView, alsoOfTable: bool) -> Result<void, SqliteError> {
+    var cursor = TableCursor.scan(1);
+    var doomed = Vector<i64>.create();
+    var roots = Vector<u32>.create();
+    while (cursor.next(mut db.pager)? is Some(row)) {
+        if (row.columns.length < 5) {
+            continue;
+        }
+        let objectName = textOrEmptyRef(borrow row.columns[1]);
+        let tableName = textOrEmptyRef(borrow row.columns[2]);
+        let matches = objectName.equalsIgnoreAsciiCase(name) || (alsoOfTable && tableName.equalsIgnoreAsciiCase(name));
+        if (!matches) {
+            continue;
+        }
+        doomed.push(row.rowId)?;
+        if (row.columns[3] is SqliteValue.Integer(root) && root > 0) {
+            roots.push(truncate<u32>(root))?;
+        }
+    }
+    var ops = Vector<TableOp>.create();
+    for (i in 0..doomed.length) {
+        ops.push(TableOp { rowId: doomed[i], record: null })?;
+    }
+    TableMutator.applyBatch(mut db.pager, 1, ops.view())?;
+    for (i in 0..roots.length) {
+        freeBTree(mut db.pager, roots[i])?;
+    }
+    return Ok();
+}
+
+fn textOrEmptyRef(value: borrow SqliteValue) -> StringView => match (value) {
+    SqliteValue.Text(s) => s.view(),
+    _ => "",
+};
+
+/// Gives every page of a b-tree (table or index, overflow pages included) back to the freelist.
+fn freeBTree(pager: borrow mut WritablePager, root: u32) -> Result<void, SqliteError> {
+    let usable = pager.usable;
+    var pending = Vector<u32>.create();
+    var all = Vector<u32>.create();
+    pending.push(root)?;
+    while (pending.pop() is Some(page)) {
+        if (all.length > pager.pageCount as usize) {
+            return Err(corrupt("a b-tree's pages form a cycle"));
+        }
+        all.push(page)?;
+        let bytes = pager.copy(page)?;
+        let header = BTreePageHeader.parse(bytes.view()[0..usable], page)?;
+        let table = header.kind == PAGE_LEAF_TABLE || header.kind == PAGE_INTERIOR_TABLE;
+        for (i in 0..header.cellCount) {
+            let offset = header.cellOffset(bytes.view()[0..usable], i)?;
+            if (!header.isLeaf()) {
+                pending.push(bytes.readBE<u32>(offset))?;
+                if (table) {
+                    continue;
+                }
+            }
+            // A cell with a payload: its overflow pages too.
+            var at = if (header.isLeaf()) offset else offset + 4;
+            let length = Varint.read(bytes.view(), at)?;
+            at += length.length;
+            if (header.kind == PAGE_LEAF_TABLE) {
+                at += Varint.read(bytes.view(), at)?.length;
+            }
+            let total = checkedTruncate<usize>(length.value) ?? 0;
+            let maxLocal = if (table) usable - 35 else (usable - 12) * 64 / 255 - 23;
+            if (total > maxLocal) {
+                let inCell = cellPayloadSize(usable, total, maxLocal);
+                var overflow = bytes.readBE<u32>(at + inCell - 4);
+                while (overflow != 0) {
+                    if (all.length > pager.pageCount as usize) {
+                        return Err(corrupt("an overflow chain forms a cycle"));
+                    }
+                    all.push(overflow)?;
+                    overflow = pager.read(overflow)?.readBE<u32>(0);
+                }
+            }
+        }
+        if (!header.isLeaf()) {
+            pending.push(header.rightMost)?;
+        }
+    }
+    for (i in 0..all.length) {
+        pager.freePage(all[i])?;
+    }
+    return Ok();
+}
+
+fn objectExists(db: borrow Session, name: StringView) -> bool {
+    for (i in 0..db.entries.length) {
+        if (db.entries[i].name.view().equalsIgnoreAsciiCase(name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn existsError(kind: StringView, name: StringView) -> SqliteError {
+    var message = String.create();
+    let _ = message.append(kind);
+    let _ = message.append(" ");
+    let _ = message.append(name);
+    let _ = message.append(" already exists");
+    return SqliteError.Sql(message);
+}
+
+fn isReservedName(name: StringView) -> bool => name.length >= 7 && name[0..7].equalsIgnoreAsciiCase("sqlite_");
+
+/// CREATE TABLE.
+fn executeCreateTable(
+    stmt: borrow CreateTableStmt,
+    sql: StringView,
+    db: borrow mut Session,
+) -> Result<void, SqliteError> {
+    if (stmt.temporary) {
+        return Err(unsupported("TEMP tables are not supported yet"));
+    }
+    let name = stmt.name.name.view();
+    if (objectExists(db, name)) {
+        if (stmt.ifNotExists) {
+            return Ok();
+        }
+        // SQLite names what is there: a table, an index or a view.
+        return Err(
+            existsError(
+                if (db.viewSql(name)?.isSome()) "view" else if (db.catalog.table(name)?.isSome()) "table" else "index",
+                name,
+            ),
+        );
+    }
+    if (isReservedName(name)) {
+        return Err(namedError("object name reserved for internal use: ", name));
+    }
+    let table = buildTableSchema(stmt, name, 0)?;
+    if (table.withoutRowid && table.primaryKey.length == 0) {
+        return Err(namedError("PRIMARY KEY missing on table ", name));
+    }
+    let root = db.pager.allocatePage()?;
+    initRoot(mut db.pager, root, if (table.withoutRowid) PAGE_LEAF_INDEX else PAGE_LEAF_TABLE)?;
+    addSchemaRow(db, "table", name, name, root, sql)?;
+    // An automatic index for each PRIMARY KEY (when not the rowid, nor a WITHOUT ROWID table's) and UNIQUE.
+    var sequence: u64 = 0;
+    for (k in 0..table.keys.length) {
+        if (table.keys[k].primaryKey && table.withoutRowid) {
+            continue;
+        }
+        sequence += 1;
+        var indexName = String.from("sqlite_autoindex_")?;
+        indexName.append(name)?;
+        indexName.append("_")?;
+        indexName.appendNumber(sequence)?;
+        let indexRoot = db.pager.allocatePage()?;
+        initRoot(mut db.pager, indexRoot, PAGE_LEAF_INDEX)?;
+        addSchemaRow(db, "index", indexName.view(), name, indexRoot, null)?;
+    }
+    if (table.autoincrement && db.catalog.table("sqlite_sequence")?.isNull()) {
+        let sequenceRoot = db.pager.allocatePage()?;
+        initRoot(mut db.pager, sequenceRoot, PAGE_LEAF_TABLE)?;
+        addSchemaRow(
+            db,
+            "table",
+            "sqlite_sequence",
+            "sqlite_sequence",
+            sequenceRoot,
+            "CREATE TABLE sqlite_sequence(name,seq)",
+        )?;
+    }
+    db.pager.bumpSchemaCookie()?;
+    return db.reloadSchema();
+}
+
+/// CREATE INDEX: the index is built from the table's rows.
+fn executeCreateIndex(
+    stmt: borrow CreateIndexStmt,
+    sql: StringView,
+    db: borrow mut Session,
+) -> Result<void, SqliteError> {
+    let name = stmt.name.name.view();
+    if (objectExists(db, name)) {
+        if (stmt.ifNotExists) {
+            return Ok();
+        }
+        return Err(existsError("index", name));
+    }
+    if (isReservedName(name)) {
+        return Err(namedError("object name reserved for internal use: ", name));
+    }
+    let table = db.catalog.table(stmt.table.view())? ?? {
+        return Err(namedError("no such table: main.", stmt.table.view()));
+    };
+    if (table.withoutRowid) {
+        return Err(unsupported("indexes on WITHOUT ROWID tables cannot be created yet"));
+    }
+    let tableName = table.name.clone()?;
+    let root = db.pager.allocatePage()?;
+    initRoot(mut db.pager, root, PAGE_LEAF_INDEX)?;
+    addSchemaRow(db, "index", name, tableName.view(), root, sql)?;
+    db.reloadSchema()?;
+    // Fill it, checking UNIQUE as rows go in.
+    var compiler = Compiler.create();
+    let writer = TableWriter.create(mut compiler, tableName.view(), db)?;
+    var frame = newFrame(mut compiler, [])?;
+    for (i in 0..writer.indexes.length) {
+        let index = borrow writer.indexes[i];
+        if (!index.name.view().equalsIgnoreAsciiCase(name)) {
+            continue;
+        }
+        writer.rebuildIndex(index, mut frame, db)?;
+        if (index.unique) {
+            var cursor = TableCursor.scan(writer.read.root);
+            while (cursor.next(mut db.pager)? is Some(row)) {
+                loadTableRow(borrow writer.read, row.rowId, row.columns, mut frame.slots[writer.slot])?;
+                if (writer.read.generated.length != 0) {
+                    computeGenerated(borrow writer.read, writer.slot, mut frame, db)?;
+                }
+                let Some(entry) = writer.entryFor(index, mut frame, db)? else {
+                    continue;
+                };
+                if (writer.conflictsIn(index, borrow entry, row.rowId, db)?.length != 0) {
+                    var message = String.from("UNIQUE constraint failed: ")?;
+                    message.append(index.keyNames.view())?;
+                    return Err(SqliteError.Constraint(message));
+                }
+            }
+        }
+    }
+    db.pager.bumpSchemaCookie()?;
+    return Ok();
+}
+
+/// CREATE VIEW: checked by compiling its SELECT.
+fn executeCreateView(
+    stmt: borrow CreateViewStmt,
+    sql: StringView,
+    db: borrow mut Session,
+) -> Result<void, SqliteError> {
+    if (stmt.temporary) {
+        return Err(unsupported("TEMP views are not supported yet"));
+    }
+    let name = stmt.name.name.view();
+    if (objectExists(db, name)) {
+        if (stmt.ifNotExists) {
+            return Ok();
+        }
+        return Err(existsError("view", name));
+    }
+    var compiler = Compiler.create();
+    let plan = compileSelect(mut compiler, borrow stmt.select, db)?;
+    let none = Vector<String>.create();
+    let _ = planScopeColumns(borrow plan, if (stmt.columns.length != 0) borrow stmt.columns else borrow none)?;
+    addSchemaRow(db, "view", name, name, 0, sql)?;
+    db.pager.bumpSchemaCookie()?;
+    return db.reloadSchema();
+}
+
+/// DROP TABLE, INDEX, VIEW or TRIGGER.
+fn executeDrop(stmt: borrow DropStmt, db: borrow mut Session) -> Result<void, SqliteError> {
+    let name = stmt.name.name.view();
+    var kind: StringView = "";
+    for (i in 0..db.entries.length) {
+        if (db.entries[i].name.view().equalsIgnoreAsciiCase(name)) {
+            kind = match (db.entries[i].kind.view()) {
+                "table" => "table",
+                "index" => "index",
+                "view" => "view",
+                _ => "trigger",
+            };
+        }
+    }
+    let wanted: StringView = match (stmt.kind) {
+        DropKind.Table => "table",
+        DropKind.Index => "index",
+        DropKind.View => "view",
+        DropKind.Trigger => "trigger",
+    };
+    if (kind != wanted) {
+        if (stmt.ifExists) {
+            return Ok();
+        }
+        if (kind.length != 0 && wanted != "trigger") {
+            var message = String.from("use DROP ")?;
+            message.append(match (kind) {
+                "table" => "TABLE",
+                "index" => "INDEX",
+                _ => "VIEW",
+            })?;
+            message.append(" to delete ")?;
+            message.append(kind)?;
+            message.append(" ")?;
+            message.append(name)?;
+            return Err(SqliteError.Sql(message));
+        }
+        return Err(namedError(match (stmt.kind) {
+            DropKind.Table => "no such table: ",
+            DropKind.Index => "no such index: ",
+            DropKind.View => "no such view: ",
+            DropKind.Trigger => "no such trigger: ",
+        }, name));
+    }
+    if (isReservedName(name) && stmt.kind != DropKind.Index) {
+        var message = String.from("table ")?;
+        message.append(name)?;
+        message.append(" may not be dropped")?;
+        return Err(SqliteError.Sql(message));
+    }
+    if (stmt.kind == DropKind.Index) {
+        for (i in 0..db.entries.length) {
+            if (db.entries[i].name.view().equalsIgnoreAsciiCase(name) && db.entries[i].sql.isNull()) {
+                return Err(sqlError("index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"));
+            }
+        }
+    }
+    // A table takes its indexes and triggers with it, and its row in sqlite_sequence.
+    removeSchemaRows(db, name, stmt.kind == DropKind.Table)?;
+    if (stmt.kind == DropKind.Table && db.catalog.table("sqlite_sequence")?.isSome()) {
+        db.reloadSchema()?;
+        db.removeSequence(name)?;
+    }
+    db.pager.bumpSchemaCookie()?;
+    return db.reloadSchema();
+}

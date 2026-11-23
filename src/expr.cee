@@ -60,6 +60,14 @@ struct Frame {
         return Ok(first);
     }
 
+    /// Makes sure `count` slots exist.
+    fn ensureSlots(borrow mut this, count: usize) -> Result<void, AllocError> {
+        while (this.slots.length < count) {
+            this.slots.push(Slot { values: Vector<SqliteValue>.create(), rowId: 0, isNull: false })?;
+        }
+        return Ok();
+    }
+
     fn popSlots(borrow mut this, first: usize) {
         while (this.slots.length > first) {
             let _ = this.slots.pop();

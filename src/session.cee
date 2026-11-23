@@ -61,10 +61,99 @@ public struct Session {
         return Ok(null);
     }
 
+    /// The CREATE INDEX statement of the index called `name`.
+    fn indexSql(borrow this, name: StringView) -> Result<String?, SqliteError> {
+        for (i in 0..this.entries.length) {
+            let entry = borrow this.entries[i];
+            if (entry.kind.view() == "index" && entry.name.view().equalsIgnoreAsciiCase(name)) {
+                if (borrow entry.sql is Some(sql)) {
+                    return Ok(sql.clone()?);
+                }
+            }
+        }
+        return Ok(null);
+    }
+
+    /// Whether any trigger is on the table called `name`.
+    fn hasTriggers(borrow this, name: StringView) -> bool {
+        for (i in 0..this.entries.length) {
+            if (this.entries[i].kind.view() == "trigger" && this.entries[i].tableName.view().equalsIgnoreAsciiCase(
+                name,
+            )) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Runs SQL inside the current statement, leaving the change counts as they were.
+    fn runInternal(borrow mut this, sql: StringView, params: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> {
+        let changes = this.changes;
+        let total = this.totalChanges;
+        let last = this.lastInsertRowid;
+        let stmt = Parser.parseStatement(sql)?;
+        let result = this.run(borrow stmt, sql, params);
+        this.changes = changes;
+        this.totalChanges = total;
+        this.lastInsertRowid = last;
+        return result;
+    }
+
+    /// sqlite_sequence's value for the AUTOINCREMENT table `name`.
+    fn sequenceValue(borrow mut this, name: StringView) -> Result<i64?, SqliteError> {
+        if (this.catalog.table("sqlite_sequence")?.isNull()) {
+            return Ok(null);
+        }
+        var params = Vector<SqliteValue>.create();
+        params.push(SqliteValue.text(name)?)?;
+        let result = this.runInternal("SELECT max(seq) FROM sqlite_sequence WHERE name = ?", params.view())?;
+        if (result.rows.length != 0 && result.rows[0][0] is SqliteValue.Integer(n)) {
+            return Ok(n);
+        }
+        return Ok(null);
+    }
+
+    /// Records that the AUTOINCREMENT table `name` used `rowId`.
+    fn updateSequence(borrow mut this, name: StringView, rowId: i64) -> Result<void, SqliteError> {
+        let current = this.sequenceValue(name)?;
+        var params = Vector<SqliteValue>.create();
+        params.push(SqliteValue.text(name)?)?;
+        params.push(SqliteValue.Integer(rowId))?;
+        if (current is Some(seq)) {
+            if (seq < rowId) {
+                let _ = this.runInternal("UPDATE sqlite_sequence SET seq = ?2 WHERE name = ?1", params.view())?;
+            }
+        } else {
+            let _ = this.runInternal("INSERT INTO sqlite_sequence(name, seq) VALUES (?1, ?2)", params.view())?;
+        }
+        return Ok();
+    }
+
+    /// Forgets the AUTOINCREMENT counter of a dropped table.
+    fn removeSequence(borrow mut this, name: StringView) -> Result<void, SqliteError> {
+        var params = Vector<SqliteValue>.create();
+        params.push(SqliteValue.text(name)?)?;
+        let _ = this.runInternal("DELETE FROM sqlite_sequence WHERE name = ?", params.view())?;
+        return Ok();
+    }
+
     /// Runs one SQL statement with positional parameters (?, ?N, :name in order of first use).
     public fn query(borrow mut this, sql: StringView, params: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> {
         let stmt = Parser.parseStatement(sql)?;
-        let result = this.run(borrow stmt, params);
+        // The statement's text, as sqlite_schema keeps a definition.
+        var text = sql.trim();
+        while (text.endsWith(";")) {
+            text = text[0..text.length - 1].trimEnd();
+        }
+        this.pager.beginStatement();
+        let result = this.run(borrow stmt, text, params);
+        if (result.isOk()) {
+            this.pager.endStatement();
+        } else if (this.inTransaction) {
+            // A failed statement undoes itself alone.
+            this.pager.rollbackStatement()?;
+            this.reloadSchema()?;
+        }
         if (!this.inTransaction) {
             // Each statement outside BEGIN is a transaction of its own.
             if (result.isOk()) {
@@ -78,8 +167,32 @@ public struct Session {
     }
 
     /// Runs a statement.
-    fn run(borrow mut this, stmt: borrow Stmt, params: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> {
+    fn run(
+        borrow mut this,
+        stmt: borrow Stmt,
+        sql: StringView,
+        params: Slice<SqliteValue>,
+    ) -> Result<QueryResult, SqliteError> {
         match (stmt) {
+            Stmt.Insert(s) => { return executeInsert(s, params, this); }
+            Stmt.Update(s) => { return executeUpdate(s, params, this); }
+            Stmt.Delete(s) => { return executeDelete(s, params, this); }
+            Stmt.CreateTable(s) => {
+                executeCreateTable(s, sql, this)?;
+                return Ok(emptyResult());
+            }
+            Stmt.CreateIndex(s) => {
+                executeCreateIndex(s, sql, this)?;
+                return Ok(emptyResult());
+            }
+            Stmt.CreateView(s) => {
+                executeCreateView(s, sql, this)?;
+                return Ok(emptyResult());
+            }
+            Stmt.Drop(s) => {
+                executeDrop(s, this)?;
+                return Ok(emptyResult());
+            }
             Stmt.Select(select) => {
                 var compiler = Compiler.create();
                 let plan = compileSelect(mut compiler, select, this)?;
