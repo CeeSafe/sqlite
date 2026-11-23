@@ -85,14 +85,16 @@ run code in a sandbox. The specification is embedded in `ceesafec`, so its answe
   what it prints (`askSqlite`). Files the engine writes must pass `PRAGMA integrity_check` in the shell.
 - README.md's "Status" lists what is ported and what is next; keep it current.
 - New CeeSafe gaps or bugs go in CEESAFE_FINDINGS.md.
-- The executor (`Engine/Exec` in the C#, not ported yet) keeps the C# design unless the user decides otherwise: a
-  table is loaded into memory when it is first changed, unchanged tables are read from the file through cursors,
-  and a commit applies the changes to the file. Notes for that port, from the storage work:
+- The executor writes changes to the pages of the transaction's WritablePager instead of loading tables into memory
+  as the C# did, and queries stream rows from cursors (README.md says why). Notes for the rest of the port:
+  - tests are differential: `sameAnswers` (queries), `sameScript` (one sqlite3 process a statement) and
+    `sameSession` (one sqlite3 process for a whole script, for transactions) compare answers and errors;
+  - functions not yet ported (date/time, printf, JSON, transcendental math) report "no such function";
   - a column with REAL affinity may hold an integer in a record SQLite wrote (it stores `3.0` as `3`): convert on
     read;
   - a VIRTUAL generated column has no place in a record, so record positions and column positions differ;
   - a WITHOUT ROWID table's record holds the primary key's columns first (`buildWithoutRowidTable`);
   - automatic indexes have no SQL in `sqlite_schema`; `TableSchema.keys` lists them in `sqlite_autoindex_T_n` order;
   - the catalog does not yet give `IndexSchema`s for automatic indexes: add that with the planner;
-  - `OVER w` is a name in the tree: resolve it against `SelectCore.windows` when the query runs;
+  - window functions compile (`WindowSpec`) but do not run yet; `OVER w` is resolved by name at compile time;
   - result column names should come from the statement's own text, as in SQLite, not from `SqlWriter`.
