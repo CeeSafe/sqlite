@@ -37,7 +37,9 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | PRAGMAs, pragma_* table functions | `Exec/QueryExecutor` (`ExecutePragma`) | `pragma.cee`, `integrity.cee` | schema pragmas, header fields, integrity_check and quick_check done |
 | Connection, transactions | `SqliteConnection`, `EngineGlue` | `session.cee` | done: statements commit on their own outside BEGIN, and a failed statement undoes only itself inside it |
 | WAL | `Storage/Wal*`, `Shm*` | | until then a database with a non-empty `-wal` file is refused |
-| Connection, command, pool | `SqliteConnection`, `SqliteCommand`, `SqliteConnectionPool` | | |
+| Connection, command, transaction | `SqliteConnection`, `SqliteCommand`, `SqliteTransaction`, `EngineGlue` | `api.cee`, `params.cee` | done: `Connection` with `execute`, `query`, `scalar`, `executeScript`, `begin`/`commit`/`rollback` and `transaction(work)`; `Params` bound by SQLite's rules; results materialised (see below) |
+| Connection pool | `SqliteConnectionPool`, `SharedStore` | `pool.cee` | done: shareable across threads (`Arc<ConnectionPool>`), transactions serialised, connections rolled back on return; no `:memory:` |
+| Scripts | `SqliteScript` | `script.cee` | done: `splitScript`/`splitStatements` end statements where sqlite3_complete does |
 | PostgreSQL wire front end, daemon, CLI | `CosmoNova.Engine.Sqlite.PgWire`, `CosmoSqliteD`, `.Cli` | | not started |
 
 ## Differences from the C# engine
@@ -323,8 +325,96 @@ would take Apple's algorithms, which are not published. The tests use arguments 
 - **DROP COLUMN** follows SQLite: the definition leaves the statement with its own constraints, a PRIMARY KEY or
   UNIQUE column or the last column is refused, a CHECK, generated column or index still naming it is "error in
   table/index X after drop column", and every row loses the value (`dropColumnLikeSqlite`).
+- **Parameters are numbered as SQLite numbers them** (`parametersAreNumberedAsSqliteNumbersThem`,
+  `parameterValuesBindAsSqliteBindsThem`). The parser numbers each parameter where it is written, as
+  sqlite3ExprAssignVarNumber does: `?` takes the largest number so far plus one, `?NNN` is NNN (1 to 32766), and a
+  name keeps the number it first got. The C# bound parameters by walking parts of the tree: a `?` after `?2` took
+  value 1 instead of 3, a named parameter had no number (so `?1` could not refer to `:a`), and parameters in CTEs
+  or RETURNING were not found. Before this change the port numbered them as the compiler met them, so in
+  `SELECT :a FROM t WHERE x < :b` the WHERE clause took the first value, and in `UPDATE … FROM` two compilers
+  numbered from 1 each.
+- **Binding.** `:a`, `@a` and `$a` are three parameters, and `:a` and `:A` two, as in SQLite; the C# looked names up
+  ignoring case and with their prefix stripped, so binding `:a` also bound `@a` and `$A`. A name given without a
+  prefix binds every prefix of it (`Params.bind("a", v)`), as Microsoft.Data.Sqlite does. A parameter given no
+  value is NULL, as in SQLite; the C# threw "missing value for parameter" or an index exception. A value no
+  statement has a place for is an error, as sqlite3_bind_* gives SQLITE_RANGE.
+- **Scripts** end their statements where SQLite does: by sqlite3_complete's machine over tokens, so a trigger body
+  ends at `; END ;` and not at a CASE's `END;`, a comment before CREATE TRIGGER does not hide it, and statements of
+  comments alone are dropped. The C# split by regular expressions and got all three wrong
+  (`scriptsSplitWhereSqliteEndsStatements`). A script stops at its first error, and the statements before it keep
+  their effect, as with sqlite3_exec (`aScriptStopsAtItsFirstError`).
+- **Closing inside a transaction rolls back.** The C# flushed its shared in-memory database to the file when the
+  last connection to it closed, whether or not a transaction was open, so `BEGIN; INSERT …; Close()` committed the
+  insert; its `SqliteTransaction` did nothing when disposed without `Commit`. Here `close()`, dropping a
+  connection, and `transaction(work)` when `work` fails all roll back (`closingInsideATransactionRollsBack`,
+  `transactionsCommitOrRollBack`).
+- **Connections kept apart.** The C# connections to one file shared one in-memory database: statements were
+  serialised, transactions were not, so a connection saw another's uncommitted rows, and a pooled connection given
+  back inside a transaction went to the next caller with the transaction open. For `:memory:` the pool handed
+  every caller the same connection at once. Here a pool's connections share a gate that a transaction holds from
+  start to end, a connection given back inside a transaction is rolled back first, and a connection reads the file
+  afresh when another committed since its last transaction, by the header's change counter
+  (`poolConnectionsComeBackRolledBack`, `threadsShareAPool`, `connectionsSeeEachOthersCommits`).
+- **Busy.** Since a pool's transaction holds the gate, another connection waiting for it waits at most the busy
+  timeout (`PRAGMA busy_timeout`, `setBusyTimeout`; 5000 ms in a pool, 0 for a lone connection, as in SQLite) and
+  then fails with `SqliteError.Busy`, "database is locked", as SQLite does; so does a checkout when every
+  connection is out. A thread that holds one transaction and asks a second connection for the file gets the error
+  rather than a deadlock.
+- **`:memory:` is refused**, with `file:` URIs and the empty name, rather than made into a file of that name: this
+  engine keeps databases in files only.
+
 - **Index cells take at least 4 bytes**, as SQLite counts them: a WITHOUT ROWID table of small keys made 3-byte
   cells, which sqlite3 calls out of range (`tinyIndexCellsTakeFourBytes`).
+
+## The API
+
+`api.cee`, `params.cee`, `script.cee` and `pool.cee` are the public surface, in place of the C#'s ADO.NET classes:
+
+```
+var connection = Connection.open("app.db")?;               // makes an empty database if there is none
+connection.executeScript("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)")?;
+var params = Params.create();
+params.bind(":name", SqliteValue.text("ada")?)?;           // or add(v) for ?, set(n, v) for ?n
+let changed = connection.execute("INSERT INTO t(name) VALUES (:name)", borrow params)?;
+let none = Params.create();
+let rows = connection.query("SELECT id, name FROM t", borrow none)?;   // a QueryResult
+let n = connection.scalar("SELECT count(*) FROM t", borrow none)?;   // null when there is no row
+let id = connection.transaction<i64>(work)?;              // commits when work returns Ok, else rolls back
+connection.close()?;                                       // rolls back a transaction left open
+
+let pool = Arc<ConnectionPool>.create(ConnectionPool.open("app.db", 4)?)?;
+var lease = pool.get().checkout()?;                        // goes back, rolled back if need be, when dropped
+lease.get().execute(…)?;
+```
+
+Choices where the C# concept does not fit CeeSafe:
+
+- **Errors** are `Result<T, SqliteError>`; `SqliteError.Busy` is new, for "database is locked".
+- **Lifetimes.** There is no IDisposable: a `Connection` closes when it is dropped (rolling back), and `close()`
+  says whether that rollback worked. A `PooledConnection` gives its connection back when dropped.
+  `transaction(work)` takes a function rather than handing out a transaction object, so a transaction cannot
+  outlive its scope or be forgotten open.
+- **No async methods.** The engine is in-process and synchronous; the C#'s async methods ran synchronously too.
+  Tasks can use a pool from a worker thread.
+- **Parameters** are a `Params` value passed with each call, not a command object's mutable collection, and there
+  is no `SqliteCommand`: a command was only text, parameters and a connection.
+- **Results are materialised.** `query` returns every row. The executor's SELECT (`runSelect`) builds its rows as
+  a vector, so a streaming reader here would only walk that vector; the C# reader did the same over its list.
+  Streaming needs the executor to yield rows, a larger change than this API.
+- **Several statements in one text.** `execute`, `query` and `scalar` run every statement of their text, binding
+  to each the parameters it has (Microsoft.Data.Sqlite's rule); `query`'s result is the last statement's, and
+  `execute` counts every INSERT, UPDATE and DELETE.
+- **The pool and threads.** CeeSafe checks `Send` and `Share`: a `ConnectionPool` is `Share`, so threads share it
+  through `Arc`, and a `Connection` is `Send`, so a checked-out one may move between threads but is used by one
+  at a time. The pool's connections pass one gate between them (a one-slot `Channel`), held for a whole
+  transaction: transactions of the pool run one at a time, and readers wait for a writer's transaction, which is
+  stricter than SQLite's shared locks but needs no file locks. Connections opened on their own each have their own
+  gate: two of them on one file in one process are not kept apart, any more than two processes are (CeeSafe has
+  no process-wide statics to share a gate through, and no file locks: CEESAFE_FINDINGS.md 3 and 24). Use one pool
+  per file. Settings a borrower changes with PRAGMA (foreign_keys, busy_timeout) stay with the connection for the
+  next borrower, as in other pools.
+- **Configuration.** There is no connection string; a path is given. `:memory:`, the empty name and `file:` URIs
+  are refused.
 
 ## Known differences from SQLite in PRAGMA integrity_check
 
@@ -355,7 +445,8 @@ The report matches the `sqlite3` shell's row for row on the tests' damaged files
 in FROM, aliases on the target of INSERT, UPDATE and DELETE, and `ORDER BY` inside an aggregate's arguments.
 `ON CONFLICT` clauses on column and table constraints are read and not applied, and collations other than
 BINARY, NOCASE and RTRIM are refused.
-RETURNING's column names are written again from the expression's tree, not taken from the statement's text.
+RETURNING's column names are written again from the expression's tree, not taken from the statement's text (so a
+parameter there is named `?N`, where SQLite shows it as written).
 
 ## Limits
 

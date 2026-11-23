@@ -172,3 +172,29 @@ Workaround: `0..m + 1` (`src/libm.cee`).
 element of a vector into another container in order takes `while (v.length != 0) { w.push(v.remove(0))?; }`,
 which is quadratic, or a reversed `pop` loop and a second reversal. `integrity.cee` (`tablesInSqliteOrder`) does
 the former on short lists. A `for (t in move v)` or a `Vector.drain()` iterator would say what is meant.
+
+### 23. No timed wait for threads
+
+There is no blocking sleep outside async code (`Timer.sleep` is async), no `Channel.recv` with a timeout, and no
+condition variable. A connection waiting for another's transaction to end (SQLite's busy timeout), and a pool
+checkout waiting for a free connection, must give up after a time, so neither can use the blocking `recv()`.
+
+Workaround: `takeFrom` (`src/api.cee`) polls `tryRecv()` against `Timer.now()` until the deadline, which spins a
+core while it waits. A `recvTimeout(ms)` on `Channel`, or `Thread.sleep(ms)`, would do it without spinning.
+
+### 24. No process-wide mutable state
+
+The guide lists `Mutex<T>.constant(v)`, `OnceLock<T>.constant()` and `Vector<T>.empty()` for statics, but
+`ceesafec 0.94.4` has none of them (N0200: "has no function named 'constant'"), so a `static` cannot hold a
+registry. The C# kept one per process (`SharedStore`) so that every connection to a file found the same lock.
+
+Workaround: only connections of one `ConnectionPool` share a gate; connections opened on their own each have
+their own, and README.md says to use one pool per file.
+
+### 25. A generic type argument is not inferred from a function passed by name
+
+`connection.transaction(insertTwo)`, where `transaction<T: Send>` takes `work: borrow fn(borrow mut Connection) ->
+Result<T, SqliteError>` and `insertTwo` returns `Result<i64, SqliteError>`, is N0265 ("cannot infer 'T'"); it
+needs `transaction<i64>(insertTwo)`. Also `Pool` is a built-in name (N0201), like those of findings 10 and 18.
+
+Workaround: the type argument is written (`tests/api_tests.cee`).

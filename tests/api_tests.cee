@@ -1,0 +1,467 @@
+// The public API: connections, parameters, scripts, transactions and the pool. Answers are compared with the
+// sqlite3 shell's where it can give them (parameters with `.parameter set`, scripts read from standard input).
+
+/// What `connection` answers for `sql` with `params`, as the shell prints it, or "error: " and the message.
+fn answerOf(connection: borrow mut Connection, sql: StringView, params: borrow Params) -> String {
+    match (connection.query(sql, params)) {
+        Ok(result) => { return listText(borrow result); }
+        Err(e) => {
+            var text = String.from("error: ")!;
+            text.append(e.message())!;
+            text.append("\n")!;
+            return text;
+        }
+    }
+}
+
+/// A binding for the differential parameter tests: the shell's `.parameter set KEY VALUE`, where the key is a
+/// parameter's name, or `?N` for parameter N when the statement gives it no name of its own.
+struct Binding {
+    key: String;
+    literal: String;
+}
+
+fn binding(key: StringView, literal: StringView) -> Binding =>
+    Binding { key: String.from(key)!, literal: String.from(literal)! };
+
+/// The values the shell binds for `sql`: by name, as shell.c's bind_prepared_stmt does it.
+fn paramsFor(connection: borrow mut Connection, sql: StringView, bindings: Slice<Binding>) -> Params {
+    var params = Params.create();
+    let parameters = match (statementParameters(sql)) {
+        Ok(p) => p,
+        Err(_) => { return params; }
+    };
+    for (i in 0..bindings.length) {
+        if (parameters.indexOf(bindings[i].key.view()).isNull()) {
+            if (!bindings[i].key.view().startsWith("?")) {
+                continue;
+            }
+            // `?N` binds a parameter written `?` that has no name.
+            let n = bindings[i].key.view()[1..].parseInt<usize>()!;
+            var named = false;
+            for (p in 0..parameters.names.length) {
+                if (parameters.names[p].number == n) {
+                    named = true;
+                }
+            }
+            if (named || n > parameters.count) {
+                continue;
+            }
+            var select = String.from("SELECT ")!;
+            select.append(bindings[i].literal.view())!;
+            let none = Params.create();
+            let value = connection.scalar(select.view(), borrow none)!!;
+            params.set(n, value)!;
+            continue;
+        }
+        var select = String.from("SELECT ")!;
+        select.append(bindings[i].literal.view())!;
+        let none = Params.create();
+        let value = connection.scalar(select.view(), borrow none)!!;
+        params.bind(bindings[i].key.view(), value)!;
+    }
+    return params;
+}
+
+/// Runs `setup` and then each line of `script` with `bindings`, in one sqlite3 process and through one connection,
+/// each on its own file; compares what both print and their errors.
+fn sameWithParameters(
+    name: StringView,
+    setup: StringView,
+    bindings: Slice<Binding>,
+    script: StringView,
+) -> Result<void, TestFailure> {
+    var ourPath = String.from("out/api-ours-")!;
+    ourPath.append(name)!;
+    ourPath.append(".db")!;
+    var theirPath = String.from("out/api-theirs-")!;
+    theirPath.append(name)!;
+    theirPath.append(".db")!;
+    freshPath(ourPath.view());
+    freshPath(theirPath.view());
+    makeDatabase(theirPath.view(), setup)?;
+    var input = String.from(".parameter init\n")!;
+    for (i in 0..bindings.length) {
+        input.append(".parameter set ")!;
+        input.append(bindings[i].key.view())!;
+        input.append(" ")!;
+        input.append(bindings[i].literal.view())!;
+        input.append("\n")!;
+    }
+    var statements = Vector<StringView>.create();
+    var lines = script.split("\n");
+    while (lines.next() is Some(line)) {
+        let sql = line.trim();
+        if (sql.length != 0) {
+            statements.push(sql)!;
+            input.append(sql)!;
+            input.append(";\n")!;
+        }
+    }
+    var arguments = Vector<StringView>.create();
+    arguments.push(theirPath.view())!;
+    let output = Process.capture("sqlite3", borrow arguments, input.view().bytes())!;
+    let theirs = textFromBytesLossy(output.stdout.view())!;
+    let errors = textFromBytesLossy(output.stderr.view())!;
+    var errorLines = errors.view().split("\n");
+    var theirErrors = String.create();
+    while (errorLines.next() is Some(e)) {
+        if (e.splitOnce(": ") is Some(halves)) {
+            theirErrors.append("error: ")!;
+            theirErrors.append(halves.right)!;
+            theirErrors.append("\n")!;
+        }
+    }
+    var connection = Connection.open(ourPath.view())!;
+    connection.executeScript(setup)!;
+    var mine = String.create();
+    var myErrors = String.create();
+    for (i in 0..statements.length) {
+        let params = paramsFor(mut connection, statements[i], bindings);
+        let answer = answerOf(mut connection, statements[i], borrow params);
+        if (answer.view().startsWith("error: ")) {
+            myErrors.append(answer.view())!;
+        } else {
+            mine.append(answer.view())!;
+        }
+    }
+    Check.equalText(theirs.view(), mine.view())?;
+    Check.equalText(theirErrors.view(), myErrors.view())?;
+    return Ok();
+}
+
+const PARAM_SETUP: StringView = """
+    CREATE TABLE t(x, y);
+    INSERT INTO t VALUES (1, 2), (2, 3), (3, 4);
+    CREATE TABLE u(k);
+    INSERT INTO u VALUES (2), (3);
+    """;
+
+@test
+fn parametersAreNumberedAsSqliteNumbersThem() -> Result<void, TestFailure> {
+    var bindings = Vector<Binding>.create();
+    bindings.push(binding("?1", "10"))!;
+    bindings.push(binding("?2", "20"))!;
+    bindings.push(binding("?3", "30"))!;
+    bindings.push(binding("?4", "40"))!;
+    bindings.push(binding(":a", "'colon a'"))!;
+    bindings.push(binding("@a", "'at a'"))!;
+    bindings.push(binding(":b", "3"))!;
+    bindings.push(binding(":c", "1"))!;
+    bindings.push(binding(":d", "2"))!;
+    return sameWithParameters("numbering", PARAM_SETUP, bindings.view(), """
+        SELECT ?, ?, ?3, ?
+        SELECT ?2, ?, ?
+        SELECT :a, @a, $a, :a, :A
+        SELECT :b, ?1, :a, ?
+        SELECT :a, x FROM t WHERE x < :b ORDER BY :c
+        SELECT :a, x FROM t WHERE x < :b GROUP BY x HAVING :c LIMIT :d
+        SELECT :a, k FROM t JOIN u ON u.k = :b WHERE :c
+        WITH c AS (SELECT :b AS v) SELECT v, :c, (SELECT count(*) FROM t WHERE x < :d) FROM c
+        SELECT x FROM t WHERE x IN (SELECT k FROM u WHERE k <> :d) AND y > :c
+        INSERT INTO t VALUES (:b, :c) RETURNING x, y, :d
+        UPDATE t SET y = :d WHERE x = :b RETURNING x, y, :c
+        UPDATE t SET y = :b FROM u WHERE u.k = t.x AND u.k = :d RETURNING x, y
+        DELETE FROM t WHERE x = :c RETURNING :b
+        SELECT * FROM t ORDER BY x, y
+        """);
+}
+
+@test
+fn parameterValuesBindAsSqliteBindsThem() -> Result<void, TestFailure> {
+    let path = "out/api-binding.db";
+    freshPath(path);
+    var connection = Connection.open(path)!;
+    // By number, by name, and nothing for :c, which is NULL.
+    var params = Params.create();
+    params.add(SqliteValue.Integer(1))!;
+    params.bind(":b", SqliteValue.text("two")!)!;
+    let row = connection.query("SELECT ?, :b, :c, typeof(:c)", borrow params)!;
+    Check.equalText("1|two||null\n", listText(borrow row).view())?;
+    // A name used twice is one parameter; ?2 names the second.
+    var twice = Params.create();
+    twice.bind(":x", SqliteValue.Integer(5))!;
+    twice.set(2, SqliteValue.Integer(7))!;
+    let both = connection.query("SELECT :x + :x, ?2, :y", borrow twice)!;
+    Check.equalText("10|7|\n", listText(borrow both).view())?;
+    // A name without its prefix binds every prefix; with one, that prefix only.
+    var bare = Params.create();
+    bare.bind("n", SqliteValue.Integer(3))!;
+    let all = connection.query("SELECT :n, @n, $n", borrow bare)!;
+    Check.equalText("3|3|3\n", listText(borrow all).view())?;
+    var exact = Params.create();
+    exact.bind("@n", SqliteValue.Integer(4))!;
+    let one = connection.query("SELECT :n, @n, $n", borrow exact)!;
+    Check.equalText("|4|\n", listText(borrow one).view())?;
+    // A value with no place in the statement is an error, as sqlite3_bind is.
+    var extra = Params.create();
+    extra.bind(":nope", SqliteValue.Integer(1))!;
+    Check.isTrue(connection.query("SELECT :yes", borrow extra).isErr(), "api_tests.cee line 198")?;
+    var far = Params.create();
+    far.set(3, SqliteValue.Integer(1))!;
+    Check.isTrue(connection.query("SELECT ?, ?", borrow far).isErr(), "api_tests.cee line 201")?;
+    // SQLite's limits: ?1 to ?32766 (SQLITE_MAX_VARIABLE_NUMBER's default; the macOS shell is built with 500000).
+    let none = Params.create();
+    Check.equalText(
+        "error: variable number must be between ?1 and ?32766\n",
+        answerOf(mut connection, "SELECT ?0", borrow none).view(),
+    )?;
+    Check.equalText(
+        "error: variable number must be between ?1 and ?32766\n",
+        answerOf(mut connection, "SELECT ?32767", borrow none).view(),
+    )?;
+    Check.equalText("\n", answerOf(mut connection, "SELECT ?32766", borrow none).view())?;
+    // Params.of numbers from 1.
+    var values = Vector<SqliteValue>.create();
+    values.push(SqliteValue.Integer(8))!;
+    values.push(SqliteValue.Integer(9))!;
+    let positional = Params.of(values.view())!;
+    let pair = connection.query("SELECT ?2, ?1", borrow positional)!;
+    Check.equalText("9|8\n", listText(borrow pair).view())?;
+    return Ok();
+}
+
+@test
+fn executeScalarAndCounts() -> Result<void, TestFailure> {
+    let path = "out/api-execute.db";
+    freshPath(path);
+    var connection = Connection.open(path)!;
+    let none = Params.create();
+    Check.isTrue(connection.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)", borrow none)! == 0, "api_tests.cee line 218")?;
+    var params = Params.create();
+    params.add(SqliteValue.text("a")!)!;
+    // Every statement of the text runs; the count is their DML's.
+    let changed = connection.execute("INSERT INTO t(v) VALUES (?1); INSERT INTO t(v) VALUES (?1), (?1);", borrow params)!;
+    Check.isTrue(changed == 3, "api_tests.cee line 223")?;
+    Check.isTrue(connection.lastInsertRowid() == 3, "api_tests.cee line 224")?;
+    Check.isTrue(connection.totalChanges() == 3, "api_tests.cee line 225")?;
+    Check.isTrue(connection.execute("SELECT * FROM t", borrow none)! == 0, "api_tests.cee line 226")?;
+    Check.isTrue(connection.execute("UPDATE t SET v = 'b' WHERE id > 1", borrow none)! == 2, "api_tests.cee line 227")?;
+    // scalar: null for no row, Null for a NULL.
+    Check.isTrue(connection.scalar("SELECT v FROM t WHERE id = 99", borrow none)!.isNull(), "api_tests.cee line 229")?;
+    let nothing = connection.scalar("SELECT NULL", borrow none)!;
+    Check.isTrue(nothing is Some(SqliteValue.Null), "api_tests.cee line 231")?;
+    let count = connection.scalar("SELECT count(*) FROM t", borrow none)!;
+    Check.isTrue(count is Some(SqliteValue.Integer(3)), "api_tests.cee line 233")?;
+    // A query's result is its last statement's.
+    let last = connection.query("SELECT 1; SELECT 2 AS two", borrow none)!;
+    Check.equalText("two", last.columns[0].view())?;
+    Check.isTrue(Connection.open(":memory:").isErr(), "api_tests.cee line 237")?;
+    connection.close()!;
+    return expectIntact(path);
+}
+
+@test
+fn scriptsSplitWhereSqliteEndsStatements() -> Result<void, TestFailure> {
+    // Semicolons in strings, quoted names and comments; a trigger with a comment before it and a CASE … END;
+    // in its body; empty statements and a statement of comments alone.
+    let script = """
+        CREATE TABLE t(a, b); -- a comment; with a semicolon
+        /* a block; comment */ INSERT INTO t VALUES ('x;y', 1);
+        INSERT INTO t VALUES ('it''s; fine', 2);
+        CREATE TABLE [we;ird]("c;d", `e;f`);
+        /* the trigger */ CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+          INSERT INTO [we;ird] VALUES (new.a, 'after; insert');
+          UPDATE t SET b = CASE WHEN new.b > 5 THEN new.b * 10 ELSE new.b END;
+        END;
+        ;;
+        -- a comment alone;
+        INSERT INTO t VALUES ('end', 7);
+        CREATE TABLE "x;" (end)
+        """;
+    let pieces = splitStatements(script)!;
+    Check.isTrue(pieces.length == 7, "api_tests.cee line 261")?;
+    Check.isTrue(pieces[0].view() == "CREATE TABLE t(a, b)", "api_tests.cee line 262")?;
+    Check.isTrue(pieces[4].view().startsWith("CREATE TRIGGER tr"), "api_tests.cee line 263")?;
+    Check.isTrue(pieces[4].view().endsWith("END"), "api_tests.cee line 264")?;
+    Check.isTrue(pieces[6].view() == "CREATE TABLE \"x;\" (end)", "api_tests.cee line 265")?;
+
+    let ourPath = "out/api-script-ours.db";
+    let theirPath = "out/api-script-theirs.db";
+    freshPath(ourPath);
+    makeDatabase(theirPath, script)?;
+    var connection = Connection.open(ourPath)!;
+    connection.executeScript(script)!;
+    connection.close()!;
+    expectIntact(ourPath)?;
+    let check = """
+        SELECT * FROM t ORDER BY rowid;
+        SELECT * FROM "we;ird" ORDER BY rowid;
+        SELECT type, name, sql FROM sqlite_schema ORDER BY name;
+        """;
+    let mine = askSqlite(ourPath, check)?;
+    let theirs = askSqlite(theirPath, check)?;
+    return Check.equalText(theirs.view(), mine.view());
+}
+
+@test
+fn aScriptStopsAtItsFirstError() -> Result<void, TestFailure> {
+    let path = "out/api-script-error.db";
+    freshPath(path);
+    var connection = Connection.open(path)!;
+    let failed = connection.executeScript("""
+        CREATE TABLE t(v UNIQUE);
+        INSERT INTO t VALUES (1);
+        INSERT INTO t VALUES (1);
+        INSERT INTO t VALUES (2);
+        """);
+    Check.isTrue(failed.isErr(), "api_tests.cee line 296")?;
+    let none = Params.create();
+    let count = connection.scalar("SELECT count(*) FROM t", borrow none)!;
+    Check.isTrue(count is Some(SqliteValue.Integer(1)), "api_tests.cee line 299")?;
+    Check.isTrue(!connection.inTransaction(), "api_tests.cee line 300")?;
+    return Ok();
+}
+
+fn insertTwo(c: borrow mut Connection) -> Result<i64, SqliteError> {
+    let none = Params.create();
+    let n = c.execute("INSERT INTO t VALUES (1), (2)", borrow none)?;
+    return Ok(n);
+}
+
+fn insertThenFail(c: borrow mut Connection) -> Result<i64, SqliteError> {
+    let none = Params.create();
+    let _ = c.execute("INSERT INTO t VALUES (3)", borrow none)?;
+    let _ = c.execute("INSERT INTO nosuch VALUES (4)", borrow none)?;
+    return Ok(0);
+}
+
+@test
+fn transactionsCommitOrRollBack() -> Result<void, TestFailure> {
+    let path = "out/api-transactions.db";
+    freshPath(path);
+    var connection = Connection.open(path)!;
+    connection.executeScript("CREATE TABLE t(v)")!;
+    let inserted = connection.transaction<i64>(insertTwo)!;
+    Check.isTrue(inserted == 2, "api_tests.cee line 324")?;
+    Check.isTrue(connection.transaction<i64>(insertThenFail).isErr(), "api_tests.cee line 325")?;
+    Check.isTrue(!connection.inTransaction(), "api_tests.cee line 326")?;
+    Check.equalText("2\n", askSqlite(path, "SELECT count(*) FROM t")?.view())?;
+    // A failed statement inside BEGIN undoes itself only, and the transaction stays open.
+    connection.begin()!;
+    connection.executeScript("INSERT INTO t VALUES (5)")!;
+    Check.isTrue(connection.executeScript("INSERT INTO nosuch VALUES (6)").isErr(), "api_tests.cee line 331")?;
+    Check.isTrue(connection.inTransaction(), "api_tests.cee line 332")?;
+    connection.commit()!;
+    Check.equalText("3\n", askSqlite(path, "SELECT count(*) FROM t")?.view())?;
+    // COMMIT without BEGIN is SQLite's error.
+    Check.isTrue(connection.commit().isErr(), "api_tests.cee line 336")?;
+    return expectIntact(path);
+}
+
+@test
+fn closingInsideATransactionRollsBack() -> Result<void, TestFailure> {
+    let path = "out/api-close.db";
+    freshPath(path);
+    {
+        var connection = Connection.open(path)!;
+        connection.executeScript("CREATE TABLE t(v); INSERT INTO t VALUES (1)")!;
+        connection.begin()!;
+        connection.executeScript("INSERT INTO t VALUES (2); DELETE FROM t WHERE v = 1")!;
+        connection.close()!;
+    }
+    Check.equalText("1\n", askSqlite(path, "SELECT group_concat(v) FROM t")?.view())?;
+    {
+        var dropped = Connection.open(path)!;
+        dropped.begin()!;
+        dropped.executeScript("INSERT INTO t VALUES (3)")!;
+    }
+    Check.equalText("1\n", askSqlite(path, "SELECT group_concat(v) FROM t")?.view())?;
+    return expectIntact(path);
+}
+
+@test
+fn connectionsSeeEachOthersCommits() -> Result<void, TestFailure> {
+    let path = "out/api-two-connections.db";
+    freshPath(path);
+    var first = Connection.open(path)!;
+    var second = Connection.open(path)!;
+    let none = Params.create();
+    first.executeScript("CREATE TABLE t(v); INSERT INTO t VALUES (1)")!;
+    // The second read the file before the table existed; it reads it afresh at its next transaction.
+    let count = second.scalar("SELECT count(*) FROM t", borrow none)!;
+    Check.isTrue(count is Some(SqliteValue.Integer(1)), "api_tests.cee line 371")?;
+    second.executeScript("INSERT INTO t VALUES (2)")!;
+    let sum = first.scalar("SELECT sum(v) FROM t", borrow none)!;
+    Check.isTrue(sum is Some(SqliteValue.Integer(3)), "api_tests.cee line 374")?;
+    return expectIntact(path);
+}
+
+@test
+fn poolConnectionsComeBackRolledBack() -> Result<void, TestFailure> {
+    let path = "out/api-pool.db";
+    freshPath(path);
+    var pool = ConnectionPool.open(path, 2)!;
+    pool.setBusyTimeout(0);
+    let none = Params.create();
+    {
+        var c = pool.checkout()!;
+        c.get().executeScript("CREATE TABLE t(v)")!;
+    }
+    {
+        // Given back inside a transaction: rolled back before the next checkout.
+        var c = pool.checkout()!;
+        c.get().begin()!;
+        c.get().executeScript("INSERT INTO t VALUES (1)")!;
+    }
+    Check.isTrue(pool.openConnections() == 1, "api_tests.cee line 395")?;
+    {
+        var c = pool.checkout()!;
+        Check.isTrue(!c.get().inTransaction(), "api_tests.cee line 398")?;
+        let count = c.get().scalar("SELECT count(*) FROM t", borrow none)!;
+        Check.isTrue(count is Some(SqliteValue.Integer(0)), "api_tests.cee line 400")?;
+    }
+    // Two out at once: the second cannot use the file while the first's transaction is open, and sees its rows
+    // once it commits.
+    var a = pool.checkout()!;
+    var b = pool.checkout()!;
+    Check.isTrue(pool.openConnections() == 2, "api_tests.cee line 406")?;
+    a.get().begin()!;
+    a.get().executeScript("INSERT INTO t VALUES (2)")!;
+    let blocked = b.get().query("SELECT count(*) FROM t", borrow none);
+    Check.isTrue(blocked is Err(SqliteError.Busy(_)), "api_tests.cee line 410")?;
+    // A full pool does not wait past its timeout.
+    Check.isTrue(pool.checkout() is Err(SqliteError.Busy(_)), "api_tests.cee line 412")?;
+    a.get().commit()!;
+    let seen = b.get().scalar("SELECT count(*) FROM t", borrow none)!;
+    Check.isTrue(seen is Some(SqliteValue.Integer(1)), "api_tests.cee line 415")?;
+    return expectIntact(path);
+}
+
+@test
+fn threadsShareAPool() -> Result<void, TestFailure> {
+    let path = "out/api-pool-threads.db";
+    freshPath(path);
+    let pool = Arc<ConnectionPool>.create(ConnectionPool.open(path, 3)!)!;
+    {
+        var c = pool.get().checkout()!;
+        c.get().executeScript("CREATE TABLE t(worker, n)")!;
+    }
+    var threads = Vector<Thread<bool>>.create();
+    for (w in 0..4i64) {
+        let mine = pool.clone();
+        threads.push(Thread.spawn(move () => {
+            for (k in 0..25i64) {
+                var c = match (mine.get().checkout()) {
+                    Ok(c) => c,
+                    Err(_) => { return false; }
+                };
+                var params = Params.create();
+                if (params.add(SqliteValue.Integer(w)).isErr() || params.add(SqliteValue.Integer(k)).isErr()) {
+                    return false;
+                }
+                // Each insert in a transaction of its own, which reads before it writes.
+                let sql = "BEGIN; INSERT INTO t SELECT ?1, ?2 WHERE NOT EXISTS (SELECT 1 FROM t WHERE worker = ?1 AND n = ?2); COMMIT";
+                if (c.get().execute(sql, borrow params).isErr()) {
+                    return false;
+                }
+            }
+            return true;
+        })!)!;
+    }
+    for (i in 0..threads.length) {
+        Check.isTrue(threads.pop()!.join(), "api_tests.cee line 451")?;
+    }
+    Check.equalText("100|4\n", askSqlite(path, "SELECT count(*), count(DISTINCT worker) FROM t")?.view())?;
+    return expectIntact(path);
+}

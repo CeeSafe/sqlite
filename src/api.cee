@@ -1,0 +1,423 @@
+// The public API: a connection to a database file, statements with parameters, scripts and transactions.
+//
+// A port of the C# SqliteConnection, SqliteCommand and SqliteTransaction, in CeeSafe's terms:
+// - errors are `Result<T, SqliteError>`, not exceptions;
+// - a connection is a value: it closes when it is dropped, and `close()` reports what closing does (rolling back
+//   an open transaction). There is no IDisposable, and no async surface: the engine is in-process and synchronous,
+//   as the C# admitted when it ran its async methods synchronously;
+// - parameters are a `Params` value given with each call, rather than a command object's mutable collection;
+// - results are materialised: `query` returns every row (`QueryResult`). The executor's SELECT returns its rows
+//   as a vector, so a streaming reader would only pretend to stream; the C# reader was the same over a list.
+//
+// What the C# got wrong, fixed here (README.md, "Differences from the C# engine"): parameters follow SQLite's
+// binding rules; a transaction left open when a connection closes is rolled back, not written to the file; and
+// connections that share a file see each other's commits and never each other's uncommitted changes.
+
+/// A value for a parameter given by its number.
+struct NumberedValue {
+    number: usize;
+    value: SqliteValue;
+}
+
+/// A value for a parameter given by its name.
+struct NamedValue {
+    name: String;
+    value: SqliteValue;
+}
+
+/// Values for a statement's parameters, as SQLite binds them.
+///
+/// - `add(v)` gives the next number: the first `add` is parameter 1 (`?`, `?1`, or the first name written).
+/// - `set(n, v)` gives parameter number `n` (`?n`, or the name SQLite numbered `n`).
+/// - `bind(":a", v)` gives the parameter written `:a`; `:a`, `@a` and `$a` are different parameters, as in SQLite,
+///   and names are compared exactly. A name without a prefix, `bind("a", v)`, gives `:a`, `@a` and `$a`.
+/// - A parameter given no value is NULL. A value no statement of the text has a place for is an error.
+public struct Params {
+    numbered: Vector<NumberedValue>;
+    named: Vector<NamedValue>;
+    nextNumber: usize;
+
+    /// No values.
+    public fn create() -> Params =>
+        Params { numbered: Vector<NumberedValue>.create(), named: Vector<NamedValue>.create(), nextNumber: 1 };
+
+    /// The values in `values`, numbered from 1.
+    public fn of(values: Slice<SqliteValue>) -> Result<Params, AllocError> {
+        var p = Params.create();
+        for (i in 0..values.length) {
+            p.add(values[i].clone()?)?;
+        }
+        return Ok(p);
+    }
+
+    /// Gives the next parameter number `value`.
+    public fn add(borrow mut this, value: SqliteValue) -> Result<void, AllocError> {
+        let n = this.nextNumber;
+        return this.set(n, value);
+    }
+
+    /// Gives parameter number `number` (from 1) `value`; later `add`s go on from `number + 1`.
+    public fn set(borrow mut this, number: usize, value: SqliteValue) -> Result<void, AllocError> {
+        this.numbered.push(NumberedValue { number: number, value: value })?;
+        this.nextNumber = number + 1;
+        return Ok();
+    }
+
+    /// Gives the parameter called `name` `value`.
+    public fn bind(borrow mut this, name: StringView, value: SqliteValue) -> Result<void, AllocError> {
+        this.named.push(NamedValue { name: String.from(name)?, value: value })?;
+        return Ok();
+    }
+
+    /// Whether no value is given.
+    public fn isEmpty(borrow this) -> bool => this.numbered.length == 0 && this.named.length == 0;
+
+    /// The values of the parameters of a statement numbered as `parameters` says, NULL where none is given.
+    fn valuesFor(borrow this, parameters: borrow StatementParameters) -> Result<Vector<SqliteValue>, SqliteError> {
+        var values = Vector<SqliteValue>.create();
+        for (i in 0..parameters.count) {
+            values.push(SqliteValue.Null)?;
+        }
+        for (i in 0..this.numbered.length) {
+            let n = this.numbered[i].number;
+            if (n >= 1 && n <= parameters.count) {
+                values[n - 1] = this.numbered[i].value.clone()?;
+            }
+        }
+        for (i in 0..this.named.length) {
+            let name = this.named[i].name.view();
+            if (hasParameterPrefix(name)) {
+                if (parameters.indexOf(name) is Some(n)) {
+                    values[n - 1] = this.named[i].value.clone()?;
+                }
+            } else {
+                for (p in 0..parameters.names.length) {
+                    let written = parameters.names[p].name.view();
+                    if (written[0] != '?' && written[1..] == name) {
+                        values[parameters.names[p].number - 1] = this.named[i].value.clone()?;
+                    }
+                }
+            }
+        }
+        return Ok(values);
+    }
+
+    /// An error for the first value that none of `statements` has a place for.
+    fn checkUsed(borrow this, statements: borrow Vector<StatementParameters>) -> Result<void, SqliteError> {
+        for (i in 0..this.numbered.length) {
+            let n = this.numbered[i].number;
+            var used = false;
+            for (s in 0..statements.length) {
+                if (n >= 1 && n <= statements[s].count) {
+                    used = true;
+                }
+            }
+            if (!used) {
+                var message = String.from("column index out of range: there is no parameter ")?;
+                message.appendNumber(n)?;
+                return Err(SqliteError.Sql(message));
+            }
+        }
+        for (i in 0..this.named.length) {
+            let name = this.named[i].name.view();
+            var used = false;
+            for (s in 0..statements.length) {
+                let parameters = borrow statements[s];
+                for (p in 0..parameters.names.length) {
+                    let written = parameters.names[p].name.view();
+                    if (written == name || (!hasParameterPrefix(name) && written[0] != '?' && written[1..] == name)) {
+                        used = true;
+                    }
+                }
+            }
+            if (!used) {
+                var message = String.from("no such parameter: ")?;
+                message.append(name)?;
+                return Err(SqliteError.Sql(message));
+            }
+        }
+        return Ok();
+    }
+}
+
+fn hasParameterPrefix(name: StringView) -> bool =>
+    name.length != 0 && (name[0] == ':' || name[0] == '@' || name[0] == '$' || name[0] == '?');
+
+/// Takes a value from `channel`, waiting up to `milliseconds` for one. CeeSafe has no timed wait on a channel, nor
+/// a sleep outside async code (CEESAFE_FINDINGS.md, finding 23), so the wait polls.
+fn takeFrom<T: Send>(channel: borrow Channel<T>, milliseconds: i64) -> T? {
+    var value = channel.tryRecv();
+    if (value.isNull() && milliseconds > 0) {
+        let deadline = Timer.now() + (checkedTruncate<u64>(milliseconds) ?? 0);
+        while (value.isNull() && Timer.now() < deadline) {
+            value = channel.tryRecv();
+        }
+    }
+    return value;
+}
+
+fn takeGate(gate: borrow Channel<GateToken>, milliseconds: i64) -> GateToken? => takeFrom(gate, milliseconds);
+
+/// The right to use a database file, which the connections that share it pass between them (see `Connection`).
+struct GateToken {}
+
+/// A connection to a database file.
+///
+/// Outside BEGIN … COMMIT each statement is a transaction of its own; inside, a failed statement undoes only
+/// itself, as in SQLite. A connection that is closed or dropped with a transaction open rolls it back.
+///
+/// Connections made by one `ConnectionPool` share a gate: a connection takes it when a transaction starts (the
+/// first statement outside a transaction, or BEGIN) and gives it back when the transaction ends, so the pool's
+/// transactions run one at a time and none sees another's uncommitted changes. A connection that cannot take the
+/// gate waits up to its busy timeout (`PRAGMA busy_timeout`, `setBusyTimeout`) and then fails with
+/// `SqliteError.Busy`, "database is locked". When it takes the gate it checks the file's change counter, and if
+/// another connection committed since its last transaction it reads the file afresh.
+///
+/// A connection opened on its own has a gate of its own. Two such connections on one file, or another process
+/// writing the file, are not kept apart: this engine takes no file locks (CEESAFE_FINDINGS.md, finding 3). They
+/// still see each other's commits from their next transaction, by the change counter.
+public struct Connection {
+    session: Session;
+    /// A read-only handle on the file, for its change counter.
+    header: File;
+    gate: Channel<GateToken>;
+    /// The gate, while this connection has a transaction open.
+    token: GateToken?;
+    /// The file's change counter when this connection last ended a transaction.
+    seenCounter: u32;
+
+    drop {
+        // The session's uncommitted pages go with it; the gate goes back for the others.
+        if (replace(mut this.token, null) is Some(token)) {
+            let _ = this.gate.trySend(token);
+        }
+    }
+
+    /// Opens the database file at `path`, making an empty database if there is none. `:memory:` and the empty
+    /// name (SQLite's in-memory and temporary databases) are refused: this engine keeps databases in files only.
+    public fn open(path: StringView) -> Result<Connection, SqliteError> {
+        let gate = Channel<GateToken>.create(1)?;
+        let _ = gate.trySend(GateToken {});
+        return Connection.openWithGate(path, gate, 0);
+    }
+
+    /// Opens a connection that takes the gate `gate` for its transactions, waiting up to `waitMilliseconds` for
+    /// it to open the file.
+    fn openWithGate(
+        path: StringView,
+        gate: Channel<GateToken>,
+        waitMilliseconds: i64,
+    ) -> Result<Connection, SqliteError> {
+        if (path.length == 0 || path == ":memory:" || path.startsWith("file:")) {
+            return Err(unsupported("in-memory, temporary and URI databases are not supported; give a file's path"));
+        }
+        // Making the file is a change to it: it is done holding the gate.
+        let token = takeGate(borrow gate, waitMilliseconds) ?? {
+            return Err(SqliteError.Busy(String.from("database is locked")?));
+        };
+        var connection = Connection {
+            session: match (Session.open(path)) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = gate.trySend(token);
+                    return Err(e);
+                }
+            },
+            header: match (File.open(path)) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = gate.trySend(token);
+                    return Err(SqliteError.Io(e));
+                }
+            },
+            gate: gate,
+            token: token,
+            seenCounter: 0,
+        };
+        connection.endTransaction()?;
+        return Ok(connection);
+    }
+
+    /// Closes the connection, rolling back a transaction it left open.
+    public fn close(this) -> Result<void, SqliteError> {
+        var me = this;
+        if (me.session.inTransaction) {
+            let _ = me.runOne("ROLLBACK", Vector<SqliteValue>.create().view())?;
+        }
+        return Ok();
+    }
+
+    /// Runs the statements of `sql` in order, each with the values of `params` it has places for, and returns
+    /// how many rows their INSERTs, UPDATEs and DELETEs changed. It stops at the first that fails; those before
+    /// it keep their effect (inside BEGIN, until the transaction ends).
+    public fn execute(borrow mut this, sql: StringView, params: borrow Params) -> Result<i64, SqliteError> {
+        var changed: i64 = 0;
+        let _ = this.runAll(sql, params, mut changed)?;
+        return Ok(changed);
+    }
+
+    /// Runs the statements of `sql` as `execute` does, and returns the last one's columns and rows.
+    public fn query(borrow mut this, sql: StringView, params: borrow Params) -> Result<QueryResult, SqliteError> {
+        var changed: i64 = 0;
+        return this.runAll(sql, params, mut changed);
+    }
+
+    /// The first column of the first row of `query`'s result: null when there is no row, and `SqliteValue.Null`
+    /// when there is one and its value is NULL.
+    public fn scalar(borrow mut this, sql: StringView, params: borrow Params) -> Result<SqliteValue?, SqliteError> {
+        var result = this.query(sql, params)?;
+        if (result.rows.length == 0 || result.rows[0].length == 0) {
+            return Ok(null);
+        }
+        return Ok(replace(mut result.rows[0][0], SqliteValue.Null));
+    }
+
+    /// Runs a script of statements without parameters, as sqlite3_exec does.
+    public fn executeScript(borrow mut this, sql: StringView) -> Result<void, SqliteError> {
+        let none = Params.create();
+        let _ = this.execute(sql, borrow none)?;
+        return Ok();
+    }
+
+    /// BEGIN, COMMIT and ROLLBACK.
+    public fn begin(borrow mut this) -> Result<void, SqliteError> => this.executeScript("BEGIN");
+
+    public fn commit(borrow mut this) -> Result<void, SqliteError> => this.executeScript("COMMIT");
+
+    public fn rollback(borrow mut this) -> Result<void, SqliteError> => this.executeScript("ROLLBACK");
+
+    /// Runs `work` in a transaction: it commits when `work` returns Ok, and rolls back when it returns an error
+    /// (or when the commit fails), giving that error.
+    public fn transaction<T: Send>(
+        borrow mut this,
+        work: borrow fn(borrow mut Connection) -> Result<T, SqliteError>,
+    ) -> Result<T, SqliteError> {
+        this.begin()?;
+        match (work(this)) {
+            Ok(value) => {
+                match (this.commit()) {
+                    Ok() => { return Ok(value); }
+                    Err(e) => {
+                        if (this.session.inTransaction) {
+                            let _ = this.rollback();
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            Err(e) => {
+                if (this.session.inTransaction) {
+                    let _ = this.rollback();
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    /// Whether a transaction is open (BEGIN without its COMMIT or ROLLBACK yet).
+    public fn inTransaction(borrow this) -> bool => this.session.inTransaction;
+
+    /// Rows changed by the last INSERT, UPDATE or DELETE, as sqlite3_changes counts them.
+    public fn changes(borrow this) -> i64 => this.session.changes;
+
+    /// Rows changed since the connection opened, as sqlite3_total_changes counts them.
+    public fn totalChanges(borrow this) -> i64 => this.session.totalChanges;
+
+    /// The rowid of the last row inserted, as sqlite3_last_insert_rowid gives it.
+    public fn lastInsertRowid(borrow this) -> i64 => this.session.lastInsertRowid;
+
+    /// How long, in milliseconds, to wait for another connection of the pool to end its transaction
+    /// (PRAGMA busy_timeout).
+    public fn setBusyTimeout(borrow mut this, milliseconds: i64) {
+        this.session.busyTimeout = milliseconds.max(0);
+    }
+
+    // ── running ──────────────────────────────────────────────────────────────────────────────────────────────
+
+    /// Runs each statement of `sql`, adding the rows DML changed to `changed`; the last statement's result.
+    fn runAll(
+        borrow mut this,
+        sql: StringView,
+        params: borrow Params,
+        changed: borrow mut i64,
+    ) -> Result<QueryResult, SqliteError> {
+        let spans = splitScript(sql)?;
+        var numbered = Vector<StatementParameters>.create();
+        if (!params.isEmpty()) {
+            for (i in 0..spans.length) {
+                // A statement that cannot be read has no parameters here; running it reports why.
+                let parameters = match (statementParameters(sql[spans[i].start..spans[i].end])) {
+                    Ok(p) => p,
+                    Err(_) => StatementParameters { count: 0, names: Vector<ParameterName>.create() },
+                };
+                numbered.push(parameters)?;
+            }
+            params.checkUsed(borrow numbered)?;
+        }
+        var last = QueryResult { columns: Vector<String>.create(), rows: Vector<Vector<SqliteValue>>.create() };
+        for (i in 0..spans.length) {
+            let text = sql[spans[i].start..spans[i].end];
+            let values = if (params.isEmpty()) Vector<SqliteValue>.create() else params.valuesFor(borrow numbered[i])?;
+            let total = this.session.totalChanges;
+            last = this.runOne(text, values.view())?;
+            if (this.session.totalChanges != total) {
+                changed += this.session.changes;
+            }
+        }
+        return Ok(last);
+    }
+
+    /// Runs one statement, holding the gate for as long as its transaction lasts.
+    fn runOne(borrow mut this, sql: StringView, values: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> {
+        this.startTransaction()?;
+        let result = this.session.query(sql, values);
+        this.endTransaction()?;
+        return result;
+    }
+
+    /// Takes the gate if this connection does not hold it, and reads the file afresh if it changed since.
+    fn startTransaction(borrow mut this) -> Result<void, SqliteError> {
+        if (this.token.isSome()) {
+            return Ok();
+        }
+        this.token = takeGate(borrow this.gate, this.session.busyTimeout) ?? {
+            return Err(SqliteError.Busy(String.from("database is locked")?));
+        };
+        if (this.changeCounter()? != this.seenCounter) {
+            match (this.session.reopen()) {
+                Ok() => {}
+                Err(e) => {
+                    this.giveBackGate();
+                    return Err(e);
+                }
+            }
+        }
+        return Ok();
+    }
+
+    /// Gives the gate back once no transaction is open, noting the change counter the file has then.
+    fn endTransaction(borrow mut this) -> Result<void, SqliteError> {
+        if (this.session.inTransaction || this.token.isNull()) {
+            return Ok();
+        }
+        let counter = this.changeCounter();
+        this.giveBackGate();
+        this.seenCounter = counter?;
+        return Ok();
+    }
+
+    fn giveBackGate(borrow mut this) {
+        if (replace(mut this.token, null) is Some(token)) {
+            let _ = this.gate.trySend(token);
+        }
+    }
+
+    /// The file change counter in the database header (offset 24), which every commit changes.
+    fn changeCounter(borrow mut this) -> Result<u32, SqliteError> {
+        var bytes = [0u8; 4];
+        if (!readFully(mut this.header, mut bytes[..], 24)?) {
+            return Ok(0);
+        }
+        return Ok(bytes[..].readBE<u32>(0));
+    }
+}
