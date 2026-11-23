@@ -345,8 +345,8 @@ public struct Session {
                 executeAnalyze(target, this)?;
                 return Ok(emptyResult());
             }
-            Stmt.Vacuum => {
-                executeVacuum(this)?;
+            Stmt.Vacuum(into) => {
+                executeVacuum(into, params, this)?;
                 return Ok(emptyResult());
             }
             Stmt.Reindex => {

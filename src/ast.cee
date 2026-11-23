@@ -536,7 +536,8 @@ enum Stmt {
     Release(String),
     Attach(Box<AttachStmt>),
     Detach(String),
-    Vacuum,
+    /// `VACUUM [schema] [INTO filename]`.
+    Vacuum(Expr?),
     /// `ANALYZE`, or `ANALYZE name`.
     Analyze(String?),
     Reindex,

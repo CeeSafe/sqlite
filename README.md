@@ -36,7 +36,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | ALTER TABLE | `Exec/QueryExecutor` (`ExecuteAlterTable`) | `alter.cee` | RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN done, with views and triggers following renames |
 | PRAGMAs, pragma_* table functions | `Exec/QueryExecutor` (`ExecutePragma`) | `pragma.cee`, `integrity.cee` | schema pragmas, header fields, integrity_check and quick_check done |
 | Connection, transactions | `SqliteConnection`, `EngineGlue` | `session.cee` | done: statements commit on their own outside BEGIN, and a failed statement undoes only itself inside it; SAVEPOINT, RELEASE, ROLLBACK TO; OR FAIL and OR ROLLBACK |
-| VACUUM, ANALYZE, REINDEX | (refused by the C#) | `vacuum.cee`, `analyze.cee` | done; VACUUM INTO next |
+| VACUUM, ANALYZE, REINDEX | (refused by the C#) | `vacuum.cee`, `analyze.cee` | done, with VACUUM INTO |
 | TEMP tables, ATTACH | (refused by the C#) | | not started: every part of the engine reads one database file |
 | WAL | `Storage/Wal*`, `Shm*` | `wal.cee`, `pagerw.cee`, `pragma.cee` | done: logs read (either checksum byte order) and written with SQLite's salts and checksums, damaged tails ignored as SQLite ignores them, `journal_mode` WAL and DELETE, `wal_checkpoint` (all four modes), `wal_autocheckpoint`, a checkpoint and removal of the log on `Session.close`; no `-shm` (see Limits) |
 | Connection, command, transaction | `SqliteConnection`, `SqliteCommand`, `SqliteTransaction`, `EngineGlue` | `api.cee`, `params.cee` | done: `Connection` with `execute`, `query`, `scalar`, `executeScript`, `begin`/`commit`/`rollback` and `transaction(work)`; `Params` bound by SQLite's rules; results materialised (see below) |
@@ -399,7 +399,9 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   statistics yet. The C# refused both.
 - **VACUUM** (`vacuumPacksTheFile`) builds every b-tree again into packed pages within one transaction, records
   as they are stored, header settings kept, freelist empty; the file comes out the size sqlite3's VACUUM gives.
-  Refused: VACUUM inside a transaction (as in SQLite), VACUUM INTO, UTF-16 databases and pages with reserved
+  VACUUM INTO writes the packed image to a new file
+  (`vacuumIntoWritesACopy`), refusing an existing file and a non-text name as SQLite does. Refused: VACUUM inside
+  a transaction (as in SQLite), UTF-16 databases and pages with reserved
   bytes. The C# refused VACUUM.
 - **OR FAIL and OR ROLLBACK** (`failAndRollbackActions`), from a statement, a constraint's ON CONFLICT or a
   trigger's RAISE: FAIL keeps the rows the statement changed before the failing one (indexes it left to rebuild

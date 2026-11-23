@@ -388,10 +388,14 @@ struct Parser {
             return Ok(Stmt.Detach(this.name()?));
         }
         if (this.acceptWord("VACUUM")) {
-            if (!this.atStatementEnd()) {
+            if (!this.atStatementEnd() && !this.isWord("INTO")) {
                 let _ = this.name()?;
             }
-            return Ok(Stmt.Vacuum);
+            var into: Expr? = null;
+            if (this.acceptWord("INTO")) {
+                into = this.expr()?;
+            }
+            return Ok(Stmt.Vacuum(into));
         }
         if (this.acceptWord("ANALYZE")) {
             if (this.atStatementEnd()) {

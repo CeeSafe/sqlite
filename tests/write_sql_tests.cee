@@ -780,3 +780,34 @@ fn failAndRollbackActions() -> Result<void, TestFailure> {
         PRAGMA integrity_check
         """);
 }
+
+@test
+fn vacuumIntoWritesACopy() -> Result<void, TestFailure> {
+    let copy = "out/vacuum-into-copy.db";
+    let _ = File.remove(copy);
+    let existing = "out/vacuum-into-existing.db";
+    let _ = File.create(existing)!;
+    sameScript("vacuum-into", """
+        PRAGMA user_version = 3
+        CREATE TABLE t(id INTEGER PRIMARY KEY, a, b TEXT)
+        CREATE INDEX t_a ON t(a)
+        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500) INSERT INTO t(a, b) SELECT i % 13, printf('%.*c', i * 7, 'y') FROM n
+        DELETE FROM t WHERE id % 3 = 0
+        VACUUM INTO NULL
+        VACUUM INTO 5
+        VACUUM INTO 'out/vacuum-into-existing.db'
+        SELECT count(*) FROM t
+        """)?;
+    // Ours writes a copy that sqlite3 reads, intact, with the same rows.
+    var session = Session.open("out/script-ours-vacuum-into.db")!;
+    let none = Vector<SqliteValue>.create();
+    let _ = session.query("VACUUM INTO 'out/vacuum-into-copy.db'", none.view())!;
+    Check.equalText("ok\n", askSqlite(copy, "PRAGMA integrity_check")?.view())?;
+    Check.equalText("334|3|0\n", askSqlite(copy, "SELECT count(*), (SELECT user_version FROM pragma_user_version), (SELECT freelist_count FROM pragma_freelist_count) FROM t")?.view())?;
+    Check.equalText(askSqlite("out/script-ours-vacuum-into.db", "SELECT sum(length(b)), sum(a) FROM t")?.view(), askSqlite(copy, "SELECT sum(length(b)), sum(a) FROM t")?.view())?;
+    match (session.query("VACUUM INTO 'out/vacuum-into-copy.db'", none.view())) {
+        Err(e) => { Check.equalText("output file already exists", e.message())?; }
+        Ok(_) => { return Check.fail("expected the existing file to be refused"); }
+    }
+    return Ok();
+}

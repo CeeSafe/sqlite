@@ -5,12 +5,28 @@
 // user_version, application_id, journal mode), the freelist is empty, and the schema cookie moves on. It all
 // happens in one transaction of the pager, so a failure leaves the file as it was.
 //
-// Refused: VACUUM inside a transaction (as in SQLite), VACUUM INTO, a UTF-16 database, and pages with reserved
-// bytes at their end.
+// VACUUM INTO writes the packed image to a new file instead, in rollback-journal mode, as SQLite does.
+//
+// Refused: VACUUM inside a transaction (as in SQLite), a UTF-16 database, and pages with reserved bytes at their
+// end.
 
-fn executeVacuum(db: borrow mut Session) -> Result<void, SqliteError> {
+fn executeVacuum(into: borrow Expr?, params: Slice<SqliteValue>, db: borrow mut Session) -> Result<void, SqliteError> {
     if (db.inTransaction) {
         return Err(sqlError("cannot VACUUM from within a transaction"));
+    }
+    // VACUUM INTO: the packed image goes to a new file, and this database stays as it is.
+    var target: String? = null;
+    if (into is Some(e)) {
+        var compiler = newCompiler(db)?;
+        let compiled = compiler.compile(e, db)?;
+        var frame = newFrame(mut compiler, params, db)?;
+        let SqliteValue.Text(name) = evaluate(borrow compiled, mut frame, db)? else {
+            return Err(sqlError("non-text filename"));
+        };
+        if (fileLength(name.view())?.isSome()) {
+            return Err(sqlError("output file already exists"));
+        }
+        target = name;
     }
     if (db.pager.textEncoding() != TextEncoding.Utf8) {
         return Err(unsupported("VACUUM of a UTF-16 database is not supported yet"));
@@ -64,6 +80,29 @@ fn executeVacuum(db: borrow mut Session) -> Result<void, SqliteError> {
     // The header as it was; the pager's commit writes the size, the freelist and the change counter.
     let header = db.pager.copy(1)?;
     store.page(1)[0..DATABASE_HEADER_SIZE].copyFrom(header.view()[0..DATABASE_HEADER_SIZE]);
+    if (target is Some(path)) {
+        // A file of its own: its size, an empty freelist, a rollback journal, and the header fields a commit
+        // would write.
+        let pageCount = store.count();
+        let first = store.page(1);
+        let counter = first.readBE<u32>(24).wrappingAdd(1);
+        first.writeBE(24, counter);
+        first.writeBE(28, pageCount);
+        first.writeBE(32, 0u32);
+        first.writeBE(36, 0u32);
+        first[18] = 1;
+        first[19] = 1;
+        let cookie = first.readBE<u32>(40).wrappingAdd(1);
+        first.writeBE(40, cookie);
+        first.writeBE(92, counter);
+        first.writeBE(96, WRITER_SQLITE_VERSION);
+        var file = File.create(path.view())?;
+        for (i in 0..store.pages.length) {
+            file.writeAt(store.pages[i].view(), (i as u64) * (pageSize as u64))?;
+        }
+        file.syncAll()?;
+        return Ok();
+    }
     db.pager.replaceAll(store.pages.view())?;
     db.pager.bumpSchemaCookie()?;
     return db.reloadSchema();
