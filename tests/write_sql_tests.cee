@@ -321,3 +321,34 @@ fn triggersFireAsInSqlite() -> Result<void, TestFailure> {
         SELECT count(*) FROM sqlite_schema WHERE type = 'trigger'
         """);
 }
+
+@test
+fn foreignKeysFollowSqlite() -> Result<void, TestFailure> {
+    return sameSession("fk", """
+        PRAGMA foreign_keys = ON
+        CREATE TABLE p(id INTEGER PRIMARY KEY, code TEXT UNIQUE)
+        CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) ON DELETE CASCADE ON UPDATE CASCADE, note TEXT)
+        CREATE TABLE s(id INTEGER PRIMARY KEY, pcode TEXT REFERENCES p(code) ON DELETE SET NULL)
+        CREATE TABLE r(id INTEGER PRIMARY KEY, pid INT DEFAULT 1 REFERENCES p ON DELETE SET DEFAULT)
+        CREATE TABLE x(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id))
+        INSERT INTO p VALUES (1, 'a'), (2, 'b'), (3, 'c')
+        INSERT INTO c VALUES (10, 1, 'one'), (11, 2, 'two'), (12, NULL, 'none')
+        INSERT INTO c VALUES (13, 9, 'bad')
+        INSERT INTO s VALUES (20, 'b'), (21, 'c')
+        INSERT INTO r VALUES (30, 3)
+        INSERT INTO x VALUES (40, 2)
+        DELETE FROM p WHERE id = 2
+        UPDATE p SET id = 5 WHERE id = 1
+        SELECT * FROM c ORDER BY id
+        DELETE FROM p WHERE id = 3
+        SELECT * FROM s ORDER BY id
+        SELECT * FROM r ORDER BY id
+        UPDATE x SET pid = 7
+        DELETE FROM x
+        DELETE FROM p WHERE id = 2
+        SELECT * FROM p ORDER BY id
+        PRAGMA foreign_keys = OFF
+        INSERT INTO c VALUES (14, 99, 'unchecked')
+        SELECT count(*) FROM c
+        """);
+}

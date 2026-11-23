@@ -947,6 +947,9 @@ fn executeInsert(
             continue;
         }
         writer.writeRow(mut frame, db)?;
+        if (db.foreignKeys && table.foreignKeys.length != 0) {
+            checkChildRow(table, borrow frame.slots[writer.slot], db)?;
+        }
         if (table.autoincrement) {
             db.updateSequence(table.name.view(), rowId)?;
         }
@@ -1108,6 +1111,11 @@ fn executeDelete(
         let deleted: Slot? = if (writer.triggers.length != 0) copySlot(borrow frame.slots[writer.slot])? else null;
         writer.deleteRow(rowids[i], mut frame, db)?;
         count += 1;
+        if (db.foreignKeys) {
+            let gone = copySlot(borrow frame.slots[writer.slot])?;
+            let noNew: Slot? = null;
+            parentChanged(borrow writer.table, borrow gone, borrow noNew, db)?;
+        }
         if (writer.triggers.length != 0) {
             let noRow: Slot? = null;
             let _ = fireTriggers(
@@ -1224,6 +1232,7 @@ fn updateLoadedRow(
         return Ok(false);
     }
     // Out with the old row's entries (and the row, when its rowid changes), then in with the new.
+    let oldBeforeWrite: Slot? = if (db.foreignKeys) copySlot(borrow oldSlot)? else null;
     let newSlot = replace(mut frame.slots[writer.slot], oldSlot);
     if (newRowid != oldRowid) {
         writer.deleteRow(oldRowid, frame, db)?;
@@ -1239,6 +1248,15 @@ fn updateLoadedRow(
     }
     frame.slots[writer.slot] = newSlot;
     writer.writeRow(frame, db)?;
+    if (db.foreignKeys) {
+        if (table.foreignKeys.length != 0) {
+            checkChildRow(table, borrow frame.slots[writer.slot], db)?;
+        }
+        let newRow: Slot? = copySlot(borrow frame.slots[writer.slot])?;
+        if (borrow oldBeforeWrite is Some(old)) {
+            parentChanged(table, old, borrow newRow, db)?;
+        }
+    }
     if (writer.triggers.length != 0) {
         let updated: Slot? = copySlot(borrow frame.slots[writer.slot])?;
         let _ = fireTriggers(

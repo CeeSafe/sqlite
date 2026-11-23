@@ -1,0 +1,201 @@
+// Foreign keys, enforced while PRAGMA foreign_keys is on.
+//
+// A child row's key must match a row of the parent (NULL in any of its columns matches nothing and needs
+// nothing). Changing or deleting a parent row applies each referencing key's action: CASCADE, SET NULL and SET
+// DEFAULT change the children; RESTRICT and NO ACTION refuse while children remain. The actions run as SQL
+// statements, so the children's triggers fire, as in SQLite.
+//
+// Differences from SQLite: deferred keys (DEFERRABLE INITIALLY DEFERRED, defer_foreign_keys) are checked at once
+// rather than at COMMIT, and NO ACTION is checked after each row rather than at the end of the statement.
+
+fn fkError() -> SqliteError => SqliteError.Constraint(ownedMessage("FOREIGN KEY constraint failed"));
+
+/// The parent's columns a key refers to: those named, or the parent's primary key.
+fn parentColumns(key: borrow ForeignKeySchema, parent: borrow TableSchema) -> Result<Vector<String>, SqliteError> {
+    if (key.refColumns.length != 0) {
+        return Ok(cloneStrings(borrow key.refColumns)?);
+    }
+    var out = Vector<String>.create();
+    for (k in 0..parent.primaryKey.length) {
+        out.push(parent.primaryKey[k].name.clone()?)?;
+    }
+    if (out.length == 0 && parent.rowidAlias is Some(alias)) {
+        out.push(parent.columns[alias].name.clone()?)?;
+    }
+    if (out.length != key.columns.length) {
+        var message = String.from("foreign key mismatch - \"")?;
+        message.append(key.refTable.view())?;
+        message.append("\" referencing a table")?;
+        return Err(SqliteError.Sql(message));
+    }
+    return Ok(out);
+}
+
+/// `a = ?n AND b = ?m …` over `columns`, numbering the parameters from `first`.
+fn keyCondition(out: borrow mut String, columns: Slice<String>, first: usize) -> Result<void, AllocError> {
+    for (i in 0..columns.length) {
+        if (i != 0) {
+            out.append(" AND ")?;
+        }
+        out.append(sqlName(columns[i].view())?.view())?;
+        out.append(" = ?")?;
+        out.appendNumber(first + i)?;
+    }
+    return Ok();
+}
+
+/// The values of the named columns in a row of `table`; `null` when one is NULL.
+fn keyValues(
+    table: borrow TableSchema,
+    row: borrow Slot,
+    columns: Slice<String>,
+) -> Result<Vector<SqliteValue>?, SqliteError> {
+    var values = Vector<SqliteValue>.withCapacity(columns.length)?;
+    for (i in 0..columns.length) {
+        let at = table.indexOf(columns[i].view()) ?? {
+            return Err(namedError("no such column: ", columns[i].view()));
+        };
+        let v = if (table.rowidAlias == Some(at)) SqliteValue.Integer(row.rowId) else row.values[at].clone()?;
+        if (v.isNull()) {
+            return Ok(null);
+        }
+        values.push(v)?;
+    }
+    return Ok(values);
+}
+
+/// Checks that each key of the child row in `row` has its parent.
+fn checkChildRow(table: borrow TableSchema, row: borrow Slot, db: borrow mut Session) -> Result<void, SqliteError> {
+    for (k in 0..table.foreignKeys.length) {
+        let key = borrow table.foreignKeys[k];
+        let Some(values) = keyValues(table, row, key.columns.view())? else {
+            continue;
+        };
+        let parent = db.catalog.tableCopy(key.refTable.view()).ok() ?? {
+            return Err(fkError());
+        };
+        let columns = parentColumns(key, borrow parent)?;
+        var sql = String.from("SELECT 1 FROM ")?;
+        sql.append(quotedName(parent.name.view())?.view())?;
+        sql.append(" WHERE ")?;
+        keyCondition(mut sql, columns.view(), 1)?;
+        sql.append(" LIMIT 1")?;
+        let found = db.runInternal(sql.view(), values.view())?;
+        if (found.rows.length == 0) {
+            return Err(fkError());
+        }
+    }
+    return Ok();
+}
+
+/// A parent row changed (`newRow` present) or went away: each referencing key's action on its children.
+fn parentChanged(
+    table: borrow TableSchema,
+    oldRow: borrow Slot,
+    newRow: borrow Slot?,
+    db: borrow mut Session,
+) -> Result<void, SqliteError> {
+    // Every key, in every table, that refers to this one.
+    var tables = Vector<String>.create();
+    for (i in 0..db.catalog.tables.length) {
+        tables.push(db.catalog.tables[i].name.clone()?)?;
+    }
+    for (t in 0..tables.length) {
+        let child = db.catalog.tableCopy(tables[t].view())?;
+        for (k in 0..child.foreignKeys.length) {
+            let key = borrow child.foreignKeys[k];
+            if (!key.refTable.view().equalsIgnoreAsciiCase(table.name.view())) {
+                continue;
+            }
+            let columns = parentColumns(key, table)?;
+            let Some(oldValues) = keyValues(table, oldRow, columns.view())? else {
+                continue;
+            };
+            var action = key.onDelete;
+            if (newRow is Some(n)) {
+                // An update that leaves the key as it was concerns no child.
+                if (keyValues(table, n, columns.view())? is Some(newValues)) {
+                    var same = true;
+                    for (i in 0..newValues.length) {
+                        same = same && compareValues(borrow oldValues[i], borrow newValues[i], Collation.Binary) == 0;
+                    }
+                    if (same) {
+                        continue;
+                    }
+                }
+                action = key.onUpdate;
+            }
+            var condition = String.create();
+            keyCondition(mut condition, key.columns.view(), 1)?;
+            var params = cloneValues(oldValues.view())?;
+            let childName = quotedName(child.name.view())?;
+            var sql = String.create();
+            match (action) {
+                ForeignKeyAction.NoAction | ForeignKeyAction.Restrict => {
+                    sql.append("SELECT 1 FROM ")?;
+                    sql.append(childName.view())?;
+                    sql.append(" WHERE ")?;
+                    sql.append(condition.view())?;
+                    sql.append(" LIMIT 1")?;
+                    if (db.runInternal(sql.view(), params.view())?.rows.length != 0) {
+                        return Err(fkError());
+                    }
+                    continue;
+                }
+                ForeignKeyAction.Cascade => {
+                    if (newRow is Some(n)) {
+                        // The children take the new key.
+                        let Some(newValues) = keyValues(table, n, columns.view())? else {
+                            continue;
+                        };
+                        sql.append("UPDATE ")?;
+                        sql.append(childName.view())?;
+                        sql.append(" SET ")?;
+                        for (c in 0..key.columns.length) {
+                            if (c != 0) {
+                                sql.append(", ")?;
+                            }
+                            sql.append(sqlName(key.columns[c].view())?.view())?;
+                            sql.append(" = ?")?;
+                            sql.appendNumber(oldValues.length + c + 1)?;
+                        }
+                        for (i in 0..newValues.length) {
+                            params.push(newValues[i].clone()?)?;
+                        }
+                    } else {
+                        sql.append("DELETE FROM ")?;
+                        sql.append(childName.view())?;
+                    }
+                }
+                ForeignKeyAction.SetNull | ForeignKeyAction.SetDefault => {
+                    sql.append("UPDATE ")?;
+                    sql.append(childName.view())?;
+                    sql.append(" SET ")?;
+                    for (c in 0..key.columns.length) {
+                        if (c != 0) {
+                            sql.append(", ")?;
+                        }
+                        sql.append(sqlName(key.columns[c].view())?.view())?;
+                        var replacement: StringView = " = NULL";
+                        if (action == ForeignKeyAction.SetDefault) {
+                            replacement = " = NULL";
+                            if (child.indexOf(key.columns[c].view()) is Some(at)) {
+                                if (borrow child.columns[at].defaultValue is Some(d)) {
+                                    sql.append(" = (")?;
+                                    sql.append(d.text.view())?;
+                                    sql.append(")")?;
+                                    continue;
+                                }
+                            }
+                        }
+                        sql.append(replacement)?;
+                    }
+                }
+            }
+            sql.append(" WHERE ")?;
+            sql.append(condition.view())?;
+            let _ = db.runInternal(sql.view(), params.view())?;
+        }
+    }
+    return Ok();
+}
