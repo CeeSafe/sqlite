@@ -352,3 +352,24 @@ fn foreignKeysFollowSqlite() -> Result<void, TestFailure> {
         SELECT count(*) FROM c
         """);
 }
+
+@test
+fn updateFromJoinsLikeSqlite() -> Result<void, TestFailure> {
+    return sameScript("update-from", """
+        CREATE TABLE inv(id INTEGER PRIMARY KEY, item TEXT, qty INT)
+        CREATE TABLE sales(item TEXT, n INT)
+        CREATE TABLE price(item TEXT PRIMARY KEY, p REAL)
+        INSERT INTO inv(item, qty) VALUES ('a', 10), ('b', 20), ('c', 30)
+        INSERT INTO sales VALUES ('a', 3), ('b', 5)
+        INSERT INTO price VALUES ('a', 1.5), ('c', 2.0)
+        UPDATE inv SET qty = qty - sales.n FROM sales WHERE sales.item = inv.item
+        SELECT * FROM inv ORDER BY id
+        UPDATE inv SET qty = t.total FROM (SELECT item, sum(n) * 100 AS total FROM sales GROUP BY item) AS t WHERE t.item = inv.item AND t.total > 400 RETURNING id, qty
+        UPDATE inv SET qty = qty + 1 FROM sales JOIN price USING (item) WHERE inv.item = sales.item
+        SELECT * FROM inv ORDER BY id
+        UPDATE inv SET qty = 0 FROM sales WHERE nosuch.item = inv.item
+        UPDATE inv SET nope = 0 FROM sales
+        WITH s AS (SELECT 'c' AS item) UPDATE inv SET qty = -1 FROM s WHERE s.item = inv.item
+        SELECT * FROM inv ORDER BY id
+        """);
+}

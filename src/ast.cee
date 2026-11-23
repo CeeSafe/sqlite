@@ -750,45 +750,51 @@ fn cloneFromItem(item: borrow FromItem) -> Result<FromItem, AllocError> => match
 };
 
 /// A deep copy of a SELECT.
-fn cloneSelect(s: borrow SelectStmt) -> Result<SelectStmt, AllocError> {
-    var with: WithClause? = null;
-    if (borrow s.with is Some(w)) {
-        var ctes = Vector<CommonTableExpr>.withCapacity(w.ctes.length)?;
-        for (i in 0..w.ctes.length) {
-            ctes.push(
-                CommonTableExpr {
-                    name: w.ctes[i].name.clone()?,
-                    columns: cloneStrings(borrow w.ctes[i].columns)?,
-                    select: cloneSelect(borrow w.ctes[i].select)?,
-                },
-            )?;
-        }
-        with = WithClause { recursive: w.recursive, ctes: ctes };
+fn cloneWith(with: borrow WithClause?) -> Result<WithClause?, AllocError> {
+    let Some(w) = with else {
+        return Ok(null);
+    };
+    var ctes = Vector<CommonTableExpr>.withCapacity(w.ctes.length)?;
+    for (i in 0..w.ctes.length) {
+        ctes.push(
+            CommonTableExpr {
+                name: w.ctes[i].name.clone()?,
+                columns: cloneStrings(borrow w.ctes[i].columns)?,
+                select: cloneSelect(borrow w.ctes[i].select)?,
+            },
+        )?;
     }
+    return Ok(WithClause { recursive: w.recursive, ctes: ctes });
+}
+
+fn cloneJoin(join: borrow Join) -> Result<Join, AllocError> {
+    let constraint = match (borrow join.constraint) {
+        JoinConstraint.None => JoinConstraint.None,
+        JoinConstraint.On(e) => JoinConstraint.On(cloneExpr(e)?),
+        JoinConstraint.Using(names) => JoinConstraint.Using(cloneStrings(names)?),
+    };
+    return Ok(
+        Join { kind: join.kind, natural: join.natural, item: cloneFromItem(borrow join.item)?, constraint: constraint },
+    );
+}
+
+fn cloneFromClause(from: borrow FromClause?) -> Result<FromClause?, AllocError> {
+    let Some(f) = from else {
+        return Ok(null);
+    };
+    var joins = Vector<Join>.withCapacity(f.joins.length)?;
+    for (j in 0..f.joins.length) {
+        joins.push(cloneJoin(borrow f.joins[j])?)?;
+    }
+    return Ok(FromClause { source: cloneFromItem(borrow f.source)?, joins: joins });
+}
+
+fn cloneSelect(s: borrow SelectStmt) -> Result<SelectStmt, AllocError> {
+    let with = cloneWith(borrow s.with)?;
     var cores = Vector<SelectCore>.withCapacity(s.cores.length)?;
     for (i in 0..s.cores.length) {
         let c = borrow s.cores[i];
-        var from: FromClause? = null;
-        if (borrow c.from is Some(f)) {
-            var joins = Vector<Join>.withCapacity(f.joins.length)?;
-            for (j in 0..f.joins.length) {
-                let join = borrow f.joins[j];
-                let constraint = match (borrow join.constraint) {
-                    JoinConstraint.None => JoinConstraint.None,
-                    JoinConstraint.On(e) => JoinConstraint.On(cloneExpr(e)?),
-                    JoinConstraint.Using(names) => JoinConstraint.Using(cloneStrings(names)?),
-                };
-                joins.push(
-                    Join {
-                        kind: join.kind,
-                        natural: join.natural,
-                        item: cloneFromItem(borrow join.item)?,
-                        constraint: constraint,
-                    },
-                )?;
-            }
-            from = FromClause { source: cloneFromItem(borrow f.source)?, joins: joins };
-        }
+        let from = cloneFromClause(borrow c.from)?;
         var windows = Vector<NamedWindow>.withCapacity(c.windows.length)?;
         for (k in 0..c.windows.length) {
             windows.push(NamedWindow { name: c.windows[k].name.clone()?, spec: cloneOver(borrow c.windows[k].spec)? })?;

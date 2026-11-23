@@ -26,7 +26,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Scalar functions, aggregates | `Exec/Functions`, `LikeMatcher` | `functions.cee`, `aggregate.cee` | core functions done; printf, JSON and transcendental math next |
 | Date and time functions | `Exec/Functions` (date/time part) | `datetime.cee` | done: a port of SQLite's date.c; 'localtime' and 'utc' are an error where they need the time zone, which CeeSafe lacks |
 | SELECT: joins, subqueries, views, CTEs, grouping, compounds | `Exec/QueryExecutor` | `select.cee`, `run.cee` | done but RIGHT/FULL joins, window functions, table functions, index seeks (rowid seeks done) |
-| INSERT, UPDATE, DELETE | `Exec/QueryExecutor` (DML), `InMemoryDatabase` | `dml.cee` | done for rowid tables: constraints, conflict actions, RETURNING, AUTOINCREMENT, upserts, triggers, foreign keys; UPDATE … FROM next |
+| INSERT, UPDATE, DELETE | `Exec/QueryExecutor` (DML), `InMemoryDatabase` | `dml.cee` | done for rowid tables: constraints, conflict actions, RETURNING, AUTOINCREMENT, upserts, triggers, foreign keys, UPDATE … FROM; WITHOUT ROWID tables next |
 | CREATE and DROP of tables, indexes and views | `Exec/QueryExecutor` (DDL) | `ddl.cee` | done |
 | Triggers | `Exec/QueryExecutor` (`FireTriggers`) | `triggers.cee` | BEFORE and AFTER on tables done; INSTEAD OF on views next |
 | ALTER TABLE | `Exec/QueryExecutor` (`ExecuteAlterTable`) | `alter.cee` | RENAME TO, RENAME COLUMN, ADD COLUMN done; DROP COLUMN and renames that views or triggers refer to next |

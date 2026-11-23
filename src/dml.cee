@@ -1143,6 +1143,24 @@ struct Assignments {
     values: Vector<XExpr>;
 }
 
+/// The column `name` of a SET: its position, or the column count for the rowid itself.
+fn assignmentTarget(name: StringView, table: borrow TableSchema) -> Result<usize, SqliteError> {
+    var at = table.indexOf(name);
+    if (at.isNull() && isRowidName(name)) {
+        at = table.rowidAlias ?? table.columns.length;
+    }
+    let found = at ?? {
+        return Err(namedError("no such column: ", name));
+    };
+    if (found < table.columns.length && table.columns[found].generated.isSome()) {
+        var message = String.from("cannot UPDATE generated column \"")?;
+        message.append(name)?;
+        message.append("\"")?;
+        return Err(SqliteError.Sql(message));
+    }
+    return Ok(found);
+}
+
 /// Compiles SET column = value, …, each value in the scope the compiler has.
 fn compileAssignments(
     compiler: borrow mut Compiler,
@@ -1152,21 +1170,7 @@ fn compileAssignments(
 ) -> Result<Assignments, SqliteError> {
     var out = Assignments { targets: Vector<usize>.create(), values: Vector<XExpr>.create() };
     for (a in 0..list.length) {
-        let name = list[a].column.view();
-        var at = table.indexOf(name);
-        if (at.isNull() && isRowidName(name)) {
-            at = table.rowidAlias ?? table.columns.length;
-        }
-        let found = at ?? {
-            return Err(namedError("no such column: ", name));
-        };
-        if (found < table.columns.length && table.columns[found].generated.isSome()) {
-            var message = String.from("cannot UPDATE generated column \"")?;
-            message.append(name)?;
-            message.append("\"")?;
-            return Err(SqliteError.Sql(message));
-        }
-        out.targets.push(found)?;
+        out.targets.push(assignmentTarget(list[a].column.view(), table)?)?;
         out.values.push(compiler.compile(borrow list[a].value, db)?)?;
     }
     return Ok(out);
@@ -1181,16 +1185,30 @@ fn updateLoadedRow(
     frame: borrow mut Frame,
     db: borrow mut Session,
 ) -> Result<bool, SqliteError> {
-    let table = borrow writer.table;
-    let oldRowid = frame.slots[writer.slot].rowId;
     var newValues = Vector<SqliteValue>.withCapacity(set.values.length)?;
     for (a in 0..set.values.length) {
         newValues.push(evaluate(borrow set.values[a], frame, db)?)?;
     }
+    return applyUpdate(writer, set.targets.view(), newValues, action, frame, db);
+}
+
+/// Gives the row loaded in the writer's slot `newValues` in the columns `targets`, with the constraints, conflicts,
+/// triggers and index entries that go with it. False when the row was skipped.
+fn applyUpdate(
+    writer: borrow TableWriter,
+    targets: Slice<usize>,
+    values: Vector<SqliteValue>,
+    action: ConflictAction,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<bool, SqliteError> {
+    var newValues = values;
+    let table = borrow writer.table;
+    let oldRowid = frame.slots[writer.slot].rowId;
     let oldSlot = copySlot(borrow frame.slots[writer.slot])?;
     var newRowid = oldRowid;
-    for (a in 0..set.targets.length) {
-        let at = set.targets[a];
+    for (a in 0..targets.length) {
+        let at = targets[a];
         let v = replace(mut newValues[a], SqliteValue.Null);
         if (at == table.columns.length || table.rowidAlias == Some(at)) {
             match (applyColumnAffinity(v, Affinity.Integer)?) {
@@ -1216,7 +1234,7 @@ fn updateLoadedRow(
             TriggerTiming.Before,
             borrow oldForTriggers,
             borrow proposed,
-            set.targets.view(),
+            targets,
             db,
         )?) {
             frame.slots[writer.slot] = oldSlot;
@@ -1266,7 +1284,7 @@ fn updateLoadedRow(
             TriggerTiming.After,
             borrow oldForTriggers,
             borrow updated,
-            set.targets.view(),
+            targets,
             db,
         )?;
     }
@@ -1292,7 +1310,7 @@ fn executeUpdate(
     db: borrow mut Session,
 ) -> Result<QueryResult, SqliteError> {
     if (stmt.from.isSome()) {
-        return Err(unsupported("UPDATE … FROM is not supported yet"));
+        return executeUpdateFrom(stmt, params, db);
     }
     var compiler = newCompiler(db)?;
     let writer = TableWriter.create(mut compiler, stmt.table.name.view(), db)?;
@@ -1446,4 +1464,98 @@ fn compileUpserts(
 struct ConflictFound {
     index: usize?;
     rowId: i64;
+}
+
+/// UPDATE … FROM: the target joined with the FROM items, as SQLite does it. A SELECT of the target's rowid and the
+/// new values runs first; then each target row it names takes the values of the first row that names it.
+fn executeUpdateFrom(
+    stmt: borrow UpdateStmt,
+    params: Slice<SqliteValue>,
+    db: borrow mut Session,
+) -> Result<QueryResult, SqliteError> {
+    var compiler = newCompiler(db)?;
+    let writer = TableWriter.create(mut compiler, stmt.table.name.view(), db)?;
+    var targets = Vector<usize>.withCapacity(stmt.assignments.length)?;
+    for (a in 0..stmt.assignments.length) {
+        targets.push(assignmentTarget(stmt.assignments[a].column.view(), borrow writer.table)?)?;
+    }
+    // SELECT t.rowid, value, … FROM t, <from> WHERE <filter>
+    var columns = Vector<ResultColumn>.withCapacity(stmt.assignments.length + 1)?;
+    let rowid = Expr.Column(
+        ColumnRef { schema: null, table: stmt.table.name.clone()?, name: String.from("rowid")?, doubleQuoted: false },
+    );
+    columns.push(ResultColumn.Expr(rowid, null))?;
+    for (a in 0..stmt.assignments.length) {
+        columns.push(ResultColumn.Expr(cloneExpr(borrow stmt.assignments[a].value)?, null))?;
+    }
+    let Some(from) = cloneFromClause(borrow stmt.from)? else {
+        return Err(sqlError("UPDATE … FROM without a FROM clause"));
+    };
+    var joins = Vector<Join>.withCapacity(from.joins.length + 1)?;
+    joins.push(Join { kind: JoinKind.Comma, natural: false, item: from.source, constraint: JoinConstraint.None })?;
+    for (j in 0..from.joins.length) {
+        joins.push(cloneJoin(borrow from.joins[j])?)?;
+    }
+    let target = FromItem.Table(
+        TableSource { name: cloneName(borrow stmt.table)?, alias: null, indexedBy: null, notIndexed: false },
+    );
+    var cores = Vector<SelectCore>.create();
+    cores.push(
+        SelectCore {
+            distinct: false,
+            columns: columns,
+            from: FromClause { source: target, joins: joins },
+            filter: cloneOptional(borrow stmt.filter)?,
+            groupBy: Vector<Expr>.create(),
+            having: null,
+            windows: Vector<NamedWindow>.create(),
+            isValues: false,
+        },
+    )?;
+    let select = SelectStmt {
+        with: cloneWith(borrow stmt.with)?,
+        cores: cores,
+        compoundOps: Vector<CompoundOp>.create(),
+        orderBy: Vector<OrderTerm>.create(),
+        limit: null,
+        offset: null,
+    };
+    var selectCompiler = newCompiler(db)?;
+    let plan = compileSelect(mut selectCompiler, borrow select, db)?;
+    var selectFrame = newFrame(mut selectCompiler, params, db)?;
+    var joined = runSelect(borrow plan, mut selectFrame, db)?;
+
+    let returning = compileReturning(mut compiler, borrow stmt.returning, borrow writer, db)?;
+    var frame = newFrame(mut compiler, params, db)?;
+    let action = stmt.conflict ?? ConflictAction.Abort;
+    var done = HashMap<i64, bool>.create();
+    var output = Vector<Vector<SqliteValue>>.create();
+    var count: i64 = 0;
+    for (r in 0..joined.length) {
+        let SqliteValue.Integer(rowId) = joined[r][0] else {
+            continue;
+        };
+        if (done.contains(rowId)) {
+            continue;
+        }
+        done.put(rowId, true)?;
+        if (!writer.loadRow(rowId, mut frame, db)?) {
+            continue;
+        }
+        var values = Vector<SqliteValue>.withCapacity(targets.length)?;
+        for (a in 0..targets.length) {
+            values.push(replace(mut joined[r][a + 1], SqliteValue.Null))?;
+        }
+        if (!applyUpdate(borrow writer, targets.view(), values, action, mut frame, db)?) {
+            continue;
+        }
+        count += 1;
+        if (returning.length != 0) {
+            output.push(returningRow(borrow returning, mut frame, db)?)?;
+        }
+    }
+    writer.finish(mut frame, db)?;
+    db.changes = count;
+    db.totalChanges += count;
+    return Ok(QueryResult { columns: returningNames(borrow stmt.returning, borrow writer.table)?, rows: output });
 }
