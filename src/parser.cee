@@ -675,10 +675,102 @@ struct Parser {
         }
     }
 
+    /// Whether the cursor is at `(` opening a parenthesized join rather than a subquery.
+    private fn atJoinGroup(borrow this) -> bool =>
+        this.isOp("(") && !(this.peekIsWord(1, "SELECT") || this.peekIsWord(1, "VALUES") || this.peekIsWord(1, "WITH"));
+
+    /// A parenthesized join, `(a JOIN b ON …)`.
+    private fn joinGroup(borrow mut this) -> Result<FromClause, SqliteError> {
+        this.enter()?;
+        this.expectOp("(")?;
+        let inner = this.fromClause();
+        this.nesting -= 1;
+        let group = inner?;
+        this.expectOp(")")?;
+        return Ok(group);
+    }
+
+    /// Adds a parenthesized join to `clause` as the join of `kind` and `constraint`. Inner joins associate, so a
+    /// group of inner joins joined by an inner join is the same as its joins in line, with the group's ON added to
+    /// its last join's.
+    private fn addJoinGroup(
+        clause: borrow mut FromClause,
+        group: FromClause,
+        kind: JoinKind,
+        natural: bool,
+        constraint: JoinConstraint,
+    ) -> Result<void, SqliteError> {
+        var inner = group;
+        if (inner.joins.length == 0) {
+            clause.joins.push(Join { kind: kind, natural: natural, item: inner.source, constraint: constraint })?;
+            return Ok();
+        }
+        var allInner = kind == JoinKind.Inner || kind == JoinKind.Comma || kind == JoinKind.Cross;
+        for (j in 0..inner.joins.length) {
+            let k = inner.joins[j].kind;
+            allInner = allInner && (k == JoinKind.Inner || k == JoinKind.Comma || k == JoinKind.Cross);
+        }
+        if (!allInner || natural || constraint is JoinConstraint.Using(_)) {
+            return Err(unsupported("a parenthesized join other than inner joins is not supported"));
+        }
+        clause.joins.push(Join { kind: kind, natural: false, item: inner.source, constraint: JoinConstraint.None })?;
+        let count = inner.joins.length;
+        for (j in 0..count) {
+            clause.joins.push(
+                replace(
+                    mut inner.joins[j],
+                    Join {
+                        kind: JoinKind.Comma,
+                        natural: false,
+                        item: FromItem.TableFunction(
+                            TableFunctionSource { name: String.create(), args: Vector<Expr>.create(), alias: null },
+                        ),
+                        constraint: JoinConstraint.None,
+                    },
+                ),
+            )?;
+        }
+        if (constraint is JoinConstraint.On(_)) {
+            let JoinConstraint.On(outer) = constraint else {
+                return Ok();
+            };
+            let last = clause.joins.length - 1;
+            let previous = replace(mut clause.joins[last].constraint, JoinConstraint.None);
+            clause.joins[last].constraint = match (previous) {
+                JoinConstraint.On(x) => JoinConstraint.On(
+                    Expr.Binary(BinaryOp.And, Box.create(x)?, Box.create(outer)?),
+                ),
+                JoinConstraint.None => JoinConstraint.On(outer),
+                JoinConstraint.Using(names) => {
+                    return Err(unsupported("a parenthesized join other than inner joins is not supported"));
+                },
+            };
+        }
+        return Ok();
+    }
+
     private fn fromClause(borrow mut this) -> Result<FromClause, SqliteError> {
-        var clause = FromClause { source: this.fromItem()?, joins: Vector<Join>.create() };
+        var clause = FromClause {
+            source: FromItem.TableFunction(
+                TableFunctionSource { name: String.create(), args: Vector<Expr>.create(), alias: null },
+            ),
+            joins: Vector<Join>.create(),
+        };
+        if (this.atJoinGroup()) {
+            // `(a JOIN b) …`: the group's joins come first.
+            let group = this.joinGroup()?;
+            clause.source = group.source;
+            clause.joins = group.joins;
+        } else {
+            clause.source = this.fromItem()?;
+        }
         loop {
             if (this.acceptOp(",")) {
+                if (this.atJoinGroup()) {
+                    let group = this.joinGroup()?;
+                    Parser.addJoinGroup(mut clause, group, JoinKind.Comma, false, JoinConstraint.None)?;
+                    continue;
+                }
                 clause.joins.push(
                     Join {
                         kind: JoinKind.Comma,
@@ -716,14 +808,24 @@ struct Parser {
                 }
                 return Ok(clause);
             }
-            let item = this.fromItem()?;
+            var group: FromClause? = null;
+            var item: FromItem? = null;
+            if (this.atJoinGroup()) {
+                group = this.joinGroup()?;
+            } else {
+                item = this.fromItem()?;
+            }
             var constraint = JoinConstraint.None;
             if (this.acceptWord("ON")) {
                 constraint = JoinConstraint.On(this.expr()?);
             } else if (this.acceptWord("USING")) {
                 constraint = JoinConstraint.Using(this.parenthesizedNames()?);
             }
-            clause.joins.push(Join { kind: kind, natural: natural, item: item, constraint: constraint })?;
+            if (group is Some(g)) {
+                Parser.addJoinGroup(mut clause, g, kind, natural, constraint)?;
+            } else if (item is Some(it)) {
+                clause.joins.push(Join { kind: kind, natural: natural, item: it, constraint: constraint })?;
+            }
         }
     }
 

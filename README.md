@@ -456,8 +456,9 @@ The report matches the `sqlite3` shell's row for row on the tests' damaged files
 
 ## Known gaps (inherited from the C# engine, refused by name rather than misparsed)
 
-`CREATE VIRTUAL TABLE`, `EXPLAIN`, parenthesized joins
-in FROM.
+`CREATE VIRTUAL TABLE`, `EXPLAIN`, and a parenthesized join
+that an outer join takes as a whole (`a LEFT JOIN (b JOIN c ON …) ON …`); a parenthesized group of inner joins is
+read as its joins in line (`parenthesizedJoinsMatchSqlite`).
 `ON CONFLICT` clauses on column and table constraints are read and not applied, and collations other than
 BINARY, NOCASE and RTRIM are refused.
 

@@ -525,3 +525,25 @@ fn returningColumnNamesMatchSqlite() -> Result<void, TestFailure> {
     }
     return Ok();
 }
+
+@test
+fn parenthesizedJoinsMatchSqlite() -> Result<void, TestFailure> {
+    let path = "out/query-join-groups.db";
+    makeDatabase(path, """
+        CREATE TABLE a(id INTEGER PRIMARY KEY, x);
+        CREATE TABLE b(id INTEGER PRIMARY KEY, aid, y);
+        CREATE TABLE c(id INTEGER PRIMARY KEY, bid, z);
+        INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3');
+        INSERT INTO b VALUES (1, 1, 'b1'), (2, 1, 'b2'), (3, 2, 'b3');
+        INSERT INTO c VALUES (1, 1, 'c1'), (2, 3, 'c3'), (3, 9, 'c9');
+        """)?;
+    return sameAnswers(path, """
+        SELECT x, y, z FROM (a JOIN b ON b.aid = a.id) JOIN c ON c.bid = b.id ORDER BY 1, 2, 3
+        SELECT x, y, z FROM a JOIN (b JOIN c ON c.bid = b.id) ON b.aid = a.id ORDER BY 1, 2, 3
+        SELECT x, y, z FROM (a JOIN b ON b.aid = a.id) LEFT JOIN c ON c.bid = b.id ORDER BY 1, 2, 3
+        SELECT x, y, z FROM a, (b JOIN c ON c.bid = b.id) WHERE b.aid = a.id ORDER BY 1, 2, 3
+        SELECT x, y FROM (a JOIN b ON b.aid = a.id) ORDER BY 1, 2
+        SELECT count(*) FROM ((a JOIN b ON b.aid = a.id) JOIN c ON c.bid = b.id)
+        SELECT x FROM (a) ORDER BY 1
+        """);
+}
