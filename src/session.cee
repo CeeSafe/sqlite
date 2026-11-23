@@ -55,6 +55,13 @@ public struct Session {
         });
     }
 
+    /// Closes the database, forgetting a transaction in progress. In WAL mode the log is checkpointed into the
+    /// file and removed, as SQLite does when its last connection closes.
+    public fn close(this) -> Result<void, SqliteError> {
+        let me = this;
+        return me.pager.close();
+    }
+
     /// Reads the schema again, after a statement changed it.
     fn reloadSchema(borrow mut this) -> Result<void, SqliteError> {
         this.entries = readSchemaEntries(mut this.pager)?;

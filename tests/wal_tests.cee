@@ -1,0 +1,477 @@
+// The write-ahead log: logs the sqlite3 shell leaves are read, logs this engine writes are read by the shell, and
+// damaged log tails are ignored as SQLite ignores them.
+//
+// The shell checkpoints its log into the database and empties it when it closes. `.dbconfig no_ckpt_on_close on`
+// turns that off, so a fixture made with it keeps its commits in the -wal file. The files here end in
+// `.sqlite`, not `.db`, so that the test that judges every `.db` in out/ does not open them while these run.
+
+/// Removes the database at `path` and every file beside it.
+fn freshWalPath(path: StringView) {
+    let _ = File.remove(path);
+    for (suffix in ["-wal", "-shm", "-journal"]) {
+        let name = withSuffix(path, suffix)!;
+        let _ = File.remove(name.view());
+    }
+}
+
+/// Makes a database in WAL mode with sqlite3, whose commits stay in the log.
+fn makeWalDatabase(path: StringView, sql: StringView) -> Result<void, TestFailure> {
+    freshWalPath(path);
+    var arguments = Vector<StringView>.create();
+    arguments.push(path)!;
+    arguments.push(".dbconfig no_ckpt_on_close on")!;
+    arguments.push("PRAGMA journal_mode = WAL")!;
+    arguments.push(sql)!;
+    match (Process.capture("sqlite3", borrow arguments, "".bytes())) {
+        Ok(output) => {
+            if (output.status != 0) {
+                return Check.fail("sqlite3 refused the fixture's SQL");
+            }
+            return Ok();
+        }
+        Err(_) => { return Check.fail("the sqlite3 shell is needed to make fixtures"); }
+    }
+}
+
+/// What sqlite3 prints for `sql`, leaving the database and its log as they are (no checkpoint on close).
+fn askSqliteKeepingLog(path: StringView, sql: StringView) -> Result<String, TestFailure> {
+    var arguments = Vector<StringView>.create();
+    arguments.push(path)!;
+    arguments.push(".dbconfig no_ckpt_on_close on")!;
+    arguments.push(sql)!;
+    let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
+    if (output.status != 0) {
+        Check.fail("sqlite3 refused the query")?;
+    }
+    let text = textFromBytesLossy(output.stdout.view())!;
+    // The first line is the shell's report of the setting.
+    let rest = match (text.view().splitOnce("\n")) {
+        Some(halves) => halves.right,
+        null => "",
+    };
+    return Ok(String.from(rest)!);
+}
+
+fn logLength(path: StringView) -> u64 {
+    let name = withSuffix(path, "-wal")!;
+    return fileLength(name.view())! ?? 0;
+}
+
+/// What this engine answers for each statement of `queries` (one a line), run in one session.
+fn ourAnswers(path: StringView, queries: StringView) -> String {
+    var session = Session.open(path)!;
+    var all = String.create();
+    var lines = queries.split("\n");
+    while (lines.next() is Some(line)) {
+        let sql = line.trim();
+        if (sql.length != 0) {
+            all.append(ours(mut session, sql).view())!;
+        }
+    }
+    return all;
+}
+
+/// What sqlite3 answers for the same statements.
+fn theirAnswers(path: StringView, queries: StringView) -> Result<String, TestFailure> {
+    var all = String.create();
+    var lines = queries.split("\n");
+    while (lines.next() is Some(line)) {
+        let sql = line.trim();
+        if (sql.length != 0) {
+            all.append(askSqliteKeepingLog(path, sql)?.view())!;
+        }
+    }
+    return Ok(all);
+}
+
+/// The rows of `t` and the sum of its column `n`, read by the read-only pager.
+fn countAndSum(path: StringView) -> Result<String, TestFailure> {
+    var reader = DatabaseReader.open(path)!;
+    var cursor = reader.scanTable("t")!;
+    var count: i64 = 0;
+    var sum: i64 = 0;
+    while (reader.nextRow(mut cursor)! is Some(row)) {
+        count += 1;
+        sum += integerAt(row, 1)?;
+    }
+    var text = String.create();
+    text.appendNumber(count)!;
+    text.append("|")!;
+    text.appendNumber(sum)!;
+    text.append("\n")!;
+    return Ok(text);
+}
+
+const WAL_FIXTURE_SQL: StringView = """
+    PRAGMA wal_autocheckpoint = 0;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER, label TEXT);
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 3000)
+    INSERT INTO t SELECT i, i * 3, 'row number ' || i FROM c;
+    CREATE INDEX t_n ON t(n);
+    UPDATE t SET n = n * 2, label = label || ' changed' WHERE id % 3 = 0;
+    DELETE FROM t WHERE id > 2500;
+    CREATE TABLE u(x TEXT);
+    INSERT INTO u VALUES ('only in the log');
+    """;
+
+const WAL_QUERIES: StringView = """
+    SELECT count(*), sum(n), max(label) FROM t
+    SELECT name FROM sqlite_schema ORDER BY name
+    SELECT x FROM u
+    SELECT id, n FROM t WHERE n BETWEEN 600 AND 640 ORDER BY n
+    PRAGMA integrity_check
+    PRAGMA journal_mode
+    PRAGMA page_count
+    """;
+
+@test
+fn readsCommitsSqliteLeftInItsLog() -> Result<void, TestFailure> {
+    let path = "out/wal-from-sqlite.sqlite";
+    makeWalDatabase(path, WAL_FIXTURE_SQL)?;
+    Check.isTrue(logLength(path) > 0, "the shell left its commits in the log")?;
+    // The database file alone has no table u: every commit is in the log.
+    let read = countAndSum(path)?;
+    let mine = ourAnswers(path, WAL_QUERIES);
+    Check.isTrue(logLength(path) > 0, "reading leaves the log alone")?;
+    let theirs = theirAnswers(path, WAL_QUERIES)?;
+    Check.equalText(theirs.view(), mine.view())?;
+    Check.equalText(askSqliteKeepingLog(path, "SELECT count(*), sum(n) FROM t")?.view(), read.view())?;
+    return Ok();
+}
+
+/// Rewrites the log at `path` with big-endian checksums (magic 0x377f0683), keeping every frame's content.
+fn rewriteBigEndian(path: StringView) {
+    let name = withSuffix(path, "-wal")!;
+    var bytes = wholeFile(name.view());
+    let pageSize = bytes.view().readBE<u32>(8) as usize;
+    let frameSize = 24 + pageSize;
+    bytes.viewMut().writeBE(0, 0x377f0683u32);
+    var sum = walChecksum(WalSum { first: 0, second: 0 }, bytes.view()[0..24], true);
+    bytes.viewMut().writeBE(24, sum.first);
+    bytes.viewMut().writeBE(28, sum.second);
+    var at: usize = 32;
+    while (at + frameSize <= bytes.length) {
+        sum = walChecksum(sum, bytes.view()[at..at + 8], true);
+        sum = walChecksum(sum, bytes.view()[at + 24..at + frameSize], true);
+        bytes.viewMut().writeBE(at + 16, sum.first);
+        bytes.viewMut().writeBE(at + 20, sum.second);
+        at += frameSize;
+    }
+    var file = File.create(name.view())!;
+    file.write(bytes.view())!;
+}
+
+@test
+fn readsALogWithBigEndianChecksums() -> Result<void, TestFailure> {
+    let path = "out/wal-big-endian.sqlite";
+    makeWalDatabase(path, WAL_FIXTURE_SQL)?;
+    let before = ourAnswers(path, WAL_QUERIES);
+    rewriteBigEndian(path);
+    let mine = ourAnswers(path, WAL_QUERIES);
+    Check.equalText(before.view(), mine.view())?;
+    Check.equalText(theirAnswers(path, WAL_QUERIES)?.view(), mine.view())?;
+    return Ok();
+}
+
+// Two transactions in the log, each changing the rows on the first and the last leaf of t: the frames of the
+// second follow those of the first, and the commit frame is its last.
+const TORN_FIXTURE_SQL: StringView = """
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER, label TEXT);
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 3000)
+    INSERT INTO t SELECT i, i, 'row number ' || i FROM c;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    UPDATE t SET n = 1000000 WHERE id IN (1, 3000);
+    UPDATE t SET n = 2000000 WHERE id IN (1, 3000);
+    """;
+
+const TORN_QUERIES: StringView = """
+    SELECT id, n FROM t WHERE id IN (1, 2, 2999, 3000) ORDER BY id
+    SELECT count(*), sum(n) FROM t
+    PRAGMA integrity_check
+    """;
+
+/// Changes the log of `path`: `at` counts back from the end of the file, and `cut` removes that many bytes.
+fn damageLog(path: StringView, fromEnd: usize, xor: u8, cut: usize) {
+    let name = withSuffix(path, "-wal")!;
+    var bytes = wholeFile(name.view());
+    if (fromEnd != 0) {
+        let at = bytes.length - fromEnd;
+        bytes[at] = bytes[at] ^ xor;
+    }
+    var file = File.create(name.view())!;
+    file.write(bytes.view()[0..bytes.length - cut])!;
+}
+
+/// Makes the torn fixture at `path`, damages its log (`damageLog`), and compares both engines' answers, which
+/// must begin with `expected`.
+fn sameAfterDamage(
+    path: StringView,
+    fromEnd: usize,
+    xor: u8,
+    cut: usize,
+    expected: StringView,
+) -> Result<void, TestFailure> {
+    makeWalDatabase(path, TORN_FIXTURE_SQL)?;
+    damageLog(path, fromEnd, xor, cut);
+    let mine = ourAnswers(path, TORN_QUERIES);
+    let theirs = theirAnswers(path, TORN_QUERIES)?;
+    Check.equalText(theirs.view(), mine.view())?;
+    Check.isTrue(mine.view().startsWith(expected), "the transaction the damage hides is not seen")?;
+    return Ok();
+}
+
+const PAGE_FRAME: usize = 4096 + 24;
+
+@test
+fn anUnfinishedTransactionHidesNoCommittedPage() -> Result<void, TestFailure> {
+    // The log is cut inside the second transaction's commit frame: its first frame is whole and valid but not
+    // committed, and names a page the first transaction also changed. The C# engine let it replace the first
+    // transaction's frame in its map, then dropped the page, and read it as it was before both.
+    return sameAfterDamage("out/wal-torn-cut.sqlite", 0, 0, 100, "1|1000000\n2|2\n2999|2999\n3000|1000000\n");
+}
+
+@test
+fn aBadChecksumEndsTheLog() -> Result<void, TestFailure> {
+    // A byte of the commit frame's page is changed: its checksum fails, and the transaction is not seen.
+    return sameAfterDamage("out/wal-torn-checksum.sqlite", 50, 0x40, 0, "1|1000000\n2|2\n2999|2999\n3000|1000000\n");
+}
+
+@test
+fn aFrameWithOtherSaltsEndsTheLog() -> Result<void, TestFailure> {
+    // The commit frame's salt-1 (8 bytes into its header) is changed.
+    return sameAfterDamage(
+        "out/wal-torn-salt.sqlite",
+        PAGE_FRAME - 8,
+        0x01,
+        0,
+        "1|1000000\n2|2\n2999|2999\n3000|1000000\n",
+    );
+}
+
+@test
+fn framesAfterABadOneAreIgnored() -> Result<void, TestFailure> {
+    // A byte of the first transaction's first frame is changed: neither transaction is seen, though the second's
+    // frames are whole.
+    return sameAfterDamage("out/wal-torn-early.sqlite", 4 * PAGE_FRAME - 200, 0x10, 0, "1|1\n2|2\n2999|2999\n3000|3000\n");
+}
+
+@test
+fn anUndamagedLogHasBothTransactions() -> Result<void, TestFailure> {
+    return sameAfterDamage("out/wal-torn-none.sqlite", 0, 0, 0, "1|2000000\n2|2\n2999|2999\n3000|2000000\n");
+}
+
+/// Runs a script (one statement a line) through one sqlite3 process and through one session of this engine,
+/// comparing what both print, errors included. The session is closed at the end when `close` is set.
+fn sameWalSession(name: StringView, script: StringView, close: bool) -> Result<void, TestFailure> {
+    var ourPath = String.from("out/wal-session-ours-")!;
+    ourPath.append(name)!;
+    ourPath.append(".sqlite")!;
+    var theirPath = String.from("out/wal-session-theirs-")!;
+    theirPath.append(name)!;
+    theirPath.append(".sqlite")!;
+    freshWalPath(ourPath.view());
+    freshWalPath(theirPath.view());
+    var input = String.create();
+    var lines = script.split("\n");
+    var statements = Vector<StringView>.create();
+    while (lines.next() is Some(line)) {
+        let sql = line.trim();
+        if (sql.length == 0) {
+            continue;
+        }
+        statements.push(sql)!;
+        input.append(sql)!;
+        input.append(";\n")!;
+    }
+    var arguments = Vector<StringView>.create();
+    arguments.push(theirPath.view())!;
+    let output = Process.capture("sqlite3", borrow arguments, input.view().bytes())!;
+    let theirs = textFromBytesLossy(output.stdout.view())!;
+    let errors = textFromBytesLossy(output.stderr.view())!;
+    var errorLines = errors.view().split("\n");
+    var theirErrors = String.create();
+    while (errorLines.next() is Some(e)) {
+        if (e.splitOnce(": ") is Some(halves)) {
+            theirErrors.append("error: ")!;
+            theirErrors.append(halves.right)!;
+            theirErrors.append("\n")!;
+        }
+    }
+    var session = Session.open(ourPath.view())!;
+    var mine = String.create();
+    var myErrors = String.create();
+    for (i in 0..statements.length) {
+        let answer = ours(mut session, statements[i]);
+        if (answer.view().startsWith("error: ")) {
+            myErrors.append(answer.view())!;
+        } else {
+            mine.append(answer.view())!;
+        }
+    }
+    if (close) {
+        session.close()!;
+        Check.equalU64(0, logLength(ourPath.view()))?;
+    }
+    Check.equalText(theirErrors.view(), myErrors.view())?;
+    Check.equalText(theirs.view(), mine.view())?;
+    Check.equalText("ok\n", askSqliteKeepingLog(ourPath.view(), "PRAGMA integrity_check")?.view())?;
+    return Ok();
+}
+
+@test
+fn walPragmasAnswerAsSqlites() -> Result<void, TestFailure> {
+    return sameWalSession("pragmas", """
+        PRAGMA journal_mode
+        PRAGMA wal_checkpoint
+        PRAGMA journal_mode = WAL
+        PRAGMA journal_mode
+        CREATE TABLE t(id INTEGER PRIMARY KEY, v)
+        INSERT INTO t(v) VALUES (1), (2)
+        PRAGMA wal_checkpoint
+        INSERT INTO t(v) VALUES (3)
+        INSERT INTO t(v) VALUES (4)
+        PRAGMA wal_checkpoint(PASSIVE)
+        PRAGMA wal_autocheckpoint
+        PRAGMA wal_autocheckpoint = 3
+        INSERT INTO t(v) VALUES (5)
+        INSERT INTO t(v) VALUES (6)
+        INSERT INTO t(v) VALUES (7)
+        INSERT INTO t(v) VALUES (8)
+        PRAGMA wal_checkpoint
+        BEGIN
+        INSERT INTO t(v) VALUES (9)
+        PRAGMA wal_checkpoint
+        PRAGMA journal_mode = DELETE
+        SELECT v FROM t ORDER BY v
+        ROLLBACK
+        SELECT v FROM t ORDER BY v
+        PRAGMA wal_autocheckpoint = -5
+        PRAGMA wal_autocheckpoint
+        INSERT INTO t(v) VALUES (10)
+        PRAGMA wal_checkpoint(FULL)
+        INSERT INTO t(v) VALUES (11)
+        PRAGMA wal_checkpoint(RESTART)
+        INSERT INTO t(v) VALUES (12)
+        PRAGMA wal_checkpoint(TRUNCATE)
+        PRAGMA wal_checkpoint
+        PRAGMA journal_mode = nonsense
+        PRAGMA journal_mode = DELETE
+        PRAGMA wal_checkpoint
+        PRAGMA journal_mode
+        BEGIN
+        PRAGMA journal_mode = WAL
+        ROLLBACK
+        PRAGMA journal_mode = WAL
+        INSERT INTO t(v) VALUES (13)
+        SELECT count(*), sum(v) FROM t
+        PRAGMA integrity_check
+        """, false);
+}
+
+@test
+fn closingCheckpointsAndRemovesTheLog() -> Result<void, TestFailure> {
+    return sameWalSession("close", """
+        PRAGMA journal_mode = WAL
+        CREATE TABLE t(id INTEGER PRIMARY KEY, n INT, label TEXT)
+        WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 2000) INSERT INTO t SELECT i, i, 'label ' || i FROM c
+        CREATE INDEX t_n ON t(n)
+        DELETE FROM t WHERE id % 5 = 0
+        SELECT count(*), sum(n) FROM t
+        """, true);
+}
+
+/// The bytes 18 and 19 of the database header: the file format's write and read versions.
+fn formatVersions(path: StringView) -> u32 {
+    let bytes = wholeFile(path);
+    return (bytes[18] as u32) * 256 + (bytes[19] as u32);
+}
+
+@test
+fn sqliteReadsTheLogThisEngineWrites() -> Result<void, TestFailure> {
+    let path = "out/wal-ours.sqlite";
+    freshWalPath(path);
+    var session = Session.open(path)!;
+    Check.equalText("wal\n", ours(mut session, "PRAGMA journal_mode = WAL").view())?;
+    Check.equalU64(0x0202, formatVersions(path) as u64)?;
+    let script = """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, n INT, label TEXT)
+        WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 3000) INSERT INTO t SELECT i, i * 7, 'label ' || i FROM c
+        CREATE INDEX t_n ON t(n)
+        UPDATE t SET label = label || '!' WHERE id % 4 = 0
+        DELETE FROM t WHERE id BETWEEN 100 AND 900
+        """;
+    var lines = script.split("\n");
+    while (lines.next() is Some(line)) {
+        if (line.trim().length != 0) {
+            Check.equalText("", ours(mut session, line.trim()).view())?;
+        }
+    }
+    let check = "PRAGMA integrity_check";
+    let query = "SELECT count(*), sum(n), max(label) FROM t";
+    Check.isTrue(logLength(path) > 0, "the commits are in the log")?;
+    // sqlite3 reads the log as this engine left it, before any checkpoint.
+    Check.equalText("ok\n", askSqliteKeepingLog(path, check)?.view())?;
+    Check.equalText(askSqliteKeepingLog(path, query)?.view(), ours(mut session, query).view())?;
+    // A passive checkpoint copies the pages; the next commit starts the log again with new salts.
+    let checkpointed = ours(mut session, "PRAGMA wal_checkpoint");
+    Check.isTrue(checkpointed.view().startsWith("0|"), "the checkpoint is not busy")?;
+    Check.equalText("", ours(mut session, "INSERT INTO t(n, label) VALUES (1, 'after the checkpoint')").view())?;
+    Check.equalText("ok\n", askSqliteKeepingLog(path, check)?.view())?;
+    Check.equalText(askSqliteKeepingLog(path, query)?.view(), ours(mut session, query).view())?;
+    // TRUNCATE empties the log: the file alone holds the database.
+    Check.equalText("0|0|0\n", ours(mut session, "PRAGMA wal_checkpoint(TRUNCATE)").view())?;
+    Check.equalU64(0, logLength(path))?;
+    Check.equalText("ok\n", askSqliteKeepingLog(path, check)?.view())?;
+    // A transaction that is not committed writes no frame.
+    Check.equalText("", ours(mut session, "BEGIN").view())?;
+    Check.equalText("", ours(mut session, "DELETE FROM t").view())?;
+    Check.equalU64(0, logLength(path))?;
+    Check.equalText("", ours(mut session, "ROLLBACK").view())?;
+    Check.equalText("", ours(mut session, "INSERT INTO t(n, label) VALUES (2, 'in the log')").view())?;
+    let expected = ours(mut session, query);
+    Check.equalText(askSqliteKeepingLog(path, query)?.view(), expected.view())?;
+    // Back to a rollback journal: the log is copied in and removed, and the header says so.
+    Check.equalText("delete\n", ours(mut session, "PRAGMA journal_mode = DELETE").view())?;
+    Check.equalU64(0x0101, formatVersions(path) as u64)?;
+    Check.isTrue(fileLength(withSuffix(path, "-wal")!.view())!.isNull(), "the log is removed")?;
+    Check.equalText("ok\n", askSqlite(path, check)?.view())?;
+    Check.equalText(expected.view(), askSqlite(path, query)?.view())?;
+    return Ok();
+}
+
+@test
+fn anUncommittedTransactionLeavesNothingInTheLog() -> Result<void, TestFailure> {
+    let path = "out/wal-uncommitted.sqlite";
+    makeWalDatabase(path, WAL_FIXTURE_SQL)?;
+    let before = logLength(path);
+    {
+        var session = Session.open(path)!;
+        Check.equalText("wal\n", ours(mut session, "PRAGMA journal_mode").view())?;
+        Check.equalText("", ours(mut session, "BEGIN").view())?;
+        Check.equalText("", ours(mut session, "DELETE FROM t WHERE id < 1000").view())?;
+        Check.equalText("", ours(mut session, "INSERT INTO u VALUES ('never committed')").view())?;
+        // The session ends without COMMIT.
+    }
+    Check.equalU64(before, logLength(path))?;
+    Check.equalText("ok\n2500\nonly in the log\n", askSqlite(path, "PRAGMA integrity_check; SELECT count(*) FROM t; SELECT x FROM u")?.view())?;
+    return Ok();
+}
+
+@test
+fn appendsToALogSqliteLeft() -> Result<void, TestFailure> {
+    // This engine's commits follow sqlite3's frames in the same log, with its salts and checksums.
+    let path = "out/wal-append.sqlite";
+    makeWalDatabase(path, WAL_FIXTURE_SQL)?;
+    let before = logLength(path);
+    {
+        var session = Session.open(path)!;
+        Check.equalText("", ours(mut session, "INSERT INTO u VALUES ('from this engine')").view())?;
+        Check.equalText("", ours(mut session, "UPDATE t SET n = -n WHERE id < 50").view())?;
+    }
+    Check.isTrue(logLength(path) > before, "the commits were appended")?;
+    Check.equalText(
+        "ok\n2\n-4899\n",
+        askSqliteKeepingLog(path, "PRAGMA integrity_check; SELECT count(*) FROM u; SELECT sum(n) FROM t WHERE id < 50")?.view(),
+    )?;
+    return Ok();
+}

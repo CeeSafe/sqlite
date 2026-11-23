@@ -1,0 +1,383 @@
+// The write-ahead log: in WAL mode a commit appends the pages it changed to `<database>-wal` as frames, and the
+// database file is brought up to date later, by a checkpoint. A page's latest committed frame is its content.
+// https://www.sqlite.org/fileformat2.html#walformat and https://www.sqlite.org/walformat.html
+//
+// The log starts with a 32-byte header: a magic number whose low bit says in which byte order its checksums read
+// the data, the format version, the page size, a checkpoint sequence number, two salts, and a checksum of the
+// first 24 bytes. Each frame is a 24-byte header (page number, the database's size in pages on a commit frame
+// and 0 on others, the two salts, a checksum) and the page. Each checksum continues the one before it, so a
+// frame is valid only when the header and every frame before it are. Frames after the last valid commit frame
+// belong to a transaction that did not finish, and are ignored.
+//
+// The wal-index (`-shm`) is not written or read: it is shared memory between connections, which CeeSafe cannot
+// map, and this engine has one connection at a time (README.md, Limits). The index is built here from the log
+// when the database is opened, as SQLite rebuilds the wal-index when it finds none. sqlite3 does the same with
+// the logs this engine leaves.
+//
+// Differences from the C# engine, which this replaces:
+// - each new log has random salts, and a restarted log the next salt-1 and a new salt-2, as SQLite does. The C#
+//   always wrote salts 1 and 1, so a log restarted over an old one could take the old one's frames for its own;
+// - frames that follow the last commit are left out of the index without losing the committed frame of the same
+//   page. The C#'s recovery let an uncommitted frame replace a page's committed one in its map and then dropped
+//   the page, so it read the page as it was before both (`anUnfinishedTransactionHidesNoCommittedPage`);
+// - a frame for page 0 ends the log, a log of an unknown version is refused, and the page count is that of the
+//   last commit frame, as in SQLite. The C# took the size from page 1's header field;
+// - a checkpoint copies only the frames not yet copied, and only pages inside the database.
+
+const WAL_SUFFIX: StringView = "-wal";
+const WAL_MAGIC: u32 = 0x377f0682;
+const WAL_VERSION: u32 = 3007000;
+const WAL_HEADER_SIZE: u64 = 32;
+const WAL_FRAME_HEADER_SIZE: usize = 24;
+
+/// The two running sums of SQLite's WAL checksum.
+struct WalSum {
+    first: u32;
+    second: u32;
+}
+
+/// SQLite's WAL checksum of `bytes` (a multiple of 8 long), continuing from `start`. The words are read in big-
+/// or little-endian order as the log's magic number says.
+fn walChecksum(start: WalSum, bytes: Slice<u8>, bigEndian: bool) -> WalSum {
+    var s1 = start.first;
+    var s2 = start.second;
+    var i: usize = 0;
+    while (i + 8 <= bytes.length) {
+        let x0 = if (bigEndian) bytes.readBE<u32>(i) else bytes.readLE<u32>(i);
+        let x1 = if (bigEndian) bytes.readBE<u32>(i + 4) else bytes.readLE<u32>(i + 4);
+        s1 = s1.wrappingAdd(x0).wrappingAdd(s2);
+        s2 = s2.wrappingAdd(x1).wrappingAdd(s1);
+        i += 8;
+    }
+    return WalSum { first: s1, second: s2 };
+}
+
+fn randomU32() -> Result<u32, SqliteError> => Ok(truncate<u32>(Random.below(0x1_0000_0000)?));
+
+/// What a checkpoint did: the frames in the log, and how many of them the database file now holds.
+struct WalCheckpoint {
+    logFrames: i64;
+    checkpointed: i64;
+}
+
+/// A database's write-ahead log, and the index of its committed frames.
+struct WalLog {
+    private file: File?;
+    private path: String;
+    private writable: bool;
+    /// The page size the log's frames hold.
+    pageSize: usize;
+    private bigEndian: bool;
+    /// Whether the file has a valid header, whose salts the next log must not reuse.
+    private hasHeader: bool;
+    private salt1: u32;
+    private salt2: u32;
+    private sequence: u32;
+    /// The committed frames (SQLite's mxFrame), and how many of them the database file holds.
+    frames: u32;
+    backfilled: u32;
+    /// The database's size in pages at the last commit frame.
+    databasePages: u32;
+    /// The checksum at the end of the last committed frame.
+    private sum: WalSum;
+    /// The latest committed frame (from 1) of each page.
+    private latest: HashMap<u32, u32>;
+    // A commit being written: its frames' pages, its next frame and its running checksum.
+    private pending: Vector<u32>;
+    private nextFrame: u32;
+    private pendingSum: WalSum;
+    private scratch: Vector<u8>;
+
+    /// The log of the database at `path`, read and indexed. A missing file is an empty log; `writable` opens it
+    /// for appending, and creates it on the first commit.
+    fn open(path: StringView, writable: bool) -> Result<WalLog, SqliteError> {
+        let name = withSuffix(path, WAL_SUFFIX)?;
+        let opened = if (writable) File.openReadWrite(name.view()) else File.open(name.view());
+        let file: File? = match (opened) {
+            Ok(f) => f,
+            Err(IoError.NotFound) => null,
+            Err(e) => { return Err(SqliteError.Io(e)); },
+        };
+        var log = WalLog {
+            file: file,
+            path: name,
+            writable: writable,
+            pageSize: 0,
+            bigEndian: false,
+            hasHeader: false,
+            salt1: 0,
+            salt2: 0,
+            sequence: 0,
+            frames: 0,
+            backfilled: 0,
+            databasePages: 0,
+            sum: WalSum { first: 0, second: 0 },
+            latest: HashMap<u32, u32>.create(),
+            pending: Vector<u32>.create(),
+            nextFrame: 0,
+            pendingSum: WalSum { first: 0, second: 0 },
+            scratch: Vector<u8>.create(),
+        };
+        log.recover()?;
+        return Ok(log);
+    }
+
+    /// Whether the log holds a committed frame.
+    fn hasFrames(borrow this) -> bool => this.frames != 0;
+
+    private fn frameSize(borrow this) -> u64 => (WAL_FRAME_HEADER_SIZE + this.pageSize) as u64;
+
+    /// Where frame `frame` (from 1) begins in the file.
+    private fn frameOffset(borrow this, frame: u32) -> u64 => WAL_HEADER_SIZE + ((frame - 1) as u64) * this.frameSize();
+
+    /// Reads the header and the frames, as SQLite's recovery does: the frames are taken up to the first that is
+    /// short, has other salts, names page 0 or fails its checksum, and only up to the last commit frame before it.
+    private fn recover(borrow mut this) -> Result<void, SqliteError> {
+        let Some(file) = borrow mut this.file else {
+            return Ok();
+        };
+        let size = file.length()?;
+        var header = [0u8; 32];
+        if (size < WAL_HEADER_SIZE || !readFully(file, mut header[..], 0)?) {
+            return Ok();
+        }
+        let magic = header[..].readBE<u32>(0);
+        let pageSize = header[..].readBE<u32>(8) as usize;
+        if ((magic & 0xFFFF_FFFE) != WAL_MAGIC || !isPowerOfTwoBetween(pageSize, 512, 65536)) {
+            return Ok();
+        }
+        let bigEndian = (magic & 1) == 1;
+        let headerSum = walChecksum(WalSum { first: 0, second: 0 }, header[0..24], bigEndian);
+        if (headerSum.first != header[..].readBE<u32>(24) || headerSum.second != header[..].readBE<u32>(28)) {
+            return Ok();
+        }
+        if (header[..].readBE<u32>(4) != WAL_VERSION) {
+            return Err(unsupported("the write-ahead log has a format version this engine does not know"));
+        }
+        this.hasHeader = true;
+        this.pageSize = pageSize;
+        this.bigEndian = bigEndian;
+        this.sequence = header[..].readBE<u32>(12);
+        this.salt1 = header[..].readBE<u32>(16);
+        this.salt2 = header[..].readBE<u32>(20);
+        this.sum = headerSum;
+        let frameSize = (WAL_FRAME_HEADER_SIZE + pageSize) as u64;
+        var frame = Vector<u8>.create();
+        frame.resize(WAL_FRAME_HEADER_SIZE + pageSize, 0)?;
+        var running = headerSum;
+        var read: u32 = 0;
+        var pending = Vector<u32>.create();
+        var offset = WAL_HEADER_SIZE;
+        while (offset + frameSize <= size && read < 0xFFFF_FFFE) {
+            if (!readFully(file, frame.viewMut(), offset)?) {
+                break;
+            }
+            let bytes = frame.view();
+            let pageNumber = bytes.readBE<u32>(0);
+            if (pageNumber == 0 || bytes.readBE<u32>(8) != this.salt1 || bytes.readBE<u32>(12) != this.salt2) {
+                break;
+            }
+            let sum = walChecksum(
+                walChecksum(running, bytes[0..8], bigEndian),
+                bytes[WAL_FRAME_HEADER_SIZE..],
+                bigEndian,
+            );
+            if (sum.first != bytes.readBE<u32>(16) || sum.second != bytes.readBE<u32>(20)) {
+                break;
+            }
+            running = sum;
+            read += 1;
+            pending.push(pageNumber)?;
+            let commitSize = bytes.readBE<u32>(4);
+            if (commitSize != 0) {
+                for (k in 0..pending.length) {
+                    let _ = this.latest.put(pending[k], this.frames + 1 + truncate<u32>(k))?;
+                }
+                pending.clear();
+                this.frames = read;
+                this.databasePages = commitSize;
+                this.sum = sum;
+            }
+            offset += frameSize;
+        }
+        return Ok();
+    }
+
+    /// Reads page `number`'s latest committed frame into `into`. False when the log has no frame of it.
+    fn readPage(borrow mut this, number: u32, into: SliceMut<u8>) -> Result<bool, SqliteError> {
+        let Some(frame) = this.latest.get(borrow number) else {
+            return Ok(false);
+        };
+        let offset = this.frameOffset(*frame) + (WAL_FRAME_HEADER_SIZE as u64);
+        let Some(file) = borrow mut this.file else {
+            return Ok(false);
+        };
+        if (into.length != this.pageSize || !readFully(file, into, offset)?) {
+            return Err(corrupt("the write-ahead log ends inside a frame"));
+        }
+        return Ok(true);
+    }
+
+    /// Starts a commit of pages of `pageSize` bytes. A log whose frames are all in the database file starts
+    /// again from its first frame, with a new header.
+    fn beginCommit(borrow mut this, pageSize: usize) -> Result<void, SqliteError> {
+        assert(this.writable, "only a writable log takes commits");
+        if (this.file.isNull()) {
+            // Made, then opened again for reading as well: a checkpoint reads the frames back.
+            let _ = File.create(this.path.view())?;
+            Directory.sync(directoryOf(this.path.view()))?;
+            this.file = File.openReadWrite(this.path.view())?;
+        }
+        if (this.frames == this.backfilled) {
+            this.restart(pageSize)?;
+        }
+        this.pending.clear();
+        this.nextFrame = this.frames;
+        this.pendingSum = this.sum;
+        return Ok();
+    }
+
+    /// Writes a new header: the log is empty. The checkpoint sequence and salt-1 go up by one and salt-2 is new,
+    /// so that no frame of the old log can pass for one of the new.
+    private fn restart(borrow mut this, pageSize: usize) -> Result<void, SqliteError> {
+        if (this.hasHeader) {
+            this.sequence = this.sequence.wrappingAdd(1);
+            this.salt1 = this.salt1.wrappingAdd(1);
+        } else {
+            this.sequence = 0;
+            this.salt1 = randomU32()?;
+        }
+        this.salt2 = randomU32()?;
+        this.pageSize = pageSize;
+        this.bigEndian = false;
+        var header = [0u8; 32];
+        header[..].writeBE(0, WAL_MAGIC);
+        header[..].writeBE(4, WAL_VERSION);
+        header[..].writeBE(8, truncate<u32>(pageSize));
+        header[..].writeBE(12, this.sequence);
+        header[..].writeBE(16, this.salt1);
+        header[..].writeBE(20, this.salt2);
+        let sum = walChecksum(WalSum { first: 0, second: 0 }, header[0..24], false);
+        header[..].writeBE(24, sum.first);
+        header[..].writeBE(28, sum.second);
+        let Some(file) = borrow mut this.file else {
+            return Err(unsupported("the write-ahead log is not open"));
+        };
+        file.writeAt(header[..], 0)?;
+        this.hasHeader = true;
+        this.sum = sum;
+        this.frames = 0;
+        this.backfilled = 0;
+        this.latest.clear();
+        return Ok();
+    }
+
+    /// Appends page `number`'s new content as a frame of the commit; `commitSize` is the database's size in pages
+    /// on the commit's last frame, and 0 on the others.
+    fn addFrame(borrow mut this, number: u32, page: Slice<u8>, commitSize: u32) -> Result<void, SqliteError> {
+        assert(page.length == this.pageSize, "a frame holds one page");
+        if (this.nextFrame >= 0xFFFF_FFFE) {
+            return Err(unsupported("the write-ahead log has as many frames as it can hold"));
+        }
+        var header = [0u8; 24];
+        header[..].writeBE(0, number);
+        header[..].writeBE(4, commitSize);
+        header[..].writeBE(8, this.salt1);
+        header[..].writeBE(12, this.salt2);
+        let sum = walChecksum(walChecksum(this.pendingSum, header[0..8], this.bigEndian), page, this.bigEndian);
+        header[..].writeBE(16, sum.first);
+        header[..].writeBE(20, sum.second);
+        let offset = this.frameOffset(this.nextFrame + 1);
+        let Some(file) = borrow mut this.file else {
+            return Err(unsupported("the write-ahead log is not open"));
+        };
+        file.writeAt(header[..], offset)?;
+        file.writeAt(page, offset + (WAL_FRAME_HEADER_SIZE as u64))?;
+        this.nextFrame += 1;
+        this.pending.push(number)?;
+        this.pendingSum = sum;
+        return Ok();
+    }
+
+    /// Makes the commit durable and adds its frames to the index.
+    fn finishCommit(borrow mut this, databasePages: u32) -> Result<void, SqliteError> {
+        let Some(file) = borrow mut this.file else {
+            return Err(unsupported("the write-ahead log is not open"));
+        };
+        file.syncAll()?;
+        for (k in 0..this.pending.length) {
+            let _ = this.latest.put(this.pending[k], this.frames + 1 + truncate<u32>(k))?;
+        }
+        this.pending.clear();
+        this.frames = this.nextFrame;
+        this.sum = this.pendingSum;
+        this.databasePages = databasePages;
+        return Ok();
+    }
+
+    /// Copies the pages of the frames not yet copied into the database file `db`, and gives the file the size of
+    /// the last commit.
+    fn checkpoint(borrow mut this, db: borrow mut File) -> Result<void, SqliteError> {
+        if (this.frames == this.backfilled) {
+            return Ok();
+        }
+        let pageSize = this.pageSize as u64;
+        // As in SQLite: a database larger than the file, the log's frames and the lock-byte page together is a
+        // damaged commit frame, not a size to give the file.
+        let wanted = (this.databasePages as u64) * pageSize;
+        if (wanted > db.length()? + 65536 + (this.frames as u64) * pageSize) {
+            return Err(corrupt("the write-ahead log's commit frame gives an impossible database size"));
+        }
+        this.scratch.resize(this.pageSize, 0)?;
+        let backfilled = this.backfilled;
+        for (i in 0..this.latest.length()) {
+            let number = *this.latest.keyAt(i);
+            let frame = *this.latest.valueAt(i);
+            if (frame <= backfilled || number > this.databasePages) {
+                continue;
+            }
+            let offset = this.frameOffset(frame) + (WAL_FRAME_HEADER_SIZE as u64);
+            let Some(file) = borrow mut this.file else {
+                return Err(unsupported("the write-ahead log is not open"));
+            };
+            if (!readFully(file, this.scratch.viewMut(), offset)?) {
+                return Err(corrupt("the write-ahead log ends inside a frame"));
+            }
+            db.writeAt(this.scratch.view(), ((number - 1) as u64) * pageSize)?;
+        }
+        db.setLength(wanted)?;
+        db.syncAll()?;
+        this.backfilled = this.frames;
+        return Ok();
+    }
+
+    /// Empties the log file. Every frame must be in the database file.
+    fn truncate(borrow mut this) -> Result<void, SqliteError> {
+        assert(this.frames == this.backfilled, "only a checkpointed log is emptied");
+        if (borrow mut this.file is Some(file)) {
+            file.setLength(0)?;
+            file.syncAll()?;
+        }
+        this.frames = 0;
+        this.backfilled = 0;
+        this.latest.clear();
+        return Ok();
+    }
+
+    /// Removes the log file. Every frame must be in the database file.
+    fn remove(borrow mut this) -> Result<void, SqliteError> {
+        assert(this.frames == this.backfilled, "only a checkpointed log is removed");
+        this.file = null;
+        match (File.remove(this.path.view())) {
+            Ok() => {}
+            Err(IoError.NotFound) => {}
+            Err(e) => { return Err(SqliteError.Io(e)); }
+        }
+        Directory.sync(directoryOf(this.path.view()))?;
+        this.hasHeader = false;
+        this.frames = 0;
+        this.backfilled = 0;
+        this.latest.clear();
+        return Ok();
+    }
+}

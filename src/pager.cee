@@ -29,6 +29,10 @@ const PAGER_DEFAULT_CACHE_PAGES: usize = 1000;
 
 struct Pager {
     private file: File;
+    /// The write-ahead log, empty unless the database has commits in one.
+    private wal: WalLog;
+    /// The number of pages in the database file itself.
+    private filePages: u32;
     header: DatabaseHeader;
     /// The number of pages in the database.
     pageCount: u32;
@@ -54,21 +58,24 @@ struct Pager {
         if (Journal.exists(path)?) {
             return Err(unsupported("the database has a rollback journal: an interrupted commit must be undone first"));
         }
-        // Until the WAL reader is ported, a database with frames waiting in its write-ahead log is refused:
-        // reading the main file alone would silently return rows as they were before those commits.
-        var walPath = String.from(path)?;
-        walPath.append("-wal")?;
-        if (File.open(walPath.view()) is Ok(wal) && wal.length()? > 0) {
-            return Err(unsupported("the database has a write-ahead log, which this build cannot read yet"));
-        }
         let fileLength = file.length()?;
         let pages = fileLength / (header.pageSize as u64);
-        let pageCount = checkedTruncate<u32>(pages) ?? {
+        let filePages = checkedTruncate<u32>(pages) ?? {
             return Err(corrupt("database file has more pages than the format allows"));
         };
+        // Commits in the write-ahead log are part of the database: its pages are read through the log.
+        var wal = WalLog.open(path, false)?;
+        var pageCount = filePages;
+        var current = header;
+        if (wal.hasFrames()) {
+            current = headerThroughLog(mut wal, header)?;
+            pageCount = wal.databasePages;
+        }
         return Ok(Pager {
             file: file,
-            header: header,
+            wal: wal,
+            filePages: filePages,
+            header: current,
             pageCount: pageCount,
             recent: HashMap<u32, Page>.create(),
             older: HashMap<u32, Page>.create(),
@@ -94,9 +101,15 @@ struct Pager {
         }
         var bytes = Vector<u8>.create();
         bytes.resize(this.header.pageSize, 0)?;
-        let offset = ((pageNumber - 1) as u64) * (this.header.pageSize as u64);
-        if (!readFully(mut this.file, bytes.viewMut(), offset)?) {
-            return Err(corrupt("database file ends inside a page"));
+        if (this.wal.readPage(pageNumber, bytes.viewMut())?) {
+            // The log's latest committed frame of the page.
+        } else if (this.wal.hasFrames() && pageNumber > this.filePages) {
+            // A page past the end of the file that no frame holds reads as zeros, as in SQLite.
+        } else {
+            let offset = ((pageNumber - 1) as u64) * (this.header.pageSize as u64);
+            if (!readFully(mut this.file, bytes.viewMut(), offset)?) {
+                return Err(corrupt("database file ends inside a page"));
+            }
         }
         let page = Page { bytes: Arc<Vector<u8>>.create(bytes)? };
         let copy = page.clone();
@@ -124,6 +137,24 @@ impl PageSource for Pager {
     fn textEncoding(borrow this) -> TextEncoding => this.header.textEncoding;
 
     fn totalPages(borrow this) -> u32 => this.pageCount;
+}
+
+/// The database header as a log with commits has it: from the log's frame of page 1 when it has one. The log's
+/// pages must be the database's size.
+fn headerThroughLog(wal: borrow mut WalLog, fileHeader: DatabaseHeader) -> Result<DatabaseHeader, SqliteError> {
+    if (wal.pageSize != fileHeader.pageSize) {
+        return Err(corrupt("the write-ahead log's page size is not the database's"));
+    }
+    var page = Vector<u8>.create();
+    page.resize(wal.pageSize, 0)?;
+    if (!wal.readPage(1, page.viewMut())?) {
+        return Ok(fileHeader);
+    }
+    let header = DatabaseHeader.parse(page.view()[0..100])?;
+    if (header.pageSize != fileHeader.pageSize) {
+        return Err(corrupt("the write-ahead log's page 1 gives another page size"));
+    }
+    return Ok(header);
 }
 
 /// Fills `buffer` from `offset`. False when the file ends first.
