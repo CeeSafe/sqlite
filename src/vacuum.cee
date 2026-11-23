@@ -1,0 +1,90 @@
+// VACUUM: the database written again, packed.
+//
+// Each b-tree in sqlite_schema is read whole and built again into fresh pages, its records as they are stored;
+// sqlite_schema keeps its rows, with the new root pages. The header keeps every setting (page size, encoding,
+// user_version, application_id, journal mode), the freelist is empty, and the schema cookie moves on. It all
+// happens in one transaction of the pager, so a failure leaves the file as it was.
+//
+// Refused: VACUUM inside a transaction (as in SQLite), VACUUM INTO, a UTF-16 database, and pages with reserved
+// bytes at their end.
+
+fn executeVacuum(db: borrow mut Session) -> Result<void, SqliteError> {
+    if (db.inTransaction) {
+        return Err(sqlError("cannot VACUUM from within a transaction"));
+    }
+    if (db.pager.textEncoding() != TextEncoding.Utf8) {
+        return Err(unsupported("VACUUM of a UTF-16 database is not supported yet"));
+    }
+    if (db.pager.reservedBytes() != 0) {
+        return Err(unsupported("VACUUM of a database with reserved bytes in its pages is not supported yet"));
+    }
+    let pageSize = db.pager.pageSizeBytes();
+    var store = PageStore.create(pageSize);
+    let _ = store.allocate()?;
+    // sqlite_schema's rows, and each b-tree they name.
+    var schema = Vector<TableRow>.create();
+    var cursor = TableCursor.scan(1);
+    while (cursor.next(mut db.pager)? is Some(row)) {
+        schema.push(row)?;
+    }
+    var cells = Vector<Vector<u8>>.withCapacity(schema.length)?;
+    var rowIds = Vector<i64>.withCapacity(schema.length)?;
+    for (r in 0..schema.length) {
+        var values = cloneValues(schema[r].columns.view())?;
+        if (values.length >= 5 && values[3] is SqliteValue.Integer(root) && root > 0) {
+            let oldRoot = checkedTruncate<u32>(root) ?? {
+                return Err(corrupt("a root page number is out of range"));
+            };
+            let kind = match (borrow values[0]) {
+                SqliteValue.Text(t) => t.clone()?,
+                _ => String.create(),
+            };
+            let name = match (borrow values[1]) {
+                SqliteValue.Text(t) => t.clone()?,
+                _ => String.create(),
+            };
+            var keyed = kind.view() == "index";
+            if (kind.view() == "table") {
+                if (db.catalog.table(name.view())? is Some(table)) {
+                    keyed = table.withoutRowid;
+                }
+            }
+            let newRoot = if (keyed) copyIndexTree(
+                mut db.pager,
+                oldRoot,
+                mut store,
+            )? else copyTableTree(mut db.pager, oldRoot, mut store)?;
+            values[3] = SqliteValue.Integer(newRoot as i64);
+        }
+        let record = Record.encode(values.view())?;
+        cells.push(BTreeBuilder.tableLeafCell(mut store, schema[r].rowId, record.view())?)?;
+        rowIds.push(schema[r].rowId)?;
+    }
+    BTreeBuilder.buildRootOnPage1(mut store, cells.view(), rowIds.view())?;
+    // The header as it was; the pager's commit writes the size, the freelist and the change counter.
+    let header = db.pager.copy(1)?;
+    store.page(1)[0..DATABASE_HEADER_SIZE].copyFrom(header.view()[0..DATABASE_HEADER_SIZE]);
+    db.pager.replaceAll(store.pages.view())?;
+    db.pager.bumpSchemaCookie()?;
+    return db.reloadSchema();
+}
+
+/// A table b-tree's rows, built again into `store`; returns the new root.
+fn copyTableTree(pager: borrow mut WritablePager, root: u32, store: borrow mut PageStore) -> Result<u32, SqliteError> {
+    var rows = Vector<EncodedRow>.create();
+    var cursor = TableCursor.scan(root);
+    while (cursor.next(pager)? is Some(row)) {
+        rows.push(EncodedRow { rowId: row.rowId, record: Record.encode(row.columns.view())? })?;
+    }
+    return BTreeBuilder.buildTable(store, rows.view());
+}
+
+/// An index b-tree's entries (or a WITHOUT ROWID table's records), built again into `store`; returns the new root.
+fn copyIndexTree(pager: borrow mut WritablePager, root: u32, store: borrow mut PageStore) -> Result<u32, SqliteError> {
+    var records = Vector<Vector<u8>>.create();
+    var cursor = IndexCursor.create(root, IndexRange.all(IndexOrder.plain()), false);
+    while (cursor.next(pager)? is Some(entry)) {
+        records.push(Record.encode(entry.view())?)?;
+    }
+    return BTreeBuilder.buildIndex(store, records.view());
+}

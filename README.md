@@ -458,6 +458,11 @@ Choices where the C# concept does not fit CeeSafe:
   table's name, nothing for an empty table); REINDEX rebuilds every index. The planner does not use the
   statistics yet. The C# refused both.
 
+- **VACUUM** (`vacuumPacksTheFile`) builds every b-tree again into packed pages within one transaction, records
+  as they are stored, header settings kept, freelist empty; the file comes out the size sqlite3's VACUUM gives.
+  Refused: VACUUM inside a transaction (as in SQLite), VACUUM INTO, UTF-16 databases and pages with reserved
+  bytes. The C# refused VACUUM.
+
 ## Known differences from SQLite in PRAGMA integrity_check
 
 The report matches the `sqlite3` shell's row for row on the tests' damaged files, with these exceptions:

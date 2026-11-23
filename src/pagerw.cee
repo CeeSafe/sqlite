@@ -413,6 +413,33 @@ struct WritablePager {
         return Ok();
     }
 
+    /// VACUUM: the transaction's database becomes exactly `pages` (page 1 first), with an empty freelist. The old
+    /// content stays in the journal until the commit.
+    fn replaceAll(borrow mut this, pages: Slice<Vector<u8>>) -> Result<void, SqliteError> {
+        // New pages come after the last one, not from the old freelist.
+        this.freeTrunk = 0;
+        this.freeCount = 0;
+        for (i in 0..pages.length) {
+            let number = truncate<u32>(i + 1);
+            if (number <= this.pageCount) {
+                this.write(number)?.copyFrom(pages[i].view());
+            } else {
+                let added = this.allocatePage()?;
+                this.write(added)?.copyFrom(pages[i].view());
+            }
+        }
+        this.pageCount = truncate<u32>(pages.length);
+        this.freeTrunk = 0;
+        this.freeCount = 0;
+        return Ok();
+    }
+
+    /// The page size in bytes.
+    fn pageSizeBytes(borrow this) -> usize => this.pageSize;
+
+    /// The bytes a page keeps at its end for extensions (header byte 20).
+    fn reservedBytes(borrow this) -> usize => this.pageSize - this.usable;
+
     /// Forgets everything the transaction changed.
     fn rollback(borrow mut this) {
         this.levels.clear();
