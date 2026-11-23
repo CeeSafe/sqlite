@@ -1,11 +1,15 @@
 // The writable pager: a transaction's view of a database's pages. Pages are changed in memory; `commit` journals
-// the old ones, writes the new, and removes the journal. Freed pages go to SQLite's freelist and are used again.
+// the old ones, writes the new, and removes the journal; in WAL mode it appends the new ones to the write-ahead
+// log instead (wal.cee). Freed pages go to SQLite's freelist and are used again.
 // https://www.sqlite.org/fileformat2.html#the_freelist
 //
 // Differences from the C# engine, which this replaces:
 // - a database that keeps pointer-map pages (auto-vacuum or incremental vacuum) is refused. The C# changed its
 //   b-trees without updating the pointer map, which SQLite then finds in disagreement with the file;
-// - a database in WAL mode is refused until the WAL writer is ported, rather than written behind its log;
+// - in WAL mode one pager does both: reads see the log, commits append to it. The C# had a second pager for WAL
+//   mode (WalPager), whose freelist made every freed page a trunk and checked no page number it read;
+// - in WAL mode page 1 is written only when a commit changes it, as SQLite does, so a commit's frames are the
+//   pages SQLite would write;
 // - page numbers and counts read from the freelist are checked, so a damaged freelist is `Corrupt` instead of a
 //   page handed out twice;
 // - a freed page becomes a leaf of the first trunk page while that has room. The C# made every freed page a
@@ -13,8 +17,18 @@
 // - the page that holds SQLite's lock bytes is never allocated;
 // - `rollback` forgets a transaction's changes. The C# pager could only be thrown away.
 
+/// SQLite's default for PRAGMA wal_autocheckpoint, in frames.
+const WAL_DEFAULT_AUTOCHECKPOINT: u32 = 1000;
+
 struct WritablePager {
     private file: File;
+    /// The write-ahead log; commits go to it in WAL mode.
+    private wal: WalLog;
+    private walMode: bool;
+    /// The number of pages in the database file itself, which in WAL mode may be fewer than the database has.
+    private filePages: u32;
+    /// A commit that leaves this many frames or more in the log checkpoints it; 0 never does.
+    autoCheckpoint: u32;
     private path: String;
     pageSize: usize;
     usable: usize;
@@ -39,34 +53,51 @@ struct WritablePager {
     /// Opens the database at `path` for changes, first undoing a commit that was interrupted.
     fn open(path: StringView) -> Result<WritablePager, SqliteError> {
         let _ = Journal.recover(path)?;
-        let wal = withSuffix(path, "-wal")?;
-        if ((fileLength(wal.view())? ?? 0) > 0) {
-            return Err(unsupported("the database has a write-ahead log, which this build cannot write yet"));
-        }
         var file = File.openReadWrite(path)?;
-        var bytes = [0u8; 100];
-        if (!readFully(mut file, mut bytes[..], 0)?) {
+        var bytes = Vector<u8>.create();
+        bytes.resize(100, 0)?;
+        if (!readFully(mut file, bytes.viewMut(), 0)?) {
             return Err(notADatabase("file is too small to be a SQLite database"));
         }
-        let header = DatabaseHeader.parse(bytes[..])?;
+        let fileHeader = DatabaseHeader.parse(bytes.view())?;
+        let pages = file.length()? / (fileHeader.pageSize as u64);
+        let filePages = checkedTruncate<u32>(pages) ?? {
+            return Err(corrupt("database file has more pages than the format allows"));
+        };
+        // A log with commits in it is part of the database, whatever mode the file's header names, as in SQLite.
+        var wal = WalLog.open(path, true)?;
+        var pageCount = filePages;
+        if (wal.hasFrames()) {
+            if (wal.pageSize != fileHeader.pageSize) {
+                return Err(corrupt("the write-ahead log's page size is not the database's"));
+            }
+            var page = Vector<u8>.create();
+            page.resize(wal.pageSize, 0)?;
+            if (wal.readPage(1, page.viewMut())?) {
+                bytes.viewMut().copyFrom(page.view()[0..100]);
+            }
+            pageCount = wal.databasePages;
+        }
+        let header = DatabaseHeader.parse(bytes.view())?;
+        if (header.pageSize != fileHeader.pageSize) {
+            return Err(corrupt("the write-ahead log's page 1 gives another page size"));
+        }
         if (bytes[18] > 2 || bytes[19] > 2) {
             return Err(unsupported("the database's file format is newer than this engine"));
         }
-        if (bytes[18] == 2 || bytes[19] == 2) {
-            return Err(unsupported("the database is in WAL mode, which this build cannot write yet"));
-        }
-        if (bytes[..].readBE<u32>(52) != 0) {
+        let walMode = bytes[18] == 2 || bytes[19] == 2 || wal.hasFrames();
+        if (bytes.view().readBE<u32>(52) != 0) {
             return Err(unsupported("databases with auto-vacuum or incremental vacuum cannot be written"));
         }
         if (header.schemaFormat > 4) {
             return Err(unsupported("the database's schema format is newer than this engine"));
         }
-        let pages = file.length()? / (header.pageSize as u64);
-        let pageCount = checkedTruncate<u32>(pages) ?? {
-            return Err(corrupt("database file has more pages than the format allows"));
-        };
         return Ok(WritablePager {
             file: file,
+            wal: wal,
+            walMode: walMode,
+            filePages: filePages,
+            autoCheckpoint: WAL_DEFAULT_AUTOCHECKPOINT,
             path: String.from(path)?,
             pageSize: header.pageSize,
             usable: header.usableSize(),
@@ -116,9 +147,15 @@ struct WritablePager {
         var bytes = Vector<u8>.create();
         bytes.resize(this.pageSize, 0)?;
         if (number <= this.committedPageCount) {
-            let offset = ((number - 1) as u64) * (this.pageSize as u64);
-            if (!readFully(mut this.file, bytes.viewMut(), offset)?) {
-                return Err(corrupt("database file ends inside a page"));
+            if (this.walMode && this.wal.readPage(number, bytes.viewMut())?) {
+                // The log's latest committed frame of the page.
+            } else if (this.walMode && number > this.filePages) {
+                // Past the end of the file and in no frame: zeros, as SQLite reads it.
+            } else {
+                let offset = ((number - 1) as u64) * (this.pageSize as u64);
+                if (!readFully(mut this.file, bytes.viewMut(), offset)?) {
+                    return Err(corrupt("database file ends inside a page"));
+                }
             }
         }
         let slot = this.pages.length;
@@ -315,33 +352,46 @@ struct WritablePager {
         if (this.dirty.length() == 0) {
             return Ok();
         }
-        let counter = this.changeCounter.wrappingAdd(1);
         let pageCount = this.pageCount;
         let freeTrunk = this.freeTrunk;
         let freeCount = this.freeCount;
-        let header = this.write(1)?;
-        header.writeBE(24, counter);
-        header.writeBE(28, pageCount);
-        header.writeBE(32, freeTrunk);
-        header.writeBE(36, freeCount);
-        // The version-valid-for number says the in-header size is current.
-        header.writeBE(92, counter);
-        header.writeBE(96, WRITER_SQLITE_VERSION);
+        // In WAL mode, as in SQLite, page 1 is written only when the commit changes it: its size or freelist
+        // fields, or anything else on it. A rollback-journal commit always counts a change in it.
+        let first: u32 = 1;
+        let headerChanged = this.dirty.contains(borrow first) || pageCount != this.committedPageCount ||
+            freeTrunk != this.committedFreeTrunk || freeCount != this.committedFreeCount;
+        var counter = this.changeCounter;
+        if (!this.walMode || headerChanged) {
+            counter = counter.wrappingAdd(1);
+            let header = this.write(1)?;
+            header.writeBE(24, counter);
+            header.writeBE(28, pageCount);
+            header.writeBE(32, freeTrunk);
+            header.writeBE(36, freeCount);
+            // The version-valid-for number says the in-header size is current.
+            header.writeBE(92, counter);
+            header.writeBE(96, WRITER_SQLITE_VERSION);
+        }
 
-        var journal = JournalWriter.begin(this.path.view(), this.pageSize, this.committedPageCount)?;
-        for (i in 0..this.preImages.length()) {
-            journal.add(*this.preImages.keyAt(i), this.preImages.valueAt(i).view())?;
+        if (this.walMode) {
+            this.commitToLog(pageCount)?;
+        } else {
+            var journal = JournalWriter.begin(this.path.view(), this.pageSize, this.committedPageCount)?;
+            for (i in 0..this.preImages.length()) {
+                journal.add(*this.preImages.keyAt(i), this.preImages.valueAt(i).view())?;
+            }
+            journal.finish()?;
+            for (i in 0..this.dirty.length()) {
+                let number = *this.dirty.keyAt(i);
+                let offset = ((number - 1) as u64) * (this.pageSize as u64);
+                let slot = this.slotOf(number);
+                this.file.writeAt(this.pages[slot].view(), offset)?;
+            }
+            this.file.setLength((pageCount as u64) * (this.pageSize as u64))?;
+            this.file.syncAll()?;
+            Journal.remove(this.path.view())?;
+            this.filePages = pageCount;
         }
-        journal.finish()?;
-        for (i in 0..this.dirty.length()) {
-            let number = *this.dirty.keyAt(i);
-            let offset = ((number - 1) as u64) * (this.pageSize as u64);
-            let slot = this.slotOf(number);
-            this.file.writeAt(this.pages[slot].view(), offset)?;
-        }
-        this.file.setLength((pageCount as u64) * (this.pageSize as u64))?;
-        this.file.syncAll()?;
-        Journal.remove(this.path.view())?;
 
         this.changeCounter = counter;
         this.committedPageCount = pageCount;
@@ -349,6 +399,97 @@ struct WritablePager {
         this.committedFreeCount = freeCount;
         this.preImages.clear();
         this.dirty.clear();
+        // SQLite's automatic checkpoint: a passive one once the log holds wal_autocheckpoint frames.
+        if (this.walMode && this.autoCheckpoint != 0 && this.wal.frames >= this.autoCheckpoint) {
+            let _ = this.checkpoint(false)?;
+        }
+        return Ok();
+    }
+
+    /// Appends the changed pages to the log, in page order, the last frame marking the commit.
+    private fn commitToLog(borrow mut this, pageCount: u32) -> Result<void, SqliteError> {
+        var numbers = Vector<u32>.withCapacity(this.dirty.length())?;
+        for (i in 0..this.dirty.length()) {
+            numbers.push(*this.dirty.keyAt(i))?;
+        }
+        numbers.sortBy((a, b) => if (*a < *b) -1 else if (*a > *b) 1 else 0);
+        this.wal.beginCommit(this.pageSize)?;
+        for (k in 0..numbers.length) {
+            let number = numbers[k];
+            let commitSize = if (k + 1 == numbers.length) pageCount else 0;
+            let slot = this.slotOf(number);
+            this.wal.addFrame(number, this.pages[slot].view(), commitSize)?;
+        }
+        this.wal.finishCommit(pageCount)?;
+        return Ok();
+    }
+
+    /// Whether the database is in WAL mode: commits go to its write-ahead log.
+    fn inWalMode(borrow this) -> bool => this.walMode;
+
+    /// Copies the log's committed pages into the database file (SQLite's checkpoint), and with `truncate` empties
+    /// the log. The transaction must have no changes.
+    fn checkpoint(borrow mut this, truncate: bool) -> Result<WalCheckpoint, SqliteError> {
+        assert(this.dirty.length() == 0, "a checkpoint is made between transactions");
+        if (!this.walMode) {
+            return Ok(WalCheckpoint { logFrames: -1, checkpointed: -1 });
+        }
+        this.wal.checkpoint(mut this.file)?;
+        if (this.wal.hasFrames()) {
+            this.filePages = this.wal.databasePages;
+        }
+        let result = WalCheckpoint { logFrames: this.wal.frames as i64, checkpointed: this.wal.backfilled as i64 };
+        if (truncate) {
+            this.wal.truncate()?;
+            return Ok(WalCheckpoint { logFrames: 0, checkpointed: 0 });
+        }
+        return Ok(result);
+    }
+
+    /// Puts the database in WAL mode: the header's format numbers become 2, in a commit of their own.
+    fn enterWalMode(borrow mut this) -> Result<void, SqliteError> {
+        if (this.walMode) {
+            return Ok();
+        }
+        let header = this.write(1)?;
+        header[18] = 2;
+        header[19] = 2;
+        this.commit()?;
+        this.walMode = true;
+        return Ok();
+    }
+
+    /// Leaves WAL mode for a rollback journal: the log is checkpointed and removed, and the header's format
+    /// numbers become 1.
+    fn leaveWalMode(borrow mut this) -> Result<void, SqliteError> {
+        if (!this.walMode) {
+            return Ok();
+        }
+        let _ = this.checkpoint(false)?;
+        this.wal.remove()?;
+        this.walMode = false;
+        let header = this.write(1)?;
+        header[18] = 1;
+        header[19] = 1;
+        this.commit()?;
+        return Ok();
+    }
+
+    /// Ends the connection: a transaction in progress is forgotten and, as SQLite does when its last connection
+    /// closes, a write-ahead log is checkpointed and removed.
+    fn close(this) -> Result<void, SqliteError> {
+        var me = this;
+        return me.closeLog();
+    }
+
+    /// What closing does, the pager staying usable: forgets a transaction in progress, and in WAL mode copies the
+    /// log into the file and removes it.
+    fn closeLog(borrow mut this) -> Result<void, SqliteError> {
+        this.rollback();
+        if (this.walMode) {
+            let _ = this.checkpoint(false)?;
+            this.wal.remove()?;
+        }
         return Ok();
     }
 }

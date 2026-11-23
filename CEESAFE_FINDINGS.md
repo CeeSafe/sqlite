@@ -198,3 +198,31 @@ Result<T, SqliteError>` and `insertTwo` returns `Result<i64, SqliteError>`, is N
 needs `transaction<i64>(insertTwo)`. Also `Pool` is a built-in name (N0201), like those of findings 10 and 18.
 
 Workaround: the type argument is written (`tests/api_tests.cee`).
+
+### 26. No shared memory
+
+There is no memory-mapped file (`mmap` with `MAP_SHARED`) in the library. SQLite's WAL mode keeps its
+wal-index in `<database>-shm`, mapped by every connection, with locks on bytes of it (finding 3); without
+mapping, the index cannot be shared with sqlite3 or kept current across processes.
+
+Workaround: the index is built in memory from the `-wal` file when the database is opened (`src/wal.cee`), and
+no `-shm` is written; sqlite3 rebuilds its own. This is sound only with one process at a time (README.md,
+Limits).
+
+### 27. A file cannot be created for reading and writing
+
+`File.create` makes (or empties) a file and opens it for writing only, and `File.openReadWrite` fails when the
+file does not exist; there is no `O_RDWR | O_CREAT`. Reading from the handle `File.create` gives fails with
+"Input/output error", which does not say that the handle was opened write-only (EBADF), so the WAL writer's
+first checkpoint failed in a way that took a while to trace.
+
+Workaround: create the file, drop the handle, and open it again with `File.openReadWrite`
+(`WalLog.beginCommit` in `src/wal.cee`); between the two another process could replace it. An open-options
+builder (read, write, create, truncate, exclusive) would cover this and `O_EXCL`.
+
+### 28. A literal cannot be borrowed
+
+`map.contains(borrow 1u32)` is refused (N0247, "only a variable, a field, or a place reached through a
+reference can be borrowed"), so a lookup by a constant key needs a local first (`let first: u32 = 1;`,
+`WritablePager.commit` in `src/pagerw.cee`). Borrowing a temporary for the length of the call, as Rust's `&1`
+does, would remove the extra line.

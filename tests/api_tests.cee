@@ -465,3 +465,19 @@ fn threadsShareAPool() -> Result<void, TestFailure> {
     Check.equalText("100|4\n", askSqlite(path, "SELECT count(*), count(DISTINCT worker) FROM t")?.view())?;
     return expectIntact(path);
 }
+
+@test
+fn closingAConnectionCheckpointsItsLog() -> Result<void, TestFailure> {
+    let path = "out/api-wal-close.sqlite";
+    let _ = File.remove(path);
+    let _ = File.remove(withSuffix(path, "-wal")!.view());
+    var connection = Connection.open(path)!;
+    let none = Params.create();
+    let _ = connection.query("PRAGMA journal_mode = WAL", borrow none)!;
+    let _ = connection.execute("CREATE TABLE t(x); INSERT INTO t VALUES (1), (2)", borrow none)!;
+    Check.isTrue(fileLength(withSuffix(path, "-wal")!.view())!.isSome(), "the log holds the commits")?;
+    connection.close()!;
+    Check.isTrue(fileLength(withSuffix(path, "-wal")!.view())!.isNull(), "the log is removed")?;
+    Check.equalText("2\n", askSqlite(path, "SELECT count(*) FROM t")?.view())?;
+    return Ok();
+}

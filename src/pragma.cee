@@ -406,8 +406,51 @@ fn executePragma(stmt: borrow PragmaStmt, db: borrow mut Session) -> Result<Quer
             }
         }
         "journal_mode" => {
-            // Rollback journals only, for now: asked to change, the answer is the mode in force.
-            rows.push(textRow("delete")?)?;
+            // WAL, or a rollback journal that is deleted after each commit. SQLite's other rollback modes
+            // (truncate, persist, memory, off) are taken as delete; an unknown name changes nothing. Inside a
+            // transaction the mode cannot change into or out of WAL: SQLite says so, unless the transaction has
+            // written, when it answers with the mode in force.
+            if (stmt.value.isSome() && !(db.inTransaction && db.pager.hasChanges())) {
+                let wanted = asciiLower(setText)?;
+                let rollback = match (wanted.view()) {
+                    "delete" | "truncate" | "persist" | "memory" | "off" => true,
+                    _ => false,
+                };
+                if (wanted.view() == "wal" && !db.pager.inWalMode()) {
+                    if (db.inTransaction) {
+                        return Err(sqlError("cannot change into wal mode from within a transaction"));
+                    }
+                    db.pager.enterWalMode()?;
+                } else if (rollback && db.pager.inWalMode()) {
+                    if (db.inTransaction) {
+                        return Err(sqlError("cannot change out of wal mode from within a transaction"));
+                    }
+                    db.pager.leaveWalMode()?;
+                }
+            }
+            rows.push(textRow(if (db.pager.inWalMode()) "wal" else "delete")?)?;
+        }
+        "wal_checkpoint" => {
+            // PASSIVE, FULL and RESTART copy every committed frame, there being no other connection to wait
+            // for; TRUNCATE also empties the log. Outside WAL mode there is no log: -1 frames.
+            if (db.inTransaction && db.pager.hasChanges()) {
+                return Err(sqlError("database table is locked"));
+            }
+            let truncate = setText.equalsIgnoreAsciiCase("truncate");
+            let done = db.pager.checkpoint(truncate)?;
+            columns = namesOf(["busy", "log", "checkpointed"][..])?;
+            var row = Vector<SqliteValue>.create();
+            row.push(SqliteValue.Integer(0))?;
+            row.push(SqliteValue.Integer(done.logFrames))?;
+            row.push(SqliteValue.Integer(done.checkpointed))?;
+            rows.push(row)?;
+        }
+        "wal_autocheckpoint" => {
+            if (stmt.value.isSome()) {
+                let n = setTo ?? 0;
+                db.pager.autoCheckpoint = if (n <= 0) 0 else saturatingTruncate<u32>(n);
+            }
+            rows.push(intRow(db.pager.autoCheckpoint as i64)?)?;
         }
         "legacy_alter_table" => {
             if (stmt.value.isSome()) {

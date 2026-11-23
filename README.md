@@ -9,7 +9,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Part | C# source | Here | State |
 |---|---|---|---|
 | Varints, records, values | `Engine/Format` | `varint.cee`, `record.cee`, `value.cee` | done |
-| Database header, pager, freelist count | `Storage/DatabaseHeader`, `Pager`, `FreelistReader` | `header.cee`, `pager.cee` | done (no WAL overlay yet) |
+| Database header, pager, freelist count | `Storage/DatabaseHeader`, `Pager`, `FreelistReader` | `header.cee`, `pager.cee` | done, reading through a write-ahead log |
 | Table b-tree reader | `Btree/BTreeReader` | `btree.cee` | done |
 | Index b-tree reader | `Btree/IndexBTreeReader` | `index.cee` | done, except the integer batch-count fast paths, which belong with the executor |
 | Value ordering, collations | `Exec/ValueComparer` | `compare.cee` | done |
@@ -36,7 +36,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | ALTER TABLE | `Exec/QueryExecutor` (`ExecuteAlterTable`) | `alter.cee` | RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN done, with views and triggers following renames |
 | PRAGMAs, pragma_* table functions | `Exec/QueryExecutor` (`ExecutePragma`) | `pragma.cee`, `integrity.cee` | schema pragmas, header fields, integrity_check and quick_check done |
 | Connection, transactions | `SqliteConnection`, `EngineGlue` | `session.cee` | done: statements commit on their own outside BEGIN, and a failed statement undoes only itself inside it |
-| WAL | `Storage/Wal*`, `Shm*` | | until then a database with a non-empty `-wal` file is refused |
+| WAL | `Storage/Wal*`, `Shm*` | `wal.cee`, `pagerw.cee`, `pragma.cee` | done: logs read (either checksum byte order) and written with SQLite's salts and checksums, damaged tails ignored as SQLite ignores them, `journal_mode` WAL and DELETE, `wal_checkpoint` (all four modes), `wal_autocheckpoint`, a checkpoint and removal of the log on `Session.close`; no `-shm` (see Limits) |
 | Connection, command, transaction | `SqliteConnection`, `SqliteCommand`, `SqliteTransaction`, `EngineGlue` | `api.cee`, `params.cee` | done: `Connection` with `execute`, `query`, `scalar`, `executeScript`, `begin`/`commit`/`rollback` and `transaction(work)`; `Params` bound by SQLite's rules; results materialised (see below) |
 | Connection pool | `SqliteConnectionPool`, `SharedStore` | `pool.cee` | done: shareable across threads (`Arc<ConnectionPool>`), transactions serialised, connections rolled back on return; no `:memory:` |
 | Scripts | `SqliteScript` | `script.cee` | done: `splitScript`/`splitStatements` end statements where sqlite3_complete does |
@@ -75,8 +75,19 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   duplicates across pages. The bounding entry must now satisfy the bound as written (`countsRanges`).
 - **Header checks.** A reserved-space byte that leaves fewer than 480 usable bytes, and an unknown text encoding,
   are refused; the in-header page count is used only when the header says it is valid.
-- **Write-ahead logs.** Until the WAL reader is ported, opening a database with a non-empty `-wal` file is an
-  error rather than a silent read of the main file alone.
+- **The write-ahead log's recovery.** When the log ends in frames of a transaction that did not commit, the C#
+  let such a frame replace the committed frame of the same page in its map and then dropped the page, reading it
+  as it was before both transactions. Here only committed frames enter the index
+  (`anUnfinishedTransactionHidesNoCommittedPage`). A frame naming page 0 ends the log, and a log of an unknown
+  format version is refused, as in SQLite; the database's size is the last commit frame's, not page 1's field.
+- **The write-ahead log's salts.** The C# wrote salts 1 and 1 in every log, and wrote page 1 with every commit.
+  A new log here has random salts and a restarted one the next salt-1 and a new salt-2, as SQLite does, so no
+  frame of an old log can pass for one of the new; page 1 goes into the log only when a commit changes it, so
+  `PRAGMA wal_checkpoint` counts the frames SQLite counts (`walPragmasAnswerAsSqlites`).
+- **Checkpoints.** The C# copied every page of the database back from its cache at each checkpoint, and always
+  emptied the log. Here a checkpoint copies only the frames not yet copied; PASSIVE, FULL and RESTART leave the
+  log for the next commit to start again, and TRUNCATE empties it (`sqliteReadsTheLogThisEngineWrites`). The C#
+  also wrote a `-shm` wal-index of its own, covering 4062 frames at most; none is written here (see Limits).
 
 - **Tokens.** The C# classifies characters with .NET's Unicode tables: digits of other scripts start numbers that
   then fail to parse, and `$` ends an identifier. The tokenizer here uses SQLite's classes. Malformed tokens (a
@@ -159,8 +170,9 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   index cells were as small as table cells. The one builder serves both here.
 - **The freelist.** A freed page becomes a leaf of the first trunk while it has room, rather than a trunk of its
   own; freelist pointers are checked; the page of SQLite's lock bytes is never allocated.
-- **Files the mutators cannot keep sound.** A database with pointer-map pages (auto-vacuum) or in WAL mode is
-  refused for writing; the C# wrote it, leaving the pointer map or the log out of step.
+- **Files the mutators cannot keep sound.** A database with pointer-map pages (auto-vacuum) is refused for
+  writing; the C# wrote it, leaving the pointer map out of step. A database in WAL mode is written through its
+  log by the same pager as any other (`appendsToALogSqliteLeft`).
 - **Rolling back.** A transaction's changes can be forgotten; the C# pager could only be thrown away.
 
 - **Where changes live.** The C# engine loads a whole table into memory the first time a statement changes it, and
@@ -477,6 +489,17 @@ ends the transaction.
 - **One process at a time.** The engine does not take SQLite's file locks, which CeeSafe's library does not
   offer, so it must not have a database open while another process writes it. (The C# engine has the same
   limit.)
+- **No wal-index.** In WAL mode the `-shm` file, which SQLite's connections share as memory, is neither read nor
+  written (CeeSafe can neither map shared memory nor lock bytes of a file: CEESAFE_FINDINGS.md findings 3
+  and 23). The index of the log's frames is
+  built in memory from the `-wal` file when the database is opened, as SQLite rebuilds it when it is the first
+  to open the database, and sqlite3 rebuilds its own from the logs this engine writes. A stale `-shm` that
+  sqlite3 left is harmless for the same reason.
+- **Journal modes.** WAL and DELETE only: TRUNCATE, PERSIST, MEMORY and OFF are taken as DELETE, and
+  `PRAGMA journal_mode` then answers `delete`. Leaving WAL mode writes the header's format numbers 1 and 1 and
+  removes the log, as SQLite does.
+- **Checkpoints inside a transaction.** SQLite refuses `PRAGMA wal_checkpoint` ("database table is locked") once
+  a transaction has read or written; this engine refuses it only once the transaction has written.
 
 ## Tests
 
