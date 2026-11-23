@@ -23,7 +23,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Numbers as text, text as numbers | `Exec/SqlValueOps` | `numeric.cee` | done: SQLite's own conversion routines, ported |
 | Value operations, comparison affinity | `Exec/SqlValueOps`, `ValueComparer` | `valueops.cee`, `compare.cee` | done |
 | Expressions: compiler and evaluator | `Exec/ExpressionEvaluator`, `Binding`, `ParameterBinder` | `expr.cee`, `compile.cee` | done |
-| Scalar functions, aggregates | `Exec/Functions`, `LikeMatcher` | `functions.cee`, `aggregate.cee` | core functions done; transcendental math next |
+| Scalar functions, aggregates | `Exec/Functions`, `LikeMatcher` | `functions.cee`, `aggregate.cee`, `libm.cee` | done, with every math function (`libm.cee`: msun and double-double, a last-bit difference from macOS's libm on some arguments) |
 | Date and time functions | `Exec/Functions` (date/time part) | `datetime.cee` | done: a port of SQLite's date.c; 'localtime' and 'utc' are an error where they need the time zone, which CeeSafe lacks |
 | printf() and format() | `Exec/Functions` (`Printf`) | `printf.cee` | done: a port of SQLite's `sqlite3_str_vappendf`, every conversion and flag of the SQL path |
 | JSON functions | `Exec/Json`, `Functions` (JSON1) | `json.cee` | done: SQLite 3.53.4's text JSON functions, `->`, `->>`, `json_group_array` and `json_group_object`, JSON5 input, JSONB blobs as input; the `jsonb_*` functions and the table-valued `json_each` and `json_tree` are not ported and are "no such function" |
@@ -234,6 +234,40 @@ The port fixes what was wrong in the source instead of copying it. Each item has
     `json_array(json('[1]'))` is `[[1]]`; the C# made it `["[1]"]` (`jsonNestsJsonResultsBySubtype`);
   - json_error_position() reports the character where SQLite's parser stops, and json_valid() takes SQLite's
     FLAGS argument; json_pretty() and json_array_insert() exist.
+- **Math functions** (`math_tests.cee`). The C# called .NET's `Math` with SQLite's names, and differed:
+  - an infinite result was NULL; SQLite returns it: `exp(710)`, `pow(0, -1)` and `atanh(1)` are `Inf`;
+  - arguments went through the numeric prefix of text, so `sin('1abc')` and `floor(x'33')` were numbers; SQLite
+    takes text that is entirely a number and makes anything else (other text, blobs) NULL, and so does
+    `sqrt()`, `mod()`, `floor()`, `ceil()` and `trunc()` here;
+  - `log(B, X)` with a base in (0, 1] is NULL in SQLite (logFunc requires `ln(B) > 0`); the C# computed it, and
+    took X's prefix as SQLite does only by accident;
+  - `degrees(x)` was `x * 180 / pi`, rounded twice; SQLite's is `x * (180 / pi)`;
+  - `asinh`, `acosh` and `atanh` were the textbook formulas, which lose every digit for large negative or small
+    arguments (`asinh(-1e10)` was `ln(0)`, NULL); here they are msun's.
+
+## Known differences from SQLite in the math functions
+
+The `sqlite3` shell calls the platform's libm (macOS's here), and prints reals with 17 significant digits, so a
+difference in the last bit shows. CeeSafe has no math library and the package may not call C, so `libm.cee`
+computes them: `exp`, `ln`, `log`, `log10`, `log2`, `pow`, `sinh`, `cosh`, `tanh`, `asin`, `acos` and `atan2` in
+double-double arithmetic rounded once (correctly rounded but for arguments within ~2^-100 of a tie), the
+inverse hyperbolic functions by msun's formulas over those, and `sin`, `cos`, `tan` and `atan` as FreeBSD's msun
+(fdlibm) computes them, with its exact reduction of large arguments (`sin(1e22)` matches). macOS's libm is
+neither msun nor correctly rounded for the trigonometric functions, so on 3000 random arguments a call differs in
+the last bit (never more than 2 units) this often:
+
+| Function | Differs | Function | Differs |
+|---|---|---|---|
+| `exp`, `pow`, `ln`, `log10`, `log2` | 0–0.2% | `sin`, `cos` | 4–5% |
+| `sinh`, `cosh`, `tanh` | 0.2–0.3% | `asin` | 5% |
+| `atan2` | 1–2% | `acos` | 15% |
+| `acosh`, `asinh` of large arguments | 0–0.2% | `atan` | 5% |
+| `asinh` in (-1, 1) | 7% | `tan` | 40% |
+| `atanh` | 10% | `sqrt`, `degrees`, `radians`, `mod` | 0 |
+
+Where macOS is not correctly rounded, correct rounding would not match it either (its `tan` differs from the
+correctly rounded value on 42% of arguments, `asin(0.5)` and `atan(0.5)` are a unit off); matching it bit for bit
+would take Apple's algorithms, which are not published. The tests use arguments on which the two agree.
 
 ## Known differences from SQLite in the JSON functions
 

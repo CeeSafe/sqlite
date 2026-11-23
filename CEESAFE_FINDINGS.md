@@ -145,3 +145,22 @@ carry those bytes through.
 Workaround: `textFromBytesLossy` (`src/value.cee`) turns each byte of an invalid sequence into U+FFFD, and the
 difference is listed in README.md. A byte-string type with UTF-8 views on demand would let the engine keep
 SQLite's bytes.
+
+### 20. No fused multiply-add, and none of C's float helpers besides sqrt
+
+Finding 1's workaround is now `src/libm.cee`, a port of FreeBSD's msun plus double-double arithmetic. Porting it
+met more gaps of the same kind: there is no `fma` (an exact product needs Dekker's split into 26-bit halves,
+about ten operations instead of one), no `scalbn`/`ldexp`/`frexp`, no `copysign`, no round-to-nearest-integer
+(`rint`; `x + 0x1.8p52 - 0x1.8p52` does it), and no hexadecimal float literals, so exact constants are written as
+`f64.fromBits(0x...)`. Nor is there a `wrapping` form of the bit tricks C does on signed words: msun's
+`(hx - 0x3ff00000) | lx` and `j += n << 20` had to become comparisons and `i64` arithmetic.
+
+Workaround: `libmScalbn`, `libmWords`, `ddTwoProduct` and friends in `src/libm.cee`. A correctly rounded math
+library in `lib/core` (CORE-MATH's functions are small and exact) would make all of it unnecessary.
+
+### 21. No inclusive range
+
+`0..=n` is refused (N0100, "ranges in expressions are half-open"), so a C loop `for (i = 0; i <= m; i++)` becomes
+`0..m + 1`, which reads as a different bound and overflows when `m` is the type's maximum.
+
+Workaround: `0..m + 1` (`src/libm.cee`).
