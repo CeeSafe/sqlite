@@ -23,7 +23,8 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Numbers as text, text as numbers | `Exec/SqlValueOps` | `numeric.cee` | done: SQLite's own conversion routines, ported |
 | Value operations, comparison affinity | `Exec/SqlValueOps`, `ValueComparer` | `valueops.cee`, `compare.cee` | done |
 | Expressions: compiler and evaluator | `Exec/ExpressionEvaluator`, `Binding`, `ParameterBinder` | `expr.cee`, `compile.cee` | done |
-| Scalar functions, aggregates | `Exec/Functions`, `LikeMatcher` | `functions.cee`, `aggregate.cee` | core functions done; date/time, printf, JSON and transcendental math next |
+| Scalar functions, aggregates | `Exec/Functions`, `LikeMatcher` | `functions.cee`, `aggregate.cee` | core functions done; date/time, JSON and transcendental math next |
+| printf() and format() | `Exec/Functions` (`Printf`) | `printf.cee` | done: a port of SQLite's `sqlite3_str_vappendf`, every conversion and flag of the SQL path |
 | SELECT: joins, subqueries, views, CTEs, grouping, compounds | `Exec/QueryExecutor` | `select.cee`, `run.cee` | done but RIGHT/FULL joins, window functions, table functions, index seeks (rowid seeks done) |
 | INSERT, UPDATE, DELETE | `Exec/QueryExecutor` (DML), `InMemoryDatabase` | `dml.cee` | done for rowid tables: constraints, conflict actions, RETURNING, AUTOINCREMENT; triggers, foreign keys, upserts, UPDATE … FROM next |
 | CREATE and DROP of tables, indexes and views | `Exec/QueryExecutor` (DDL) | `ddl.cee` | done; ALTER TABLE, triggers and pragmas next |
@@ -154,6 +155,24 @@ The port fixes what was wrong in the source instead of copying it. Each item has
 - **Index upkeep during a statement.** An index that cannot take a removal in place is rebuilt when the statement
   ends, from the rows as they then are; rebuilding it mid-statement would read rows not yet changed
   (`manyRowsAndIndexes`).
+
+- **printf() and format().** The C# had a subset of C's printf on .NET formatting. This is a port of SQLite's own
+  `sqlite3_str_vappendf` (`printfIntegers`, `printfReals`, `printfRealExtremes`, `printfStrings`,
+  `printfCharacters`, `printfQuoting`, `printfFlagsAndParsing`). What the C# got wrong:
+  - reals were written by .NET: `1E+20` for `%g`, `∞` for infinity, its own rounding, and no 16-digit limit; here
+    they go through `sqlite3FpDecode` as in SQLite (`Inf`, `%!` with 20 digits, `9e999` for infinity with `0`);
+  - `%d` of a real or of text went through a double, so large integers lost digits; `%u` of a negative number
+    printed a minus sign instead of the unsigned 64-bit value; `%x` and `%o` ignored the precision;
+  - the `#`, `!`, `,` and space flags and `*` widths and precisions were missing, and so were `%p`, `%r`, `%z` and
+    `%n`; an unknown conversion threw, where SQLite ends the output there; a lone `%` at the end was dropped;
+  - `%s` precision counted UTF-16 units instead of bytes (or characters with `!`); `%c` of `''` or NULL threw
+    instead of giving a NUL; `%q` and `%w` of NULL gave `''` instead of `(NULL)`;
+  - `printf(NULL)`, `printf()` and an empty result were `''`; in SQLite they are NULL.
+
+  Where this still differs from the stock library: text here is UTF-8, so where SQLite's result would not be (a
+  `%.Ns` or `%.Nq` precision that cuts a character in two, a blob argument that is not UTF-8) each stray byte
+  becomes U+FFFD. Results longer than SQLite's default limit of 10^9 bytes are "string or blob too big"; the macOS
+  `sqlite3` shell the tests use is built with a limit of 2^31 - 1, so the tests stay at sizes where both agree.
 
 ## Known gaps (inherited from the C# engine, refused by name rather than misparsed)
 

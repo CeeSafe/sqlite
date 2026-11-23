@@ -15,7 +15,9 @@
 // - sign() of text that is not entirely a number is NULL;
 // - min(), max() and nullif() compare with the collation of their arguments.
 //
-// Not yet ported: the date and time functions, printf() and format(), the JSON functions, and the math functions
+// printf() and format() are in printf.cee.
+//
+// Not yet ported: the date and time functions, the JSON functions, and the math functions
 // beyond sqrt, abs, sign, floor, ceil, trunc, mod and pi (they need a port of a math library, which CeeSafe
 // lacks). Calling one is "no such function".
 
@@ -46,6 +48,7 @@ enum ScalarFunction {
     NullIf,
     OctetLength,
     Pi,
+    Printf,
     Quote,
     Random,
     RandomBlob,
@@ -114,6 +117,7 @@ fn scalarEntry(name: StringView, argc: usize) -> FunctionEntry? {
         "nullif" => entry(ScalarFunction.NullIf, argc, 2, 2),
         "octet_length" => entry(ScalarFunction.OctetLength, argc, 1, 1),
         "pi" => entry(ScalarFunction.Pi, argc, 0, 0),
+        "printf" | "format" => entry(ScalarFunction.Printf, argc, 0, MANY),
         "quote" => entry(ScalarFunction.Quote, argc, 1, 1),
         "random" => entry(ScalarFunction.Random, argc, 0, 0),
         "randomblob" => entry(ScalarFunction.RandomBlob, argc, 1, 1),
@@ -972,6 +976,7 @@ fn callFunction(
             return Ok(values.swapRemove(0));
         }
         ScalarFunction.Pi => { return Ok(SqliteValue.Real(3.141592653589793)); }
+        ScalarFunction.Printf => { return printfFunction(v); }
         ScalarFunction.Quote => { return Ok(SqliteValue.Text(quoteValue(borrow v[0])?)); }
         ScalarFunction.Random => {
             let bytes = randomBytes(8)?;
