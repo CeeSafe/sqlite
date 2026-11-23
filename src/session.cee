@@ -1,0 +1,136 @@
+// A connection to a database file: statements run against it in transactions of its writable pager.
+//
+// The C# engine loaded each table into memory the first time a statement changed it, and wrote whole tables back
+// at commit. Here a statement's changes go to the pages they touch, held by the pager until the transaction
+// commits, and reads see them; a commit journals and writes those pages only.
+
+/// The result of a statement: its column names and its rows.
+public struct QueryResult {
+    public columns: Vector<String>;
+    public rows: Vector<Vector<SqliteValue>>;
+}
+
+public struct Session {
+    pager: WritablePager;
+    catalog: SchemaCatalog;
+    entries: Vector<SchemaEntry>;
+    /// Rows changed by the last INSERT, UPDATE or DELETE, and by all since the session opened.
+    changes: i64;
+    totalChanges: i64;
+    lastInsertRowid: i64;
+    /// Inside BEGIN … COMMIT: statements do not commit on their own.
+    inTransaction: bool;
+
+    /// Opens the database file at `path`, making an empty database if there is none.
+    public fn open(path: StringView) -> Result<Session, SqliteError> {
+        if ((fileLength(path)? ?? 0) == 0) {
+            var writer = DatabaseWriter.create(WriterOptions.defaults())?;
+            writer.writeToFile(path)?;
+        }
+        var pager = WritablePager.open(path)?;
+        let entries = readSchemaEntries(mut pager)?;
+        let catalog = SchemaCatalog.fromEntries(entries.view())?;
+        return Ok(Session {
+            pager: pager,
+            catalog: catalog,
+            entries: entries,
+            changes: 0,
+            totalChanges: 0,
+            lastInsertRowid: 0,
+            inTransaction: false,
+        });
+    }
+
+    /// Reads the schema again, after a statement changed it.
+    fn reloadSchema(borrow mut this) -> Result<void, SqliteError> {
+        this.entries = readSchemaEntries(mut this.pager)?;
+        this.catalog = SchemaCatalog.fromEntries(this.entries.view())?;
+        return Ok();
+    }
+
+    /// The CREATE VIEW statement of the view called `name`.
+    fn viewSql(borrow this, name: StringView) -> Result<String?, SqliteError> {
+        for (i in 0..this.entries.length) {
+            let entry = borrow this.entries[i];
+            if (entry.kind.view() == "view" && entry.name.view().equalsIgnoreAsciiCase(name)) {
+                if (borrow entry.sql is Some(sql)) {
+                    return Ok(sql.clone()?);
+                }
+            }
+        }
+        return Ok(null);
+    }
+
+    /// Runs one SQL statement with positional parameters (?, ?N, :name in order of first use).
+    public fn query(borrow mut this, sql: StringView, params: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> {
+        let stmt = Parser.parseStatement(sql)?;
+        let result = this.run(borrow stmt, params);
+        if (!this.inTransaction) {
+            // Each statement outside BEGIN is a transaction of its own.
+            if (result.isOk()) {
+                this.pager.commit()?;
+            } else {
+                this.pager.rollback();
+                this.reloadSchema()?;
+            }
+        }
+        return result;
+    }
+
+    /// Runs a statement.
+    fn run(borrow mut this, stmt: borrow Stmt, params: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> {
+        match (stmt) {
+            Stmt.Select(select) => {
+                var compiler = Compiler.create();
+                let plan = compileSelect(mut compiler, select, this)?;
+                var frame = newFrame(mut compiler, params)?;
+                let rows = runSelect(borrow plan, mut frame, this)?;
+                return Ok(QueryResult { columns: cloneStrings(borrow plan.columnNames)?, rows: rows });
+            }
+            Stmt.Begin(_) => {
+                if (this.inTransaction) {
+                    return Err(sqlError("cannot start a transaction within a transaction"));
+                }
+                this.inTransaction = true;
+                return Ok(emptyResult());
+            }
+            Stmt.Commit => {
+                if (!this.inTransaction) {
+                    return Err(sqlError("cannot commit - no transaction is active"));
+                }
+                this.pager.commit()?;
+                this.inTransaction = false;
+                return Ok(emptyResult());
+            }
+            Stmt.Rollback(null) => {
+                if (!this.inTransaction) {
+                    return Err(sqlError("cannot rollback - no transaction is active"));
+                }
+                this.pager.rollback();
+                this.inTransaction = false;
+                this.reloadSchema()?;
+                return Ok(emptyResult());
+            }
+            _ => { return Err(unsupported("this statement is not supported yet")); }
+        }
+    }
+}
+
+fn emptyResult() -> QueryResult =>
+    QueryResult { columns: Vector<String>.create(), rows: Vector<Vector<SqliteValue>>.create() };
+
+/// The frame a compiled statement runs in: its slots, parameters and CTEs, and its time.
+fn newFrame(compiler: borrow mut Compiler, params: Slice<SqliteValue>) -> Result<Frame, SqliteError> {
+    var frame = Frame.create();
+    let _ = frame.pushSlots(compiler.slotsInUse)?;
+    frame.params = cloneValues(params)?;
+    frame.ctes = replace(mut compiler.ctePlans, Vector<CtePlan?>.create());
+    for (i in 0..frame.ctes.length) {
+        frame.cteRows.push(null)?;
+    }
+    for (i in 0..compiler.workingTables) {
+        frame.working.push(Vector<Vector<SqliteValue>>.create())?;
+    }
+    frame.nowMillis = Clock.now().millis();
+    return Ok(frame);
+}

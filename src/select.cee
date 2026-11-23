@@ -1,0 +1,1322 @@
+// SELECT: compilation into plans, and execution.
+//
+// Rows stream from b-tree cursors through nested loops: no table is loaded whole. The C# engine materialised every
+// table a query touched (and kept it), which made a query on a large table cost its size in memory.
+//
+// Differences from the C# engine, which this replaces:
+// - NATURAL and USING joins compare with the columns' affinities and collations, and `*` shows a shared column
+//   once, as SQLite does;
+// - an aggregate query's bare columns come from the row of its min() or max() when it has exactly one, as SQLite
+//   documents, else from the group's last row;
+// - LIMIT and OFFSET must be integers ("datatype mismatch" otherwise), and a negative LIMIT means none;
+// - ORDER BY and GROUP BY ordinals are checked ("1st ORDER BY term out of range - should be between 1 and N").
+//
+// Not yet supported, and refused by name rather than answered wrongly: RIGHT and FULL joins, window functions,
+// ORDER BY in a recursive CTE, and table-valued functions.
+
+// ── plans ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// How a table's rows are read into a slot.
+struct TablePlan {
+    root: u32;
+    withoutRowid: bool;
+    /// For each declared column, its place in the record; `null` for a VIRTUAL generated column.
+    recordPosition: Vector<usize?>;
+    /// Columns of REAL affinity: an integer in the record reads as a real.
+    realColumns: Vector<bool>;
+    rowidAlias: usize?;
+    /// Each column's value in a record written before the column was added.
+    defaults: Vector<SqliteValue>;
+    /// VIRTUAL generated columns, computed after the row is read, in declaration order.
+    generated: Vector<GeneratedColumn>;
+}
+
+struct GeneratedColumn {
+    column: usize;
+    expr: XExpr;
+}
+
+enum SourceKind {
+    Table(TablePlan),
+    /// A subquery or a view: its rows are computed, then read.
+    Rows(Box<SelectPlan>),
+    /// A common table expression, by number.
+    Cte(usize),
+    /// A recursive CTE's current step.
+    Working(usize),
+}
+
+struct SourcePlan {
+    kind: SourceKind;
+    slot: usize;
+    columnCount: usize;
+    /// LEFT JOIN: a row of NULLs when nothing matches.
+    left: bool;
+    on: XExpr?;
+    /// The rowid this source's row must have, from earlier sources: a seek instead of a scan.
+    rowidSeek: XExpr?;
+}
+
+struct CorePlan {
+    sources: Vector<SourcePlan>;
+    filter: XExpr?;
+    groupBy: Vector<XExpr>;
+    groupCollations: Vector<Collation>;
+    having: XExpr?;
+    outputs: Vector<XExpr>;
+    outputCollations: Vector<Collation>;
+    /// ORDER BY of a SELECT that is not a compound: evaluated with each row.
+    sortKeys: Vector<XOrderTerm>;
+    aggregates: Vector<AggregateSpec>;
+    isAggregate: bool;
+    /// The one min() or max() whose row bare columns come from.
+    minMax: usize?;
+    distinct: bool;
+}
+
+/// ORDER BY of a compound SELECT: a result column.
+struct ColumnOrder {
+    column: usize;
+    descending: bool;
+    nullsFirst: bool;
+    collation: Collation;
+}
+
+struct SelectPlan {
+    cores: Vector<CorePlan>;
+    ops: Vector<CompoundOp>;
+    compoundOrder: Vector<ColumnOrder>;
+    limit: XExpr?;
+    offset: XExpr?;
+    columnNames: Vector<String>;
+    columnAffinities: Vector<ExprAffinity>;
+    columnCollations: Vector<Collation?>;
+    firstColumnAffinity: ExprAffinity;
+    firstColumnCollation: Collation?;
+}
+
+struct RecursivePlan {
+    anchor: SelectPlan;
+    recursive: SelectPlan;
+    /// UNION rather than UNION ALL: rows already produced are not produced again.
+    distinct: bool;
+    working: usize;
+    limit: XExpr?;
+    offset: XExpr?;
+}
+
+enum CtePlan {
+    Plain(SelectPlan),
+    Recursive(RecursivePlan),
+}
+
+/// A result row, with its ORDER BY keys.
+struct SortedRow {
+    values: Vector<SqliteValue>;
+    keys: Vector<SqliteValue>;
+}
+
+// ── compilation ──────────────────────────────────────────────────────────────────────────────────────────────
+
+/// What a core's result column gives: its expression and the name it shows.
+struct OutputColumn {
+    name: String;
+    affinity: ExprAffinity;
+    collation: Collation?;
+}
+
+fn ordinalWord(n: usize) -> Result<String, AllocError> {
+    var s = String.create();
+    s.appendNumber(n)?;
+    s.append(match (n) {
+        1 => "st",
+        2 => "nd",
+        3 => "rd",
+        _ => "th",
+    })?;
+    return Ok(s);
+}
+
+fn termError(n: usize, clause: StringView, message: StringView, count: usize) -> SqliteError {
+    var s = ordinalWord(n).ok() ?? String.create();
+    let _ = s.append(" ");
+    let _ = s.append(clause);
+    let _ = s.append(message);
+    if (count != 0) {
+        let _ = s.appendNumber(count);
+    }
+    return SqliteError.Sql(s);
+}
+
+/// A literal positive integer term: an ordinal.
+fn ordinalOf(e: borrow Expr) -> i64? {
+    if (e is Expr.Literal(Literal { kind: LiteralKind.Integer, text })) {
+        return text.view().parseInt<i64>();
+    }
+    return null;
+}
+
+/// Whether an expression contains an aggregate call outside subqueries.
+fn containsAggregate(e: borrow Expr) -> bool {
+    match (e) {
+        Expr.Function(call) => {
+            if (call.over.isNull() && aggregateFunctionNamed(call.name.view(), call.args.length, call.star).isSome()) {
+                return true;
+            }
+            for (i in 0..call.args.length) {
+                if (containsAggregate(borrow call.args[i])) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        Expr.Unary(_, x) | Expr.Collate(x, _) | Expr.Cast(x, _) => { return containsAggregate(x); }
+        Expr.Binary(_, a, b) | Expr.Is(a, b, _) => { return containsAggregate(a) || containsAggregate(b); }
+        Expr.Between(b) => {
+            return containsAggregate(
+                borrow b.operand,
+            ) || containsAggregate(borrow b.low) || containsAggregate(borrow b.high);
+        }
+        Expr.Like(l) => { return containsAggregate(borrow l.operand) || containsAggregate(borrow l.pattern); }
+        Expr.In(i) => {
+            if (containsAggregate(borrow i.operand)) {
+                return true;
+            }
+            if (borrow i.source is InSource.Items(items)) {
+                for (k in 0..items.length) {
+                    if (containsAggregate(borrow items[k])) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        Expr.Case(c) => {
+            if (borrow c.operand is Some(x) && containsAggregate(x)) {
+                return true;
+            }
+            for (k in 0..c.branches.length) {
+                if (containsAggregate(borrow c.branches[k].when) || containsAggregate(borrow c.branches[k].then)) {
+                    return true;
+                }
+            }
+            if (borrow c.otherwise is Some(x)) {
+                return containsAggregate(x);
+            }
+            return false;
+        }
+        Expr.RowValue(items) => {
+            for (k in 0..items.length) {
+                if (containsAggregate(borrow items[k])) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        _ => { return false; }
+    }
+}
+
+/// Whether an expression calls a window function.
+fn containsWindow(e: borrow Expr) -> bool {
+    match (e) {
+        Expr.Function(call) => {
+            if (call.over.isSome()) {
+                return true;
+            }
+            for (i in 0..call.args.length) {
+                if (containsWindow(borrow call.args[i])) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        Expr.Unary(_, x) | Expr.Collate(x, _) | Expr.Cast(x, _) => { return containsWindow(x); }
+        Expr.Binary(_, a, b) | Expr.Is(a, b, _) => { return containsWindow(a) || containsWindow(b); }
+        Expr.Case(c) => {
+            for (k in 0..c.branches.length) {
+                if (containsWindow(borrow c.branches[k].when) || containsWindow(borrow c.branches[k].then)) {
+                    return true;
+                }
+            }
+            if (borrow c.otherwise is Some(x)) {
+                return containsWindow(x);
+            }
+            return false;
+        }
+        _ => { return false; }
+    }
+}
+
+/// The name a result column shows when it has no alias.
+fn defaultColumnName(e: borrow Expr) -> Result<String, AllocError> {
+    if (e is Expr.Column(c)) {
+        return c.name.clone();
+    }
+    return SqlWriter.expression(e);
+}
+
+/// The columns of a table as names see them.
+fn tableScopeColumns(table: borrow TableSchema) -> Result<Vector<ScopeColumn>, AllocError> {
+    var columns = Vector<ScopeColumn>.withCapacity(table.columns.length)?;
+    for (i in 0..table.columns.length) {
+        let c = borrow table.columns[i];
+        columns.push(
+            ScopeColumn { name: c.name.clone()?, affinity: c.affinity, collation: c.collation, hidden: false },
+        )?;
+    }
+    return Ok(columns);
+}
+
+/// A plan's result columns as names see them, for a subquery, view or CTE in FROM.
+fn planScopeColumns(plan: borrow SelectPlan, names: borrow Vector<String>) -> Result<Vector<ScopeColumn>, SqliteError> {
+    if (names.length != 0 && names.length != plan.columnNames.length) {
+        var message = String.from("table has ")?;
+        message.appendNumber(plan.columnNames.length)?;
+        message.append(" values for ")?;
+        message.appendNumber(names.length)?;
+        message.append(" columns")?;
+        return Err(SqliteError.Sql(message));
+    }
+    var columns = Vector<ScopeColumn>.withCapacity(plan.columnNames.length)?;
+    for (i in 0..plan.columnNames.length) {
+        let name = if (names.length != 0) names[i].clone()? else plan.columnNames[i].clone()?;
+        // A subquery's column has its expression's affinity, and BLOB when it has none.
+        let affinity = match (plan.columnAffinities[i]) {
+            ExprAffinity.Text => Affinity.Text,
+            ExprAffinity.Numeric => Affinity.Numeric,
+            ExprAffinity.Integer => Affinity.Integer,
+            ExprAffinity.Real => Affinity.Real,
+            _ => Affinity.Blob,
+        };
+        columns.push(
+            ScopeColumn {
+                name: name,
+                affinity: affinity,
+                collation: plan.columnCollations[i] ?? Collation.Binary,
+                hidden: false,
+            },
+        )?;
+    }
+    return Ok(columns);
+}
+
+/// How to read a table's rows.
+fn tablePlan(
+    table: borrow TableSchema,
+    compiler: borrow mut Compiler,
+    slot: usize,
+    db: borrow mut Session,
+) -> Result<TablePlan, SqliteError> {
+    var recordPosition = Vector<usize?>.withCapacity(table.columns.length)?;
+    var realColumns = Vector<bool>.withCapacity(table.columns.length)?;
+    var defaults = Vector<SqliteValue>.withCapacity(table.columns.length)?;
+    var position: usize = 0;
+    if (table.withoutRowid) {
+        // The record holds the primary key's columns first, then the others in declaration order.
+        for (i in 0..table.columns.length) {
+            recordPosition.push(null)?;
+        }
+        for (k in 0..table.primaryKey.length) {
+            let at = table.indexOf(table.primaryKey[k].name.view())!;
+            recordPosition[at] = position;
+            position += 1;
+        }
+        for (i in 0..table.columns.length) {
+            let c = borrow table.columns[i];
+            if (recordPosition[i].isNull() && (c.generated.isNull() || c.generatedStored)) {
+                recordPosition[i] = position;
+                position += 1;
+            }
+        }
+    } else {
+        for (i in 0..table.columns.length) {
+            let c = borrow table.columns[i];
+            if (c.generated.isNull() || c.generatedStored) {
+                recordPosition.push(position)?;
+                position += 1;
+            } else {
+                recordPosition.push(null)?;
+            }
+        }
+    }
+    var generated = Vector<GeneratedColumn>.create();
+    for (i in 0..table.columns.length) {
+        let c = borrow table.columns[i];
+        realColumns.push(c.affinity == Affinity.Real)?;
+        var value = SqliteValue.Null;
+        if (borrow c.defaultValue is Some(d)) {
+            if (constantValue(borrow d.expr)? is Some(v)) {
+                value = v;
+            }
+        }
+        defaults.push(value)?;
+        if (borrow c.generated is Some(g) && !c.generatedStored) {
+            // Generated in the table's own scope: its columns are this slot's.
+            var scope = Scope { sources: Vector<ScopeSource>.create() };
+            scope.sources.push(
+                ScopeSource {
+                    name: table.name.clone()?,
+                    columns: tableScopeColumns(table)?,
+                    slot: slot,
+                    hasRowid: !table.withoutRowid,
+                    rowidAlias: table.rowidAlias,
+                    merged: Vector<String>.create(),
+                },
+            )?;
+            let saved = replace(mut compiler.scopes, Vector<Scope>.create());
+            compiler.scopes.push(scope)?;
+            let expr = compiler.compile(borrow g.expr, db);
+            compiler.scopes = saved;
+            generated.push(GeneratedColumn { column: i, expr: expr? })?;
+        }
+    }
+    return Ok(TablePlan {
+        root: table.rootPage,
+        withoutRowid: table.withoutRowid,
+        recordPosition: recordPosition,
+        realColumns: realColumns,
+        rowidAlias: table.rowidAlias,
+        defaults: defaults,
+        generated: generated,
+    });
+}
+
+/// The value of an expression that needs no row: a literal, possibly signed.
+fn constantValue(e: borrow Expr) -> Result<SqliteValue?, SqliteError> {
+    match (e) {
+        Expr.Literal(literal) => {
+            if (literal.kind == LiteralKind.CurrentTime ||
+                literal.kind == LiteralKind.CurrentDate || literal.kind == LiteralKind.CurrentTimestamp) {
+                return Ok(null);
+            }
+            return Ok(literalValue(literal)?);
+        }
+        Expr.Unary(UnaryOp.Negate, x) => {
+            if (constantValue(x)? is Some(v)) {
+                return Ok(negate(borrow v));
+            }
+            return Ok(null);
+        }
+        Expr.Unary(UnaryOp.Plus, x) => { return constantValue(x); }
+        _ => { return Ok(null); }
+    }
+}
+
+fn findCte(compiler: borrow Compiler, name: StringView) -> usize? {
+    var i = compiler.cteNames.length;
+    while (i > 0) {
+        i -= 1;
+        if (compiler.cteNames[i].name.view().equalsIgnoreAsciiCase(name)) {
+            return i;
+        }
+    }
+    return null;
+}
+
+/// Compiles a WITH clause: each CTE's plan, and its name for what follows.
+fn compileWith(
+    compiler: borrow mut Compiler,
+    with: borrow WithClause,
+    db: borrow mut Session,
+) -> Result<usize, SqliteError> {
+    let before = compiler.cteNames.length;
+    for (i in 0..with.ctes.length) {
+        let cte = borrow with.ctes[i];
+        let index = compiler.ctePlans.length;
+        compiler.ctePlans.push(null)?;
+        let recursive = with.recursive && selectRefersTo(borrow cte.select, cte.name.view());
+        if (!recursive) {
+            let plan = compileSelect(compiler, borrow cte.select, db)?;
+            let columns = planScopeColumns(borrow plan, borrow cte.columns)?;
+            compiler.ctePlans[index] = CtePlan.Plain(plan);
+            compiler.cteNames.push(
+                CteName { name: cte.name.clone()?, index: index, working: false, columns: columns },
+            )?;
+            continue;
+        }
+        compiler.ctePlans[index] = CtePlan.Recursive(compileRecursive(compiler, cte, db)?);
+        var columns = Vector<ScopeColumn>.create();
+        if (borrow compiler.ctePlans[index] is Some(CtePlan.Recursive(r))) {
+            columns = planScopeColumns(borrow r.anchor, borrow cte.columns)?;
+        }
+        compiler.cteNames.push(CteName { name: cte.name.clone()?, index: index, working: false, columns: columns })?;
+    }
+    return Ok(before);
+}
+
+/// Whether a SELECT's FROM clauses name `name` (a CTE referring to itself).
+fn selectRefersTo(select: borrow SelectStmt, name: StringView) -> bool {
+    for (c in 0..select.cores.length) {
+        if (borrow select.cores[c].from is Some(from)) {
+            if (fromItemRefersTo(borrow from.source, name)) {
+                return true;
+            }
+            for (j in 0..from.joins.length) {
+                if (fromItemRefersTo(borrow from.joins[j].item, name)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+fn fromItemRefersTo(item: borrow FromItem, name: StringView) -> bool => match (item) {
+    FromItem.Table(t) => t.name.schema.isNull() && t.name.name.view().equalsIgnoreAsciiCase(name),
+    FromItem.Subquery(s) => selectRefersTo(borrow s.select, name),
+    _ => false,
+};
+
+/// A recursive CTE: the cores before the first one that names the CTE are the anchor, the rest the recursive part.
+fn compileRecursive(
+    compiler: borrow mut Compiler,
+    cte: borrow CommonTableExpr,
+    db: borrow mut Session,
+) -> Result<RecursivePlan, SqliteError> {
+    let select = borrow cte.select;
+    if (select.orderBy.length != 0) {
+        return Err(unsupported("ORDER BY in a recursive common table expression is not supported"));
+    }
+    var split = select.cores.length;
+    for (c in 0..select.cores.length) {
+        var refers = false;
+        if (borrow select.cores[c].from is Some(from)) {
+            refers = fromItemRefersTo(borrow from.source, cte.name.view());
+            for (j in 0..from.joins.length) {
+                refers = refers || fromItemRefersTo(borrow from.joins[j].item, cte.name.view());
+            }
+        }
+        if (refers) {
+            split = c;
+            break;
+        }
+    }
+    if (split == 0 || split == select.cores.length) {
+        return Err(namedError("circular reference: ", cte.name.view()));
+    }
+    let op = select.compoundOps[split - 1];
+    if (op != CompoundOp.Union && op != CompoundOp.UnionAll) {
+        return Err(namedError("circular reference: ", cte.name.view()));
+    }
+    let anchor = compileCores(compiler, select, 0, split, db)?;
+    let columns = planScopeColumns(borrow anchor, borrow cte.columns)?;
+    let working = compiler.workingTables;
+    compiler.workingTables += 1;
+    compiler.cteNames.push(CteName { name: cte.name.clone()?, index: working, working: true, columns: columns })?;
+    let recursive = compileCores(compiler, select, split, select.cores.length, db);
+    let _ = compiler.cteNames.pop();
+    var limit: XExpr? = null;
+    var offset: XExpr? = null;
+    if (borrow select.limit is Some(l)) {
+        limit = compiler.compile(l, db)?;
+    }
+    if (borrow select.offset is Some(o)) {
+        offset = compiler.compile(o, db)?;
+    }
+    return Ok(
+        RecursivePlan {
+            anchor: anchor,
+            recursive: recursive?,
+            distinct: op == CompoundOp.Union,
+            working: working,
+            limit: limit,
+            offset: offset,
+        },
+    );
+}
+
+/// Compiles a SELECT statement.
+fn compileSelect(
+    compiler: borrow mut Compiler,
+    select: borrow SelectStmt,
+    db: borrow mut Session,
+) -> Result<SelectPlan, SqliteError> {
+    var ctesBefore = compiler.cteNames.length;
+    if (borrow select.with is Some(with)) {
+        ctesBefore = compileWith(compiler, with, db)?;
+    }
+    var plan = compileCores(compiler, select, 0, select.cores.length, db)?;
+    // ORDER BY: per row for a simple SELECT (done in compileCores), by result column for a compound.
+    if (select.cores.length > 1) {
+        for (t in 0..select.orderBy.length) {
+            let term = borrow select.orderBy[t];
+            var column: usize? = null;
+            let collation = termCollation(borrow term.expr)?;
+            let e = withoutCollate(borrow term.expr);
+            if (ordinalOf(e) is Some(n)) {
+                if (n < 1 || n > truncate<i64>(plan.columnNames.length)) {
+                    return Err(
+                        termError(
+                            t + 1,
+                            "ORDER BY",
+                            " term out of range - should be between 1 and ",
+                            plan.columnNames.length,
+                        ),
+                    );
+                }
+                column = truncate<usize>(n - 1);
+            } else if (e is Expr.Column(c) && c.table.isNull()) {
+                for (k in 0..plan.columnNames.length) {
+                    if (plan.columnNames[k].view().equalsIgnoreAsciiCase(c.name.view())) {
+                        column = k;
+                        break;
+                    }
+                }
+            }
+            let at = column ?? {
+                return Err(termError(t + 1, "ORDER BY", " term does not match any column in the result set", 0));
+            };
+            plan.compoundOrder.push(ColumnOrder {
+                column: at,
+                descending: term.descending,
+                nullsFirst: term.nullsFirst ?? !term.descending,
+                collation: collation ?? plan.columnCollations[at] ?? Collation.Binary,
+            })?;
+        }
+    }
+    if (borrow select.limit is Some(l)) {
+        plan.limit = compiler.compile(l, db)?;
+    }
+    if (borrow select.offset is Some(o)) {
+        plan.offset = compiler.compile(o, db)?;
+    }
+    while (compiler.cteNames.length > ctesBefore) {
+        let _ = compiler.cteNames.pop();
+    }
+    return Ok(plan);
+}
+
+/// Compiles cores `from..to` of a SELECT, joined by its compound operators.
+fn compileCores(
+    compiler: borrow mut Compiler,
+    select: borrow SelectStmt,
+    from: usize,
+    to: usize,
+    db: borrow mut Session,
+) -> Result<SelectPlan, SqliteError> {
+    var plan = SelectPlan {
+        cores: Vector<CorePlan>.create(),
+        ops: Vector<CompoundOp>.create(),
+        compoundOrder: Vector<ColumnOrder>.create(),
+        limit: null,
+        offset: null,
+        columnNames: Vector<String>.create(),
+        columnAffinities: Vector<ExprAffinity>.create(),
+        columnCollations: Vector<Collation?>.create(),
+        firstColumnAffinity: ExprAffinity.None,
+        firstColumnCollation: null,
+    };
+    let simple = select.cores.length == 1;
+    for (c in from..to) {
+        let orderBy = if (simple) select.orderBy.view() else select.orderBy.view()[0..0];
+        var outputs = Vector<OutputColumn>.create();
+        let core = compileCore(compiler, borrow select.cores[c], orderBy, mut outputs, db)?;
+        if (c == from) {
+            for (k in 0..outputs.length) {
+                plan.columnNames.push(outputs[k].name.clone()?)?;
+                plan.columnAffinities.push(outputs[k].affinity)?;
+                plan.columnCollations.push(outputs[k].collation)?;
+            }
+        } else if (outputs.length != plan.columnNames.length) {
+            let op = select.compoundOps[c - 1];
+            var message = String.from("SELECTs to the left and right of ")?;
+            message.append(match (op) {
+                CompoundOp.Union => "UNION",
+                CompoundOp.UnionAll => "UNION ALL",
+                CompoundOp.Intersect => "INTERSECT",
+                CompoundOp.Except => "EXCEPT",
+            })?;
+            message.append(" do not have the same number of result columns")?;
+            return Err(SqliteError.Sql(message));
+        }
+        if (c > from) {
+            plan.ops.push(select.compoundOps[c - 1])?;
+        }
+        plan.cores.push(core)?;
+    }
+    if (plan.columnAffinities.length != 0) {
+        plan.firstColumnAffinity = plan.columnAffinities[0];
+        plan.firstColumnCollation = plan.columnCollations[0];
+    }
+    return Ok(plan);
+}
+
+/// Adds a FROM item: its source plan, and its names to the scope.
+fn compileFromItem(
+    compiler: borrow mut Compiler,
+    item: borrow FromItem,
+    scope: borrow mut Scope,
+    sources: borrow mut Vector<SourcePlan>,
+    db: borrow mut Session,
+) -> Result<void, SqliteError> {
+    let slot = compiler.slotsInUse;
+    compiler.slotsInUse += 1;
+    match (item) {
+        FromItem.Table(t) => {
+            let alias = if (borrow t.alias is Some(a)) a.clone()? else t.name.name.clone()?;
+            if (t.name.schema.isNull()) {
+                if (findCte(compiler, t.name.name.view()) is Some(at)) {
+                    let columns = cloneScopeColumns(borrow compiler.cteNames[at].columns)?;
+                    let kind = if (compiler.cteNames[at].working) SourceKind.Working(
+                        compiler.cteNames[at].index,
+                    ) else SourceKind.Cte(compiler.cteNames[at].index);
+                    let count = columns.length;
+                    scope.sources.push(
+                        ScopeSource {
+                            name: alias,
+                            columns: columns,
+                            slot: slot,
+                            hasRowid: false,
+                            rowidAlias: null,
+                            merged: Vector<String>.create(),
+                        },
+                    )?;
+                    sources.push(
+                        SourcePlan {
+                            kind: kind,
+                            slot: slot,
+                            columnCount: count,
+                            left: false,
+                            on: null,
+                            rowidSeek: null,
+                        },
+                    )?;
+                    return Ok();
+                }
+            }
+            if (borrow t.name.schema is Some(schema)) {
+                if (!schema.view().equalsIgnoreAsciiCase("main")) {
+                    return Err(namedError("unknown database ", schema.view()));
+                }
+            }
+            if (db.catalog.table(t.name.name.view())?.isSome()) {
+                let tableCopy = db.catalog.tableCopy(t.name.name.view())?;
+                let plan = tablePlan(borrow tableCopy, compiler, slot, db)?;
+                let columns = tableScopeColumns(borrow tableCopy)?;
+                let count = columns.length;
+                scope.sources.push(
+                    ScopeSource {
+                        name: alias,
+                        columns: columns,
+                        slot: slot,
+                        hasRowid: !tableCopy.withoutRowid,
+                        rowidAlias: tableCopy.rowidAlias,
+                        merged: Vector<String>.create(),
+                    },
+                )?;
+                sources.push(
+                    SourcePlan {
+                        kind: SourceKind.Table(plan),
+                        slot: slot,
+                        columnCount: count,
+                        left: false,
+                        on: null,
+                        rowidSeek: null,
+                    },
+                )?;
+                return Ok();
+            }
+            if (db.viewSql(t.name.name.view())? is Some(sql)) {
+                let Stmt.CreateView(view) = Parser.parseStatement(sql.view())? else {
+                    return Err(corrupt("a view's definition is not a CREATE VIEW statement"));
+                };
+                // A view sees only the database, not the query that uses it.
+                let saved = replace(mut compiler.scopes, Vector<Scope>.create());
+                let savedCtes = replace(mut compiler.cteNames, Vector<CteName>.create());
+                let compiled = compileSelect(compiler, borrow view.select, db);
+                compiler.scopes = saved;
+                compiler.cteNames = savedCtes;
+                let plan = compiled?;
+                let columns = planScopeColumns(borrow plan, borrow view.columns)?;
+                let count = columns.length;
+                scope.sources.push(
+                    ScopeSource {
+                        name: alias,
+                        columns: columns,
+                        slot: slot,
+                        hasRowid: false,
+                        rowidAlias: null,
+                        merged: Vector<String>.create(),
+                    },
+                )?;
+                sources.push(
+                    SourcePlan {
+                        kind: SourceKind.Rows(Box.create(plan)?),
+                        slot: slot,
+                        columnCount: count,
+                        left: false,
+                        on: null,
+                        rowidSeek: null,
+                    },
+                )?;
+                return Ok();
+            }
+            return Err(namedError("no such table: ", t.name.name.view()));
+        }
+        FromItem.Subquery(sub) => {
+            let plan = compileSelect(compiler, borrow sub.select, db)?;
+            let none = Vector<String>.create();
+            let columns = planScopeColumns(borrow plan, borrow none)?;
+            let count = columns.length;
+            var name = String.create();
+            if (borrow sub.alias is Some(a)) {
+                name = a.clone()?;
+            }
+            scope.sources.push(
+                ScopeSource {
+                    name: name,
+                    columns: columns,
+                    slot: slot,
+                    hasRowid: false,
+                    rowidAlias: null,
+                    merged: Vector<String>.create(),
+                },
+            )?;
+            sources.push(
+                SourcePlan {
+                    kind: SourceKind.Rows(Box.create(plan)?),
+                    slot: slot,
+                    columnCount: count,
+                    left: false,
+                    on: null,
+                    rowidSeek: null,
+                },
+            )?;
+            return Ok();
+        }
+        FromItem.TableFunction(f) => {
+            return Err(namedError("table-valued functions are not supported yet: ", f.name.view()));
+        }
+    }
+}
+
+fn cloneScopeColumns(columns: borrow Vector<ScopeColumn>) -> Result<Vector<ScopeColumn>, AllocError> {
+    var out = Vector<ScopeColumn>.withCapacity(columns.length)?;
+    for (i in 0..columns.length) {
+        out.push(
+            ScopeColumn {
+                name: columns[i].name.clone()?,
+                affinity: columns[i].affinity,
+                collation: columns[i].collation,
+                hidden: columns[i].hidden,
+            },
+        )?;
+    }
+    return Ok(out);
+}
+
+/// `left = right` for a NATURAL or USING join, on the slots' columns.
+fn joinEquality(scope: borrow Scope, name: StringView, rightIndex: usize) -> Result<XExpr?, SqliteError> {
+    let right = borrow scope.sources[rightIndex];
+    let rightColumn = Compiler.findColumn(right, name) ?? {
+        return Ok(null);
+    };
+    for (s in 0..rightIndex) {
+        let left = borrow scope.sources[s];
+        if (Compiler.findColumn(left, name) is Some(leftColumn)) {
+            let lc = borrow left.columns[leftColumn];
+            let rc = borrow right.columns[rightColumn];
+            let c = XCompare {
+                op: CompareOp.Equal,
+                left: XExpr.Column(left.slot, leftColumn),
+                right: XExpr.Column(right.slot, rightColumn),
+                affinity: compareAffinity(exprAffinityOf(lc.affinity), exprAffinityOf(rc.affinity)),
+                collation: lc.collation,
+            };
+            return Ok(XExpr.Compare(Box.create(c)?));
+        }
+    }
+    return Ok(null);
+}
+
+fn andWith(a: XExpr?, b: XExpr) -> Result<XExpr, AllocError> {
+    if (a is Some(x)) {
+        return Ok(XExpr.And(Box.create(x)?, Box.create(b)?));
+    }
+    return Ok(b);
+}
+
+/// Compiles one SELECT core (or VALUES row).
+fn compileCore(
+    compiler: borrow mut Compiler,
+    core: borrow SelectCore,
+    orderBy: Slice<OrderTerm>,
+    outputs: borrow mut Vector<OutputColumn>,
+    db: borrow mut Session,
+) -> Result<CorePlan, SqliteError> {
+    // The query's own state: a subquery compiled inside it gets fresh state of its own.
+    let savedAggregates = replace(mut compiler.aggregates, Vector<AggregateSpec>.create());
+    let savedWindows = replace(mut compiler.windows, Vector<WindowSpec>.create());
+    let savedAliases = replace(mut compiler.aliases, Vector<OutputAlias>.create());
+    let savedNamed = replace(mut compiler.namedWindows, Vector<NamedWindow>.create());
+    let savedContext = compiler.context;
+    let savedUse = compiler.useAliases;
+    let result = compileCoreInner(compiler, core, orderBy, outputs, db);
+    compiler.aggregates = savedAggregates;
+    compiler.windows = savedWindows;
+    compiler.aliases = savedAliases;
+    compiler.namedWindows = savedNamed;
+    compiler.context = savedContext;
+    compiler.useAliases = savedUse;
+    return result;
+}
+
+fn compileCoreInner(
+    compiler: borrow mut Compiler,
+    core: borrow SelectCore,
+    orderBy: Slice<OrderTerm>,
+    outputs: borrow mut Vector<OutputColumn>,
+    db: borrow mut Session,
+) -> Result<CorePlan, SqliteError> {
+    var scope = Scope { sources: Vector<ScopeSource>.create() };
+    var sources = Vector<SourcePlan>.create();
+    var ons = Vector<Expr?>.create();
+    if (borrow core.from is Some(from)) {
+        compileFromItem(compiler, borrow from.source, mut scope, mut sources, db)?;
+        for (j in 0..from.joins.length) {
+            let join = borrow from.joins[j];
+            if (join.kind == JoinKind.Right || join.kind == JoinKind.Full) {
+                return Err(unsupported("RIGHT and FULL joins are not supported yet"));
+            }
+            compileFromItem(compiler, borrow join.item, mut scope, mut sources, db)?;
+            let at = sources.length - 1;
+            sources[at].left = join.kind == JoinKind.Left;
+            // NATURAL and USING: equality on the shared columns, which the right side then hides.
+            var shared = Vector<String>.create();
+            if (join.natural) {
+                let right = borrow scope.sources[at];
+                for (k in 0..right.columns.length) {
+                    let name = right.columns[k].name.view();
+                    for (s in 0..at) {
+                        if (Compiler.findColumn(borrow scope.sources[s], name).isSome()) {
+                            shared.push(String.from(name)?)?;
+                            break;
+                        }
+                    }
+                }
+            } else if (borrow join.constraint is JoinConstraint.Using(names)) {
+                for (k in 0..names.length) {
+                    var inLeft = false;
+                    for (s in 0..at) {
+                        inLeft = inLeft || Compiler.findColumn(borrow scope.sources[s], names[k].view()).isSome();
+                    }
+                    if (!inLeft || Compiler.findColumn(borrow scope.sources[at], names[k].view()).isNull()) {
+                        return Err(namedError("cannot join using column ", names[k].view()));
+                    }
+                    shared.push(names[k].clone()?)?;
+                }
+            }
+            var condition: XExpr? = null;
+            for (k in 0..shared.length) {
+                if (joinEquality(borrow scope, shared[k].view(), at)? is Some(eq)) {
+                    condition = andWith(condition, eq)?;
+                }
+            }
+            sources[at].on = condition;
+            scope.sources[at].merged = shared;
+        }
+    }
+    compiler.scopes.push(scope)?;
+    let result = compileCoreBody(compiler, core, orderBy, outputs, sources, db);
+    let _ = compiler.scopes.pop();
+    return result;
+}
+
+fn compileCoreBody(
+    compiler: borrow mut Compiler,
+    core: borrow SelectCore,
+    orderBy: Slice<OrderTerm>,
+    outputs: borrow mut Vector<OutputColumn>,
+    sourcesIn: Vector<SourcePlan>,
+    db: borrow mut Session,
+) -> Result<CorePlan, SqliteError> {
+    var sources = sourcesIn;
+    let top = compiler.scopes.length - 1;
+    // ON conditions, in the scope of every source so far (SQLite allows a later one's too).
+    if (borrow core.from is Some(from)) {
+        for (j in 0..from.joins.length) {
+            if (borrow from.joins[j].constraint is JoinConstraint.On(on)) {
+                let compiled = compiler.compile(on, db)?;
+                let existing = replace(mut sources[j + 1].on, null);
+                sources[j + 1].on = andWith(existing, compiled)?;
+            }
+        }
+    }
+    // Aggregate or not.
+    var isAggregate = core.groupBy.length != 0;
+    for (i in 0..core.columns.length) {
+        if (borrow core.columns[i] is ResultColumn.Expr(e, _)) {
+            isAggregate = isAggregate || containsAggregate(e);
+        }
+    }
+    if (borrow core.having is Some(h)) {
+        if (!isAggregate && !containsAggregate(h)) {
+            // HAVING without GROUP BY or aggregates is still an aggregate query, of one group.
+        }
+        isAggregate = true;
+    }
+    for (i in 0..orderBy.length) {
+        isAggregate = isAggregate || containsAggregate(borrow orderBy[i].expr);
+    }
+    for (i in 0..core.columns.length) {
+        if (borrow core.columns[i] is ResultColumn.Expr(e, _)) {
+            if (containsWindow(e)) {
+                return Err(unsupported("window functions are not supported yet"));
+            }
+        }
+    }
+    var outputExprsIn = Vector<XExpr>.create();
+    // Result-column aliases, which WHERE, GROUP BY, HAVING and ORDER BY may name (but not other result columns).
+    for (i in 0..core.columns.length) {
+        if (borrow core.columns[i] is ResultColumn.Expr(e, Some(alias))) {
+            compiler.aliases.push(OutputAlias { name: alias.clone()?, expr: cloneExpr(e)? })?;
+        }
+    }
+    // WHERE: no aggregates; aliases after columns.
+    compiler.useAliases = true;
+    compiler.aliasesFirst = false;
+    compiler.context = CallContext.Plain;
+    var filter: XExpr? = null;
+    if (borrow core.filter is Some(w)) {
+        filter = compiler.compile(w, db)?;
+    }
+    // The result columns.
+    compiler.useAliases = false;
+    compiler.context = if (isAggregate) CallContext.Aggregates else CallContext.Plain;
+    for (i in 0..core.columns.length) {
+        match (borrow core.columns[i]) {
+            ResultColumn.Star => {
+                let scope = borrow compiler.scopes[top];
+                if (scope.sources.length == 0) {
+                    return Err(sqlError("no tables specified"));
+                }
+                for (s in 0..scope.sources.length) {
+                    let source = borrow scope.sources[s];
+                    for (k in 0..source.columns.length) {
+                        let col = borrow source.columns[k];
+                        if (col.hidden || Compiler.isMerged(source, col.name.view())) {
+                            continue;
+                        }
+                        let compiled = Compiler.columnOf(source, k);
+                        outputExprsIn.push(compiled.expr)?;
+                        outputs.push(
+                            OutputColumn {
+                                name: col.name.clone()?,
+                                affinity: compiled.affinity,
+                                collation: compiled.collation,
+                            },
+                        )?;
+                    }
+                }
+            }
+            ResultColumn.TableStar(table) => {
+                let scope = borrow compiler.scopes[top];
+                var found = false;
+                for (s in 0..scope.sources.length) {
+                    let source = borrow scope.sources[s];
+                    if (!source.name.view().equalsIgnoreAsciiCase(table.view())) {
+                        continue;
+                    }
+                    found = true;
+                    for (k in 0..source.columns.length) {
+                        let col = borrow source.columns[k];
+                        if (col.hidden) {
+                            continue;
+                        }
+                        let compiled = Compiler.columnOf(source, k);
+                        outputExprsIn.push(compiled.expr)?;
+                        outputs.push(
+                            OutputColumn {
+                                name: col.name.clone()?,
+                                affinity: compiled.affinity,
+                                collation: compiled.collation,
+                            },
+                        )?;
+                    }
+                }
+                if (!found) {
+                    return Err(namedError("no such table: ", table.view()));
+                }
+            }
+            ResultColumn.Expr(e, alias) => {
+                let compiled = compiler.typed(e, db)?;
+                let name = if (alias is Some(a)) a.clone()? else defaultColumnName(e)?;
+                outputExprsIn.push(compiled.expr)?;
+                outputs.push(OutputColumn { name: name, affinity: compiled.affinity, collation: compiled.collation })?;
+            }
+        }
+    }
+    compiler.useAliases = true;
+    compiler.aliasesFirst = false;
+    // GROUP BY: ordinals name result columns.
+    var groupBy = Vector<XExpr>.create();
+    var groupCollations = Vector<Collation>.create();
+    compiler.context = CallContext.Plain;
+    for (g in 0..core.groupBy.length) {
+        let term = borrow core.groupBy[g];
+        if (ordinalOf(term) is Some(n)) {
+            if (n < 1 || n > truncate<i64>(outputs.length)) {
+                return Err(
+                    termError(g + 1, "GROUP BY", " term out of range - should be between 1 and ", outputs.length),
+                );
+            }
+            let at = truncate<usize>(n - 1);
+            let compiled = compiler.typed(outputExprAt(core, at)?, db)?;
+            groupCollations.push(compiled.collation ?? Collation.Binary)?;
+            groupBy.push(compiled.expr)?;
+            continue;
+        }
+        if (containsAggregate(term)) {
+            return Err(sqlError("aggregate functions are not allowed in the GROUP BY clause"));
+        }
+        let compiled = compiler.typed(term, db)?;
+        groupCollations.push(compiled.collation ?? Collation.Binary)?;
+        groupBy.push(compiled.expr)?;
+    }
+    compiler.context = if (isAggregate) CallContext.Aggregates else CallContext.Plain;
+    var having: XExpr? = null;
+    if (borrow core.having is Some(h)) {
+        having = compiler.compile(h, db)?;
+    }
+    // ORDER BY of a simple SELECT: ordinals and aliases name result columns.
+    compiler.aliasesFirst = true;
+    var sortKeys = Vector<XOrderTerm>.create();
+    for (t in 0..orderBy.length) {
+        let term = borrow orderBy[t];
+        let collation = termCollation(borrow term.expr)?;
+        let e = withoutCollate(borrow term.expr);
+        if (ordinalOf(e) is Some(n)) {
+            if (n < 1 || n > truncate<i64>(outputs.length)) {
+                return Err(
+                    termError(t + 1, "ORDER BY", " term out of range - should be between 1 and ", outputs.length),
+                );
+            }
+            let at = truncate<usize>(n - 1);
+            sortKeys.push(XOrderTerm {
+                expr: XExpr.Value(SqliteValue.Null),
+                output: at,
+                descending: term.descending,
+                nullsFirst: term.nullsFirst ?? !term.descending,
+                collation: collation ?? outputs[at].collation ?? Collation.Binary,
+            })?;
+            continue;
+        }
+        let c = compiler.typed(e, db)?;
+        sortKeys.push(XOrderTerm {
+            expr: c.expr,
+            output: null,
+            descending: term.descending,
+            nullsFirst: term.nullsFirst ?? !term.descending,
+            collation: collation ?? c.collation ?? Collation.Binary,
+        })?;
+    }
+    compiler.useAliases = false;
+    let aggregates = replace(mut compiler.aggregates, Vector<AggregateSpec>.create());
+    // Bare columns come from the row of the min() or max(), when there is exactly one.
+    var minMax: usize? = null;
+    if (aggregates.length == 1 &&
+        (aggregates[0].function == AggregateFunction.Min || aggregates[0].function == AggregateFunction.Max)) {
+        minMax = 0;
+    }
+    var outputCollations = Vector<Collation>.withCapacity(outputs.length)?;
+    for (i in 0..outputs.length) {
+        outputCollations.push(outputs[i].collation ?? Collation.Binary)?;
+    }
+    let outputExprs = replace(mut outputExprsIn, Vector<XExpr>.create());
+    // Seeks: `rowid = expression` on a source, from the WHERE clause, where the expression uses only earlier
+    // sources.
+    if (borrow filter is Some(f)) {
+        for (s in 0..sources.length) {
+            if (sources[s].kind is SourceKind.Table(TablePlan { withoutRowid: false, .. })) {
+                sources[s].rowidSeek = rowidEqualityFor(f, sources[s].slot)?;
+            }
+        }
+    }
+    for (s in 1..sources.length) {
+        if (sources[s].rowidSeek.isNull() && sources[s].kind is SourceKind.Table(TablePlan {
+            withoutRowid: false,
+            ..
+        })) {
+            if (borrow sources[s].on is Some(on)) {
+                sources[s].rowidSeek = rowidEqualityFor(on, sources[s].slot)?;
+            }
+        }
+    }
+    return Ok(CorePlan {
+        sources: sources,
+        filter: filter,
+        groupBy: groupBy,
+        groupCollations: groupCollations,
+        having: having,
+        outputs: outputExprs,
+        outputCollations: outputCollations,
+        sortKeys: sortKeys,
+        aggregates: aggregates,
+        isAggregate: isAggregate,
+        minMax: minMax,
+        distinct: core.distinct,
+    });
+}
+
+/// The expression of result column `at` of a core (for GROUP BY and ORDER BY ordinals).
+fn outputExprAt(core: borrow SelectCore, at: usize) -> Result<borrow Expr, SqliteError> {
+    var index: usize = 0;
+    for (i in 0..core.columns.length) {
+        match (borrow core.columns[i]) {
+            ResultColumn.Expr(e, _) => {
+                if (index == at) {
+                    return Ok(e);
+                }
+                index += 1;
+            }
+            _ => { return Err(unsupported("an ordinal with * among the result columns is not supported")); }
+        }
+    }
+    return Err(sqlError("result column out of range"));
+}
+
+/// The largest slot an expression reads, and whether it reads anything that changes per row in ways a seek
+/// cannot rely on (a subquery that depends on the row, a window, an aggregate).
+struct SlotUse {
+    highest: usize?;
+    opaque: bool;
+}
+
+fn slotUse(e: borrow XExpr, acc: borrow mut SlotUse) {
+    match (e) {
+        XExpr.Column(slot, _) | XExpr.Rowid(slot) => {
+            let current = acc.highest ?? slot;
+            acc.highest = current.max(slot);
+        }
+        XExpr.Negate(x) | XExpr.Plus(x) | XExpr.BitNot(x) | XExpr.Not(x) | XExpr.Cast(x, _) => { slotUse(x, acc); }
+        XExpr.Arith(_, a, b) | XExpr.Bits(_, a, b) | XExpr.Concat(a, b) | XExpr.And(a, b) | XExpr.Or(a, b) | XExpr.JsonGet(a, b, _) => {
+            slotUse(a, acc);
+            slotUse(b, acc);
+        }
+        XExpr.Compare(c) => {
+            slotUse(borrow c.left, acc);
+            slotUse(borrow c.right, acc);
+        }
+        XExpr.Call(call) => {
+            for (i in 0..call.args.length) {
+                slotUse(borrow call.args[i], acc);
+            }
+            // random() and the like differ per call: not a key.
+            if (call.function == ScalarFunction.Random || call.function == ScalarFunction.RandomBlob) {
+                acc.opaque = true;
+            }
+        }
+        XExpr.Value(_) | XExpr.Param(_) | XExpr.Now(_) => {}
+        XExpr.Subquery(s) | XExpr.Exists(s) => {
+            if (s.correlated) {
+                acc.opaque = true;
+            }
+        }
+        _ => { acc.opaque = true; }
+    }
+}
+
+/// From the AND-terms of `condition`, an expression the rowid of `slot` must equal, that uses earlier slots only.
+fn rowidEqualityFor(condition: borrow XExpr, slot: usize) -> Result<XExpr?, SqliteError> {
+    match (condition) {
+        XExpr.And(a, b) => {
+            if (rowidEqualityFor(a, slot)? is Some(found)) {
+                return Ok(found);
+            }
+            return rowidEqualityFor(b, slot);
+        }
+        XExpr.Compare(c) => {
+            if (c.op != CompareOp.Equal && c.op != CompareOp.Is) {
+                return Ok(null);
+            }
+            let leftIsRowid = c.left is XExpr.Rowid(s) && s == slot;
+            let rightIsRowid = c.right is XExpr.Rowid(s) && s == slot;
+            let other = if (leftIsRowid) borrow c.right else if (rightIsRowid) borrow c.left else {
+                return Ok(null);
+            };
+            var use = SlotUse { highest: null, opaque: false };
+            slotUse(other, mut use);
+            if (use.opaque || (use.highest.isSome() && use.highest! >= slot)) {
+                return Ok(null);
+            }
+            // The rowid has INTEGER affinity: the other side is compared as a number.
+            return Ok(cloneSimple(other)?);
+        }
+        _ => { return Ok(null); }
+    }
+}
+
+/// A copy of an expression without subqueries, aggregates or windows; `null` for one with them.
+fn cloneSimple(e: borrow XExpr) -> Result<XExpr?, AllocError> {
+    match (e) {
+        XExpr.Value(v) => { return Ok(XExpr.Value(v.clone()?)); }
+        XExpr.Column(slot, column) => { return Ok(XExpr.Column(slot, column)); }
+        XExpr.Rowid(slot) => { return Ok(XExpr.Rowid(slot)); }
+        XExpr.Param(i) => { return Ok(XExpr.Param(i)); }
+        XExpr.Now(kind) => { return Ok(XExpr.Now(kind)); }
+        XExpr.Negate(x) | XExpr.Plus(x) | XExpr.BitNot(x) | XExpr.Not(x) => {
+            let inner = cloneSimple(x)? ?? {
+                return Ok(null);
+            };
+            let b = Box.create(inner)?;
+            return Ok(match (e) {
+                XExpr.Negate(_) => XExpr.Negate(b),
+                XExpr.Plus(_) => XExpr.Plus(b),
+                XExpr.BitNot(_) => XExpr.BitNot(b),
+                _ => XExpr.Not(b),
+            });
+        }
+        XExpr.Cast(x, affinity) => {
+            let inner = cloneSimple(x)? ?? {
+                return Ok(null);
+            };
+            return Ok(XExpr.Cast(Box.create(inner)?, affinity));
+        }
+        XExpr.Arith(op, a, b) => {
+            let l = cloneSimple(a)? ?? { return Ok(null); };
+            let r = cloneSimple(b)? ?? { return Ok(null); };
+            return Ok(XExpr.Arith(op, Box.create(l)?, Box.create(r)?));
+        }
+        XExpr.Bits(op, a, b) => {
+            let l = cloneSimple(a)? ?? { return Ok(null); };
+            let r = cloneSimple(b)? ?? { return Ok(null); };
+            return Ok(XExpr.Bits(op, Box.create(l)?, Box.create(r)?));
+        }
+        XExpr.Concat(a, b) => {
+            let l = cloneSimple(a)? ?? { return Ok(null); };
+            let r = cloneSimple(b)? ?? { return Ok(null); };
+            return Ok(XExpr.Concat(Box.create(l)?, Box.create(r)?));
+        }
+        XExpr.Call(call) => {
+            var args = Vector<XExpr>.withCapacity(call.args.length)?;
+            for (i in 0..call.args.length) {
+                let a = cloneSimple(borrow call.args[i])? ?? { return Ok(null); };
+                args.push(a)?;
+            }
+            return Ok(
+                XExpr.Call(Box.create(XCall { function: call.function, args: args, collation: call.collation })?),
+            );
+        }
+        _ => { return Ok(null); }
+    }
+}
+
+/// An ORDER BY term's COLLATE, if it ends with one.
+fn termCollation(e: borrow Expr) -> Result<Collation?, SqliteError> {
+    if (e is Expr.Collate(_, name)) {
+        let c = Collation.named(name.view()) ?? {
+            return Err(namedError("no such collation sequence: ", name.view()));
+        };
+        return Ok(c);
+    }
+    return Ok(null);
+}
+
+/// An ORDER BY term without its COLLATE.
+fn withoutCollate(e: borrow Expr) -> borrow Expr {
+    if (e is Expr.Collate(inner, _)) {
+        return inner;
+    }
+    return e;
+}

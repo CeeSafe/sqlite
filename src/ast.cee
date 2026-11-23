@@ -31,6 +31,8 @@ struct ColumnRef {
     schema: String?;
     table: String?;
     name: String;
+    /// An unqualified name written in double quotes: a string when no column has the name.
+    doubleQuoted: bool;
 }
 
 enum UnaryOp {
@@ -521,4 +523,299 @@ enum Stmt {
     /// `ANALYZE`, or `ANALYZE name`.
     Analyze(String?),
     Reindex,
+}
+
+// ── copies ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+fn cloneString(s: borrow String?) -> Result<String?, AllocError> => match (s) {
+    Some(x) => Ok(x.clone()?),
+    null => Ok(null),
+};
+
+fn cloneStrings(list: borrow Vector<String>) -> Result<Vector<String>, AllocError> {
+    var out = Vector<String>.withCapacity(list.length)?;
+    for (i in 0..list.length) {
+        out.push(list[i].clone()?)?;
+    }
+    return Ok(out);
+}
+
+fn cloneBoxed(e: borrow Expr) -> Result<Box<Expr>, AllocError> => Box.create(cloneExpr(e)?);
+
+fn cloneOptional(e: borrow Expr?) -> Result<Expr?, AllocError> => match (e) {
+    Some(x) => Ok(cloneExpr(x)?),
+    null => Ok(null),
+};
+
+fn cloneExprList(list: borrow Vector<Expr>) -> Result<Vector<Expr>, AllocError> {
+    var out = Vector<Expr>.withCapacity(list.length)?;
+    for (i in 0..list.length) {
+        out.push(cloneExpr(borrow list[i])?)?;
+    }
+    return Ok(out);
+}
+
+fn cloneName(n: borrow QualifiedName) -> Result<QualifiedName, AllocError> =>
+    Ok(QualifiedName { schema: cloneString(borrow n.schema)?, name: n.name.clone()? });
+
+fn cloneOrderList(list: borrow Vector<OrderTerm>) -> Result<Vector<OrderTerm>, AllocError> {
+    var out = Vector<OrderTerm>.withCapacity(list.length)?;
+    for (i in 0..list.length) {
+        out.push(
+            OrderTerm {
+                expr: cloneExpr(borrow list[i].expr)?,
+                descending: list[i].descending,
+                nullsFirst: list[i].nullsFirst,
+            },
+        )?;
+    }
+    return Ok(out);
+}
+
+fn cloneOver(o: borrow OverClause) -> Result<OverClause, AllocError> {
+    var frame: FrameSpec? = null;
+    if (borrow o.frame is Some(f)) {
+        frame = FrameSpec {
+            mode: f.mode,
+            start: FrameBound { kind: f.start.kind, offset: cloneOptional(borrow f.start.offset)? },
+            end: FrameBound { kind: f.end.kind, offset: cloneOptional(borrow f.end.offset)? },
+            exclude: f.exclude,
+        };
+    }
+    return Ok(
+        OverClause {
+            baseName: cloneString(borrow o.baseName)?,
+            partitionBy: cloneExprList(borrow o.partitionBy)?,
+            orderBy: cloneOrderList(borrow o.orderBy)?,
+            frame: frame,
+        },
+    );
+}
+
+/// A deep copy of an expression.
+fn cloneExpr(e: borrow Expr) -> Result<Expr, AllocError> {
+    match (e) {
+        Expr.Literal(l) => { return Ok(Expr.Literal(Literal { kind: l.kind, text: l.text.clone()? })); }
+        Expr.Column(c) => {
+            return Ok(
+                Expr.Column(
+                    ColumnRef {
+                        schema: cloneString(borrow c.schema)?,
+                        table: cloneString(borrow c.table)?,
+                        name: c.name.clone()?,
+                        doubleQuoted: c.doubleQuoted,
+                    },
+                ),
+            );
+        }
+        Expr.RowValue(items) => { return Ok(Expr.RowValue(cloneExprList(items)?)); }
+        Expr.Param(p) => { return Ok(Expr.Param(p.clone()?)); }
+        Expr.Unary(op, x) => { return Ok(Expr.Unary(op, cloneBoxed(x)?)); }
+        Expr.Binary(op, a, b) => { return Ok(Expr.Binary(op, cloneBoxed(a)?, cloneBoxed(b)?)); }
+        Expr.Collate(x, name) => { return Ok(Expr.Collate(cloneBoxed(x)?, name.clone()?)); }
+        Expr.Is(a, b, negated) => { return Ok(Expr.Is(cloneBoxed(a)?, cloneBoxed(b)?, negated)); }
+        Expr.Between(b) => {
+            return Ok(
+                Expr.Between(
+                    Box.create(
+                        BetweenExpr {
+                            operand: cloneExpr(borrow b.operand)?,
+                            low: cloneExpr(borrow b.low)?,
+                            high: cloneExpr(borrow b.high)?,
+                            negated: b.negated,
+                        },
+                    )?,
+                ),
+            );
+        }
+        Expr.Like(l) => {
+            return Ok(
+                Expr.Like(
+                    Box.create(
+                        LikeExpr {
+                            op: l.op,
+                            operand: cloneExpr(borrow l.operand)?,
+                            pattern: cloneExpr(borrow l.pattern)?,
+                            escape: cloneOptional(borrow l.escape)?,
+                            negated: l.negated,
+                        },
+                    )?,
+                ),
+            );
+        }
+        Expr.In(i) => {
+            let source = match (borrow i.source) {
+                InSource.Items(items) => InSource.Items(cloneExprList(items)?),
+                InSource.Select(s) => InSource.Select(cloneSelect(s)?),
+                InSource.Table(t) => InSource.Table(cloneName(t)?),
+            };
+            return Ok(
+                Expr.In(
+                    Box.create(InExpr { operand: cloneExpr(borrow i.operand)?, negated: i.negated, source: source })?,
+                ),
+            );
+        }
+        Expr.Function(f) => {
+            var over: OverClause? = null;
+            if (borrow f.over is Some(o)) {
+                over = cloneOver(o)?;
+            }
+            return Ok(
+                Expr.Function(
+                    Box.create(
+                        FunctionCall {
+                            name: f.name.clone()?,
+                            distinct: f.distinct,
+                            star: f.star,
+                            args: cloneExprList(borrow f.args)?,
+                            filter: cloneOptional(borrow f.filter)?,
+                            over: over,
+                        },
+                    )?,
+                ),
+            );
+        }
+        Expr.Cast(x, t) => { return Ok(Expr.Cast(cloneBoxed(x)?, t.clone()?)); }
+        Expr.Case(c) => {
+            var branches = Vector<WhenThen>.withCapacity(c.branches.length)?;
+            for (k in 0..c.branches.length) {
+                branches.push(
+                    WhenThen {
+                        when: cloneExpr(borrow c.branches[k].when)?,
+                        then: cloneExpr(borrow c.branches[k].then)?,
+                    },
+                )?;
+            }
+            return Ok(
+                Expr.Case(
+                    Box.create(
+                        CaseExpr {
+                            operand: cloneOptional(borrow c.operand)?,
+                            branches: branches,
+                            otherwise: cloneOptional(borrow c.otherwise)?,
+                        },
+                    )?,
+                ),
+            );
+        }
+        Expr.Subquery(s) => { return Ok(Expr.Subquery(Box.create(cloneSelect(s)?)?)); }
+        Expr.Exists(s) => { return Ok(Expr.Exists(Box.create(cloneSelect(s)?)?)); }
+        Expr.Raise(action, message) => {
+            var m: Box<Expr>? = null;
+            if (message is Some(x)) {
+                m = cloneBoxed(x)?;
+            }
+            return Ok(Expr.Raise(action, m));
+        }
+    }
+}
+
+fn cloneResultColumns(list: borrow Vector<ResultColumn>) -> Result<Vector<ResultColumn>, AllocError> {
+    var out = Vector<ResultColumn>.withCapacity(list.length)?;
+    for (i in 0..list.length) {
+        out.push(match (borrow list[i]) {
+            ResultColumn.Star => ResultColumn.Star,
+            ResultColumn.TableStar(t) => ResultColumn.TableStar(t.clone()?),
+            ResultColumn.Expr(e, alias) => ResultColumn.Expr(cloneExpr(e)?, cloneString(alias)?),
+        })?;
+    }
+    return Ok(out);
+}
+
+fn cloneFromItem(item: borrow FromItem) -> Result<FromItem, AllocError> => match (item) {
+    FromItem.Table(t) => Ok(
+        FromItem.Table(
+            TableSource {
+                name: cloneName(borrow t.name)?,
+                alias: cloneString(borrow t.alias)?,
+                indexedBy: cloneString(borrow t.indexedBy)?,
+                notIndexed: t.notIndexed,
+            },
+        ),
+    ),
+    FromItem.Subquery(s) => Ok(
+        FromItem.Subquery(
+            Box.create(SubquerySource { select: cloneSelect(borrow s.select)?, alias: cloneString(borrow s.alias)? })?,
+        ),
+    ),
+    FromItem.TableFunction(f) => Ok(
+        FromItem.TableFunction(
+            TableFunctionSource {
+                name: f.name.clone()?,
+                args: cloneExprList(borrow f.args)?,
+                alias: cloneString(borrow f.alias)?,
+            },
+        ),
+    ),
+};
+
+/// A deep copy of a SELECT.
+fn cloneSelect(s: borrow SelectStmt) -> Result<SelectStmt, AllocError> {
+    var with: WithClause? = null;
+    if (borrow s.with is Some(w)) {
+        var ctes = Vector<CommonTableExpr>.withCapacity(w.ctes.length)?;
+        for (i in 0..w.ctes.length) {
+            ctes.push(
+                CommonTableExpr {
+                    name: w.ctes[i].name.clone()?,
+                    columns: cloneStrings(borrow w.ctes[i].columns)?,
+                    select: cloneSelect(borrow w.ctes[i].select)?,
+                },
+            )?;
+        }
+        with = WithClause { recursive: w.recursive, ctes: ctes };
+    }
+    var cores = Vector<SelectCore>.withCapacity(s.cores.length)?;
+    for (i in 0..s.cores.length) {
+        let c = borrow s.cores[i];
+        var from: FromClause? = null;
+        if (borrow c.from is Some(f)) {
+            var joins = Vector<Join>.withCapacity(f.joins.length)?;
+            for (j in 0..f.joins.length) {
+                let join = borrow f.joins[j];
+                let constraint = match (borrow join.constraint) {
+                    JoinConstraint.None => JoinConstraint.None,
+                    JoinConstraint.On(e) => JoinConstraint.On(cloneExpr(e)?),
+                    JoinConstraint.Using(names) => JoinConstraint.Using(cloneStrings(names)?),
+                };
+                joins.push(
+                    Join {
+                        kind: join.kind,
+                        natural: join.natural,
+                        item: cloneFromItem(borrow join.item)?,
+                        constraint: constraint,
+                    },
+                )?;
+            }
+            from = FromClause { source: cloneFromItem(borrow f.source)?, joins: joins };
+        }
+        var windows = Vector<NamedWindow>.withCapacity(c.windows.length)?;
+        for (k in 0..c.windows.length) {
+            windows.push(NamedWindow { name: c.windows[k].name.clone()?, spec: cloneOver(borrow c.windows[k].spec)? })?;
+        }
+        cores.push(SelectCore {
+            distinct: c.distinct,
+            columns: cloneResultColumns(borrow c.columns)?,
+            from: from,
+            filter: cloneOptional(borrow c.filter)?,
+            groupBy: cloneExprList(borrow c.groupBy)?,
+            having: cloneOptional(borrow c.having)?,
+            windows: windows,
+            isValues: c.isValues,
+        })?;
+    }
+    var ops = Vector<CompoundOp>.withCapacity(s.compoundOps.length)?;
+    for (i in 0..s.compoundOps.length) {
+        ops.push(s.compoundOps[i])?;
+    }
+    return Ok(
+        SelectStmt {
+            with: with,
+            cores: cores,
+            compoundOps: ops,
+            orderBy: cloneOrderList(borrow s.orderBy)?,
+            limit: cloneOptional(borrow s.limit)?,
+            offset: cloneOptional(borrow s.offset)?,
+        },
+    );
 }

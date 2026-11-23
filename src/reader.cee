@@ -32,41 +32,51 @@ struct DatabaseReader {
     /// Opens the database file at `path` and reads its schema.
     fn open(path: StringView) -> Result<DatabaseReader, SqliteError> {
         var pager = Pager.open(path)?;
-        var entries = Vector<SchemaEntry>.create();
+        let entries = readSchemaEntries(mut pager)?;
         var tables = HashMap<String, usize>.create();
         var indexes = HashMap<String, usize>.create();
-        var cursor = TableCursor.scan(1);
-        while (cursor.next(mut pager)? is Some(row)) {
-            // sqlite_schema's columns: type, name, tbl_name, rootpage, sql.
-            var columns = row.columns;
-            if (columns.length < 5) {
-                return Err(corrupt("a row of sqlite_schema has too few columns"));
-            }
-            let sql: String? = match (columns.pop()!) {
-                SqliteValue.Text(s) => s,
-                _ => null,
-            };
-            let rootPage: u32 = match (columns.pop()!) {
-                SqliteValue.Integer(n) => checkedTruncate<u32>(n) ?? {
-                    return Err(corrupt("a root page number in sqlite_schema is out of range"));
-                },
-                _ => 0,
-            };
-            let tableName = textOrEmpty(columns.pop()!);
-            let name = textOrEmpty(columns.pop()!);
-            let kind = textOrEmpty(columns.pop()!);
-            let key = asciiLower(name.view())?;
-            let at = entries.length;
-            if (kind.view() == "table" && !tables.contains(borrow key)) {
+        for (at in 0..entries.length) {
+            let key = asciiLower(entries[at].name.view())?;
+            let kind = entries[at].kind.view();
+            if (kind == "table" && !tables.contains(borrow key)) {
                 let _ = tables.put(key, at)?;
-            } else if (kind.view() == "index" && !indexes.contains(borrow key)) {
+            } else if (kind == "index" && !indexes.contains(borrow key)) {
                 let _ = indexes.put(key, at)?;
             }
-            entries.push(SchemaEntry { kind: kind, name: name, tableName: tableName, rootPage: rootPage, sql: sql })?;
         }
         return Ok(DatabaseReader { pager: pager, entries: entries, tablesByName: tables, indexesByName: indexes });
     }
+}
 
+/// Every row of sqlite_schema, in the file's order.
+fn readSchemaEntries<P: PageSource>(pager: borrow mut P) -> Result<Vector<SchemaEntry>, SqliteError> {
+    var entries = Vector<SchemaEntry>.create();
+    var cursor = TableCursor.scan(1);
+    while (cursor.next(pager)? is Some(row)) {
+        // sqlite_schema's columns: type, name, tbl_name, rootpage, sql.
+        var columns = row.columns;
+        if (columns.length < 5) {
+            return Err(corrupt("a row of sqlite_schema has too few columns"));
+        }
+        let sql: String? = match (columns.pop()!) {
+            SqliteValue.Text(s) => s,
+            _ => null,
+        };
+        let rootPage: u32 = match (columns.pop()!) {
+            SqliteValue.Integer(n) => checkedTruncate<u32>(n) ?? {
+                return Err(corrupt("a root page number in sqlite_schema is out of range"));
+            },
+            _ => 0,
+        };
+        let tableName = textOrEmpty(columns.pop()!);
+        let name = textOrEmpty(columns.pop()!);
+        let kind = textOrEmpty(columns.pop()!);
+        entries.push(SchemaEntry { kind: kind, name: name, tableName: tableName, rootPage: rootPage, sql: sql })?;
+    }
+    return Ok(entries);
+}
+
+impl DatabaseReader {
     fn pageSize(borrow this) -> usize => this.pager.pageSize();
 
     fn textEncoding(borrow this) -> TextEncoding => this.pager.textEncoding();

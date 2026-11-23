@@ -422,7 +422,11 @@ struct DecodedReal {
     point: i32;
 
     /// `r` must be finite and greater than zero.
-    fn of(r: f64) -> Result<DecodedReal, AllocError> {
+    fn of(r: f64) -> Result<DecodedReal, AllocError> => DecodedReal.rounded(r, 17, 20);
+
+    /// sqlite3FpDecode: `iRound` > 0 rounds to that many significant digits (at most `mxRound`); `iRound` <= 0
+    /// rounds to -iRound digits after the decimal point.
+    fn rounded(r: f64, iRoundIn: i32, mxRound: i32) -> Result<DecodedReal, AllocError> {
         let bits = r.bits();
         var e = truncate<i32>((bits >> 52) & 0x7ff);
         var v = bits & 0x000fffffffffffff;
@@ -434,7 +438,7 @@ struct DecodedReal {
             v = (v << 11) | 0x8000000000000000;
             e -= 1086;
         }
-        let decimal = Decimal64.of(v, e, 18);
+        let decimal = Decimal64.of(v, e, if (iRoundIn <= 0 || iRoundIn >= 18) 18 else iRoundIn + 1);
         var z = Vector<u8>.withCapacity(21)?;
         var value = decimal.digits;
         while (value > 0) {
@@ -449,10 +453,24 @@ struct DecodedReal {
         var n = truncate<i32>(z.length);
         var point = n + decimal.power;
         let exp = decimal.power;
-        var iRound: i32 = 17;
-        if (iRound < n || n > 20) {
+        var iRound = iRoundIn;
+        if (iRound <= 0) {
+            iRound = point - iRound;
+            if (iRound == 0 && z[0] >= '5') {
+                iRound = 1;
+                z.insert(0, '0')?;
+                n += 1;
+                point += 1;
+            }
+        }
+        if (iRound > 0 && (iRound < n || n > mxRound)) {
+            if (iRound > mxRound) {
+                iRound = mxRound;
+            }
             // With exactly 17 digits, `!` tries fewer when they read back as the same real.
-            if (z[15] == '9' && z[14] == '9') {
+            if (iRound != 17) {
+                // Not the `%!.17g` case.
+            } else if (z[15] == '9' && z[14] == '9') {
                 var jj: i32 = 14;
                 while (jj > 0 && z[truncate<usize>(jj - 1)] == '9') {
                     jj -= 1;
@@ -504,6 +522,11 @@ struct DecodedReal {
         }
         while (z.length > 1 && z[z.length - 1] == '0') {
             let _ = z.pop();
+        }
+        // Rounding may have left leading zeros (0.0049 to two places): the first digit is significant.
+        while (z.length > 1 && z[0] == '0') {
+            let _ = z.remove(0);
+            point -= 1;
         }
         return Ok(DecodedReal { digits: z, point: point });
     }
@@ -582,4 +605,27 @@ fn realText(r: f64) -> Result<String, AllocError> {
     var out = String.create();
     appendReal(mut out, r)?;
     return Ok(out);
+}
+
+/// round(r, n) for 0 < n <= 30: r written with n digits after the point as SQLite's printf does, read back.
+fn roundToDecimals(r: f64, n: i32) -> Result<f64, AllocError> {
+    if (r == 0.0 || r != r || r > 1.7976931348623157e308 || r < -1.7976931348623157e308) {
+        return Ok(r);
+    }
+    let decoded = DecodedReal.rounded(r.abs(), 0 - n, 20)?;
+    // printf's %.nf shows the digits down to the n-th place after the point, and no further.
+    let keep = decoded.point + n;
+    let count = if (keep <= 0) 0 else (truncate<usize>(keep)).min(decoded.digits.length);
+    if (count == 0 || (count == 1 && decoded.digits[0] == '0')) {
+        return Ok(if (r < 0.0) -0.0 else 0.0);
+    }
+    var text = String.create();
+    if (r < 0.0) {
+        text.append("-")?;
+    }
+    text.append("0.")?;
+    appendAscii(mut text, decoded.digits.view()[0..count])?;
+    text.append("e")?;
+    text.appendNumber(decoded.point)?;
+    return Ok(RealParse.of(text.view().bytes()).value);
 }

@@ -1,0 +1,694 @@
+// Expressions compiled for execution, and their evaluation.
+//
+// The C# engine evaluated the syntax tree directly, looking each column name up in the current rows on every
+// evaluation. Here a statement's expressions are compiled once: names become positions in the frame of current
+// rows, and every comparison carries the affinity and collation SQLite's rules give it, so that:
+// - a comparison's collation is the left operand's explicit COLLATE, else the right's, else the left column's,
+//   else the right column's (sqlite3BinaryCompareCollSeq). The C# took the left column's and ignored a COLLATE on
+//   the right;
+// - CAST and unary + pass their operand's collation through, and a COLLATE anywhere inside an operand counts;
+// - `+column` has no affinity, as in SQLite, so `+x = '1'` compares without conversion;
+// - IN with a list compares with the left operand's affinity and collation, as SQLite does, and IN (SELECT …)
+//   with the affinity of the pair;
+// - CASE x WHEN y compares as x = y does.
+
+// ── the frame of current rows ────────────────────────────────────────────────────────────────────────────────
+
+/// A source's current row.
+struct Slot {
+    values: Vector<SqliteValue>;
+    rowId: i64;
+    /// The missing side of an outer join: every column reads as NULL.
+    isNull: bool;
+}
+
+/// What expressions are evaluated against: the current row of each source in scope (an outer query's included),
+/// the statement's parameters, and the current group's aggregates and the current row's window values.
+struct Frame {
+    slots: Vector<Slot>;
+    params: Vector<SqliteValue>;
+    aggregates: Vector<SqliteValue>;
+    windows: Vector<SqliteValue>;
+    /// Results of subqueries that do not depend on the current row, by subquery number.
+    cache: Vector<Vector<Vector<SqliteValue>>?>;
+    /// The statement's common table expressions, and each one's rows once computed.
+    ctes: Vector<CtePlan?>;
+    cteRows: Vector<Vector<Vector<SqliteValue>>?>;
+    /// The rows of each recursive CTE's current step.
+    working: Vector<Vector<Vector<SqliteValue>>>;
+    /// The statement's notion of now, as a Julian day number in milliseconds, fixed for the statement.
+    nowMillis: i64;
+
+    fn create() -> Frame => Frame {
+        slots: Vector<Slot>.create(),
+        params: Vector<SqliteValue>.create(),
+        aggregates: Vector<SqliteValue>.create(),
+        windows: Vector<SqliteValue>.create(),
+        cache: Vector<Vector<Vector<SqliteValue>>?>.create(),
+        ctes: Vector<CtePlan?>.create(),
+        cteRows: Vector<Vector<Vector<SqliteValue>>?>.create(),
+        working: Vector<Vector<Vector<SqliteValue>>>.create(),
+        nowMillis: 0,
+    };
+
+    /// Makes room for `count` more slots, empty, and returns the first.
+    fn pushSlots(borrow mut this, count: usize) -> Result<usize, AllocError> {
+        let first = this.slots.length;
+        for (i in 0..count) {
+            this.slots.push(Slot { values: Vector<SqliteValue>.create(), rowId: 0, isNull: false })?;
+        }
+        return Ok(first);
+    }
+
+    fn popSlots(borrow mut this, first: usize) {
+        while (this.slots.length > first) {
+            let _ = this.slots.pop();
+        }
+    }
+}
+
+// ── compiled expressions ─────────────────────────────────────────────────────────────────────────────────────
+
+enum CompareOp {
+    Equal,
+    NotEqual,
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+    /// IS: NULL equals NULL.
+    Is,
+    /// IS NOT.
+    IsNot,
+}
+
+struct XCompare {
+    op: CompareOp;
+    left: XExpr;
+    right: XExpr;
+    affinity: ExprAffinity;
+    collation: Collation;
+}
+
+struct XBetween {
+    operand: XExpr;
+    low: XExpr;
+    high: XExpr;
+    negated: bool;
+    lowAffinity: ExprAffinity;
+    lowCollation: Collation;
+    highAffinity: ExprAffinity;
+    highCollation: Collation;
+}
+
+struct XLike {
+    op: LikeOp;
+    operand: XExpr;
+    pattern: XExpr;
+    escape: XExpr?;
+    negated: bool;
+}
+
+struct XIn {
+    operand: XExpr;
+    negated: bool;
+    items: Vector<XExpr>;
+    /// IN (SELECT …) or IN table: the subquery whose first column holds the values.
+    subquery: XSubquery?;
+    affinity: ExprAffinity;
+    collation: Collation;
+}
+
+struct XWhen {
+    when: XExpr;
+    then: XExpr;
+    affinity: ExprAffinity;
+    collation: Collation;
+}
+
+struct XCase {
+    operand: XExpr?;
+    branches: Vector<XWhen>;
+    otherwise: XExpr?;
+}
+
+struct XCall {
+    function: ScalarFunction;
+    args: Vector<XExpr>;
+    /// The collation of the arguments, for the functions that compare them (min, max, nullif, instr, replace…).
+    collation: Collation;
+}
+
+struct XSubquery {
+    plan: Box<SelectPlan>;
+    /// Whether it reads the current row of an enclosing query; if not, it runs once and is cached.
+    correlated: bool;
+    /// Its place in the frame's cache.
+    cacheIndex: usize;
+}
+
+enum XExpr {
+    Value(SqliteValue),
+    /// A slot's column.
+    Column(usize, usize),
+    /// A slot's rowid.
+    Rowid(usize),
+    /// A parameter, by its index from 0.
+    Param(usize),
+    Negate(Box<XExpr>),
+    Plus(Box<XExpr>),
+    BitNot(Box<XExpr>),
+    Not(Box<XExpr>),
+    Arith(ArithmeticOp, Box<XExpr>, Box<XExpr>),
+    Bits(BitOp, Box<XExpr>, Box<XExpr>),
+    Concat(Box<XExpr>, Box<XExpr>),
+    /// `->` (false) and `->>` (true).
+    JsonGet(Box<XExpr>, Box<XExpr>, bool),
+    And(Box<XExpr>, Box<XExpr>),
+    Or(Box<XExpr>, Box<XExpr>),
+    Compare(Box<XCompare>),
+    Between(Box<XBetween>),
+    In(Box<XIn>),
+    Like(Box<XLike>),
+    Case(Box<XCase>),
+    Cast(Box<XExpr>, Affinity),
+    Call(Box<XCall>),
+    /// The current group's value of aggregate number n.
+    Aggregate(usize),
+    /// The current row's value of window function number n.
+    Window(usize),
+    Subquery(Box<XSubquery>),
+    Exists(Box<XSubquery>),
+    Raise(RaiseAction, Box<XExpr>?),
+    /// CURRENT_TIME, CURRENT_DATE or CURRENT_TIMESTAMP.
+    Now(LiteralKind),
+    /// A row value: legal only as an operand of a comparison or IN.
+    RowValue(Vector<XExpr>),
+}
+
+/// A RAISE() in a trigger, which stops its statement; carried as an error.
+fn raiseError(action: RaiseAction, message: String) -> SqliteError => match (action) {
+    RaiseAction.Ignore => SqliteError.Constraint(String.from("RAISE(IGNORE)").ok() ?? String.create()),
+    _ => SqliteError.Constraint(message),
+};
+
+/// Whether a value counts as true in WHERE, ON, HAVING and CASE WHEN: NULL does not.
+fn isTrue(value: borrow SqliteValue) -> bool => truthOf(value) ?? false;
+
+// ── evaluation ───────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Evaluates `expr` against the frame. `db` is there for subqueries and functions that need the database.
+fn evaluate(expr: borrow XExpr, frame: borrow mut Frame, db: borrow mut Session) -> Result<SqliteValue, SqliteError> {
+    match (expr) {
+        XExpr.Value(v) => { return Ok(v.clone()?); }
+        XExpr.Column(slot, column) => {
+            let s = borrow frame.slots[slot];
+            if (s.isNull || column >= s.values.length) {
+                return Ok(SqliteValue.Null);
+            }
+            return Ok(s.values[column].clone()?);
+        }
+        XExpr.Rowid(slot) => {
+            let s = borrow frame.slots[slot];
+            return Ok(if (s.isNull) SqliteValue.Null else SqliteValue.Integer(s.rowId));
+        }
+        XExpr.Param(index) => {
+            if (index < frame.params.length) {
+                return Ok(frame.params[index].clone()?);
+            }
+            return Ok(SqliteValue.Null);
+        }
+        XExpr.Negate(operand) => {
+            let v = evaluate(operand, frame, db)?;
+            return Ok(negate(borrow v));
+        }
+        XExpr.Plus(operand) => { return evaluate(operand, frame, db); }
+        XExpr.BitNot(operand) => {
+            let v = evaluate(operand, frame, db)?;
+            return Ok(bitNot(borrow v));
+        }
+        XExpr.Not(operand) => {
+            let v = evaluate(operand, frame, db)?;
+            return Ok(match (truthOf(borrow v)) {
+                Some(b) => boolValue(!b),
+                null => SqliteValue.Null,
+            });
+        }
+        XExpr.Arith(op, left, right) => {
+            let a = evaluate(left, frame, db)?;
+            let b = evaluate(right, frame, db)?;
+            return Ok(arithmetic(op, borrow a, borrow b));
+        }
+        XExpr.Bits(op, left, right) => {
+            let a = evaluate(left, frame, db)?;
+            let b = evaluate(right, frame, db)?;
+            return Ok(bitwise(op, borrow a, borrow b));
+        }
+        XExpr.Concat(left, right) => {
+            let a = evaluate(left, frame, db)?;
+            let b = evaluate(right, frame, db)?;
+            return Ok(concatenate(borrow a, borrow b)?);
+        }
+        XExpr.JsonGet(left, right, asSql) => {
+            let a = evaluate(left, frame, db)?;
+            let b = evaluate(right, frame, db)?;
+            return jsonArrow(borrow a, borrow b, asSql);
+        }
+        XExpr.And(left, right) => {
+            // FALSE AND anything is FALSE without evaluating the rest.
+            let av = evaluate(left, frame, db)?;
+            let a = truthOf(borrow av);
+            if (a == Some(false)) {
+                return Ok(SqliteValue.Integer(0));
+            }
+            let bv = evaluate(right, frame, db)?;
+            let b = truthOf(borrow bv);
+            if (b == Some(false)) {
+                return Ok(SqliteValue.Integer(0));
+            }
+            return Ok(if (a.isNull() || b.isNull()) SqliteValue.Null else SqliteValue.Integer(1));
+        }
+        XExpr.Or(left, right) => {
+            let av = evaluate(left, frame, db)?;
+            let a = truthOf(borrow av);
+            if (a == Some(true)) {
+                return Ok(SqliteValue.Integer(1));
+            }
+            let bv = evaluate(right, frame, db)?;
+            let b = truthOf(borrow bv);
+            if (b == Some(true)) {
+                return Ok(SqliteValue.Integer(1));
+            }
+            return Ok(if (a.isNull() || b.isNull()) SqliteValue.Null else SqliteValue.Integer(0));
+        }
+        XExpr.Compare(c) => { return evaluateCompare(c, frame, db); }
+        XExpr.Between(b) => {
+            let x = evaluate(borrow b.operand, frame, db)?;
+            let low = evaluate(borrow b.low, frame, db)?;
+            let high = evaluate(borrow b.high, frame, db)?;
+            let ge = compareOp(CompareOp.GreaterOrEqual, borrow x, borrow low, b.lowAffinity, b.lowCollation)?;
+            let le = compareOp(CompareOp.LessOrEqual, borrow x, borrow high, b.highAffinity, b.highCollation)?;
+            // x BETWEEN a AND b is (x >= a) AND (x <= b).
+            var result: bool? = null;
+            if (ge == Some(false) || le == Some(false)) {
+                result = false;
+            } else if (ge.isSome() && le.isSome()) {
+                result = true;
+            }
+            if (b.negated) {
+                result = match (result) {
+                    Some(r) => !r,
+                    null => null,
+                };
+            }
+            return Ok(boolValue(result));
+        }
+        XExpr.In(i) => { return evaluateIn(i, frame, db); }
+        XExpr.Like(l) => { return evaluateLike(l, frame, db); }
+        XExpr.Case(c) => {
+            if (borrow c.operand is Some(base)) {
+                let x = evaluate(base, frame, db)?;
+                for (k in 0..c.branches.length) {
+                    let branch = borrow c.branches[k];
+                    let w = evaluate(borrow branch.when, frame, db)?;
+                    if (compareOp(
+                        CompareOp.Equal,
+                        borrow x,
+                        borrow w,
+                        branch.affinity,
+                        branch.collation,
+                    )? == Some(true)) {
+                        return evaluate(borrow branch.then, frame, db);
+                    }
+                }
+            } else {
+                for (k in 0..c.branches.length) {
+                    let w = evaluate(borrow c.branches[k].when, frame, db)?;
+                    if (isTrue(borrow w)) {
+                        return evaluate(borrow c.branches[k].then, frame, db);
+                    }
+                }
+            }
+            if (borrow c.otherwise is Some(e)) {
+                return evaluate(e, frame, db);
+            }
+            return Ok(SqliteValue.Null);
+        }
+        XExpr.Cast(operand, affinity) => {
+            let v = evaluate(operand, frame, db)?;
+            return Ok(castValue(v, affinity)?);
+        }
+        XExpr.Call(call) => { return callFunction(call, frame, db); }
+        XExpr.Aggregate(n) => { return Ok(frame.aggregates[n].clone()?); }
+        XExpr.Window(n) => { return Ok(frame.windows[n].clone()?); }
+        XExpr.Subquery(sub) => {
+            let row = subqueryFirstRow(sub, frame, db)?;
+            return Ok(match (row) {
+                Some(values) => if (values.length == 0) SqliteValue.Null else values[0].clone()?,
+                null => SqliteValue.Null,
+            });
+        }
+        XExpr.Exists(sub) => {
+            let row = subqueryFirstRow(sub, frame, db)?;
+            return Ok(SqliteValue.Integer(if (row.isSome()) 1 else 0));
+        }
+        XExpr.Raise(action, message) => {
+            var text = String.create();
+            if (message is Some(m)) {
+                let v = evaluate(m, frame, db)?;
+                appendValueText(mut text, borrow v)?;
+            }
+            return Err(raiseError(action, text));
+        }
+        XExpr.Now(kind) => { return nowText(kind, frame.nowMillis); }
+        XExpr.RowValue(_) => { return Err(sqlError("row value misused")); }
+    }
+}
+
+/// The result of a comparison operator: `null` when it is NULL.
+fn compareOp(
+    op: CompareOp,
+    left: borrow SqliteValue,
+    right: borrow SqliteValue,
+    affinity: ExprAffinity,
+    collation: Collation,
+) -> Result<bool?, SqliteError> {
+    if (left.isNull() || right.isNull()) {
+        return match (op) {
+            CompareOp.Is => Ok(left.isNull() && right.isNull()),
+            CompareOp.IsNot => Ok(!(left.isNull() && right.isNull())),
+            _ => Ok(null),
+        };
+    }
+    let c = compareWithAffinity(left, right, affinity, collation)?;
+    return Ok(match (op) {
+        CompareOp.Equal | CompareOp.Is => c == 0,
+        CompareOp.NotEqual | CompareOp.IsNot => c != 0,
+        CompareOp.Less => c < 0,
+        CompareOp.LessOrEqual => c <= 0,
+        CompareOp.Greater => c > 0,
+        CompareOp.GreaterOrEqual => c >= 0,
+    });
+}
+
+fn evaluateCompare(
+    c: borrow XCompare,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<SqliteValue, SqliteError> {
+    if (borrow c.left is XExpr.RowValue(lefts)) {
+        return evaluateRowCompare(c, lefts.view(), frame, db);
+    }
+    let a = evaluate(borrow c.left, frame, db)?;
+    let b = evaluate(borrow c.right, frame, db)?;
+    return Ok(boolValue(compareOp(c.op, borrow a, borrow b, c.affinity, c.collation)?));
+}
+
+/// (a, b, …) op (c, d, …): element by element, as SQLite compares row values.
+fn evaluateRowCompare(
+    c: borrow XCompare,
+    lefts: Slice<XExpr>,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<SqliteValue, SqliteError> {
+    var rights = Vector<SqliteValue>.create();
+    match (borrow c.right) {
+        XExpr.RowValue(items) => {
+            for (i in 0..items.length) {
+                rights.push(evaluate(borrow items[i], frame, db)?)?;
+            }
+        }
+        XExpr.Subquery(sub) => {
+            if (subqueryFirstRow(sub, frame, db)? is Some(row)) {
+                rights = row;
+            } else {
+                return Ok(SqliteValue.Null);
+            }
+        }
+        _ => { return Err(sqlError("row value misused")); }
+    }
+    if (rights.length != lefts.length) {
+        return Err(sqlError("row value misused"));
+    }
+    var sawNull = false;
+    for (i in 0..lefts.length) {
+        let a = evaluate(borrow lefts[i], frame, db)?;
+        let b = borrow rights[i];
+        if (a.isNull() || b.isNull()) {
+            if (c.op == CompareOp.Is || c.op == CompareOp.IsNot) {
+                if (a.isNull() && b.isNull()) {
+                    continue;
+                }
+                return Ok(SqliteValue.Integer(if (c.op == CompareOp.IsNot) 1 else 0));
+            }
+            if (c.op == CompareOp.Equal || c.op == CompareOp.NotEqual) {
+                sawNull = true;
+                continue;
+            }
+            return Ok(SqliteValue.Null);
+        }
+        let order = compareWithAffinity(borrow a, b, c.affinity, c.collation)?;
+        if (order != 0) {
+            return Ok(boolValue(match (c.op) {
+                CompareOp.Equal | CompareOp.Is => false,
+                CompareOp.NotEqual | CompareOp.IsNot => true,
+                CompareOp.Less | CompareOp.LessOrEqual => order < 0,
+                CompareOp.Greater | CompareOp.GreaterOrEqual => order > 0,
+            }));
+        }
+    }
+    if (sawNull) {
+        return Ok(SqliteValue.Null);
+    }
+    return Ok(boolValue(match (c.op) {
+        CompareOp.Equal | CompareOp.Is | CompareOp.LessOrEqual | CompareOp.GreaterOrEqual => true,
+        _ => false,
+    }));
+}
+
+fn evaluateIn(i: borrow XIn, frame: borrow mut Frame, db: borrow mut Session) -> Result<SqliteValue, SqliteError> {
+    var values = Vector<SqliteValue>.create();
+    if (borrow i.subquery is Some(sub)) {
+        values = subqueryFirstColumn(sub, frame, db)?;
+    } else {
+        for (k in 0..i.items.length) {
+            values.push(evaluate(borrow i.items[k], frame, db)?)?;
+        }
+    }
+    // x IN () is false even for a NULL x.
+    if (values.length == 0) {
+        return Ok(SqliteValue.Integer(if (i.negated) 1 else 0));
+    }
+    let x = evaluate(borrow i.operand, frame, db)?;
+    if (x.isNull()) {
+        return Ok(SqliteValue.Null);
+    }
+    var sawNull = false;
+    for (k in 0..values.length) {
+        if (values[k].isNull()) {
+            sawNull = true;
+            continue;
+        }
+        if (compareWithAffinity(borrow x, borrow values[k], i.affinity, i.collation)? == 0) {
+            return Ok(SqliteValue.Integer(if (i.negated) 0 else 1));
+        }
+    }
+    if (sawNull) {
+        return Ok(SqliteValue.Null);
+    }
+    return Ok(SqliteValue.Integer(if (i.negated) 1 else 0));
+}
+
+fn evaluateLike(l: borrow XLike, frame: borrow mut Frame, db: borrow mut Session) -> Result<SqliteValue, SqliteError> {
+    let x = evaluate(borrow l.operand, frame, db)?;
+    let pattern = evaluate(borrow l.pattern, frame, db)?;
+    var escape: u32? = null;
+    if (borrow l.escape is Some(e)) {
+        let ev = evaluate(e, frame, db)?;
+        if (ev.isNull()) {
+            return Ok(SqliteValue.Null);
+        }
+        let text = valueText(borrow ev)?;
+        var chars = Utf8Chars.of(text.view().bytes());
+        let first = chars.next();
+        if (first.isNull() || chars.next().isSome()) {
+            return Err(sqlError("ESCAPE expression must be a single character"));
+        }
+        escape = first;
+    }
+    if (x.isNull() || pattern.isNull()) {
+        return Ok(SqliteValue.Null);
+    }
+    let subject = valueText(borrow x)?;
+    let p = valueText(borrow pattern)?;
+    let matched = match (l.op) {
+        LikeOp.Like => likeMatch(p.view().bytes(), subject.view().bytes(), escape),
+        LikeOp.Glob => globMatch(p.view().bytes(), subject.view().bytes()),
+        LikeOp.Match => { return Err(sqlError("unable to use function MATCH in the requested context")); },
+        LikeOp.Regexp => { return Err(sqlError("no such function: REGEXP")); },
+    };
+    return Ok(SqliteValue.Integer(if (matched != l.negated) 1 else 0));
+}
+
+// ── compilation ──────────────────────────────────────────────────────────────────────────────────────────────
+
+/// A column a name can refer to.
+struct ScopeColumn {
+    name: String;
+    affinity: Affinity;
+    collation: Collation;
+    /// A hidden column (a table function's arguments) is found only by name, never by `*`.
+    hidden: bool;
+}
+
+/// A FROM item as names see it.
+struct ScopeSource {
+    /// The name that qualifies its columns: the alias, or the table's name.
+    name: String;
+    columns: Vector<ScopeColumn>;
+    slot: usize;
+    /// Whether rowid, _rowid_ and oid name its rowid.
+    hasRowid: bool;
+    /// The column that is the rowid, if one is.
+    rowidAlias: usize?;
+    /// Columns joined by USING or NATURAL to an earlier source: an unqualified name finds the earlier one.
+    merged: Vector<String>;
+}
+
+struct Scope {
+    sources: Vector<ScopeSource>;
+}
+
+/// The names a SELECT's result columns give, which WHERE, GROUP BY, HAVING and ORDER BY may use.
+struct OutputAlias {
+    name: String;
+    expr: Expr;
+}
+
+/// An aggregate call found while compiling a query's result columns and HAVING.
+struct AggregateSpec {
+    function: AggregateFunction;
+    args: Vector<XExpr>;
+    distinct: bool;
+    filter: XExpr?;
+    /// The collation of the first argument, for min, max and DISTINCT.
+    collation: Collation;
+    /// The separator argument of group_concat, which is not per row in the usual case.
+    star: bool;
+}
+
+/// A window function call found while compiling a query's result columns and ORDER BY.
+struct WindowSpec {
+    function: WindowFunction;
+    args: Vector<XExpr>;
+    distinct: bool;
+    filter: XExpr?;
+    partitionBy: Vector<XExpr>;
+    partitionCollations: Vector<Collation>;
+    orderBy: Vector<XOrderTerm>;
+    frame: XFrame?;
+    /// The frame's offsets, compiled: they are constant.
+    startOffset: XExpr?;
+    endOffset: XExpr?;
+    collation: Collation;
+}
+
+/// A window frame without its offsets, which are compiled beside it.
+struct XFrame {
+    mode: FrameMode;
+    start: FrameBoundKind;
+    end: FrameBoundKind;
+    exclude: FrameExclude;
+}
+
+struct XOrderTerm {
+    expr: XExpr;
+    /// A term that names a result column (an ordinal): its key is that column's value.
+    output: usize?;
+    descending: bool;
+    nullsFirst: bool;
+    collation: Collation;
+}
+
+/// Where aggregate and window calls may appear in the expression being compiled.
+enum CallContext {
+    /// WHERE, ON, a VALUES row, LIMIT: neither.
+    Plain,
+    /// The result columns, HAVING and ORDER BY of an aggregate query.
+    Aggregates,
+    /// Inside an aggregate's arguments: no other aggregate.
+    InsideAggregate,
+}
+
+struct Compiler {
+    scopes: Vector<Scope>;
+    /// How many scopes belong to enclosing statements; a name found in one of them makes the current subquery
+    /// correlated.
+    outerScopes: usize;
+    /// The scope depth the current subquery started at, and the shallowest depth it reached for a name.
+    subqueryBase: usize;
+    shallowest: usize;
+    context: CallContext;
+    aggregates: Vector<AggregateSpec>;
+    windows: Vector<WindowSpec>;
+    windowsAllowed: bool;
+    namedWindows: Vector<NamedWindow>;
+    aliases: Vector<OutputAlias>;
+    /// Whether output aliases are searched before columns (ORDER BY) or after them (WHERE, GROUP BY, HAVING).
+    aliasesFirst: bool;
+    useAliases: bool;
+    params: ParamTable;
+    nextCacheIndex: usize;
+    /// The slots in use, so a subquery's sources take the next ones.
+    slotsInUse: usize;
+    /// The common table expressions in scope, innermost last, and their compiled plans.
+    cteNames: Vector<CteName>;
+    ctePlans: Vector<CtePlan?>;
+    /// How many recursive CTEs' working tables have been numbered.
+    workingTables: usize;
+}
+
+/// A common table expression's name in scope.
+struct CteName {
+    name: String;
+    /// Its plan's number, or for the recursive part of a recursive CTE its working table's.
+    index: usize;
+    working: bool;
+    columns: Vector<ScopeColumn>;
+}
+
+/// Parameter numbering: `?` takes the next number, `?N` is N, and a name keeps the number it first got.
+struct ParamTable {
+    count: usize;
+    names: Vector<String>;
+    numbers: Vector<usize>;
+
+    fn create() -> ParamTable =>
+        ParamTable { count: 0, names: Vector<String>.create(), numbers: Vector<usize>.create() };
+
+    /// The 0-based index of the parameter written as `text`.
+    fn indexOf(borrow mut this, text: StringView) -> Result<usize, SqliteError> {
+        if (text == "?") {
+            this.count += 1;
+            return Ok(this.count - 1);
+        }
+        if (text[0] == '?') {
+            let n = text[1..].parseInt<usize>() ?? 0;
+            if (n == 0 || n > 32766) {
+                var message = String.from("variable number must be between ?1 and ?32766")?;
+                return Err(SqliteError.Sql(message));
+            }
+            this.count = this.count.max(n);
+            return Ok(n - 1);
+        }
+        for (i in 0..this.names.length) {
+            if (this.names[i].view() == text) {
+                return Ok(this.numbers[i]);
+            }
+        }
+        this.count += 1;
+        this.names.push(String.from(text)?)?;
+        this.numbers.push(this.count - 1)?;
+        return Ok(this.count - 1);
+    }
+}

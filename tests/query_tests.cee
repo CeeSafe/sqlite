@@ -1,0 +1,174 @@
+// Queries, answered by this engine and by the sqlite3 shell on the same database, compared as the shell prints
+// them (list mode: columns joined by '|', NULL as nothing).
+
+fn listText(result: borrow QueryResult) -> String {
+    var out = String.create();
+    for (r in 0..result.rows.length) {
+        let row = borrow result.rows[r];
+        for (c in 0..row.length) {
+            if (c != 0) {
+                out.append("|")!;
+            }
+            appendValueText(mut out, borrow row[c])!;
+        }
+        out.append("\n")!;
+    }
+    return out;
+}
+
+/// What this engine answers, or the error's message.
+fn ours(session: borrow mut Session, sql: StringView) -> String {
+    let none = Vector<SqliteValue>.create();
+    match (session.query(sql, none.view())) {
+        Ok(result) => { return listText(borrow result); }
+        Err(e) => {
+            var text = String.from("error: ")!;
+            text.append(e.message())!;
+            text.append("\n")!;
+            return text;
+        }
+    }
+}
+
+/// What the sqlite3 shell answers, or "error: " and its message.
+fn theirAnswer(path: StringView, sql: StringView) -> String {
+    var arguments = Vector<StringView>.create();
+    arguments.push(path)!;
+    arguments.push(sql)!;
+    let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
+    if (output.status == 0) {
+        return textFromBytesLossy(output.stdout.view())!;
+    }
+    // "Parse error in 2nd command line argument: no such column: x" and the like.
+    let errors = textFromBytesLossy(output.stderr.view())!;
+    let firstLine = errors.view().splitOnce("\n") ?? TextHalves { left: errors.view(), right: "" };
+    let message = match (firstLine.left.splitOnce("argument: ")) {
+        Some(halves) => halves.right,
+        null => firstLine.left,
+    };
+    var text = String.from("error: ")!;
+    text.append(message)!;
+    text.append("\n")!;
+    return text;
+}
+
+/// Runs each query (one a line) in both engines and compares.
+fn sameAnswers(path: StringView, queries: StringView) -> Result<void, TestFailure> {
+    var session = Session.open(path)!;
+    var lines = queries.split("\n");
+    while (lines.next() is Some(line)) {
+        let sql = line.trim();
+        if (sql.length == 0 || sql.startsWith("--")) {
+            continue;
+        }
+        let theirs = theirAnswer(path, sql);
+        let mine = ours(mut session, sql);
+        if (theirs.view() != mine.view()) {
+            var message = String.from(sql)!;
+            message.append("\n  sqlite3:\n")!;
+            message.append(theirs.view())!;
+            message.append("  this engine:\n")!;
+            message.append(mine.view())!;
+            return Check.fail(message.view());
+        }
+    }
+    return Ok();
+}
+
+const QUERY_FIXTURE: StringView = """
+    CREATE TABLE emp(id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE, dept INTEGER, salary REAL, boss INTEGER, note);
+    CREATE TABLE dept(id INTEGER PRIMARY KEY, title TEXT, budget NUMERIC);
+    INSERT INTO dept VALUES (1, 'Sales', 1000), (2, 'Engineering', '2500.50'), (3, 'Empty', NULL);
+    INSERT INTO emp VALUES
+        (1, 'alice', 1, 5000, NULL, 'x'), (2, 'Bob', 1, 4000.5, 1, NULL), (3, 'carol', 2, 7000, 1, 12),
+        (4, 'Dave', 2, 6500, 3, 1.5), (5, 'eve', 2, NULL, 3, x'4142'), (6, 'ALICE', NULL, 3000, 2, '7'),
+        (7, 'frank', 9, 100, NULL, 'z');
+    CREATE VIEW rich AS SELECT name, salary FROM emp WHERE salary > 4500;
+    """;
+
+@test
+fn expressionsWithoutTables() -> Result<void, TestFailure> {
+    let path = "out/query-expressions.db";
+    makeDatabase(path, "CREATE TABLE t(x)")?;
+    return sameAnswers(path, """
+        SELECT 1 + 2 * 3, 7 / 2, 7.0 / 2, 7 % 3, -7 % 3, 5.5 % 2, 1 / 0, 9223372036854775807 + 1
+        SELECT '12abc' + 1, ' 12 ' * 2, 'abc' || 1.5 || NULL, 1 < 2, 'a' < 'b', NULL = NULL, NULL IS NULL
+        SELECT 1 << 63, 1 << 64, -8 >> 1, ~5, 6 & 3, 6 | 3, -9223372036854775808 / -1
+        SELECT 0.1 + 0.2, 1e20, 1.0 / 3, 2.0 / 3, 100.0, -0.0, 1e308 * 10
+        SELECT CAST('9007199254740993' AS INTEGER), CAST('1e3' AS INTEGER), CAST(' 12.7abc' AS REAL), CAST(12 AS TEXT), CAST('3.0' AS NUMERIC), CAST(x'3132' AS INTEGER)
+        SELECT typeof(1), typeof(1.0), typeof('1'), typeof(x'01'), typeof(NULL), typeof(CAST(1 AS BLOB))
+        SELECT abs(-5), abs(-5.5), abs('-12'), length('héllo'), length(x'0102'), length(123), octet_length('héllo')
+        SELECT upper('abcé'), lower('ABCÉ'), substr('héllo', 2, 3), substr('héllo', -3), substr('abc', 0, 2), hex(substr(x'01020304', 2, 2))
+        SELECT instr('héllo', 'l'), instr('abc', ''), instr('abc', 'z'), replace('aaa', 'a', 'bb'), replace(12, '', 'x')
+        SELECT trim('  x  '), ltrim('xxhixx', 'x'), rtrim('xxhixx', 'x'), trim('éaé', 'é')
+        SELECT coalesce(NULL, NULL, 3), ifnull(NULL, 'y'), nullif(1, 1), nullif(1, 2), iif(0, 'a', 'b'), iif(0, 1), iif(0, 1, 1, 2, 3)
+        SELECT max(1, 2.5, '3'), min(1, 2.5, '3'), max(1, NULL), min('b', 'A' COLLATE NOCASE)
+        SELECT hex('héllo'), hex(1.5), hex(NULL), quote('it''s'), quote(1.5), quote(x'0a'), quote(NULL), quote(1e999)
+        SELECT round(2.5), round(-2.5), round(1.005, 2), round(3.14159, 3), round(5), round(NULL), round(1e20, 2)
+        SELECT sign(-3.5), sign('abc'), sign(' 0 '), char(72, 105, 0x1F600), unicode('é'), unicode('')
+        SELECT 'abc' LIKE 'A%', 'abc' LIKE 'a_c', 'a%c' LIKE 'a\%c' ESCAPE '\', 'abc' GLOB 'a*', 'abc' GLOB '[a-b]*', 'Abc' GLOB 'a*', 'é' LIKE 'É'
+        SELECT 3 BETWEEN 1 AND 5, 3 NOT BETWEEN 4 AND 5, 2 IN (1, 2, 3), 2 IN (), NULL IN (1), 4 NOT IN (1, NULL)
+        SELECT CASE 3 WHEN 1 THEN 'one' WHEN 3 THEN 'three' ELSE 'other' END, CASE WHEN 0 THEN 1 END
+        SELECT 'a' = 'A' COLLATE NOCASE, 'a ' = 'a' COLLATE RTRIM, 1 = '1', 1 = +'1', (1, 2) = (1, 2), (1, 2) < (1, 3)
+        SELECT unhex('4142'), unhex('41 42', ' '), unhex('4G'), zeroblob(2) = x'0000', concat('a', NULL, 1), concat_ws('-', 1, NULL, 'b')
+        SELECT 1 AND NULL, 0 AND NULL, 1 OR NULL, 0 OR NULL, NOT NULL, NOT 0, NOT 'abc'
+        SELECT 1 = 1.0, '1' = 1.0, 2 > '1', x'01' > 'z', 1 < x'00'
+        """);
+}
+
+@test
+fn selectsFromTables() -> Result<void, TestFailure> {
+    let path = "out/query-tables.db";
+    makeDatabase(path, QUERY_FIXTURE)?;
+    return sameAnswers(path, """
+        SELECT * FROM emp
+        SELECT id, name FROM emp WHERE dept = 2 ORDER BY salary DESC
+        SELECT name FROM emp WHERE name = 'ALICE' ORDER BY id
+        SELECT name FROM emp ORDER BY name, id
+        SELECT name FROM emp ORDER BY name COLLATE BINARY, id
+        SELECT salary FROM emp ORDER BY salary NULLS LAST
+        SELECT salary FROM emp ORDER BY 1 DESC NULLS FIRST
+        SELECT id FROM emp WHERE note = 12
+        SELECT id FROM emp WHERE note = '12'
+        SELECT id FROM emp WHERE salary = '5000'
+        SELECT id FROM emp WHERE dept IN (SELECT id FROM dept WHERE budget > 1500)
+        SELECT id, (SELECT title FROM dept WHERE dept.id = emp.dept) FROM emp
+        SELECT id FROM emp WHERE EXISTS (SELECT 1 FROM emp AS e2 WHERE e2.boss = emp.id)
+        SELECT e.name, d.title FROM emp e JOIN dept d ON d.id = e.dept ORDER BY e.id
+        SELECT e.name, d.title FROM emp e LEFT JOIN dept d ON d.id = e.dept ORDER BY e.id
+        SELECT e.name, b.name FROM emp e LEFT JOIN emp b ON b.id = e.boss ORDER BY e.id
+        SELECT count(*) FROM emp, dept
+        SELECT * FROM dept NATURAL JOIN (SELECT id, 'x' AS tag FROM emp) ORDER BY id
+        SELECT * FROM dept JOIN (SELECT id, 'x' AS tag FROM emp) USING (id) ORDER BY id
+        SELECT dept, count(*), sum(salary), avg(salary), min(name), max(salary), total(salary) FROM emp GROUP BY dept ORDER BY dept
+        SELECT dept, group_concat(name, ';') FROM emp GROUP BY dept HAVING count(*) > 1 ORDER BY 1
+        SELECT count(*), count(note), count(DISTINCT dept), sum(id), avg(id) FROM emp
+        SELECT count(*), sum(salary), max(salary) FROM emp WHERE id > 100
+        SELECT name, max(salary) FROM emp
+        SELECT DISTINCT dept FROM emp ORDER BY dept
+        SELECT DISTINCT name FROM emp ORDER BY 1
+        SELECT id FROM emp ORDER BY id LIMIT 3
+        SELECT id FROM emp ORDER BY id LIMIT 2 OFFSET 3
+        SELECT id FROM emp ORDER BY id LIMIT 4, 2
+        SELECT id FROM emp LIMIT -1 OFFSET 5
+        SELECT name AS n FROM emp WHERE n LIKE 'a%' ORDER BY n
+        SELECT dept AS d, count(*) FROM emp GROUP BY d ORDER BY d
+        SELECT id FROM emp WHERE id = 3
+        SELECT id FROM emp WHERE rowid = '4'
+        SELECT id FROM emp WHERE id = 3.5
+        SELECT * FROM rich ORDER BY 1
+        SELECT id FROM dept UNION SELECT dept FROM emp ORDER BY 1
+        SELECT id FROM dept UNION ALL SELECT dept FROM emp ORDER BY 1
+        SELECT dept FROM emp INTERSECT SELECT id FROM dept ORDER BY 1
+        SELECT dept FROM emp EXCEPT SELECT id FROM dept ORDER BY 1
+        VALUES (1, 'a'), (2, 'b')
+        WITH big AS (SELECT * FROM emp WHERE salary > 4500) SELECT count(*) FROM big
+        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10) SELECT sum(i), count(*) FROM n
+        WITH RECURSIVE chain(id, depth) AS (SELECT id, 0 FROM emp WHERE boss IS NULL UNION ALL SELECT emp.id, depth + 1 FROM emp JOIN chain ON emp.boss = chain.id) SELECT id, depth FROM chain ORDER BY id
+        SELECT id, name FROM emp WHERE salary > (SELECT avg(salary) FROM emp) ORDER BY id
+        SELECT nosuch FROM emp
+        SELECT * FROM nosuch
+        SELECT id FROM emp ORDER BY 9
+        SELECT count(*) FROM emp WHERE count(*) > 1
+        """);
+}

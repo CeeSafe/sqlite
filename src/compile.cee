@@ -1,0 +1,882 @@
+// Compiling syntax-tree expressions: names resolved to frame positions, literals to values, and each expression's
+// affinity and collation worked out as SQLite does (sqlite3ExprAffinity, sqlite3ExprCollSeq).
+
+/// A compiled expression, with what comparisons need to know of it.
+struct Compiled {
+    expr: XExpr;
+    affinity: ExprAffinity;
+    /// A column's collation, or one from a COLLATE.
+    collation: Collation?;
+    /// Whether a COLLATE inside the expression gave the collation (EP_Collate).
+    explicit: bool;
+}
+
+fn plain(expr: XExpr) -> Compiled =>
+    Compiled { expr: expr, affinity: ExprAffinity.None, collation: null, explicit: false };
+
+/// The collation of a comparison between two operands (sqlite3BinaryCompareCollSeq).
+fn pairCollation(left: borrow Compiled, right: borrow Compiled) -> Collation {
+    if (left.explicit) {
+        return left.collation ?? Collation.Binary;
+    }
+    if (right.explicit) {
+        return right.collation ?? Collation.Binary;
+    }
+    return left.collation ?? right.collation ?? Collation.Binary;
+}
+
+/// What an operand passes up of its collation.
+struct CollationInfo {
+    collation: Collation?;
+    explicit: bool;
+}
+
+fn infoOf(c: borrow Compiled) -> CollationInfo => CollationInfo { collation: c.collation, explicit: c.explicit };
+
+/// The collation an expression passes up: an explicit one from its operands, left first (EP_Collate).
+fn passedCollation(parts: Slice<CollationInfo>) -> Compiled {
+    for (i in 0..parts.length) {
+        if (parts[i].explicit) {
+            return Compiled {
+                expr: XExpr.Value(SqliteValue.Null),
+                affinity: ExprAffinity.None,
+                collation: parts[i].collation,
+                explicit: true,
+            };
+        }
+    }
+    return Compiled {
+        expr: XExpr.Value(SqliteValue.Null),
+        affinity: ExprAffinity.None,
+        collation: null,
+        explicit: false,
+    };
+}
+
+fn withPassed(expr: XExpr, parts: Slice<CollationInfo>) -> Compiled {
+    let passed = passedCollation(parts);
+    return Compiled { expr: expr, affinity: ExprAffinity.None, collation: passed.collation, explicit: passed.explicit };
+}
+
+fn hexValue(c: u8) -> u8 => if (c <= '9') c - '0' else if (c >= 'a') c - 'a' + 10 else c - 'A' + 10;
+
+/// The value of a literal.
+fn literalValue(literal: borrow Literal) -> Result<SqliteValue, SqliteError> {
+    let text = literal.text.view();
+    match (literal.kind) {
+        LiteralKind.Null => { return Ok(SqliteValue.Null); }
+        LiteralKind.True => { return Ok(SqliteValue.Integer(1)); }
+        LiteralKind.False => { return Ok(SqliteValue.Integer(0)); }
+        LiteralKind.String => { return Ok(SqliteValue.text(text)?); }
+        LiteralKind.Float => { return Ok(SqliteValue.Real(RealParse.of(text.bytes()).value)); }
+        LiteralKind.Integer => {
+            if (text.length > 2 && (text[1] == 'x' || text[1] == 'X')) {
+                // Up to 16 hex digits, as the two's-complement bits of the integer.
+                var bits: u64 = 0;
+                for (c in text.bytes()[2..]) {
+                    bits = (bits << 4) | (hexValue(c) as u64);
+                }
+                return Ok(SqliteValue.Integer(truncate<i64>(bits)));
+            }
+            return Ok(SqliteValue.Integer(IntegerPrefix.scan(text.bytes()).value));
+        }
+        LiteralKind.Blob => {
+            var bytes = Vector<u8>.withCapacity(text.length / 2)?;
+            var i: usize = 0;
+            while (i + 1 < text.length) {
+                bytes.push((hexValue(text[i]) << 4) | hexValue(text[i + 1]))?;
+                i += 2;
+            }
+            return Ok(SqliteValue.Blob(bytes));
+        }
+        _ => { return Ok(SqliteValue.Null); }
+    }
+}
+
+fn isRowidName(name: StringView) -> bool =>
+    name.equalsIgnoreAsciiCase("rowid") || name.equalsIgnoreAsciiCase("_rowid_") || name.equalsIgnoreAsciiCase("oid");
+
+fn namedError(prefix: StringView, name: StringView) -> SqliteError {
+    var text = String.create();
+    let _ = text.append(prefix);
+    let _ = text.append(name);
+    return SqliteError.Sql(text);
+}
+
+fn columnNameError(column: borrow ColumnRef) -> SqliteError {
+    var text = String.create();
+    let _ = text.append("no such column: ");
+    if (borrow column.table is Some(table)) {
+        let _ = text.append(table.view());
+        let _ = text.append(".");
+    }
+    let _ = text.append(column.name.view());
+    return SqliteError.Sql(text);
+}
+
+fn functionNameError(prefix: StringView, name: StringView, suffix: StringView) -> SqliteError {
+    var text = String.create();
+    let _ = text.append(prefix);
+    let _ = text.append(name);
+    let _ = text.append(suffix);
+    return SqliteError.Sql(text);
+}
+
+/// A name found in a scope.
+struct Resolved {
+    scope: usize;
+    compiled: Compiled;
+}
+
+impl Compiler {
+    fn create() -> Compiler => Compiler {
+        scopes: Vector<Scope>.create(),
+        outerScopes: 0,
+        subqueryBase: 0,
+        shallowest: 0,
+        context: CallContext.Plain,
+        aggregates: Vector<AggregateSpec>.create(),
+        windows: Vector<WindowSpec>.create(),
+        windowsAllowed: false,
+        namedWindows: Vector<NamedWindow>.create(),
+        aliases: Vector<OutputAlias>.create(),
+        aliasesFirst: false,
+        useAliases: false,
+        params: ParamTable.create(),
+        nextCacheIndex: 0,
+        slotsInUse: 0,
+        cteNames: Vector<CteName>.create(),
+        ctePlans: Vector<CtePlan?>.create(),
+        workingTables: 0,
+    };
+
+    /// Compiles an expression.
+    fn compile(borrow mut this, e: borrow Expr, db: borrow mut Session) -> Result<XExpr, SqliteError> {
+        let compiled = this.typed(e, db)?;
+        return Ok(compiled.expr);
+    }
+
+    /// Compiles a column of a source in a scope.
+    fn columnOf(source: borrow ScopeSource, column: usize) -> Compiled {
+        let c = borrow source.columns[column];
+        if (source.rowidAlias == Some(column)) {
+            return Compiled {
+                expr: XExpr.Rowid(source.slot),
+                affinity: ExprAffinity.Integer,
+                collation: c.collation,
+                explicit: false,
+            };
+        }
+        return Compiled {
+            expr: XExpr.Column(source.slot, column),
+            affinity: exprAffinityOf(c.affinity),
+            collation: c.collation,
+            explicit: false,
+        };
+    }
+
+    fn findColumn(source: borrow ScopeSource, name: StringView) -> usize? {
+        for (i in 0..source.columns.length) {
+            if (source.columns[i].name.view().equalsIgnoreAsciiCase(name)) {
+                return i;
+            }
+        }
+        return null;
+    }
+
+    fn isMerged(source: borrow ScopeSource, name: StringView) -> bool {
+        for (i in 0..source.merged.length) {
+            if (source.merged[i].view().equalsIgnoreAsciiCase(name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Finds a column in the scopes, innermost first.
+    private fn resolveInScopes(borrow mut this, column: borrow ColumnRef) -> Result<Resolved?, SqliteError> {
+        let name = column.name.view();
+        var depth = this.scopes.length;
+        while (depth > 0) {
+            depth -= 1;
+            let scope = borrow this.scopes[depth];
+            var found: Compiled? = null;
+            var matches: usize = 0;
+            for (s in 0..scope.sources.length) {
+                let source = borrow scope.sources[s];
+                if (borrow column.table is Some(table)) {
+                    if (!source.name.view().equalsIgnoreAsciiCase(table.view())) {
+                        continue;
+                    }
+                } else if (Compiler.isMerged(source, name)) {
+                    continue;
+                }
+                if (Compiler.findColumn(source, name) is Some(at)) {
+                    matches += 1;
+                    if (found.isNull()) {
+                        found = Compiler.columnOf(source, at);
+                    }
+                }
+            }
+            if (matches > 1) {
+                var text = String.from("ambiguous column name: ")?;
+                if (borrow column.table is Some(table)) {
+                    text.append(table.view())?;
+                    text.append(".")?;
+                }
+                text.append(name)?;
+                return Err(SqliteError.Sql(text));
+            }
+            if (found is Some(compiled)) {
+                return Ok(Resolved { scope: depth, compiled: compiled });
+            }
+            // rowid, _rowid_ and oid, when no column has the name.
+            if (isRowidName(name)) {
+                var rowidSource: usize? = null;
+                var count: usize = 0;
+                for (s in 0..scope.sources.length) {
+                    let source = borrow scope.sources[s];
+                    if (!source.hasRowid) {
+                        continue;
+                    }
+                    if (borrow column.table is Some(table)) {
+                        if (!source.name.view().equalsIgnoreAsciiCase(table.view())) {
+                            continue;
+                        }
+                    }
+                    count += 1;
+                    rowidSource = source.slot;
+                }
+                if (count > 1) {
+                    return Err(namedError("ambiguous column name: ", name));
+                }
+                if (rowidSource is Some(slot)) {
+                    return Ok(
+                        Resolved {
+                            scope: depth,
+                            compiled: Compiled {
+                                expr: XExpr.Rowid(slot),
+                                affinity: ExprAffinity.Integer,
+                                collation: null,
+                                explicit: false,
+                            },
+                        },
+                    );
+                }
+            }
+        }
+        return Ok(null);
+    }
+
+    private fn aliasNamed(borrow this, name: StringView) -> usize? {
+        for (i in 0..this.aliases.length) {
+            if (this.aliases[i].name.view().equalsIgnoreAsciiCase(name)) {
+                return i;
+            }
+        }
+        return null;
+    }
+
+    /// Compiles the result column an alias names, in place of the name.
+    private fn compileAlias(borrow mut this, index: usize, db: borrow mut Session) -> Result<Compiled, SqliteError> {
+        // An alias's expression is compiled without aliases, so that one cannot refer to itself. The list moves
+        // out of the compiler meanwhile, so the expression can be borrowed while the compiler changes.
+        let aliases = replace(mut this.aliases, Vector<OutputAlias>.create());
+        let saved = this.useAliases;
+        this.useAliases = false;
+        let result = this.typed(borrow aliases[index].expr, db);
+        this.useAliases = saved;
+        this.aliases = aliases;
+        return result;
+    }
+
+    private fn column(
+        borrow mut this,
+        column: borrow ColumnRef,
+        db: borrow mut Session,
+    ) -> Result<Compiled, SqliteError> {
+        let unqualified = column.table.isNull() && column.schema.isNull();
+        if (unqualified && this.useAliases && this.aliasesFirst) {
+            if (this.aliasNamed(column.name.view()) is Some(index)) {
+                return this.compileAlias(index, db);
+            }
+        }
+        if (this.resolveInScopes(column)? is Some(resolved)) {
+            if (resolved.scope < this.shallowest) {
+                this.shallowest = resolved.scope;
+            }
+            return Ok(resolved.compiled);
+        }
+        if (unqualified && this.useAliases && !this.aliasesFirst) {
+            if (this.aliasNamed(column.name.view()) is Some(index)) {
+                return this.compileAlias(index, db);
+            }
+        }
+        // SQLite's double-quoted string fallback.
+        if (unqualified && column.doubleQuoted) {
+            return Ok(plain(XExpr.Value(SqliteValue.text(column.name.view())?)));
+        }
+        return Err(columnNameError(column));
+    }
+
+    /// Compiles an expression, with its affinity and collation.
+    fn typed(borrow mut this, e: borrow Expr, db: borrow mut Session) -> Result<Compiled, SqliteError> {
+        match (e) {
+            Expr.Literal(literal) => {
+                if (literal.kind == LiteralKind.CurrentTime ||
+                    literal.kind == LiteralKind.CurrentDate || literal.kind == LiteralKind.CurrentTimestamp) {
+                    return Ok(plain(XExpr.Now(literal.kind)));
+                }
+                return Ok(plain(XExpr.Value(literalValue(literal)?)));
+            }
+            Expr.Column(column) => { return this.column(column, db); }
+            Expr.Param(text) => { return Ok(plain(XExpr.Param(this.params.indexOf(text.view())?))); }
+            Expr.RowValue(items) => {
+                var compiled = Vector<XExpr>.create();
+                var first: Compiled? = null;
+                for (i in 0..items.length) {
+                    let c = this.typed(borrow items[i], db)?;
+                    if (i == 0) {
+                        first = Compiled {
+                            expr: XExpr.Value(SqliteValue.Null),
+                            affinity: c.affinity,
+                            collation: c.collation,
+                            explicit: c.explicit,
+                        };
+                    }
+                    compiled.push(c.expr)?;
+                }
+                let meta = first!;
+                return Ok(
+                    Compiled {
+                        expr: XExpr.RowValue(compiled),
+                        affinity: meta.affinity,
+                        collation: meta.collation,
+                        explicit: meta.explicit,
+                    },
+                );
+            }
+            Expr.Unary(op, operand) => {
+                let inner = this.typed(operand, db)?;
+                match (op) {
+                    // Unary + passes the collation through, and the affinity not.
+                    UnaryOp.Plus => {
+                        return Ok(
+                            Compiled {
+                                expr: XExpr.Plus(Box.create(inner.expr)?),
+                                affinity: ExprAffinity.None,
+                                collation: inner.collation,
+                                explicit: inner.explicit,
+                            },
+                        );
+                    }
+                    UnaryOp.Negate => {
+                        return Ok(
+                            Compiled {
+                                expr: XExpr.Negate(Box.create(inner.expr)?),
+                                affinity: ExprAffinity.None,
+                                collation: if (inner.explicit) inner.collation else null,
+                                explicit: inner.explicit,
+                            },
+                        );
+                    }
+                    UnaryOp.BitNot => {
+                        return Ok(
+                            Compiled {
+                                expr: XExpr.BitNot(Box.create(inner.expr)?),
+                                affinity: ExprAffinity.None,
+                                collation: if (inner.explicit) inner.collation else null,
+                                explicit: inner.explicit,
+                            },
+                        );
+                    }
+                    UnaryOp.Not => {
+                        return Ok(
+                            Compiled {
+                                expr: XExpr.Not(Box.create(inner.expr)?),
+                                affinity: ExprAffinity.None,
+                                collation: if (inner.explicit) inner.collation else null,
+                                explicit: inner.explicit,
+                            },
+                        );
+                    }
+                }
+            }
+            Expr.Binary(op, left, right) => { return this.binary(op, left, right, db); }
+            Expr.Collate(operand, name) => {
+                let inner = this.typed(operand, db)?;
+                let collation = Collation.named(name.view()) ?? {
+                    return Err(namedError("no such collation sequence: ", name.view()));
+                };
+                return Ok(
+                    Compiled { expr: inner.expr, affinity: inner.affinity, collation: collation, explicit: true },
+                );
+            }
+            Expr.Is(left, right, negated) => {
+                let a = this.typed(left, db)?;
+                let b = this.typed(right, db)?;
+                return Ok(this.comparison(if (negated) CompareOp.IsNot else CompareOp.Is, a, b)?);
+            }
+            Expr.Between(between) => {
+                let x = this.typed(borrow between.operand, db)?;
+                let low = this.typed(borrow between.low, db)?;
+                let high = this.typed(borrow between.high, db)?;
+                let parts = [infoOf(borrow x)];
+                let compiled = XBetween {
+                    lowAffinity: compareAffinity(x.affinity, low.affinity),
+                    lowCollation: pairCollation(borrow x, borrow low),
+                    highAffinity: compareAffinity(x.affinity, high.affinity),
+                    highCollation: pairCollation(borrow x, borrow high),
+                    operand: x.expr,
+                    low: low.expr,
+                    high: high.expr,
+                    negated: between.negated,
+                };
+                return Ok(withPassed(XExpr.Between(Box.create(compiled)?), parts[..]));
+            }
+            Expr.Like(like) => {
+                let operand = this.typed(borrow like.operand, db)?;
+                let pattern = this.typed(borrow like.pattern, db)?;
+                var escape: XExpr? = null;
+                if (borrow like.escape is Some(escapeExpr)) {
+                    escape = this.compile(escapeExpr, db)?;
+                }
+                let x = XLike {
+                    op: like.op,
+                    operand: operand.expr,
+                    pattern: pattern.expr,
+                    escape: escape,
+                    negated: like.negated,
+                };
+                return Ok(plain(XExpr.Like(Box.create(x)?)));
+            }
+            Expr.In(inExpr) => { return this.inExpr(inExpr, db); }
+            Expr.Function(call) => { return this.call(call, db); }
+            Expr.Cast(operand, typeName) => {
+                let inner = this.typed(operand, db)?;
+                let affinity = affinityOf(typeName.view());
+                return Ok(
+                    Compiled {
+                        expr: XExpr.Cast(Box.create(inner.expr)?, affinity),
+                        affinity: exprAffinityOf(affinity),
+                        collation: inner.collation,
+                        explicit: inner.explicit,
+                    },
+                );
+            }
+            Expr.Case(c) => { return this.caseExpr(c, db); }
+            Expr.Subquery(select) => {
+                let sub = this.subquery(select, db)?;
+                let affinity = sub.plan.firstColumnAffinity;
+                return Ok(
+                    Compiled {
+                        expr: XExpr.Subquery(Box.create(sub)?),
+                        affinity: affinity,
+                        collation: null,
+                        explicit: false,
+                    },
+                );
+            }
+            Expr.Exists(select) => {
+                let sub = this.subquery(select, db)?;
+                return Ok(plain(XExpr.Exists(Box.create(sub)?)));
+            }
+            Expr.Raise(action, message) => {
+                var compiled: Box<XExpr>? = null;
+                if (message is Some(m)) {
+                    compiled = Box.create(this.compile(m, db)?)?;
+                }
+                return Ok(plain(XExpr.Raise(action, compiled)));
+            }
+        }
+    }
+
+    private fn comparison(borrow mut this, op: CompareOp, a: Compiled, b: Compiled) -> Result<Compiled, SqliteError> {
+        let affinity = compareAffinity(a.affinity, b.affinity);
+        let collation = pairCollation(borrow a, borrow b);
+        let parts = [infoOf(borrow a), infoOf(borrow b)];
+        let c = XCompare { op: op, left: a.expr, right: b.expr, affinity: affinity, collation: collation };
+        return Ok(withPassed(XExpr.Compare(Box.create(c)?), parts[..]));
+    }
+
+    private fn binary(
+        borrow mut this,
+        op: BinaryOp,
+        left: borrow Expr,
+        right: borrow Expr,
+        db: borrow mut Session,
+    ) -> Result<Compiled, SqliteError> {
+        let a = this.typed(left, db)?;
+        let b = this.typed(right, db)?;
+        let compareKind: CompareOp? = match (op) {
+            BinaryOp.Equal => CompareOp.Equal,
+            BinaryOp.NotEqual => CompareOp.NotEqual,
+            BinaryOp.Less => CompareOp.Less,
+            BinaryOp.LessOrEqual => CompareOp.LessOrEqual,
+            BinaryOp.Greater => CompareOp.Greater,
+            BinaryOp.GreaterOrEqual => CompareOp.GreaterOrEqual,
+            _ => null,
+        };
+        if (compareKind is Some(kind)) {
+            return this.comparison(kind, a, b);
+        }
+        let parts = [infoOf(borrow a), infoOf(borrow b)];
+        let l = Box.create(a.expr)?;
+        let r = Box.create(b.expr)?;
+        let expr = match (op) {
+            BinaryOp.Or => XExpr.Or(l, r),
+            BinaryOp.And => XExpr.And(l, r),
+            BinaryOp.Add => XExpr.Arith(ArithmeticOp.Add, l, r),
+            BinaryOp.Subtract => XExpr.Arith(ArithmeticOp.Subtract, l, r),
+            BinaryOp.Multiply => XExpr.Arith(ArithmeticOp.Multiply, l, r),
+            BinaryOp.Divide => XExpr.Arith(ArithmeticOp.Divide, l, r),
+            BinaryOp.Modulo => XExpr.Arith(ArithmeticOp.Remainder, l, r),
+            BinaryOp.Concat => XExpr.Concat(l, r),
+            BinaryOp.BitAnd => XExpr.Bits(BitOp.And, l, r),
+            BinaryOp.BitOr => XExpr.Bits(BitOp.Or, l, r),
+            BinaryOp.ShiftLeft => XExpr.Bits(BitOp.ShiftLeft, l, r),
+            BinaryOp.ShiftRight => XExpr.Bits(BitOp.ShiftRight, l, r),
+            BinaryOp.JsonGet => XExpr.JsonGet(l, r, false),
+            BinaryOp.JsonGetValue => XExpr.JsonGet(l, r, true),
+            _ => XExpr.Value(SqliteValue.Null),
+        };
+        return Ok(withPassed(expr, parts[..]));
+    }
+
+    private fn caseExpr(borrow mut this, c: borrow CaseExpr, db: borrow mut Session) -> Result<Compiled, SqliteError> {
+        var base: Compiled? = null;
+        if (borrow c.operand is Some(operand)) {
+            base = this.typed(operand, db)?;
+        }
+        var branches = Vector<XWhen>.create();
+        for (i in 0..c.branches.length) {
+            let when = this.typed(borrow c.branches[i].when, db)?;
+            let then = this.compile(borrow c.branches[i].then, db)?;
+            var affinity = ExprAffinity.None;
+            var collation = Collation.Binary;
+            if (borrow base is Some(b)) {
+                affinity = compareAffinity(b.affinity, when.affinity);
+                collation = pairCollation(b, borrow when);
+            }
+            branches.push(XWhen { when: when.expr, then: then, affinity: affinity, collation: collation })?;
+        }
+        var otherwise: XExpr? = null;
+        if (borrow c.otherwise is Some(e)) {
+            otherwise = this.compile(e, db)?;
+        }
+        var operand: XExpr? = null;
+        if (base is Some(b)) {
+            operand = b.expr;
+        }
+        return Ok(plain(XExpr.Case(Box.create(XCase { operand: operand, branches: branches, otherwise: otherwise })?)));
+    }
+
+    private fn inExpr(borrow mut this, inExpr: borrow InExpr, db: borrow mut Session) -> Result<Compiled, SqliteError> {
+        let operand = this.typed(borrow inExpr.operand, db)?;
+        var items = Vector<XExpr>.create();
+        var subquery: XSubquery? = null;
+        var affinity = operand.affinity;
+        var collation = operand.collation ?? Collation.Binary;
+        match (borrow inExpr.source) {
+            InSource.Items(list) => {
+                for (i in 0..list.length) {
+                    items.push(this.compile(borrow list[i], db)?)?;
+                }
+            }
+            InSource.Select(select) => {
+                let sub = this.subquery(select, db)?;
+                affinity = compareAffinity(sub.plan.firstColumnAffinity, operand.affinity);
+                if (!operand.explicit && operand.collation.isNull()) {
+                    collation = sub.plan.firstColumnCollation ?? Collation.Binary;
+                }
+                subquery = sub;
+            }
+            InSource.Table(table) => {
+                let select = selectAllFrom(table)?;
+                let sub = this.subquery(borrow select, db)?;
+                affinity = compareAffinity(sub.plan.firstColumnAffinity, operand.affinity);
+                subquery = sub;
+            }
+        }
+        let x = XIn {
+            operand: operand.expr,
+            negated: inExpr.negated,
+            items: items,
+            subquery: subquery,
+            affinity: affinity,
+            collation: collation,
+        };
+        return Ok(plain(XExpr.In(Box.create(x)?)));
+    }
+
+    /// Compiles a subquery with the current scopes as its enclosing ones.
+    fn subquery(borrow mut this, select: borrow SelectStmt, db: borrow mut Session) -> Result<XSubquery, SqliteError> {
+        let savedBase = this.subqueryBase;
+        let savedShallowest = this.shallowest;
+        let base = this.scopes.length;
+        this.subqueryBase = base;
+        this.shallowest = base;
+        let plan = compileSelect(this, select, db)?;
+        let correlated = this.shallowest < base;
+        let reached = this.shallowest;
+        this.subqueryBase = savedBase;
+        this.shallowest = savedShallowest.min(reached);
+        let index = this.nextCacheIndex;
+        this.nextCacheIndex += 1;
+        return Ok(XSubquery { plan: Box.create(plan)?, correlated: correlated, cacheIndex: index });
+    }
+
+    /// Compiles a function call: scalar, aggregate or window.
+    private fn call(
+        borrow mut this,
+        call: borrow FunctionCall,
+        db: borrow mut Session,
+    ) -> Result<Compiled, SqliteError> {
+        let name = call.name.view();
+        let argc = call.args.length;
+        if (borrow call.over is Some(over)) {
+            return this.windowCall(call, over, db);
+        }
+        if (aggregateFunctionNamed(name, argc, call.star) is Some(function)) {
+            match (this.context) {
+                CallContext.Plain => { return Err(functionNameError("misuse of aggregate: ", name, "()")); }
+                CallContext.InsideAggregate => {
+                    return Err(functionNameError("misuse of aggregate function ", name, "()"));
+                }
+                CallContext.Aggregates => {}
+            }
+            this.context = CallContext.InsideAggregate;
+            var args = Vector<XExpr>.create();
+            var collation = Collation.Binary;
+            for (i in 0..argc) {
+                let c = this.typed(borrow call.args[i], db)?;
+                if (i == 0) {
+                    collation = c.collation ?? Collation.Binary;
+                }
+                args.push(c.expr)?;
+            }
+            var filter: XExpr? = null;
+            if (borrow call.filter is Some(f)) {
+                filter = this.compile(f, db)?;
+            }
+            this.context = CallContext.Aggregates;
+            if (call.distinct && argc != 1) {
+                return Err(functionNameError("DISTINCT aggregates must have exactly one argument", "", ""));
+            }
+            let index = this.aggregates.length;
+            this.aggregates.push(
+                AggregateSpec {
+                    function: function,
+                    args: args,
+                    distinct: call.distinct,
+                    filter: filter,
+                    collation: collation,
+                    star: call.star,
+                },
+            )?;
+            return Ok(plain(XExpr.Aggregate(index)));
+        }
+        if (windowOnlyFunctionNamed(name).isSome()) {
+            return Err(functionNameError("misuse of window function ", name, "()"));
+        }
+        if (call.distinct || call.filter.isSome()) {
+            return Err(functionNameError("", name, "() may not be used with DISTINCT or FILTER here"));
+        }
+        let function = scalarFunctionNamed(name, argc)?;
+        var compiled = Vector<Compiled>.create();
+        for (i in 0..argc) {
+            compiled.push(this.typed(borrow call.args[i], db)?)?;
+        }
+        // min, max and nullif compare with the first argument's collation that has one.
+        var collation = Collation.Binary;
+        for (i in 0..compiled.length) {
+            if (compiled[i].collation is Some(c)) {
+                collation = c;
+                break;
+            }
+        }
+        var infos = Vector<CollationInfo>.withCapacity(compiled.length)?;
+        for (i in 0..compiled.length) {
+            infos.push(infoOf(borrow compiled[i]))?;
+        }
+        let passed = passedCollation(infos.view());
+        var affinity = ExprAffinity.None;
+        var resultCollation = passed.collation;
+        var explicit = passed.explicit;
+        // likely(), unlikely() and likelihood() are their first argument for affinity and collation.
+        if (function == ScalarFunction.Likely ||
+            function == ScalarFunction.Unlikely || function == ScalarFunction.Likelihood) {
+            affinity = compiled[0].affinity;
+            resultCollation = compiled[0].collation;
+            explicit = compiled[0].explicit;
+        }
+        var args = Vector<XExpr>.withCapacity(compiled.length)?;
+        while (compiled.pop() is Some(c)) {
+            args.push(c.expr)?;
+        }
+        let count = args.length;
+        for (i in 0..count / 2) {
+            args.swap(i, count - 1 - i);
+        }
+        let x = XCall { function: function, args: args, collation: collation };
+        return Ok(
+            Compiled {
+                expr: XExpr.Call(Box.create(x)?),
+                affinity: affinity,
+                collation: resultCollation,
+                explicit: explicit,
+            },
+        );
+    }
+
+    private fn windowCall(
+        borrow mut this,
+        call: borrow FunctionCall,
+        over: borrow OverClause,
+        db: borrow mut Session,
+    ) -> Result<Compiled, SqliteError> {
+        let name = call.name.view();
+        if (!this.windowsAllowed) {
+            return Err(functionNameError("misuse of window function ", name, "()"));
+        }
+        let function = windowFunctionNamed(name, call.args.length, call.star) ?? {
+            if (scalarFunctionNamed(name, call.args.length).isOk()) {
+                return Err(functionNameError("", name, "() may not be used as a window function"));
+            }
+            return Err(functionNameError("no such function: ", name, ""));
+        };
+        // A named window: OVER w, or OVER (w ORDER BY …) building on it. The list moves out of the compiler
+        // meanwhile, so its definitions can be borrowed while the compiler changes.
+        let named = replace(mut this.namedWindows, Vector<NamedWindow>.create());
+        var spec: usize? = null;
+        if (borrow over.baseName is Some(base)) {
+            for (i in 0..named.length) {
+                if (named[i].name.view().equalsIgnoreAsciiCase(base.view())) {
+                    spec = i;
+                }
+            }
+            if (spec.isNull()) {
+                return Err(namedError("no such window: ", base.view()));
+            }
+        }
+        let useNamedPartition = spec.isSome() && over.partitionBy.length == 0;
+        let useNamedOrder = spec.isSome() && over.orderBy.length == 0;
+        let useNamedFrame = spec.isSome() && over.frame.isNull();
+        let at = spec ?? 0;
+        let partition = if (useNamedPartition) borrow named[at].spec.partitionBy else borrow over.partitionBy;
+        let order = if (useNamedOrder) borrow named[at].spec.orderBy else borrow over.orderBy;
+        let frame = if (useNamedFrame) borrow named[at].spec.frame else borrow over.frame;
+        let saved = this.context;
+        this.context = CallContext.InsideAggregate;
+        let savedWindows = this.windowsAllowed;
+        this.windowsAllowed = false;
+        var args = Vector<XExpr>.create();
+        var collation = Collation.Binary;
+        for (i in 0..call.args.length) {
+            let c = this.typed(borrow call.args[i], db)?;
+            if (i == 0) {
+                collation = c.collation ?? Collation.Binary;
+            }
+            args.push(c.expr)?;
+        }
+        var filter: XExpr? = null;
+        if (borrow call.filter is Some(f)) {
+            filter = this.compile(f, db)?;
+        }
+        this.context = saved;
+        var partitionBy = Vector<XExpr>.create();
+        var partitionCollations = Vector<Collation>.create();
+        for (i in 0..partition.length) {
+            let c = this.typed(borrow partition[i], db)?;
+            partitionCollations.push(c.collation ?? Collation.Binary)?;
+            partitionBy.push(c.expr)?;
+        }
+        let orderBy = this.orderTerms(order.view(), db)?;
+        var startOffset: XExpr? = null;
+        var endOffset: XExpr? = null;
+        var compiledFrame: XFrame? = null;
+        if (frame is Some(f)) {
+            if (borrow f.start.offset is Some(o)) {
+                startOffset = this.compile(o, db)?;
+            }
+            if (borrow f.end.offset is Some(o)) {
+                endOffset = this.compile(o, db)?;
+            }
+            compiledFrame = XFrame { mode: f.mode, start: f.start.kind, end: f.end.kind, exclude: f.exclude };
+        }
+        this.windowsAllowed = savedWindows;
+        this.namedWindows = named;
+        let index = this.windows.length;
+        this.windows.push(WindowSpec {
+            function: function,
+            args: args,
+            distinct: call.distinct,
+            filter: filter,
+            partitionBy: partitionBy,
+            partitionCollations: partitionCollations,
+            orderBy: orderBy,
+            frame: compiledFrame,
+            startOffset: startOffset,
+            endOffset: endOffset,
+            collation: collation,
+        })?;
+        return Ok(plain(XExpr.Window(index)));
+    }
+
+    /// Compiles ORDER BY terms: each with its collation, from a COLLATE in it or its column.
+    fn orderTerms(
+        borrow mut this,
+        terms: Slice<OrderTerm>,
+        db: borrow mut Session,
+    ) -> Result<Vector<XOrderTerm>, SqliteError> {
+        var out = Vector<XOrderTerm>.withCapacity(terms.length)?;
+        for (i in 0..terms.length) {
+            let c = this.typed(borrow terms[i].expr, db)?;
+            out.push(XOrderTerm {
+                expr: c.expr,
+                output: null,
+                descending: terms[i].descending,
+                // NULLs are smallest: first when ascending, last when descending, unless the term says.
+                nullsFirst: terms[i].nullsFirst ?? !terms[i].descending,
+                collation: c.collation ?? Collation.Binary,
+            })?;
+        }
+        return Ok(out);
+    }
+}
+
+/// `SELECT * FROM table`, for `x IN table`.
+fn selectAllFrom(table: borrow QualifiedName) -> Result<SelectStmt, AllocError> {
+    var core = SelectCore {
+        distinct: false,
+        columns: Vector<ResultColumn>.create(),
+        from: null,
+        filter: null,
+        groupBy: Vector<Expr>.create(),
+        having: null,
+        windows: Vector<NamedWindow>.create(),
+        isValues: false,
+    };
+    core.columns.push(ResultColumn.Star)?;
+    var schema: String? = null;
+    if (borrow table.schema is Some(s)) {
+        schema = s.clone()?;
+    }
+    let name = QualifiedName { schema: schema, name: table.name.clone()? };
+    core.from = FromClause {
+        source: FromItem.Table(TableSource { name: name, alias: null, indexedBy: null, notIndexed: false }),
+        joins: Vector<Join>.create(),
+    };
+    var cores = Vector<SelectCore>.create();
+    cores.push(core)?;
+    return Ok(
+        SelectStmt {
+            with: null,
+            cores: cores,
+            compoundOps: Vector<CompoundOp>.create(),
+            orderBy: Vector<OrderTerm>.create(),
+            limit: null,
+            offset: null,
+        },
+    );
+}

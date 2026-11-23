@@ -244,7 +244,7 @@ fn definitionError(tokens: Slice<Token>, at: usize) -> SqliteError {
 }
 
 fn cloneToken(token: borrow Token) -> Result<Token, AllocError> =>
-    Ok(Token { kind: token.kind, text: token.text.clone()?, offset: token.offset });
+    Ok(Token { kind: token.kind, text: token.text.clone()?, offset: token.offset, doubleQuoted: token.doubleQuoted });
 
 /// A token as SQL text.
 fn appendToken(out: borrow mut String, token: borrow Token) -> Result<void, AllocError> {
@@ -286,7 +286,7 @@ fn schemaExpr(tokens: Slice<Token>) -> Result<SchemaExpr, SqliteError> {
     for (i in 0..tokens.length) {
         copy.push(cloneToken(borrow tokens[i])?)?;
     }
-    copy.push(Token { kind: TokenKind.Eof, text: String.create(), offset: 0 })?;
+    copy.push(Token { kind: TokenKind.Eof, text: String.create(), offset: 0, doubleQuoted: false })?;
     return Ok(SchemaExpr { text: renderTokens(tokens)?, expr: Parser.parseExpressionTokens(copy)? });
 }
 
@@ -797,14 +797,17 @@ struct SchemaCatalog {
     private tablesByName: HashMap<String, usize>;
 
     /// Reads the catalog from the database's sqlite_schema.
-    fn load(reader: borrow DatabaseReader) -> Result<SchemaCatalog, SqliteError> {
+    fn load(reader: borrow DatabaseReader) -> Result<SchemaCatalog, SqliteError> =>
+        SchemaCatalog.fromEntries(reader.schema());
+
+    /// The catalog of the rows of sqlite_schema.
+    fn fromEntries(entries: Slice<SchemaEntry>) -> Result<SchemaCatalog, SqliteError> {
         var catalog = SchemaCatalog {
             tables: Vector<TableSchema>.create(),
             indexes: Vector<IndexSchema>.create(),
             unsupported: Vector<String>.create(),
             tablesByName: HashMap<String, usize>.create(),
         };
-        let entries = reader.schema();
         // Tables first: an index needs its table's columns.
         for (i in 0..entries.length) {
             let entry = borrow entries[i];
@@ -870,5 +873,97 @@ struct SchemaCatalog {
             return Ok(borrow this.tables[*at]);
         }
         return Ok(null);
+    }
+}
+
+// ── copies ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+fn cloneSchemaExpr(e: borrow SchemaExpr?) -> Result<SchemaExpr?, AllocError> => match (e) {
+    Some(x) => Ok(SchemaExpr { text: x.text.clone()?, expr: cloneExpr(borrow x.expr)? }),
+    null => Ok(null),
+};
+
+fn cloneForeignKey(k: borrow ForeignKeySchema) -> Result<ForeignKeySchema, AllocError> => Ok(ForeignKeySchema {
+    columns: cloneStrings(borrow k.columns)?,
+    refTable: k.refTable.clone()?,
+    refColumns: cloneStrings(borrow k.refColumns)?,
+    onDelete: k.onDelete,
+    onUpdate: k.onUpdate,
+    deferred: k.deferred,
+});
+
+fn cloneKeyColumnList(list: borrow Vector<KeyColumn>) -> Result<Vector<KeyColumn>, AllocError> =>
+    cloneKeyColumns(list.view());
+
+impl TableSchema {
+    /// A deep copy.
+    fn copy(borrow this) -> Result<TableSchema, AllocError> {
+        var columns = Vector<ColumnSchema>.withCapacity(this.columns.length)?;
+        for (i in 0..this.columns.length) {
+            let c = borrow this.columns[i];
+            var key: ForeignKeySchema? = null;
+            if (borrow c.foreignKey is Some(k)) {
+                key = cloneForeignKey(k)?;
+            }
+            columns.push(ColumnSchema {
+                name: c.name.clone()?,
+                declaredType: c.declaredType.clone()?,
+                affinity: c.affinity,
+                notNull: c.notNull,
+                primaryKey: c.primaryKey,
+                pkDescending: c.pkDescending,
+                unique: c.unique,
+                autoincrement: c.autoincrement,
+                isRowidAlias: c.isRowidAlias,
+                collation: c.collation,
+                defaultValue: cloneSchemaExpr(borrow c.defaultValue)?,
+                check: cloneSchemaExpr(borrow c.check)?,
+                generated: cloneSchemaExpr(borrow c.generated)?,
+                generatedStored: c.generatedStored,
+                foreignKey: key,
+            })?;
+        }
+        var checks = Vector<SchemaExpr>.withCapacity(this.checks.length)?;
+        for (i in 0..this.checks.length) {
+            checks.push(
+                SchemaExpr { text: this.checks[i].text.clone()?, expr: cloneExpr(borrow this.checks[i].expr)? },
+            )?;
+        }
+        var keys = Vector<KeyConstraint>.withCapacity(this.keys.length)?;
+        for (i in 0..this.keys.length) {
+            keys.push(
+                KeyConstraint {
+                    columns: cloneKeyColumnList(borrow this.keys[i].columns)?,
+                    primaryKey: this.keys[i].primaryKey,
+                },
+            )?;
+        }
+        var foreignKeys = Vector<ForeignKeySchema>.withCapacity(this.foreignKeys.length)?;
+        for (i in 0..this.foreignKeys.length) {
+            foreignKeys.push(cloneForeignKey(borrow this.foreignKeys[i])?)?;
+        }
+        return Ok(TableSchema {
+            name: this.name.clone()?,
+            columns: columns,
+            rootPage: this.rootPage,
+            withoutRowid: this.withoutRowid,
+            strict: this.strict,
+            autoincrement: this.autoincrement,
+            primaryKey: cloneKeyColumnList(borrow this.primaryKey)?,
+            checks: checks,
+            keys: keys,
+            foreignKeys: foreignKeys,
+            rowidAlias: this.rowidAlias,
+        });
+    }
+}
+
+impl SchemaCatalog {
+    /// A copy of the table called `name`.
+    fn tableCopy(borrow this, name: StringView) -> Result<TableSchema, SqliteError> {
+        let table = this.table(name)? ?? {
+            return Err(namedError("no such table: ", name));
+        };
+        return Ok(table.copy()?);
     }
 }

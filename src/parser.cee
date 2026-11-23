@@ -997,7 +997,14 @@ struct Parser {
                 depth -= 1;
             }
             let token = borrow this.tokens[this.at];
-            tokens.push(Token { kind: token.kind, text: token.text.clone()?, offset: token.offset })?;
+            tokens.push(
+                Token {
+                    kind: token.kind,
+                    text: token.text.clone()?,
+                    offset: token.offset,
+                    doubleQuoted: token.doubleQuoted,
+                },
+            )?;
             this.advance();
         }
     }
@@ -1080,7 +1087,7 @@ struct Parser {
                 expr = Parser.unbox(operand);
             }
             match (expr) {
-                Expr.Column(ColumnRef { schema: null, table: null, name }) => { column.name = name; }
+                Expr.Column(ColumnRef { schema: null, table: null, name, .. }) => { column.name = name; }
                 other => { column.expression = other; }
             }
             if (this.acceptWord("DESC")) {
@@ -1582,8 +1589,10 @@ struct Parser {
             if (this.peekIsOp(1, "(")) {
                 return this.functionCall();
             }
-            var column = ColumnRef { schema: null, table: null, name: this.name()? };
+            let quoted = this.tokens[this.at].doubleQuoted;
+            var column = ColumnRef { schema: null, table: null, name: this.name()?, doubleQuoted: quoted };
             if (this.acceptOp(".")) {
+                column.doubleQuoted = false;
                 column.table = replace(mut column.name, this.name()?);
                 if (this.acceptOp(".")) {
                     column.schema = replace(mut column.table, null);

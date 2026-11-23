@@ -1,0 +1,672 @@
+// Running SELECT plans.
+
+/// Where a core's rows go as the nested loops produce them.
+struct CoreSink {
+    rows: Vector<SortedRow>;
+    distinctSeen: HashMap<Vector<u8>, bool>?;
+    /// Aggregate queries: the groups, and each group's key.
+    groups: Vector<GroupState>;
+    groupIndex: HashMap<Vector<u8>, usize>;
+    /// Stop once this many rows are kept: a query with LIMIT and nothing that needs every row.
+    stopAfter: usize?;
+}
+
+struct GroupState {
+    accumulators: Vector<Accumulator>;
+    /// The current rows of the core's slots when the group's bare columns were last taken.
+    slots: Vector<Slot>;
+}
+
+fn copySlot(slot: borrow Slot) -> Result<Slot, AllocError> =>
+    Ok(Slot { values: cloneValues(slot.values.view())?, rowId: slot.rowId, isNull: slot.isNull });
+
+/// A key for grouping and DISTINCT: the values in a form where equal ones (under their collations) are identical.
+fn groupKey(values: Slice<SqliteValue>, collations: Slice<Collation>) -> Result<Vector<u8>, AllocError> {
+    var normalized = Vector<SqliteValue>.withCapacity(values.length)?;
+    for (i in 0..values.length) {
+        let collation = if (i < collations.length) collations[i] else Collation.Binary;
+        // Equal numbers of different types group together: 1 and 1.0.
+        var v = normalizeForKey(borrow values[i], collation)?;
+        if (v is SqliteValue.Real(r) && realAsExactInteger(r) is Some(n)) {
+            v = SqliteValue.Integer(n);
+        }
+        normalized.push(v)?;
+    }
+    return Ok(Record.encode(normalized.view()).ok() ?? Vector<u8>.create());
+}
+
+/// Reads a table row's record into a slot's values, as the table's columns.
+fn loadTableRow(
+    plan: borrow TablePlan,
+    rowId: i64,
+    record: Vector<SqliteValue>,
+    slot: borrow mut Slot,
+) -> Result<void, AllocError> {
+    var values = Vector<SqliteValue>.withCapacity(plan.recordPosition.length)?;
+    var stored = record;
+    for (c in 0..plan.recordPosition.length) {
+        var v = SqliteValue.Null;
+        if (plan.recordPosition[c] is Some(at)) {
+            if (at < stored.length) {
+                v = replace(mut stored[at], SqliteValue.Null);
+            } else {
+                v = plan.defaults[c].clone()?;
+            }
+        }
+        if (plan.rowidAlias == Some(c)) {
+            v = SqliteValue.Integer(rowId);
+        } else if (plan.realColumns[c] && v is SqliteValue.Integer(i)) {
+            v = SqliteValue.Real(round<f64>(i));
+        }
+        values.push(v)?;
+    }
+    slot.values = values;
+    slot.rowId = rowId;
+    slot.isNull = false;
+    return Ok();
+}
+
+/// Evaluates VIRTUAL generated columns for the row in `slot`.
+fn computeGenerated(
+    plan: borrow TablePlan,
+    slot: usize,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<void, SqliteError> {
+    for (g in 0..plan.generated.length) {
+        let v = evaluate(borrow plan.generated[g].expr, frame, db)?;
+        let column = plan.generated[g].column;
+        frame.slots[slot].values[column] = v;
+    }
+    return Ok();
+}
+
+/// Rows of a computed source: a subquery, a view, a CTE or a working table.
+fn sourceRows(
+    kind: borrow SourceKind,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<Vector<SqliteValue>>, SqliteError> {
+    match (kind) {
+        SourceKind.Rows(plan) => { return runSelect(plan, frame, db); }
+        SourceKind.Cte(index) => { return cteRows(index, frame, db); }
+        SourceKind.Working(index) => {
+            var copy = Vector<Vector<SqliteValue>>.withCapacity(frame.working[index].length)?;
+            for (i in 0..frame.working[index].length) {
+                copy.push(cloneValues(frame.working[index][i].view())?)?;
+            }
+            return Ok(copy);
+        }
+        SourceKind.Table(_) => { return Ok(Vector<Vector<SqliteValue>>.create()); }
+    }
+}
+
+/// A CTE's rows, computed the first time they are needed.
+fn cteRows(
+    index: usize,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<Vector<SqliteValue>>, SqliteError> {
+    if (frame.cteRows[index].isNull()) {
+        let plan = replace(mut frame.ctes[index], null) ?? {
+            return Err(sqlError("circular reference in a common table expression"));
+        };
+        let rows = match (borrow plan) {
+            CtePlan.Plain(p) => runSelect(p, frame, db),
+            CtePlan.Recursive(r) => runRecursive(r, frame, db),
+        };
+        frame.ctes[index] = plan;
+        frame.cteRows[index] = rows?;
+    }
+    var copy = Vector<Vector<SqliteValue>>.create();
+    if (borrow frame.cteRows[index] is Some(cached)) {
+        for (i in 0..cached.length) {
+            copy.push(cloneValues(cached[i].view())?)?;
+        }
+    }
+    return Ok(copy);
+}
+
+/// Runs a recursive CTE: the anchor's rows, then the recursive part on each step's rows until it gives none.
+fn runRecursive(
+    plan: borrow RecursivePlan,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<Vector<SqliteValue>>, SqliteError> {
+    let limit = limitValue(borrow plan.limit, frame, db)?;
+    let offset = limitValue(borrow plan.offset, frame, db)? ?? 0;
+    var all = Vector<Vector<SqliteValue>>.create();
+    var seen = HashMap<Vector<u8>, bool>.create();
+    var produced: usize = 0;
+    var pending = runSelect(borrow plan.anchor, frame, db)?;
+    let collations = plan.anchor.columnCollations.view();
+    var binary = Vector<Collation>.create();
+    for (i in 0..collations.length) {
+        binary.push(collations[i] ?? Collation.Binary)?;
+    }
+    loop {
+        var next = Vector<Vector<SqliteValue>>.create();
+        while (pending.length != 0) {
+            let row = takeRow(mut pending, 0);
+            let _ = pending.remove(0);
+            if (plan.distinct) {
+                let key = groupKey(row.view(), binary.view())?;
+                if (seen.contains(borrow key)) {
+                    continue;
+                }
+                let _ = seen.put(key, true)?;
+            }
+            if (limit is Some(l) && produced >= l + offset) {
+                return Ok(skipRows(all, offset)?);
+            }
+            produced += 1;
+            all.push(cloneValues(row.view())?)?;
+            next.push(row)?;
+        }
+        if (next.length == 0) {
+            break;
+        }
+        // One step: the recursive part sees the rows the last step added.
+        frame.working[plan.working] = next;
+        pending = runSelect(borrow plan.recursive, frame, db)?;
+    }
+    return Ok(skipRows(all, offset)?);
+}
+
+fn skipRows(rows: Vector<Vector<SqliteValue>>, offset: usize) -> Result<Vector<Vector<SqliteValue>>, AllocError> {
+    var all = rows;
+    var out = Vector<Vector<SqliteValue>>.create();
+    for (index in 0..all.length) {
+        if (index >= offset) {
+            out.push(takeRow(mut all, index))?;
+        }
+    }
+    return Ok(out);
+}
+
+/// LIMIT or OFFSET: `null` for none (or a negative LIMIT).
+fn limitValue(e: borrow XExpr?, frame: borrow mut Frame, db: borrow mut Session) -> Result<usize?, SqliteError> {
+    let Some(x) = e else {
+        return Ok(null);
+    };
+    let v = evaluate(x, frame, db)?;
+    let n = match (v) {
+        SqliteValue.Integer(i) => i,
+        SqliteValue.Text(s) => match (textWithNumericAffinity(s.view().bytes(), true)) {
+            Some(SqliteValue.Integer(i)) => i,
+            _ => { return Err(sqlError("datatype mismatch")); },
+        },
+        SqliteValue.Real(r) => match (realAsExactInteger(r)) {
+            Some(i) => i,
+            null => { return Err(sqlError("datatype mismatch")); },
+        },
+        _ => { return Err(sqlError("datatype mismatch")); },
+    };
+    if (n < 0) {
+        return Ok(null);
+    }
+    return Ok(truncate<usize>(n));
+}
+
+/// The rowid a seek expression gives: `null` when no row can match (NULL, a non-integral number, text that is not
+/// a number).
+fn seekRowid(e: borrow XExpr, frame: borrow mut Frame, db: borrow mut Session) -> Result<i64?, SqliteError> {
+    let v = evaluate(e, frame, db)?;
+    match (v) {
+        SqliteValue.Integer(i) => { return Ok(i); }
+        SqliteValue.Real(r) => { return Ok(realAsExactInteger(r)); }
+        SqliteValue.Text(s) => {
+            return Ok(match (textWithNumericAffinity(s.view().bytes(), true)) {
+                Some(SqliteValue.Integer(i)) => i,
+                _ => null,
+            });
+        }
+        _ => { return Ok(null); }
+    }
+}
+
+/// The nested loop at `level`: each row of source `level` that its ON allows, then the next level.
+fn joinLevel(
+    core: borrow CorePlan,
+    level: usize,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+    sink: borrow mut CoreSink,
+) -> Result<void, SqliteError> {
+    if (level == core.sources.length) {
+        return acceptRow(core, frame, db, sink);
+    }
+    let source = borrow core.sources[level];
+    var matched = false;
+    match (borrow source.kind) {
+        SourceKind.Table(table) => {
+            if (table.withoutRowid) {
+                return Err(unsupported("reading WITHOUT ROWID tables in queries is not supported yet"));
+            }
+            var cursor = TableCursor.scan(table.root);
+            if (borrow source.rowidSeek is Some(seek)) {
+                let Some(rowId) = seekRowid(seek, frame, db)? else {
+                    return finishLeft(core, level, matched, frame, db, sink);
+                };
+                cursor = TableCursor.range(table.root, rowId, rowId);
+            }
+            loop {
+                if (sink.stopAfter is Some(n) && sink.rows.length >= n) {
+                    return Ok();
+                }
+                let Some(row) = cursor.next(mut db.pager)? else {
+                    break;
+                };
+                loadTableRow(table, row.rowId, row.columns, mut frame.slots[source.slot])?;
+                if (table.generated.length != 0) {
+                    computeGenerated(table, source.slot, frame, db)?;
+                }
+                if (borrow source.on is Some(on)) {
+                    let ok = evaluate(on, frame, db)?;
+                    if (!isTrue(borrow ok)) {
+                        continue;
+                    }
+                }
+                matched = true;
+                joinLevel(core, level + 1, frame, db, sink)?;
+            }
+        }
+        _ => {
+            var rows = sourceRows(borrow source.kind, frame, db)?;
+            var rowId: i64 = 0;
+            for (r in 0..rows.length) {
+                if (sink.stopAfter is Some(n) && sink.rows.length >= n) {
+                    return Ok();
+                }
+                let values = takeRow(mut rows, r);
+                rowId += 1;
+                frame.slots[source.slot] = Slot { values: values, rowId: rowId, isNull: false };
+                if (borrow source.on is Some(on)) {
+                    let ok = evaluate(on, frame, db)?;
+                    if (!isTrue(borrow ok)) {
+                        continue;
+                    }
+                }
+                matched = true;
+                joinLevel(core, level + 1, frame, db, sink)?;
+            }
+        }
+    }
+    return finishLeft(core, level, matched, frame, db, sink);
+}
+
+/// A LEFT JOIN source that matched nothing: one row of NULLs.
+fn finishLeft(
+    core: borrow CorePlan,
+    level: usize,
+    matched: bool,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+    sink: borrow mut CoreSink,
+) -> Result<void, SqliteError> {
+    let source = borrow core.sources[level];
+    if (matched || !source.left) {
+        return Ok();
+    }
+    frame.slots[source.slot] = Slot { values: Vector<SqliteValue>.create(), rowId: 0, isNull: true };
+    joinLevel(core, level + 1, frame, db, sink)?;
+    return Ok();
+}
+
+/// A complete row of the core's sources: filtered, then added to its group or projected.
+fn acceptRow(
+    core: borrow CorePlan,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+    sink: borrow mut CoreSink,
+) -> Result<void, SqliteError> {
+    if (borrow core.filter is Some(f)) {
+        let ok = evaluate(f, frame, db)?;
+        if (!isTrue(borrow ok)) {
+            return Ok();
+        }
+    }
+    if (core.isAggregate) {
+        var keyValues = Vector<SqliteValue>.withCapacity(core.groupBy.length)?;
+        for (g in 0..core.groupBy.length) {
+            keyValues.push(evaluate(borrow core.groupBy[g], frame, db)?)?;
+        }
+        let key = groupKey(keyValues.view(), core.groupCollations.view())?;
+        var index = sink.groups.length;
+        if (sink.groupIndex.get(borrow key) is Some(at)) {
+            index = *at;
+        } else {
+            var accumulators = Vector<Accumulator>.withCapacity(core.aggregates.length)?;
+            for (a in 0..core.aggregates.length) {
+                accumulators.push(Accumulator.create(borrow core.aggregates[a]))?;
+            }
+            sink.groups.push(GroupState { accumulators: accumulators, slots: Vector<Slot>.create() })?;
+            let _ = sink.groupIndex.put(key, index)?;
+        }
+        var takeRow = core.minMax.isNull();
+        for (a in 0..core.aggregates.length) {
+            let newBest = sink.groups[index].accumulators[a].step(borrow core.aggregates[a], frame, db)?;
+            if (core.minMax == Some(a) && newBest) {
+                takeRow = true;
+            }
+        }
+        if (takeRow || sink.groups[index].slots.length == 0) {
+            var slots = Vector<Slot>.withCapacity(core.sources.length)?;
+            for (s in 0..core.sources.length) {
+                slots.push(copySlot(borrow frame.slots[core.sources[s].slot])?)?;
+            }
+            sink.groups[index].slots = slots;
+        }
+        return Ok();
+    }
+    return project(core, frame, db, sink);
+}
+
+/// Evaluates the result columns and sort keys for the current row, and keeps them.
+fn project(
+    core: borrow CorePlan,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+    sink: borrow mut CoreSink,
+) -> Result<void, SqliteError> {
+    var values = Vector<SqliteValue>.withCapacity(core.outputs.length)?;
+    for (i in 0..core.outputs.length) {
+        values.push(evaluate(borrow core.outputs[i], frame, db)?)?;
+    }
+    if (borrow mut sink.distinctSeen is Some(seen)) {
+        let key = groupKey(values.view(), core.outputCollations.view())?;
+        if (seen.contains(borrow key)) {
+            return Ok();
+        }
+        let _ = seen.put(key, true)?;
+    }
+    var keys = Vector<SqliteValue>.withCapacity(core.sortKeys.length)?;
+    for (k in 0..core.sortKeys.length) {
+        if (core.sortKeys[k].output is Some(at)) {
+            keys.push(values[at].clone()?)?;
+        } else {
+            keys.push(evaluate(borrow core.sortKeys[k].expr, frame, db)?)?;
+        }
+    }
+    sink.rows.push(SortedRow { values: values, keys: keys })?;
+    return Ok();
+}
+
+/// Runs one core.
+fn runCore(
+    core: borrow CorePlan,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+    stopAfter: usize?,
+) -> Result<Vector<SortedRow>, SqliteError> {
+    var sink = CoreSink {
+        rows: Vector<SortedRow>.create(),
+        distinctSeen: if (core.distinct) HashMap<Vector<u8>, bool>.create() else null,
+        groups: Vector<GroupState>.create(),
+        groupIndex: HashMap<Vector<u8>, usize>.create(),
+        stopAfter: if (core.isAggregate || core.distinct || core.sortKeys.length != 0) null else stopAfter,
+    };
+    joinLevel(core, 0, frame, db, mut sink)?;
+    if (!core.isAggregate) {
+        return Ok(sink.rows);
+    }
+    // An aggregate without GROUP BY gives one row even with no input: its bare columns are NULL.
+    if (sink.groups.length == 0 && core.groupBy.length == 0) {
+        var accumulators = Vector<Accumulator>.withCapacity(core.aggregates.length)?;
+        for (a in 0..core.aggregates.length) {
+            accumulators.push(Accumulator.create(borrow core.aggregates[a]))?;
+        }
+        var slots = Vector<Slot>.create();
+        for (s in 0..core.sources.length) {
+            slots.push(Slot { values: Vector<SqliteValue>.create(), rowId: 0, isNull: true })?;
+        }
+        sink.groups.push(GroupState { accumulators: accumulators, slots: slots })?;
+    }
+    let saved = replace(mut frame.aggregates, Vector<SqliteValue>.create());
+    var groups = replace(mut sink.groups, Vector<GroupState>.create());
+    for (g in 0..groups.length) {
+        var results = Vector<SqliteValue>.withCapacity(core.aggregates.length)?;
+        for (a in 0..core.aggregates.length) {
+            results.push(groups[g].accumulators[a].finish(borrow core.aggregates[a])?)?;
+        }
+        frame.aggregates = results;
+        var slots = replace(mut groups[g].slots, Vector<Slot>.create());
+        for (s in 0..slots.length) {
+            let at = core.sources[s].slot;
+            frame.slots[at] = replace(
+                mut slots[s],
+                Slot { values: Vector<SqliteValue>.create(), rowId: 0, isNull: true },
+            );
+        }
+        if (borrow core.having is Some(h)) {
+            let ok = evaluate(h, frame, db)?;
+            if (!isTrue(borrow ok)) {
+                continue;
+            }
+        }
+        project(core, frame, db, mut sink)?;
+    }
+    frame.aggregates = saved;
+    return Ok(sink.rows);
+}
+
+/// Compares two rows' sort keys.
+fn compareKeys(a: Slice<SqliteValue>, b: Slice<SqliteValue>, terms: Slice<XOrderTerm>) -> i32 {
+    for (i in 0..terms.length) {
+        let c = compareForOrder(borrow a[i], borrow b[i], terms[i].collation, terms[i].descending, terms[i].nullsFirst);
+        if (c != 0) {
+            return c;
+        }
+    }
+    return 0;
+}
+
+/// One ORDER BY term's comparison: NULLs first or last as asked, then the order, reversed for DESC.
+fn compareForOrder(
+    a: borrow SqliteValue,
+    b: borrow SqliteValue,
+    collation: Collation,
+    descending: bool,
+    nullsFirst: bool,
+) -> i32 {
+    if (a.isNull() || b.isNull()) {
+        if (a.isNull() && b.isNull()) {
+            return 0;
+        }
+        return if (a.isNull() == nullsFirst) -1 else 1;
+    }
+    let c = compareValues(a, b, collation);
+    return if (descending) 0 - c else c;
+}
+
+/// Runs a SELECT plan, and gives its rows.
+fn runSelect(
+    plan: borrow SelectPlan,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<Vector<SqliteValue>>, SqliteError> {
+    let limit = limitValue(borrow plan.limit, frame, db)?;
+    let offset = limitValue(borrow plan.offset, frame, db)? ?? 0;
+    var stopAfter: usize? = null;
+    if (limit is Some(l)) {
+        stopAfter = l + offset;
+    }
+    if (plan.cores.length == 1) {
+        let core = borrow plan.cores[0];
+        var rows = runCore(core, frame, db, stopAfter)?;
+        if (core.sortKeys.length != 0) {
+            let terms = core.sortKeys.view();
+            rows.sortBy((x, y) => compareKeys(x.keys.view(), y.keys.view(), terms));
+        }
+        var out = Vector<Vector<SqliteValue>>.withCapacity(rows.length)?;
+        for (index in 0..rows.length) {
+            if (index >= offset && (limit.isNull() || out.length < limit!)) {
+                out.push(replace(mut rows[index].values, Vector<SqliteValue>.create()))?;
+            }
+        }
+        return Ok(out);
+    }
+    // A compound: each core's rows, combined left to right.
+    var collations = Vector<Collation>.withCapacity(plan.columnCollations.length)?;
+    for (i in 0..plan.columnCollations.length) {
+        collations.push(plan.columnCollations[i] ?? Collation.Binary)?;
+    }
+    var result = Vector<Vector<SqliteValue>>.create();
+    for (c in 0..plan.cores.length) {
+        var rows = runCore(borrow plan.cores[c], frame, db, null)?;
+        var values = Vector<Vector<SqliteValue>>.withCapacity(rows.length)?;
+        for (i in 0..rows.length) {
+            values.push(replace(mut rows[i].values, Vector<SqliteValue>.create()))?;
+        }
+        if (c == 0) {
+            result = values;
+            continue;
+        }
+        result = combine(plan.ops[c - 1], result, values, collations.view())?;
+    }
+    if (plan.compoundOrder.length != 0) {
+        let order = plan.compoundOrder.view();
+        result.sortBy((x, y) => compareByColumns(x.view(), y.view(), order));
+    }
+    var out = Vector<Vector<SqliteValue>>.create();
+    for (index in 0..result.length) {
+        if (index >= offset && (limit.isNull() || out.length < limit!)) {
+            out.push(takeRow(mut result, index))?;
+        }
+    }
+    return Ok(out);
+}
+
+fn compareByColumns(a: Slice<SqliteValue>, b: Slice<SqliteValue>, order: Slice<ColumnOrder>) -> i32 {
+    for (i in 0..order.length) {
+        let at = order[i].column;
+        let c = compareForOrder(
+            borrow a[at],
+            borrow b[at],
+            order[i].collation,
+            order[i].descending,
+            order[i].nullsFirst,
+        );
+        if (c != 0) {
+            return c;
+        }
+    }
+    return 0;
+}
+
+/// UNION, UNION ALL, INTERSECT or EXCEPT of two row lists. All but UNION ALL give distinct rows.
+fn combine(
+    op: CompoundOp,
+    leftIn: Vector<Vector<SqliteValue>>,
+    rightIn: Vector<Vector<SqliteValue>>,
+    collations: Slice<Collation>,
+) -> Result<Vector<Vector<SqliteValue>>, SqliteError> {
+    var left = leftIn;
+    var right = rightIn;
+    var out = Vector<Vector<SqliteValue>>.create();
+    if (op == CompoundOp.UnionAll) {
+        out = left;
+        for (i in 0..right.length) {
+            out.push(takeRow(mut right, i))?;
+        }
+        return Ok(out);
+    }
+    var rightKeys = HashMap<Vector<u8>, bool>.create();
+    if (op != CompoundOp.Union) {
+        for (i in 0..right.length) {
+            let _ = rightKeys.put(groupKey(right[i].view(), collations)?, true)?;
+        }
+    }
+    var seen = HashMap<Vector<u8>, bool>.create();
+    for (i in 0..left.length) {
+        let row = takeRow(mut left, i);
+        let key = groupKey(row.view(), collations)?;
+        if (seen.contains(borrow key)) {
+            continue;
+        }
+        let keep = match (op) {
+            CompoundOp.Intersect => rightKeys.contains(borrow key),
+            CompoundOp.Except => !rightKeys.contains(borrow key),
+            _ => true,
+        };
+        let _ = seen.put(key, true)?;
+        if (keep) {
+            out.push(row)?;
+        }
+    }
+    if (op == CompoundOp.Union) {
+        for (i in 0..right.length) {
+            let row = takeRow(mut right, i);
+            let key = groupKey(row.view(), collations)?;
+            if (seen.contains(borrow key)) {
+                continue;
+            }
+            let _ = seen.put(key, true)?;
+            out.push(row)?;
+        }
+    }
+    return Ok(out);
+}
+
+/// A subquery's rows, cached when it does not depend on the current row.
+fn subqueryRows(
+    sub: borrow XSubquery,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<Vector<SqliteValue>>, SqliteError> {
+    if (!sub.correlated) {
+        while (frame.cache.length <= sub.cacheIndex) {
+            frame.cache.push(null)?;
+        }
+        if (borrow frame.cache[sub.cacheIndex] is Some(rows)) {
+            var copy = Vector<Vector<SqliteValue>>.withCapacity(rows.length)?;
+            for (i in 0..rows.length) {
+                copy.push(cloneValues(rows[i].view())?)?;
+            }
+            return Ok(copy);
+        }
+    }
+    let rows = runSelect(borrow sub.plan, frame, db)?;
+    if (!sub.correlated) {
+        var copy = Vector<Vector<SqliteValue>>.withCapacity(rows.length)?;
+        for (i in 0..rows.length) {
+            copy.push(cloneValues(rows[i].view())?)?;
+        }
+        frame.cache[sub.cacheIndex] = copy;
+    }
+    return Ok(rows);
+}
+
+/// A subquery's first row, or `null` when it has none.
+fn subqueryFirstRow(
+    sub: borrow XSubquery,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<SqliteValue>?, SqliteError> {
+    var rows = subqueryRows(sub, frame, db)?;
+    if (rows.length == 0) {
+        return Ok(null);
+    }
+    return Ok(rows.swapRemove(0));
+}
+
+/// A subquery's first column, for IN.
+fn subqueryFirstColumn(
+    sub: borrow XSubquery,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<SqliteValue>, SqliteError> {
+    var rows = subqueryRows(sub, frame, db)?;
+    var out = Vector<SqliteValue>.withCapacity(rows.length)?;
+    for (i in 0..rows.length) {
+        if (rows[i].length != 1) {
+            return Err(sqlError("sub-select returns more than 1 column"));
+        }
+        out.push(rows[i].swapRemove(0))?;
+    }
+    return Ok(out);
+}
+
+/// Takes row `i` out of a list, leaving an empty one in its place.
+fn takeRow(rows: borrow mut Vector<Vector<SqliteValue>>, i: usize) -> Vector<SqliteValue> =>
+    replace(mut rows[i], Vector<SqliteValue>.create());

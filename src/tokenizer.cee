@@ -35,6 +35,8 @@ struct Token {
     text: String;
     /// Where the token starts in the SQL text, for error messages.
     offset: usize;
+    /// A QuotedId written in double quotes, which SQLite takes as a string when no column has its name.
+    doubleQuoted: bool;
 
     fn isWord(borrow this, keyword: StringView) -> bool =>
         this.kind == TokenKind.Word && this.text.view().equalsIgnoreAsciiCase(keyword);
@@ -85,7 +87,9 @@ struct Tokenizer<region r> {
         end: usize,
         offset: usize,
     ) -> Result<void, SqliteError> {
-        this.tokens.push(Token { kind: kind, text: String.from(this.text[start..end])?, offset: offset })?;
+        this.tokens.push(
+            Token { kind: kind, text: String.from(this.text[start..end])?, offset: offset, doubleQuoted: false },
+        )?;
         return Ok();
     }
 
@@ -182,7 +186,7 @@ struct Tokenizer<region r> {
             this.add(TokenKind.Op, start, start + length, start)?;
             this.at += length;
         }
-        this.tokens.push(Token { kind: TokenKind.Eof, text: String.create(), offset: n })?;
+        this.tokens.push(Token { kind: TokenKind.Eof, text: String.create(), offset: n, doubleQuoted: false })?;
         return Ok();
     }
 
@@ -288,7 +292,7 @@ struct Tokenizer<region r> {
             }
         }
         text.append(this.text[from..this.at])?;
-        this.tokens.push(Token { kind: kind, text: text, offset: start })?;
+        this.tokens.push(Token { kind: kind, text: text, offset: start, doubleQuoted: false })?;
         return Ok();
     }
 
@@ -315,7 +319,7 @@ struct Tokenizer<region r> {
             }
             break;
         }
-        this.tokens.push(Token { kind: kind, text: text, offset: start })?;
+        this.tokens.push(Token { kind: kind, text: text, offset: start, doubleQuoted: delimiter == '"' })?;
         this.at = i + 1;
         return Ok();
     }

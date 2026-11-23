@@ -1,0 +1,1186 @@
+// The built-in functions: scalar ones here, aggregates and window functions named here and computed in
+// aggregate.cee. Each follows SQLite's func.c (3.53): its NULL handling, its types, its argument counts.
+//
+// Differences from the C# engine, which this replaces (each checked against sqlite3 3.54):
+// - LIKE and GLOB are a port of SQLite's patternCompare: LIKE folds ASCII letters only, `[...]` sets, ranges and
+//   `^` work in GLOB, an ESCAPE must be one character, and text stops at a NUL as in SQLite;
+// - length() counts characters up to the first NUL, and substr() counts characters for text and bytes for blobs,
+//   with SQLite's rules for a negative start and length;
+// - iif() takes two or more arguments like a CASE, and coalesce(), ifnull() and iif() evaluate only the arguments
+//   they need;
+// - abs() of the smallest integer is an "integer overflow" error, as in SQLite; abs() of text is a real;
+// - round() goes through SQLite's own decimal rounding, so round(1.005, 2) is 1.0 as in SQLite, and round() of
+//   an integer is a real;
+// - quote() of a real has 17 significant digits (shortened as SQLite shortens them), and infinity is 9.0e+999;
+// - sign() of text that is not entirely a number is NULL;
+// - min(), max() and nullif() compare with the collation of their arguments.
+//
+// Not yet ported: the date and time functions, printf() and format(), the JSON functions, and the math functions
+// beyond sqrt, abs, sign, floor, ceil, trunc, mod and pi (they need a port of a math library, which CeeSafe
+// lacks). Calling one is "no such function".
+
+enum ScalarFunction {
+    Abs,
+    Ceil,
+    Changes,
+    Char,
+    Coalesce,
+    Concat,
+    ConcatWs,
+    Floor,
+    Glob,
+    Hex,
+    IfNull,
+    Iif,
+    Instr,
+    LastInsertRowid,
+    Length,
+    Like,
+    Likelihood,
+    Likely,
+    Lower,
+    Ltrim,
+    Max,
+    Min,
+    Mod,
+    NullIf,
+    OctetLength,
+    Pi,
+    Quote,
+    Random,
+    RandomBlob,
+    Replace,
+    Round,
+    Rtrim,
+    Sign,
+    Sqrt,
+    SqliteVersion,
+    Substr,
+    TotalChanges,
+    Trim,
+    Trunc,
+    TypeOf,
+    Unhex,
+    Unicode,
+    Unlikely,
+    Upper,
+    ZeroBlob,
+}
+
+/// The function and whether `argc` arguments suit it.
+struct FunctionEntry {
+    function: ScalarFunction;
+    fits: bool;
+}
+
+fn entry(function: ScalarFunction, argc: usize, least: usize, most: usize) -> FunctionEntry =>
+    FunctionEntry { function: function, fits: argc >= least && argc <= most };
+
+const MANY: usize = 1000;
+
+fn scalarEntry(name: StringView, argc: usize) -> FunctionEntry? {
+    var lower = [0u8; 32];
+    if (name.length > 32) {
+        return null;
+    }
+    for (i in 0..name.length) {
+        lower[i] = foldAscii(name[i]);
+    }
+    let key = lower[0..name.length];
+    return match (key) {
+        "abs" => entry(ScalarFunction.Abs, argc, 1, 1),
+        "ceil" | "ceiling" => entry(ScalarFunction.Ceil, argc, 1, 1),
+        "changes" => entry(ScalarFunction.Changes, argc, 0, 0),
+        "char" => entry(ScalarFunction.Char, argc, 0, MANY),
+        "coalesce" => entry(ScalarFunction.Coalesce, argc, 2, MANY),
+        "concat" => entry(ScalarFunction.Concat, argc, 1, MANY),
+        "concat_ws" => entry(ScalarFunction.ConcatWs, argc, 2, MANY),
+        "floor" => entry(ScalarFunction.Floor, argc, 1, 1),
+        "glob" => entry(ScalarFunction.Glob, argc, 2, 2),
+        "hex" => entry(ScalarFunction.Hex, argc, 1, 1),
+        "ifnull" => entry(ScalarFunction.IfNull, argc, 2, 2),
+        "iif" | "if" => entry(ScalarFunction.Iif, argc, 2, MANY),
+        "instr" => entry(ScalarFunction.Instr, argc, 2, 2),
+        "last_insert_rowid" => entry(ScalarFunction.LastInsertRowid, argc, 0, 0),
+        "length" => entry(ScalarFunction.Length, argc, 1, 1),
+        "like" => entry(ScalarFunction.Like, argc, 2, 3),
+        "likelihood" => entry(ScalarFunction.Likelihood, argc, 2, 2),
+        "likely" => entry(ScalarFunction.Likely, argc, 1, 1),
+        "lower" => entry(ScalarFunction.Lower, argc, 1, 1),
+        "ltrim" => entry(ScalarFunction.Ltrim, argc, 1, 2),
+        "max" => entry(ScalarFunction.Max, argc, 2, MANY),
+        "min" => entry(ScalarFunction.Min, argc, 2, MANY),
+        "mod" => entry(ScalarFunction.Mod, argc, 2, 2),
+        "nullif" => entry(ScalarFunction.NullIf, argc, 2, 2),
+        "octet_length" => entry(ScalarFunction.OctetLength, argc, 1, 1),
+        "pi" => entry(ScalarFunction.Pi, argc, 0, 0),
+        "quote" => entry(ScalarFunction.Quote, argc, 1, 1),
+        "random" => entry(ScalarFunction.Random, argc, 0, 0),
+        "randomblob" => entry(ScalarFunction.RandomBlob, argc, 1, 1),
+        "replace" => entry(ScalarFunction.Replace, argc, 3, 3),
+        "round" => entry(ScalarFunction.Round, argc, 1, 2),
+        "rtrim" => entry(ScalarFunction.Rtrim, argc, 1, 2),
+        "sign" => entry(ScalarFunction.Sign, argc, 1, 1),
+        "sqrt" => entry(ScalarFunction.Sqrt, argc, 1, 1),
+        "sqlite_version" => entry(ScalarFunction.SqliteVersion, argc, 0, 0),
+        "substr" | "substring" => entry(ScalarFunction.Substr, argc, 2, 3),
+        "total_changes" => entry(ScalarFunction.TotalChanges, argc, 0, 0),
+        "trim" => entry(ScalarFunction.Trim, argc, 1, 2),
+        "trunc" => entry(ScalarFunction.Trunc, argc, 1, 1),
+        "typeof" => entry(ScalarFunction.TypeOf, argc, 1, 1),
+        "unhex" => entry(ScalarFunction.Unhex, argc, 1, 2),
+        "unicode" => entry(ScalarFunction.Unicode, argc, 1, 1),
+        "unlikely" => entry(ScalarFunction.Unlikely, argc, 1, 1),
+        "upper" => entry(ScalarFunction.Upper, argc, 1, 1),
+        "zeroblob" => entry(ScalarFunction.ZeroBlob, argc, 1, 1),
+        _ => null,
+    };
+}
+
+/// The scalar function `name` taking `argc` arguments.
+fn scalarFunctionNamed(name: StringView, argc: usize) -> Result<ScalarFunction, SqliteError> {
+    let found = scalarEntry(name, argc) ?? {
+        return Err(functionNameError("no such function: ", name, ""));
+    };
+    if (!found.fits) {
+        return Err(functionNameError("wrong number of arguments to function ", name, "()"));
+    }
+    return Ok(found.function);
+}
+
+enum AggregateFunction {
+    Count,
+    CountStar,
+    Sum,
+    Total,
+    Avg,
+    Min,
+    Max,
+    GroupConcat,
+}
+
+/// The aggregate `name` taking `argc` arguments, if it is one.
+fn aggregateFunctionNamed(name: StringView, argc: usize, star: bool) -> AggregateFunction? {
+    if (star) {
+        return if (name.equalsIgnoreAsciiCase("count")) AggregateFunction.CountStar else null;
+    }
+    if (name.equalsIgnoreAsciiCase("count") && argc <= 1) {
+        return if (argc == 0) AggregateFunction.CountStar else AggregateFunction.Count;
+    }
+    if (argc == 1) {
+        if (name.equalsIgnoreAsciiCase("sum")) {
+            return AggregateFunction.Sum;
+        }
+        if (name.equalsIgnoreAsciiCase("total")) {
+            return AggregateFunction.Total;
+        }
+        if (name.equalsIgnoreAsciiCase("avg")) {
+            return AggregateFunction.Avg;
+        }
+        if (name.equalsIgnoreAsciiCase("min")) {
+            return AggregateFunction.Min;
+        }
+        if (name.equalsIgnoreAsciiCase("max")) {
+            return AggregateFunction.Max;
+        }
+    }
+    if (name.equalsIgnoreAsciiCase("group_concat") && (argc == 1 || argc == 2)) {
+        return AggregateFunction.GroupConcat;
+    }
+    if (name.equalsIgnoreAsciiCase("string_agg") && argc == 2) {
+        return AggregateFunction.GroupConcat;
+    }
+    return null;
+}
+
+enum WindowFunction {
+    /// An aggregate used as a window function.
+    Aggregate(AggregateFunction),
+    RowNumber,
+    Rank,
+    DenseRank,
+    PercentRank,
+    CumeDist,
+    Ntile,
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+    NthValue,
+}
+
+/// The functions that exist only as window functions.
+fn windowOnlyFunctionNamed(name: StringView) -> WindowFunction? {
+    let names = [
+        "row_number",
+        "rank",
+        "dense_rank",
+        "percent_rank",
+        "cume_dist",
+        "ntile",
+        "lag",
+        "lead",
+        "first_value",
+        "last_value",
+        "nth_value",
+    ];
+    let functions = [
+        WindowFunction.RowNumber, WindowFunction.Rank, WindowFunction.DenseRank, WindowFunction.PercentRank,
+        WindowFunction.CumeDist, WindowFunction.Ntile, WindowFunction.Lag, WindowFunction.Lead,
+        WindowFunction.FirstValue, WindowFunction.LastValue, WindowFunction.NthValue,
+    ];
+    for (i in 0..names.length) {
+        if (name.equalsIgnoreAsciiCase(names[i])) {
+            return functions[i];
+        }
+    }
+    return null;
+}
+
+/// The window function `name` taking `argc` arguments, if it is one.
+fn windowFunctionNamed(name: StringView, argc: usize, star: bool) -> WindowFunction? {
+    if (aggregateFunctionNamed(name, argc, star) is Some(a)) {
+        return WindowFunction.Aggregate(a);
+    }
+    let found = windowOnlyFunctionNamed(name) ?? {
+        return null;
+    };
+    let fits = match (found) {
+        WindowFunction.RowNumber | WindowFunction.Rank | WindowFunction.DenseRank | WindowFunction.PercentRank | WindowFunction.CumeDist =>
+            argc == 0,
+        WindowFunction.Ntile | WindowFunction.FirstValue | WindowFunction.LastValue => argc == 1,
+        WindowFunction.NthValue => argc == 2,
+        WindowFunction.Lag | WindowFunction.Lead => argc >= 1 && argc <= 3,
+        WindowFunction.Aggregate(_) => false,
+    };
+    return if (fits) found else null;
+}
+
+// ── UTF-8 ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The characters of UTF-8 text, as SQLite reads them: a byte that does not start a valid sequence is read as
+/// U+FFFD; a NUL ends the text.
+struct Utf8Chars<region r> {
+    bytes: Slice<r, u8>;
+    at: usize;
+
+    fn of(bytes: Slice<r, u8>) -> Utf8Chars<r> => Utf8Chars { bytes: bytes, at: 0 };
+
+    fn next(borrow mut this) -> u32? {
+        if (this.at >= this.bytes.length || this.bytes[this.at] == 0) {
+            return null;
+        }
+        let b = this.bytes[this.at];
+        this.at += 1;
+        if (b < 0x80) {
+            return b as u32;
+        }
+        let extra: usize = if (b >= 0xF0 && b <= 0xF7) 3 else if (b >= 0xE0) 2 else if (b >= 0xC0) 1 else 0;
+        if (extra == 0) {
+            return 0xFFFD;
+        }
+        var code = (b as u32) & (0x3Fu32 >> truncate<u32>(extra));
+        for (i in 0..extra) {
+            if (this.at >= this.bytes.length || (this.bytes[this.at] & 0xC0) != 0x80) {
+                return 0xFFFD;
+            }
+            code = (code << 6) | ((this.bytes[this.at] & 0x3F) as u32);
+            this.at += 1;
+        }
+        return code;
+    }
+
+    /// The bytes not yet read.
+    fn rest(borrow this) -> Slice<r, u8> => this.bytes[this.at..];
+}
+
+/// The text before its first NUL, as SQLite's C strings end there.
+fn beforeNul(bytes: Slice<u8>) -> Slice<u8> => match (bytes.indexOfByte(0)) {
+    Some(at) => bytes[0..at],
+    null => bytes,
+};
+
+fn appendCodePoint(out: borrow mut String, code: u32) -> Result<void, AllocError> {
+    var bytes = Vector<u8>.create();
+    // Surrogates and values past Unicode cannot be held in UTF-8 text.
+    let valid = code <= 0x10FFFF && !(code >= 0xD800 && code <= 0xDFFF);
+    appendUtf8(mut bytes, if (valid) code else 0xFFFD)?;
+    return out.append(StringView.fromUtf8(bytes.view())!);
+}
+
+// ── LIKE and GLOB ────────────────────────────────────────────────────────────────────────────────────────────
+
+/// What patternCompare can answer.
+enum PatternResult {
+    Match,
+    NoMatch,
+    /// No match, and none is possible with a later start: stops the search early.
+    NoWildcardMatch,
+}
+
+fn lowerAscii(c: u32) -> u32 => if (c >= 'A' && c <= 'Z') c + 32 else c;
+
+/// SQLite's patternCompare. `matchOther` is the escape character for LIKE (0 for none), or '[' for GLOB.
+fn patternCompare(
+    pattern: Slice<u8>,
+    subject: Slice<u8>,
+    matchOne: u32,
+    matchAll: u32,
+    noCase: bool,
+    matchSet: bool,
+    matchOther: u32,
+) -> PatternResult {
+    var p = Utf8Chars.of(pattern);
+    var s = Utf8Chars.of(subject);
+    var escapedAt: usize? = null;
+    loop {
+        let c0 = p.next() ?? {
+            return if (s.next().isNull()) PatternResult.Match else PatternResult.NoMatch;
+        };
+        var c = c0;
+        if (c == matchAll) {
+            // Skip further * or %, and for each ? or _ among them, one character of the subject.
+            loop {
+                c = p.next() ?? {
+                    return PatternResult.Match;
+                };
+                if (c == matchAll) {
+                    continue;
+                }
+                if (c == matchOne && matchOne != 0) {
+                    if (s.next().isNull()) {
+                        return PatternResult.NoWildcardMatch;
+                    }
+                    continue;
+                }
+                break;
+            }
+            if (c == matchOther && matchOther != 0) {
+                if (!matchSet) {
+                    c = p.next() ?? {
+                        return PatternResult.NoWildcardMatch;
+                    };
+                } else {
+                    // "[...]" right after "*": try every start.
+                    let setStart = p.at - 1;
+                    var start = s.at;
+                    while (start < subject.length && subject[start] != 0) {
+                        let r = patternCompare(
+                            pattern[setStart..],
+                            subject[start..],
+                            matchOne,
+                            matchAll,
+                            noCase,
+                            matchSet,
+                            matchOther,
+                        );
+                        if (r != PatternResult.NoMatch) {
+                            return r;
+                        }
+                        var skip = Utf8Chars.of(subject[start..]);
+                        let _ = skip.next();
+                        start += skip.at;
+                    }
+                    return PatternResult.NoWildcardMatch;
+                }
+            }
+            // Find each place the next pattern character matches, and try the rest of the pattern from there.
+            let rest = p.rest();
+            loop {
+                let c2 = s.next() ?? {
+                    return PatternResult.NoWildcardMatch;
+                };
+                let same = c2 == c || (noCase && c < 0x80 && c2 < 0x80 && lowerAscii(c) == lowerAscii(c2));
+                if (!same) {
+                    continue;
+                }
+                let r = patternCompare(rest, s.rest(), matchOne, matchAll, noCase, matchSet, matchOther);
+                if (r != PatternResult.NoMatch) {
+                    return r;
+                }
+            }
+        }
+        if (c == matchOther && matchOther != 0) {
+            if (!matchSet) {
+                c = p.next() ?? {
+                    return PatternResult.NoMatch;
+                };
+                escapedAt = p.at;
+            } else {
+                let subjectChar = s.next() ?? {
+                    return PatternResult.NoMatch;
+                };
+                var priorChar: u32 = 0;
+                var seen = false;
+                var invert = false;
+                var c2 = p.next() ?? 0;
+                if (c2 == '^') {
+                    invert = true;
+                    c2 = p.next() ?? 0;
+                }
+                if (c2 == ']') {
+                    if (subjectChar == ']') {
+                        seen = true;
+                    }
+                    c2 = p.next() ?? 0;
+                }
+                while (c2 != 0 && c2 != ']') {
+                    let following = p.rest();
+                    if (c2 == '-' && following.length > 0 &&
+                        following[0] != ']' && following[0] != 0 && priorChar > 0) {
+                        c2 = p.next() ?? 0;
+                        if (subjectChar >= priorChar && subjectChar <= c2) {
+                            seen = true;
+                        }
+                        priorChar = 0;
+                    } else {
+                        if (subjectChar == c2) {
+                            seen = true;
+                        }
+                        priorChar = c2;
+                    }
+                    c2 = p.next() ?? 0;
+                }
+                if (c2 == 0 || seen == invert) {
+                    return PatternResult.NoMatch;
+                }
+                continue;
+            }
+        }
+        let c2 = s.next() ?? 0;
+        if (c == c2) {
+            continue;
+        }
+        if (noCase && c < 0x80 && c2 < 0x80 && lowerAscii(c) == lowerAscii(c2)) {
+            continue;
+        }
+        if (c == matchOne && escapedAt != Some(p.at) && c2 != 0) {
+            continue;
+        }
+        return PatternResult.NoMatch;
+    }
+}
+
+/// `subject LIKE pattern [ESCAPE escape]`: ASCII letters fold, `%` and `_` are wildcards.
+fn likeMatch(pattern: Slice<u8>, subject: Slice<u8>, escape: u32?) -> bool =>
+    patternCompare(pattern, subject, '_', '%', true, false, escape ?? 0) == PatternResult.Match;
+
+/// `subject GLOB pattern`: case matters, `*`, `?` and `[...]` are wildcards.
+fn globMatch(pattern: Slice<u8>, subject: Slice<u8>) -> bool =>
+    patternCompare(pattern, subject, '?', '*', false, true, '[') == PatternResult.Match;
+
+/// SQLite's limit on the length of a LIKE or GLOB pattern.
+const LIKE_PATTERN_LIMIT: usize = 50000;
+
+// ── calls ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+fn textResult(text: String) -> SqliteValue => SqliteValue.Text(text);
+
+fn hexDigit(n: u8) -> u8 => if (n < 10) '0' + n else 'A' + n - 10;
+
+/// The bytes a value has as text, or as a blob for a blob.
+fn valueBytes(value: borrow SqliteValue) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.create();
+    match (value) {
+        SqliteValue.Blob(b) => { out.extend(b.view())?; }
+        SqliteValue.Text(s) => { out.extend(s.view().bytes())?; }
+        SqliteValue.Null => {}
+        _ => {
+            let text = valueText(value)?;
+            out.extend(text.view().bytes())?;
+        }
+    }
+    return Ok(out);
+}
+
+/// The characters of a TRIM set.
+fn trimSet(value: borrow SqliteValue) -> Result<Vector<u32>, AllocError> {
+    let text = valueText(value)?;
+    var chars = Vector<u32>.create();
+    var it = Utf8Chars.of(text.view().bytes());
+    while (it.next() is Some(c)) {
+        chars.push(c)?;
+    }
+    return Ok(chars);
+}
+
+fn trimText(value: borrow SqliteValue, set: Slice<u32>, left: bool, right: bool) -> Result<SqliteValue, AllocError> {
+    let text = valueText(value)?;
+    let bytes = beforeNul(text.view().bytes());
+    var start: usize = 0;
+    var end = bytes.length;
+    if (left) {
+        loop {
+            var it = Utf8Chars.of(bytes[start..end]);
+            let Some(c) = it.next() else {
+                break;
+            };
+            var inSet = false;
+            for (k in 0..set.length) {
+                if (set[k] == c) {
+                    inSet = true;
+                }
+            }
+            if (!inSet) {
+                break;
+            }
+            start += it.at;
+        }
+    }
+    if (right) {
+        while (end > start) {
+            // The start of the last character.
+            var at = end - 1;
+            while (at > start && (bytes[at] & 0xC0) == 0x80) {
+                at -= 1;
+            }
+            var it = Utf8Chars.of(bytes[at..end]);
+            let c = it.next() ?? 0;
+            var inSet = false;
+            for (k in 0..set.length) {
+                if (set[k] == c) {
+                    inSet = true;
+                }
+            }
+            if (!inSet) {
+                break;
+            }
+            end = at;
+        }
+    }
+    return Ok(SqliteValue.Text(textFromBytesLossy(bytes[start..end])?));
+}
+
+/// substr(X, Y, Z) on characters (text) or bytes (blob), as SQLite computes it.
+fn substrValue(
+    x: borrow SqliteValue,
+    y: borrow SqliteValue,
+    z: borrow SqliteValue?,
+) -> Result<SqliteValue, SqliteError> {
+    if (x.isNull()) {
+        return Ok(SqliteValue.Null);
+    }
+    var p1 = integerValue(y);
+    var p2: i64 = 1_000_000_000;
+    if (z is Some(zv)) {
+        if (zv.isNull()) {
+            return Ok(SqliteValue.Null);
+        }
+        p2 = integerValue(zv);
+    }
+    if (p1 == 0 && y.isNull()) {
+        return Ok(SqliteValue.Null);
+    }
+    let isBlob = x is SqliteValue.Blob(_);
+    let bytes = valueBytes(x)?;
+    let data = if (isBlob) bytes.view() else beforeNul(bytes.view());
+    var len: i64 = 0;
+    if (isBlob) {
+        len = truncate<i64>(data.length);
+    } else if (p1 < 0) {
+        var it = Utf8Chars.of(data);
+        while (it.next().isSome()) {
+            len += 1;
+        }
+    }
+    if (p1 < 0) {
+        p1 += len;
+        if (p1 < 0) {
+            p2 = if (p2 < 0) 0 else p2 + p1;
+            p1 = 0;
+        }
+    } else if (p1 > 0) {
+        p1 -= 1;
+    } else if (p2 > 0) {
+        p2 -= 1;
+    }
+    if (p2 < 0) {
+        if (p2 < 0 - p1) {
+            p2 = p1;
+        } else {
+            p2 = 0 - p2;
+        }
+        p1 -= p2;
+    }
+    if (isBlob) {
+        if (p1 >= len) {
+            p1 = 0;
+            p2 = 0;
+        } else if (p2 > len - p1) {
+            p2 = len - p1;
+        }
+        let start = truncate<usize>(p1);
+        return Ok(SqliteValue.blob(data[start..start + truncate<usize>(p2)])?);
+    }
+    var it = Utf8Chars.of(data);
+    while (p1 > 0 && it.next().isSome()) {
+        p1 -= 1;
+    }
+    let start = it.at;
+    while (p2 > 0 && it.next().isSome()) {
+        p2 -= 1;
+    }
+    return Ok(SqliteValue.Text(textFromBytesLossy(data[start..it.at])?));
+}
+
+fn findBytes(haystack: Slice<u8>, needle: Slice<u8>) -> usize? {
+    if (needle.length == 0) {
+        return 0;
+    }
+    if (needle.length > haystack.length) {
+        return null;
+    }
+    for (i in 0..haystack.length - needle.length + 1) {
+        if (haystack[i..i + needle.length] == needle) {
+            return i;
+        }
+    }
+    return null;
+}
+
+/// quote(X): the value as an SQL literal.
+fn quoteValue(value: borrow SqliteValue) -> Result<String, AllocError> {
+    var out = String.create();
+    match (value) {
+        SqliteValue.Null => { out.append("NULL")?; }
+        SqliteValue.Integer(i) => { out.appendNumber(i)?; }
+        SqliteValue.Real(r) => {
+            // "%!0.17g": the zero flag writes infinity as 9.0e+999.
+            if (r > 1.7976931348623157e308) {
+                out.append("9.0e+999")?;
+            } else if (r < -1.7976931348623157e308) {
+                out.append("-9.0e+999")?;
+            } else {
+                appendReal(mut out, r)?;
+            }
+        }
+        SqliteValue.Text(s) => {
+            // %Q stops at a NUL, as the C string does.
+            let text = textFromBytesLossy(beforeNul(s.view().bytes()))?;
+            SqlWriter.appendStringLiteral(mut out, text.view())?;
+        }
+        SqliteValue.Blob(b) => {
+            out.append("X'")?;
+            var hex = Vector<u8>.withCapacity(b.length * 2)?;
+            for (byte in b.view()) {
+                hex.push(hexDigit(byte >> 4))?;
+                hex.push(hexDigit(byte & 15))?;
+            }
+            appendAscii(mut out, hex.view())?;
+            out.append("'")?;
+        }
+    }
+    return Ok(out);
+}
+
+/// Random bytes, from the operating system.
+fn randomBytes(count: usize) -> Result<Vector<u8>, SqliteError> {
+    var bytes = Vector<u8>.create();
+    bytes.resize(count, 0)?;
+    Random.fill(bytes.viewMut())?;
+    return Ok(bytes);
+}
+
+/// floor(), ceil() and trunc(): an integer stays as it is, a real becomes integral, and text is read as a number.
+fn roundingFunction(function: ScalarFunction, value: borrow SqliteValue) -> SqliteValue {
+    let number = numericValue(value);
+    match (number) {
+        SqliteValue.Integer(i) => { return SqliteValue.Integer(i); }
+        SqliteValue.Real(r) => {
+            return SqliteValue.Real(match (function) {
+                ScalarFunction.Floor => r.floor(),
+                ScalarFunction.Ceil => r.ceil(),
+                _ => if (r < 0.0) r.ceil() else r.floor(),
+            });
+        }
+        _ => { return SqliteValue.Null; }
+    }
+}
+
+/// fmod(x, y), exactly: x - trunc(x / y) * y computed without rounding error.
+fn floatRemainder(x: f64, y: f64) -> f64 {
+    if (y == 0.0 || x != x || y != y || x > 1.7976931348623157e308 || x < -1.7976931348623157e308) {
+        return f64.fromBits(0x7FF8000000000000);
+    }
+    if (y > 1.7976931348623157e308 || y < -1.7976931348623157e308) {
+        return x;
+    }
+    var r = x.abs();
+    let m = y.abs();
+    // Long division by repeated subtraction of m scaled by powers of two: every step is exact.
+    while (r >= m) {
+        var scaled = m;
+        while (scaled * 2.0 <= r && scaled * 2.0 <= 1.7976931348623157e308) {
+            scaled = scaled * 2.0;
+        }
+        r = r - scaled;
+    }
+    return if (x < 0.0) 0.0 - r else r;
+}
+
+/// Calls a scalar function.
+fn callFunction(
+    call: borrow XCall,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<SqliteValue, SqliteError> {
+    let args = call.args.view();
+    // The functions that evaluate only some of their arguments.
+    match (call.function) {
+        ScalarFunction.Coalesce | ScalarFunction.IfNull => {
+            for (i in 0..args.length) {
+                let v = evaluate(borrow args[i], frame, db)?;
+                if (!v.isNull()) {
+                    return Ok(v);
+                }
+            }
+            return Ok(SqliteValue.Null);
+        }
+        ScalarFunction.Iif => {
+            var i: usize = 0;
+            while (i + 1 < args.length) {
+                let condition = evaluate(borrow args[i], frame, db)?;
+                if (isTrue(borrow condition)) {
+                    return evaluate(borrow args[i + 1], frame, db);
+                }
+                i += 2;
+            }
+            if (i < args.length) {
+                return evaluate(borrow args[i], frame, db);
+            }
+            return Ok(SqliteValue.Null);
+        }
+        _ => {}
+    }
+    var values = Vector<SqliteValue>.withCapacity(args.length)?;
+    for (i in 0..args.length) {
+        values.push(evaluate(borrow args[i], frame, db)?)?;
+    }
+    let v = values.view();
+    match (call.function) {
+        ScalarFunction.Abs => {
+            match (borrow v[0]) {
+                SqliteValue.Null => { return Ok(SqliteValue.Null); }
+                SqliteValue.Integer(i) => {
+                    if (i == -9223372036854775808) {
+                        return Err(sqlError("integer overflow"));
+                    }
+                    return Ok(SqliteValue.Integer(i.abs()));
+                }
+                other => { return Ok(SqliteValue.Real(realValue(other).abs())); }
+            }
+        }
+        ScalarFunction.Ceil | ScalarFunction.Floor | ScalarFunction.Trunc => {
+            return Ok(roundingFunction(call.function, borrow v[0]));
+        }
+        ScalarFunction.Changes => { return Ok(SqliteValue.Integer(db.changes)); }
+        ScalarFunction.TotalChanges => { return Ok(SqliteValue.Integer(db.totalChanges)); }
+        ScalarFunction.LastInsertRowid => { return Ok(SqliteValue.Integer(db.lastInsertRowid)); }
+        ScalarFunction.Char => {
+            var out = String.create();
+            for (i in 0..v.length) {
+                let x = integerValue(borrow v[i]);
+                appendCodePoint(mut out, if (x < 0 || x > 0x10FFFF) 0xFFFD else truncate<u32>(x))?;
+            }
+            return Ok(textResult(out));
+        }
+        ScalarFunction.Concat => {
+            var out = String.create();
+            for (i in 0..v.length) {
+                appendValueText(mut out, borrow v[i])?;
+            }
+            return Ok(textResult(out));
+        }
+        ScalarFunction.ConcatWs => {
+            if (v[0].isNull()) {
+                return Ok(SqliteValue.Null);
+            }
+            let separator = valueText(borrow v[0])?;
+            var out = String.create();
+            var first = true;
+            for (i in 1..v.length) {
+                if (v[i].isNull()) {
+                    continue;
+                }
+                if (!first) {
+                    out.append(separator.view())?;
+                }
+                first = false;
+                appendValueText(mut out, borrow v[i])?;
+            }
+            return Ok(textResult(out));
+        }
+        ScalarFunction.Glob | ScalarFunction.Like => {
+            if (v[0].isNull() || v[1].isNull()) {
+                return Ok(SqliteValue.Null);
+            }
+            let pattern = valueText(borrow v[0])?;
+            let subject = valueText(borrow v[1])?;
+            if (pattern.length > LIKE_PATTERN_LIMIT) {
+                return Err(sqlError("LIKE or GLOB pattern too complex"));
+            }
+            if (call.function == ScalarFunction.Glob) {
+                return Ok(SqliteValue.Integer(if (globMatch(pattern.view().bytes(), subject.view().bytes())) 1 else 0));
+            }
+            var escape: u32? = null;
+            if (v.length == 3) {
+                if (v[2].isNull()) {
+                    return Ok(SqliteValue.Null);
+                }
+                let e = valueText(borrow v[2])?;
+                var chars = Utf8Chars.of(e.view().bytes());
+                escape = chars.next();
+                if (escape.isNull() || chars.next().isSome()) {
+                    return Err(sqlError("ESCAPE expression must be a single character"));
+                }
+            }
+            return Ok(
+                SqliteValue.Integer(if (likeMatch(pattern.view().bytes(), subject.view().bytes(), escape)) 1 else 0),
+            );
+        }
+        ScalarFunction.Hex => {
+            let bytes = valueBytes(borrow v[0])?;
+            var hex = Vector<u8>.withCapacity(bytes.length * 2)?;
+            for (b in bytes.view()) {
+                hex.push(hexDigit(b >> 4))?;
+                hex.push(hexDigit(b & 15))?;
+            }
+            return Ok(SqliteValue.Text(String.from(StringView.fromUtf8(hex.view())!)?));
+        }
+        ScalarFunction.Instr => {
+            if (v[0].isNull() || v[1].isNull()) {
+                return Ok(SqliteValue.Null);
+            }
+            let bothBlobs = v[0] is SqliteValue.Blob(_) && v[1] is SqliteValue.Blob(_);
+            let haystack = valueBytes(borrow v[0])?;
+            let needle = valueBytes(borrow v[1])?;
+            let Some(at) = findBytes(haystack.view(), needle.view()) else {
+                return Ok(SqliteValue.Integer(0));
+            };
+            if (bothBlobs) {
+                return Ok(SqliteValue.Integer(truncate<i64>(at) + 1));
+            }
+            // The position in characters.
+            var count: i64 = 1;
+            var it = Utf8Chars.of(haystack.view()[0..at]);
+            while (it.at < at) {
+                let _ = it.next();
+                if (it.at >= at && haystack[at - 1] == 0) {
+                    break;
+                }
+                count += 1;
+            }
+            var chars: i64 = 1;
+            var i: usize = 0;
+            while (i < at) {
+                if ((haystack[i] & 0xC0) != 0x80) {
+                    chars += 1;
+                }
+                i += 1;
+            }
+            return Ok(SqliteValue.Integer(chars));
+        }
+        ScalarFunction.Length => {
+            match (borrow v[0]) {
+                SqliteValue.Null => { return Ok(SqliteValue.Null); }
+                SqliteValue.Blob(b) => { return Ok(SqliteValue.Integer(truncate<i64>(b.length))); }
+                other => {
+                    let text = valueText(other)?;
+                    var count: i64 = 0;
+                    var it = Utf8Chars.of(text.view().bytes());
+                    while (it.next().isSome()) {
+                        count += 1;
+                    }
+                    return Ok(SqliteValue.Integer(count));
+                }
+            }
+        }
+        ScalarFunction.OctetLength => {
+            if (v[0].isNull()) {
+                return Ok(SqliteValue.Null);
+            }
+            return Ok(SqliteValue.Integer(truncate<i64>(valueBytes(borrow v[0])?.length)));
+        }
+        ScalarFunction.Likelihood => {
+            let p = borrow v[1];
+            let valid = (p is SqliteValue.Real(_) || p is SqliteValue.Integer(_)) && realValue(
+                p,
+            ) >= 0.0 && realValue(p) <= 1.0;
+            if (!valid) {
+                return Err(sqlError("second argument to likelihood() must be a constant between 0.0 and 1.0"));
+            }
+            return Ok(values.remove(0));
+        }
+        ScalarFunction.Likely | ScalarFunction.Unlikely => { return Ok(values.remove(0)); }
+        ScalarFunction.Lower | ScalarFunction.Upper => {
+            if (v[0].isNull()) {
+                return Ok(SqliteValue.Null);
+            }
+            let text = valueText(borrow v[0])?;
+            var out = Vector<u8>.withCapacity(text.length)?;
+            for (b in text.view().bytes()) {
+                if (call.function == ScalarFunction.Lower) {
+                    out.push(if (b >= 'A' && b <= 'Z') b + 32 else b)?;
+                } else {
+                    out.push(if (b >= 'a' && b <= 'z') b - 32 else b)?;
+                }
+            }
+            return Ok(SqliteValue.Text(String.from(StringView.fromUtf8(out.view())!)?));
+        }
+        ScalarFunction.Ltrim | ScalarFunction.Rtrim | ScalarFunction.Trim => {
+            if (v[0].isNull() || (v.length == 2 && v[1].isNull())) {
+                return Ok(SqliteValue.Null);
+            }
+            var set = Vector<u32>.create();
+            if (v.length == 2) {
+                set = trimSet(borrow v[1])?;
+            } else {
+                set.push(' ')?;
+            }
+            let left = call.function != ScalarFunction.Rtrim;
+            let right = call.function != ScalarFunction.Ltrim;
+            return Ok(trimText(borrow v[0], set.view(), left, right)?);
+        }
+        ScalarFunction.Max | ScalarFunction.Min => {
+            var best: usize = 0;
+            for (i in 0..v.length) {
+                if (v[i].isNull()) {
+                    return Ok(SqliteValue.Null);
+                }
+                if (i == 0) {
+                    continue;
+                }
+                let c = compareValues(borrow v[best], borrow v[i], call.collation);
+                // min keeps the later of equals, max the earlier, as SQLite's minmaxFunc does.
+                if ((call.function == ScalarFunction.Min && c >= 0) || (call.function == ScalarFunction.Max && c < 0)) {
+                    best = i;
+                }
+            }
+            return Ok(values.swapRemove(best));
+        }
+        ScalarFunction.Mod => {
+            if (v[0].isNull() || v[1].isNull()) {
+                return Ok(SqliteValue.Null);
+            }
+            let r = floatRemainder(realValue(borrow v[0]), realValue(borrow v[1]));
+            return Ok(realResult(r));
+        }
+        ScalarFunction.NullIf => {
+            if (!v[0].isNull() && !v[1].isNull() && compareValues(borrow v[0], borrow v[1], call.collation) == 0) {
+                return Ok(SqliteValue.Null);
+            }
+            return Ok(values.swapRemove(0));
+        }
+        ScalarFunction.Pi => { return Ok(SqliteValue.Real(3.141592653589793)); }
+        ScalarFunction.Quote => { return Ok(SqliteValue.Text(quoteValue(borrow v[0])?)); }
+        ScalarFunction.Random => {
+            let bytes = randomBytes(8)?;
+            var r = bytes.readLE<i64>(0);
+            if (r < 0) {
+                r = 0 - truncate<i64>(truncate<u64>(r) & 0x7FFF_FFFF_FFFF_FFFF);
+            }
+            return Ok(SqliteValue.Integer(r));
+        }
+        ScalarFunction.RandomBlob => {
+            let n = integerValue(borrow v[0]);
+            return Ok(SqliteValue.Blob(randomBytes(if (n < 1) 1 else truncate<usize>(n.min(1_000_000_000)))?));
+        }
+        ScalarFunction.Replace => {
+            if (v[0].isNull() || v[1].isNull()) {
+                return Ok(SqliteValue.Null);
+            }
+            let pattern = valueBytes(borrow v[1])?;
+            if (pattern.length == 0) {
+                return Ok(values.swapRemove(0));
+            }
+            if (v[2].isNull()) {
+                return Ok(SqliteValue.Null);
+            }
+            let subject = valueBytes(borrow v[0])?;
+            let replacement = valueBytes(borrow v[2])?;
+            var out = Vector<u8>.withCapacity(subject.length)?;
+            var i: usize = 0;
+            while (i < subject.length) {
+                if (i + pattern.length <= subject.length && subject.view()[i..i + pattern.length] == pattern.view()) {
+                    out.extend(replacement.view())?;
+                    i += pattern.length;
+                } else {
+                    out.push(subject[i])?;
+                    i += 1;
+                }
+            }
+            return Ok(SqliteValue.Text(textFromBytesLossy(out.view())?));
+        }
+        ScalarFunction.Round => {
+            var n: i64 = 0;
+            if (v.length == 2) {
+                if (v[1].isNull()) {
+                    return Ok(SqliteValue.Null);
+                }
+                n = integerValue(borrow v[1]).max(0).min(30);
+            }
+            if (v[0].isNull()) {
+                return Ok(SqliteValue.Null);
+            }
+            var r = realValue(borrow v[0]);
+            if (r < -4503599627370496.0 || r > 4503599627370496.0) {
+                // Already integral: nothing to round.
+            } else if (n == 0) {
+                r = round<f64>(saturatingTruncate<i64>(r + (if (r < 0.0) -0.5 else 0.5)));
+            } else {
+                r = roundToDecimals(r, truncate<i32>(n))?;
+            }
+            return Ok(SqliteValue.Real(r));
+        }
+        ScalarFunction.Sign => {
+            let number = match (borrow v[0]) {
+                SqliteValue.Text(s) => textWithNumericAffinity(s.view().bytes(), false) ?? SqliteValue.Null,
+                SqliteValue.Integer(i) => SqliteValue.Integer(i),
+                SqliteValue.Real(r) => SqliteValue.Real(r),
+                _ => SqliteValue.Null,
+            };
+            match (number) {
+                SqliteValue.Integer(i) => { return Ok(SqliteValue.Integer(if (i < 0) -1 else if (i > 0) 1 else 0)); }
+                SqliteValue.Real(r) => { return Ok(SqliteValue.Integer(if (r < 0.0) -1 else if (r > 0.0) 1 else 0)); }
+                _ => { return Ok(SqliteValue.Null); }
+            }
+        }
+        ScalarFunction.Sqrt => {
+            if (v[0].isNull()) {
+                return Ok(SqliteValue.Null);
+            }
+            let x = realValue(borrow v[0]);
+            return Ok(if (x < 0.0) SqliteValue.Null else realResult(x.sqrt()));
+        }
+        ScalarFunction.SqliteVersion => { return Ok(SqliteValue.text(SQLITE_VERSION)?); }
+        ScalarFunction.Substr => {
+            let z: SqliteValue? = if (v.length == 3) v[2].clone()? else null;
+            return substrValue(borrow v[0], borrow v[1], borrow z);
+        }
+        ScalarFunction.TypeOf => { return Ok(SqliteValue.text(typeName(borrow v[0]))?); }
+        ScalarFunction.Unhex => {
+            if (v[0].isNull() || (v.length == 2 && v[1].isNull())) {
+                return Ok(SqliteValue.Null);
+            }
+            let digits = valueBytes(borrow v[0])?;
+            var ignore = Vector<u32>.create();
+            if (v.length == 2) {
+                ignore = trimSet(borrow v[1])?;
+            }
+            var out = Vector<u8>.create();
+            var it = Utf8Chars.of(digits.view());
+            loop {
+                let Some(c) = it.next() else {
+                    break;
+                };
+                if (c < 0x80 && isSqlHexDigit(truncate<u8>(c))) {
+                    let Some(d) = it.next() else {
+                        return Ok(SqliteValue.Null);
+                    };
+                    if (!(d < 0x80 && isSqlHexDigit(truncate<u8>(d)))) {
+                        return Ok(SqliteValue.Null);
+                    }
+                    out.push((hexValue(truncate<u8>(c)) << 4) | hexValue(truncate<u8>(d)))?;
+                    continue;
+                }
+                var skippable = false;
+                for (k in 0..ignore.length) {
+                    if (ignore[k] == c) {
+                        skippable = true;
+                    }
+                }
+                if (!skippable) {
+                    return Ok(SqliteValue.Null);
+                }
+            }
+            return Ok(SqliteValue.Blob(out));
+        }
+        ScalarFunction.Unicode => {
+            if (v[0].isNull()) {
+                return Ok(SqliteValue.Null);
+            }
+            let text = valueText(borrow v[0])?;
+            var it = Utf8Chars.of(text.view().bytes());
+            return Ok(match (it.next()) {
+                Some(c) => SqliteValue.Integer(c as i64),
+                null => SqliteValue.Null,
+            });
+        }
+        ScalarFunction.ZeroBlob => {
+            let n = integerValue(borrow v[0]);
+            if (n > 1_000_000_000) {
+                return Err(sqlError("string or blob too big"));
+            }
+            var bytes = Vector<u8>.create();
+            bytes.resize(if (n < 0) 0 else truncate<usize>(n), 0)?;
+            return Ok(SqliteValue.Blob(bytes));
+        }
+        ScalarFunction.Coalesce | ScalarFunction.IfNull | ScalarFunction.Iif => { return Ok(SqliteValue.Null); }
+    }
+}
+
+/// The SQLite release whose behaviour this engine follows.
+const SQLITE_VERSION: StringView = "3.53.4";
+
+/// `->` and `->>`: not yet ported.
+fn jsonArrow(left: borrow SqliteValue, right: borrow SqliteValue, asSql: bool) -> Result<SqliteValue, SqliteError> =>
+    Err(unsupported("the JSON functions and operators are not ported yet"));
+
+/// The civil date of a day number from 1970-01-01 (Howard Hinnant's algorithm).
+struct CivilDate {
+    year: i64;
+    month: i64;
+    day: i64;
+
+    fn ofDays(days: i64) -> CivilDate {
+        let z = days + 719468;
+        let era = floorDivide(z, 146097);
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if (mp < 10) mp + 3 else mp - 9;
+        let year = yoe + era * 400 + (if (month <= 2) 1 else 0);
+        return CivilDate { year: year, month: month, day: day };
+    }
+}
+
+fn appendTwoDigits(out: borrow mut String, n: i64) -> Result<void, AllocError> {
+    if (n < 10) {
+        out.append("0")?;
+    }
+    return out.appendNumber(n);
+}
+
+/// CURRENT_TIME, CURRENT_DATE or CURRENT_TIMESTAMP for the statement's time, in UTC.
+fn nowText(kind: LiteralKind, unixMillis: i64) -> Result<SqliteValue, SqliteError> {
+    let seconds = floorDivide(unixMillis, 1000);
+    let days = floorDivide(seconds, 86400);
+    let inDay = seconds - days * 86400;
+    let date = CivilDate.ofDays(days);
+    var out = String.create();
+    if (kind != LiteralKind.CurrentTime) {
+        var year = String.create();
+        year.appendNumber(date.year)?;
+        for (i in year.length..4) {
+            out.append("0")?;
+        }
+        out.append(year.view())?;
+        out.append("-")?;
+        appendTwoDigits(mut out, date.month)?;
+        out.append("-")?;
+        appendTwoDigits(mut out, date.day)?;
+    }
+    if (kind != LiteralKind.CurrentDate) {
+        if (kind == LiteralKind.CurrentTimestamp) {
+            out.append(" ")?;
+        }
+        appendTwoDigits(mut out, inDay / 3600)?;
+        out.append(":")?;
+        appendTwoDigits(mut out, inDay / 60 % 60)?;
+        out.append(":")?;
+        appendTwoDigits(mut out, inDay % 60)?;
+    }
+    return Ok(SqliteValue.Text(out));
+}

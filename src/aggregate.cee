@@ -1,0 +1,240 @@
+// Aggregate functions' running state (func.c's xStep and xFinal).
+//
+// Differences from the C# engine, which this replaces:
+// - sum(), avg() and total() add reals with the Kahan–Babuška–Neumaier compensation SQLite uses, so their last
+//   digits are SQLite's; an integer sum that overflows is the "integer overflow" error, as in SQLite, not a real;
+// - text arguments are read as numbers the way sqlite3_value_numeric_type reads them;
+// - group_concat() puts each row's own separator before its value, and keeps an empty string as a value.
+
+/// The running sums of sum(), avg() and total() (SumCtx).
+struct SumState {
+    rSum: f64;
+    rErr: f64;
+    iSum: i64;
+    count: i64;
+    approx: bool;
+    overflow: bool;
+
+    fn create() -> SumState => SumState { rSum: 0.0, rErr: 0.0, iSum: 0, count: 0, approx: false, overflow: false };
+
+    private fn step(borrow mut this, r: f64) {
+        let s = this.rSum;
+        let t = s + r;
+        if (s.abs() > r.abs()) {
+            this.rErr += (s - t) + r;
+        } else {
+            this.rErr += (r - t) + s;
+        }
+        this.rSum = t;
+    }
+
+    private fn stepInteger(borrow mut this, value: i64) {
+        if (value <= -4503599627370496 || value >= 4503599627370496) {
+            let small = value % 16384;
+            this.step(round<f64>(value - small));
+            this.step(round<f64>(small));
+        } else {
+            this.step(round<f64>(value));
+        }
+    }
+
+    private fn begin(borrow mut this, value: i64) {
+        if (value <= -4503599627370496 || value >= 4503599627370496) {
+            let small = value % 16384;
+            this.rSum = round<f64>(value - small);
+            this.rErr = round<f64>(small);
+        } else {
+            this.rSum = round<f64>(value);
+            this.rErr = 0.0;
+        }
+    }
+
+    fn add(borrow mut this, value: borrow SqliteValue) {
+        // sqlite3_value_numeric_type: text that is entirely a number counts as one; other text as a real.
+        var number = match (value) {
+            SqliteValue.Null => { return; },
+            SqliteValue.Integer(i) => SqliteValue.Integer(i),
+            SqliteValue.Real(r) => SqliteValue.Real(r),
+            SqliteValue.Text(s) => textWithNumericAffinity(
+                s.view().bytes(),
+                false,
+            ) ?? SqliteValue.Real(realValue(value)),
+            SqliteValue.Blob(_) => SqliteValue.Real(realValue(value)),
+        };
+        this.count += 1;
+        if (!this.approx) {
+            if (number is SqliteValue.Integer(i)) {
+                if (this.iSum.checkedAdd(i) is Some(sum)) {
+                    this.iSum = sum;
+                } else {
+                    this.overflow = true;
+                    this.begin(this.iSum);
+                    this.approx = true;
+                    this.stepInteger(i);
+                }
+            } else {
+                this.begin(this.iSum);
+                this.approx = true;
+                this.step(realValue(borrow number));
+            }
+        } else if (number is SqliteValue.Integer(i)) {
+            this.stepInteger(i);
+        } else {
+            this.overflow = false;
+            this.step(realValue(borrow number));
+        }
+    }
+
+    private fn compensated(borrow this) -> f64 {
+        let error = this.rErr;
+        let finite = error == error && error <= 1.7976931348623157e308 && error >= -1.7976931348623157e308;
+        return if (finite) this.rSum + error else this.rSum;
+    }
+
+    fn sum(borrow this) -> Result<SqliteValue, SqliteError> {
+        if (this.count == 0) {
+            return Ok(SqliteValue.Null);
+        }
+        if (!this.approx) {
+            return Ok(SqliteValue.Integer(this.iSum));
+        }
+        if (this.overflow) {
+            return Err(sqlError("integer overflow"));
+        }
+        return Ok(SqliteValue.Real(this.compensated()));
+    }
+
+    fn total(borrow this) -> SqliteValue =>
+        SqliteValue.Real(if (this.approx) this.compensated() else round<f64>(this.iSum));
+
+    fn average(borrow this) -> SqliteValue {
+        if (this.count == 0) {
+            return SqliteValue.Null;
+        }
+        let r = if (this.approx) this.compensated() else round<f64>(this.iSum);
+        return SqliteValue.Real(r / round<f64>(this.count));
+    }
+}
+
+/// One aggregate's running state for one group.
+enum AggregateState {
+    Count(i64),
+    Sum(SumState),
+    /// min() or max(): the best value so far.
+    Best(SqliteValue),
+    /// group_concat(): the text so far, and whether a value has been added.
+    Concat(String, bool),
+}
+
+struct Accumulator {
+    state: AggregateState;
+    /// The DISTINCT values seen, as keys.
+    seen: HashMap<Vector<u8>, bool>?;
+
+    fn create(spec: borrow AggregateSpec) -> Accumulator {
+        let state = match (spec.function) {
+            AggregateFunction.Count | AggregateFunction.CountStar => AggregateState.Count(0),
+            AggregateFunction.Sum | AggregateFunction.Total | AggregateFunction.Avg => AggregateState.Sum(
+                SumState.create(),
+            ),
+            AggregateFunction.Min | AggregateFunction.Max => AggregateState.Best(SqliteValue.Null),
+            AggregateFunction.GroupConcat => AggregateState.Concat(String.create(), false),
+        };
+        return Accumulator { state: state, seen: if (spec.distinct) HashMap<Vector<u8>, bool>.create() else null };
+    }
+
+    /// Adds the current row: its arguments are evaluated against the frame. True when a min() or max() took
+    /// this row's value as its new best, which makes this row the one bare columns come from.
+    fn step(
+        borrow mut this,
+        spec: borrow AggregateSpec,
+        frame: borrow mut Frame,
+        db: borrow mut Session,
+    ) -> Result<bool, SqliteError> {
+        if (borrow spec.filter is Some(filter)) {
+            let passes = evaluate(filter, frame, db)?;
+            if (!isTrue(borrow passes)) {
+                return Ok(false);
+            }
+        }
+        if (spec.function == AggregateFunction.CountStar) {
+            if (this.state is AggregateState.Count(n)) {
+                this.state = AggregateState.Count(n + 1);
+            }
+            return Ok(false);
+        }
+        let value = evaluate(borrow spec.args[0], frame, db)?;
+        if (borrow this.seen is Some(_)) {
+            if (value.isNull()) {
+                return Ok(false);
+            }
+            let normalized = normalizeForKey(borrow value, spec.collation)?;
+            var one = Vector<SqliteValue>.create();
+            one.push(normalized)?;
+            let key = Record.encode(one.view())?;
+            if (borrow mut this.seen is Some(seen)) {
+                if (seen.contains(borrow key)) {
+                    return Ok(false);
+                }
+                let _ = seen.put(key, true)?;
+            }
+        }
+        match (borrow mut this.state) {
+            AggregateState.Count(n) => {
+                if (!value.isNull()) {
+                    n += 1;
+                }
+            }
+            AggregateState.Sum(sum) => { sum.add(borrow value); }
+            AggregateState.Best(best) => {
+                if (!value.isNull()) {
+                    let replace = best.isNull() || match (spec.function) {
+                        AggregateFunction.Min => compareValues(borrow value, best, spec.collation) < 0,
+                        _ => compareValues(borrow value, best, spec.collation) > 0,
+                    };
+                    if (replace) {
+                        best = value;
+                        return Ok(true);
+                    }
+                }
+            }
+            AggregateState.Concat(text, started) => {
+                if (value.isNull()) {
+                    return Ok(false);
+                }
+                if (started) {
+                    if (spec.args.length == 2) {
+                        let separator = evaluate(borrow spec.args[1], frame, db)?;
+                        appendValueText(text, borrow separator)?;
+                    } else {
+                        text.append(",")?;
+                    }
+                }
+                started = true;
+                appendValueText(text, borrow value)?;
+            }
+        }
+        return Ok(false);
+    }
+
+    /// The aggregate's value for the group.
+    fn finish(borrow this, spec: borrow AggregateSpec) -> Result<SqliteValue, SqliteError> {
+        match (borrow this.state) {
+            AggregateState.Count(n) => { return Ok(SqliteValue.Integer(n)); }
+            AggregateState.Sum(sum) => {
+                return match (spec.function) {
+                    AggregateFunction.Total => Ok(sum.total()),
+                    AggregateFunction.Avg => Ok(sum.average()),
+                    _ => sum.sum(),
+                };
+            }
+            AggregateState.Best(best) => { return Ok(best.clone()?); }
+            AggregateState.Concat(text, started) => {
+                if (!started) {
+                    return Ok(SqliteValue.Null);
+                }
+                return Ok(SqliteValue.Text(text.clone()?));
+            }
+        }
+    }
+}
