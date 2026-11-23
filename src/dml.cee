@@ -32,6 +32,8 @@ struct TableIndex {
     /// does not already hold), and where in the entry each primary-key column is.
     suffix: Vector<usize>;
     keyAt: Vector<usize>;
+    /// An automatic index's ON CONFLICT (from its constraint); none for CREATE INDEX.
+    onConflict: ConflictAction?;
     /// A removal could not be done in place: the index is rebuilt from the table when the statement ends, and
     /// takes no more changes until then.
     stale: Cell<bool>;
@@ -51,6 +53,8 @@ struct TableWriter {
     triggers: Vector<TriggerPlan>;
     /// A WITHOUT ROWID table's primary key; no columns for a rowid table.
     primaryKey: PrimaryKeyColumns;
+    /// The ON CONFLICT of the table's own key: the INTEGER PRIMARY KEY's, or a WITHOUT ROWID table's PRIMARY KEY's.
+    keyConflict: ConflictAction?;
 }
 
 /// What names a row: its rowid, or in a WITHOUT ROWID table its primary key's values, in the key's order.
@@ -238,6 +242,7 @@ fn tableIndexes(
                 keyNames: keyNames,
                 suffix: suffix,
                 keyAt: keyAt,
+                onConflict: table.keys[k].onConflict,
                 stale: Cell<bool>.create(false),
             },
         )?;
@@ -298,6 +303,7 @@ fn tableIndexes(
                 keyNames: keyNames,
                 suffix: suffix,
                 keyAt: keyAt,
+                onConflict: null,
                 stale: Cell<bool>.create(false),
             },
         )?;
@@ -371,6 +377,12 @@ impl TableWriter {
         }
         let triggers = tableTriggers(db, table.name.view())?;
         let primaryKey = withoutRowidKey(borrow table)?;
+        var keyConflict = table.rowidConflict;
+        for (k in 0..table.keys.length) {
+            if (table.keys[k].primaryKey && table.withoutRowid) {
+                keyConflict = table.keys[k].onConflict;
+            }
+        }
         return Ok(
             TableWriter {
                 table: table,
@@ -383,6 +395,7 @@ impl TableWriter {
                 checkNames: checkNames,
                 triggers: triggers,
                 primaryKey: primaryKey,
+                keyConflict: keyConflict,
             },
         );
     }
@@ -709,11 +722,12 @@ impl TableWriter {
         return Ok();
     }
 
-    /// Checks NOT NULL and CHECK for the row in the slot. With REPLACE, a NULL in a NOT NULL column with a default
-    /// takes the default. False when the row is to be skipped (OR IGNORE).
+    /// Checks NOT NULL and CHECK for the row in the slot. `action` is the statement's (OR …), which overrides a
+    /// NOT NULL's own ON CONFLICT; CHECK takes the statement's or ABORT. With REPLACE, a NULL in a NOT NULL column
+    /// with a default takes the default. False when the row is to be skipped (IGNORE).
     fn checkRow(
         borrow this,
-        action: ConflictAction,
+        action: ConflictAction?,
         frame: borrow mut Frame,
         db: borrow mut Session,
     ) -> Result<bool, SqliteError> {
@@ -729,10 +743,11 @@ impl TableWriter {
             ) || !frame.slots[this.slot].values[c].isNull()) {
                 continue;
             }
-            if (action == ConflictAction.Ignore) {
+            let effective = action ?? column.notNullConflict ?? ConflictAction.Abort;
+            if (effective == ConflictAction.Ignore) {
                 return Ok(false);
             }
-            if (action == ConflictAction.Replace) {
+            if (effective == ConflictAction.Replace) {
                 if (borrow this.defaults[c] is Some(d)) {
                     let v = evaluate(d, frame, db)?;
                     frame.slots[this.slot].values[c] = applyColumnAffinity(v, column.affinity)?;
@@ -750,7 +765,7 @@ impl TableWriter {
         for (k in 0..this.checks.length) {
             let v = evaluate(borrow this.checks[k], frame, db)?;
             if (truthOf(borrow v) == Some(false)) {
-                if (action == ConflictAction.Ignore) {
+                if (action == Some(ConflictAction.Ignore)) {
                     return Ok(false);
                 }
                 var message = String.from("CHECK constraint failed: ")?;
@@ -779,11 +794,12 @@ impl TableWriter {
     }
 
     /// Resolves UNIQUE and PRIMARY KEY conflicts of the row in the slot before it is written; `old` names the row
-    /// it replaces in an UPDATE. False when the row is to be skipped (OR IGNORE). REPLACE deletes the rows it
-    /// conflicts with.
+    /// it replaces in an UPDATE. Each constraint acts by the statement's OR action, else its own ON CONFLICT, else
+    /// ABORT; as in SQLite, the constraints that REPLACE are dealt with after the others, so a row another
+    /// constraint refuses deletes nothing. False when the row is to be skipped (IGNORE).
     fn resolveConflicts(
         borrow this,
-        action: ConflictAction,
+        action: ConflictAction?,
         old: borrow RowKey?,
         frame: borrow mut Frame,
         db: borrow mut Session,
@@ -797,44 +813,53 @@ impl TableWriter {
             sameAsOld = this.sameRow(o, borrow key);
         }
         // The table's own key.
-        if (!sameAsOld && this.findRow(borrow key, db)?.isSome()) {
-            if (action == ConflictAction.Ignore) {
+        let ownAction = action ?? this.keyConflict ?? ConflictAction.Abort;
+        let ownConflict = !sameAsOld && this.findRow(borrow key, db)?.isSome();
+        if (ownConflict && ownAction != ConflictAction.Replace) {
+            if (ownAction == ConflictAction.Ignore) {
                 return Ok(false);
             }
-            if (action != ConflictAction.Replace) {
-                return Err(SqliteError.Constraint(this.keyConflictMessage()?));
-            }
-            this.replaceRow(borrow key, frame, db)?;
+            return Err(SqliteError.Constraint(this.keyConflictMessage()?));
         }
-        for (i in 0..this.indexes.length) {
-            let index = borrow this.indexes[i];
-            if (!index.unique) {
-                continue;
+        for (pass in 0..2) {
+            let replacing = pass == 1;
+            if (replacing && ownConflict) {
+                this.replaceRow(borrow key, frame, db)?;
             }
-            if (index.stale.get()) {
-                // Its entries are out of date: rebuild it from the table as it is now, before relying on it.
-                let saved = copySlot(borrow frame.slots[this.slot])?;
-                this.rebuildIndex(index, frame, db)?;
-                frame.slots[this.slot] = saved;
-                index.stale.set(false);
-            }
-            let Some(entry) = this.entryFor(index, frame, db)? else {
-                continue;
-            };
-            let conflicting = this.conflictsIn(index, borrow entry, except.view(), db)?;
-            if (conflicting.length == 0) {
-                continue;
-            }
-            if (action == ConflictAction.Ignore) {
-                return Ok(false);
-            }
-            if (action != ConflictAction.Replace) {
-                var message = String.from("UNIQUE constraint failed: ")?;
-                message.append(index.keyNames.view())?;
-                return Err(SqliteError.Constraint(message));
-            }
-            for (k in 0..conflicting.length) {
-                this.replaceRow(borrow conflicting[k], frame, db)?;
+            for (i in 0..this.indexes.length) {
+                let index = borrow this.indexes[i];
+                if (!index.unique) {
+                    continue;
+                }
+                let effective = action ?? index.onConflict ?? ConflictAction.Abort;
+                if ((effective == ConflictAction.Replace) != replacing) {
+                    continue;
+                }
+                if (index.stale.get()) {
+                    // Its entries are out of date: rebuild it from the table as it is now, before relying on it.
+                    let saved = copySlot(borrow frame.slots[this.slot])?;
+                    this.rebuildIndex(index, frame, db)?;
+                    frame.slots[this.slot] = saved;
+                    index.stale.set(false);
+                }
+                let Some(entry) = this.entryFor(index, frame, db)? else {
+                    continue;
+                };
+                let conflicting = this.conflictsIn(index, borrow entry, except.view(), db)?;
+                if (conflicting.length == 0) {
+                    continue;
+                }
+                if (effective == ConflictAction.Ignore) {
+                    return Ok(false);
+                }
+                if (!replacing) {
+                    var message = String.from("UNIQUE constraint failed: ")?;
+                    message.append(index.keyNames.view())?;
+                    return Err(SqliteError.Constraint(message));
+                }
+                for (k in 0..conflicting.length) {
+                    this.replaceRow(borrow conflicting[k], frame, db)?;
+                }
             }
         }
         return Ok(true);
@@ -1053,7 +1078,7 @@ fn executeInsert(
     var frame = newFrame(mut compiler, params, db)?;
     var rows = insertRows(borrow source, mut frame, db)?;
     var output = Vector<Vector<SqliteValue>>.create();
-    let action = stmt.conflict ?? ConflictAction.Abort;
+    let action = stmt.conflict;
     var count: i64 = 0;
     for (r in 0..rows.length) {
         let given = takeRow(mut rows, r);
@@ -1482,7 +1507,7 @@ fn compileAssignments(
 fn updateLoadedRow(
     writer: borrow TableWriter,
     set: borrow Assignments,
-    action: ConflictAction,
+    action: ConflictAction?,
     frame: borrow mut Frame,
     db: borrow mut Session,
 ) -> Result<bool, SqliteError> {
@@ -1499,7 +1524,7 @@ fn applyUpdate(
     writer: borrow TableWriter,
     targets: Slice<usize>,
     values: Vector<SqliteValue>,
-    action: ConflictAction,
+    action: ConflictAction?,
     frame: borrow mut Frame,
     db: borrow mut Session,
 ) -> Result<bool, SqliteError> {
@@ -1636,7 +1661,7 @@ fn executeUpdate(
     let returning = compileReturning(mut compiler, borrow stmt.returning, borrow writer, db)?;
     var frame = newFrame(mut compiler, params, db)?;
     let rowids = matchingRows(borrow writer, borrow filter, mut frame, db)?;
-    let action = stmt.conflict ?? ConflictAction.Abort;
+    let action = stmt.conflict;
     var output = Vector<Vector<SqliteValue>>.create();
     var count: i64 = 0;
     for (i in 0..rowids.length) {
@@ -1875,7 +1900,7 @@ fn executeUpdateFrom(
 
     let returning = compileReturning(mut compiler, borrow stmt.returning, borrow writer, db)?;
     var frame = newFrame(mut compiler, params, db)?;
-    let action = stmt.conflict ?? ConflictAction.Abort;
+    let action = stmt.conflict;
     var done = Vector<RowKey>.create();
     var doneRowids = HashMap<i64, bool>.create();
     var output = Vector<Vector<SqliteValue>>.create();

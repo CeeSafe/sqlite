@@ -610,3 +610,30 @@ fn targetAliasesAndReturningNames() -> Result<void, TestFailure> {
         SELECT * FROM t
         """);
 }
+
+@test
+fn constraintConflictClausesApply() -> Result<void, TestFailure> {
+    return sameScript("constraint-conflict", """
+        CREATE TABLE r(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, u UNIQUE ON CONFLICT IGNORE, n NOT NULL ON CONFLICT IGNORE, d NOT NULL ON CONFLICT REPLACE DEFAULT 'dflt')
+        INSERT INTO r VALUES (1, 'a', 1, 'x'), (2, 'b', 2, 'y')
+        INSERT INTO r VALUES (1, 'c', 3, 'z')
+        INSERT INTO r VALUES (5, 'a', 4, 'w')
+        INSERT INTO r VALUES (6, 'f', NULL, 'v')
+        INSERT INTO r VALUES (7, 'g', 7, NULL)
+        INSERT OR ABORT INTO r VALUES (8, 'b', 8, 'q')
+        INSERT OR FAIL INTO r VALUES (9, 'h', NULL, 'q')
+        UPDATE r SET u = 'b' WHERE id = 1
+        UPDATE r SET id = 2 WHERE id = 1
+        SELECT * FROM r ORDER BY id
+        CREATE TABLE k(a, b, c, UNIQUE (a, b) ON CONFLICT REPLACE, UNIQUE (c) ON CONFLICT ABORT)
+        INSERT INTO k VALUES (1, 1, 'x'), (1, 2, 'y')
+        INSERT INTO k VALUES (1, 1, 'y')
+        INSERT INTO k VALUES (1, 1, 'z')
+        SELECT * FROM k ORDER BY a, b
+        CREATE TABLE w(p PRIMARY KEY ON CONFLICT IGNORE, v) WITHOUT ROWID
+        INSERT INTO w VALUES (1, 'one'), (1, 'uno'), (2, 'two')
+        SELECT * FROM w
+        CREATE TABLE bad(a UNIQUE ON CONFLICT IGNORE, UNIQUE (a) ON CONFLICT REPLACE)
+        CREATE TABLE fine(a UNIQUE ON CONFLICT IGNORE, UNIQUE (a))
+        """);
+}

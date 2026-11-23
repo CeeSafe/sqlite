@@ -431,6 +431,11 @@ Choices where the C# concept does not fit CeeSafe:
 - **Configuration.** There is no connection string; a path is given. `:memory:`, the empty name and `file:` URIs
   are refused.
 
+- **ON CONFLICT on constraints** applies as in SQLite (`constraintConflictClausesApply`): a statement's OR action
+  overrides it; IGNORE and REPLACE on NOT NULL, PRIMARY KEY and UNIQUE work, REPLACE constraints are resolved after
+  the others, and two constraints that share an index with different actions are "conflicting ON CONFLICT clauses
+  specified". The C# read the clauses and ignored them.
+
 ## Known differences from SQLite in PRAGMA integrity_check
 
 The report matches the `sqlite3` shell's row for row on the tests' damaged files, with these exceptions:
@@ -459,8 +464,9 @@ The report matches the `sqlite3` shell's row for row on the tests' damaged files
 `CREATE VIRTUAL TABLE`, `EXPLAIN`, and a parenthesized join
 that an outer join takes as a whole (`a LEFT JOIN (b JOIN c ON …) ON …`); a parenthesized group of inner joins is
 read as its joins in line (`parenthesizedJoinsMatchSqlite`).
-`ON CONFLICT` clauses on column and table constraints are read and not applied, and collations other than
-BINARY, NOCASE and RTRIM are refused.
+Collations other than BINARY, NOCASE and RTRIM are refused. OR FAIL and OR ROLLBACK (and the same ON
+CONFLICT on a constraint) act as ABORT: the statement's earlier rows are undone, where FAIL keeps them and ROLLBACK
+ends the transaction.
 
 ## Limits
 

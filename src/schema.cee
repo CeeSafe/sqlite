@@ -111,6 +111,11 @@ struct ColumnSchema {
     generated: SchemaExpr?;
     generatedStored: bool;
     foreignKey: ForeignKeySchema?;
+    /// `NOT NULL ON CONFLICT action`.
+    notNullConflict: ConflictAction?;
+    /// The ON CONFLICT of the column's PRIMARY KEY and UNIQUE.
+    pkConflict: ConflictAction?;
+    uniqueConflict: ConflictAction?;
 }
 
 struct KeyColumn {
@@ -124,6 +129,8 @@ struct KeyColumn {
 struct KeyConstraint {
     columns: Vector<KeyColumn>;
     primaryKey: bool;
+    /// `ON CONFLICT action`: what a conflict does when the statement says nothing.
+    onConflict: ConflictAction?;
 }
 
 struct TableSchema {
@@ -144,6 +151,8 @@ struct TableSchema {
     foreignKeys: Vector<ForeignKeySchema>;
     /// The column that is the rowid, if one is.
     rowidAlias: usize?;
+    /// The ON CONFLICT of the INTEGER PRIMARY KEY, which a rowid conflict uses.
+    rowidConflict: ConflictAction?;
 
     /// The index of the column called `name` (ASCII case is ignored).
     fn indexOf(borrow this, name: StringView) -> usize? {
@@ -167,7 +176,12 @@ struct TableSchema {
     }
 
     /// Adds a key constraint unless an earlier one has the same columns and collations.
-    fn addKey(borrow mut this, columns: Vector<KeyColumn>, primaryKey: bool) -> Result<void, AllocError> {
+    fn addKey(
+        borrow mut this,
+        columns: Vector<KeyColumn>,
+        primaryKey: bool,
+        onConflict: ConflictAction?,
+    ) -> Result<void, SqliteError> {
         for (k in 0..this.keys.length) {
             if (this.keys[k].columns.length != columns.length) {
                 continue;
@@ -184,10 +198,18 @@ struct TableSchema {
                 }
             }
             if (same) {
+                // One index serves both; their ON CONFLICT clauses must agree.
+                if (onConflict is Some(action)) {
+                    if (this.keys[k].onConflict is Some(existing) && existing != action) {
+                        return Err(sqlError("conflicting ON CONFLICT clauses specified"));
+                    }
+                    this.keys[k].onConflict = action;
+                }
                 return Ok();
             }
         }
-        return this.keys.push(KeyConstraint { columns: columns, primaryKey: primaryKey });
+        this.keys.push(KeyConstraint { columns: columns, primaryKey: primaryKey, onConflict: onConflict })?;
+        return Ok();
     }
 }
 
@@ -354,7 +376,25 @@ fn collationNamed(name: StringView) -> Result<Collation, SqliteError> {
     return Err(SqliteError.Unsupported(text));
 }
 
-/// Skips `ON CONFLICT action` at `at`; the action itself is not kept.
+/// `ON CONFLICT action` at `at`: the action, and where the clause ends (at `at` when there is none).
+fn conflictClause(tokens: Slice<Token>, at: borrow mut usize) -> Result<ConflictAction?, SqliteError> {
+    let start = *at;
+    let end = skipConflictClause(tokens, start)?;
+    if (end == start) {
+        return Ok(null);
+    }
+    *at = end;
+    let word = tokens[end - 1].text.view();
+    return Ok(
+        if (word.equalsIgnoreAsciiCase("ROLLBACK")) ConflictAction.Rollback
+            else if (word.equalsIgnoreAsciiCase("ABORT")) ConflictAction.Abort
+            else if (word.equalsIgnoreAsciiCase("FAIL")) ConflictAction.Fail
+            else if (word.equalsIgnoreAsciiCase("IGNORE")) ConflictAction.Ignore
+            else ConflictAction.Replace,
+    );
+}
+
+/// Skips `ON CONFLICT action` at `at`.
 fn skipConflictClause(tokens: Slice<Token>, at: usize) -> Result<usize, SqliteError> {
     if (!(tokenIsWord(tokens, at, "ON") && tokenIsWord(tokens, at + 1, "CONFLICT"))) {
         return Ok(at);
@@ -531,6 +571,9 @@ fn buildColumnSchema(
         generated: null,
         generatedStored: false,
         foreignKey: null,
+        notNullConflict: null,
+        pkConflict: null,
+        uniqueConflict: null,
     };
     // The declared type: the tokens before the first constraint keyword.
     var i: usize = 0;
@@ -545,7 +588,8 @@ fn buildColumnSchema(
             i += 2;
         } else if (tokenIsWord(tokens, i, "NOT") && tokenIsWord(tokens, i + 1, "NULL")) {
             column.notNull = true;
-            i = skipConflictClause(tokens, i + 2)?;
+            i += 2;
+            column.notNullConflict = conflictClause(tokens, mut i)?;
         } else if (tokenIsWord(tokens, i, "NULL")) {
             i = skipConflictClause(tokens, i + 1)?;
         } else if (tokenIsWord(tokens, i, "PRIMARY") && tokenIsWord(tokens, i + 1, "KEY")) {
@@ -557,14 +601,15 @@ fn buildColumnSchema(
             } else if (tokenIsWord(tokens, i, "ASC")) {
                 i += 1;
             }
-            i = skipConflictClause(tokens, i)?;
+            column.pkConflict = conflictClause(tokens, mut i)?;
             if (tokenIsWord(tokens, i, "AUTOINCREMENT")) {
                 column.autoincrement = true;
                 i += 1;
             }
         } else if (tokenIsWord(tokens, i, "UNIQUE")) {
             column.unique = true;
-            i = skipConflictClause(tokens, i + 1)?;
+            i += 1;
+            column.uniqueConflict = conflictClause(tokens, mut i)?;
         } else if (tokenIsWord(tokens, i, "COLLATE")) {
             let name = definitionName(tokens, i + 1)?;
             column.collation = collationNamed(name.view())?;
@@ -679,6 +724,7 @@ fn buildTableSchema(
         keys: Vector<KeyConstraint>.create(),
         foreignKeys: Vector<ForeignKeySchema>.create(),
         rowidAlias: null,
+        rowidConflict: null,
     };
     for (i in 0..stmt.columns.length) {
         var column = buildColumnSchema(borrow stmt.columns[i], stmt.withoutRowid, sql)?;
@@ -698,6 +744,11 @@ fn buildTableSchema(
         }
         let ownKey = column.primaryKey && !column.isRowidAlias;
         let ownUnique = column.unique;
+        let pkConflict = column.pkConflict;
+        let uniqueConflict = column.uniqueConflict;
+        if (column.isRowidAlias) {
+            table.rowidConflict = column.pkConflict;
+        }
         let keyName = column.name.clone()?;
         let keyDescending = column.pkDescending;
         // The table keeps the column's CHECK and REFERENCES with its own.
@@ -709,10 +760,10 @@ fn buildTableSchema(
         }
         table.columns.push(column)?;
         if (ownKey) {
-            table.addKey(oneKeyColumn(keyName.view(), keyDescending)?, true)?;
+            table.addKey(oneKeyColumn(keyName.view(), keyDescending)?, true, pkConflict)?;
         }
         if (ownUnique) {
-            table.addKey(oneKeyColumn(keyName.view(), false)?, false)?;
+            table.addKey(oneKeyColumn(keyName.view(), false)?, false, uniqueConflict)?;
         }
     }
     for (c in 0..stmt.constraints.length) {
@@ -741,7 +792,7 @@ fn buildTableSchema(
             let isPrimaryKey = tokenIsWord(tokens, i, "PRIMARY");
             i += if (isPrimaryKey) 2 else 1;
             let columns = keyColumns(tokens, mut i)?;
-            i = skipConflictClause(tokens, i)?;
+            let onConflict = conflictClause(tokens, mut i)?;
             for (k in 0..columns.length) {
                 if (table.indexOf(columns[k].name.view()).isNull()) {
                     return Err(sqlError("a key names a column the table does not have"));
@@ -761,6 +812,7 @@ fn buildTableSchema(
                     table.columns[only].isRowidAlias = true;
                     table.columns[only].primaryKey = true;
                     table.rowidAlias = only;
+                    table.rowidConflict = onConflict;
                     table.primaryKey = cloneKeyColumns(columns.view())?;
                 } else {
                     for (k in 0..columns.length) {
@@ -768,10 +820,10 @@ fn buildTableSchema(
                         table.columns[at].primaryKey = true;
                     }
                     table.primaryKey = cloneKeyColumns(columns.view())?;
-                    table.addKey(columns, true)?;
+                    table.addKey(columns, true, onConflict)?;
                 }
             } else {
-                table.addKey(columns, false)?;
+                table.addKey(columns, false, onConflict)?;
             }
         } else {
             return Err(definitionError(tokens, i));
@@ -959,6 +1011,9 @@ impl TableSchema {
                 generated: cloneSchemaExpr(borrow c.generated)?,
                 generatedStored: c.generatedStored,
                 foreignKey: key,
+                notNullConflict: c.notNullConflict,
+                pkConflict: c.pkConflict,
+                uniqueConflict: c.uniqueConflict,
             })?;
         }
         var checks = Vector<SchemaExpr>.withCapacity(this.checks.length)?;
@@ -973,6 +1028,7 @@ impl TableSchema {
                 KeyConstraint {
                     columns: cloneKeyColumnList(borrow this.keys[i].columns)?,
                     primaryKey: this.keys[i].primaryKey,
+                    onConflict: this.keys[i].onConflict,
                 },
             )?;
         }
@@ -992,6 +1048,7 @@ impl TableSchema {
             keys: keys,
             foreignKeys: foreignKeys,
             rowidAlias: this.rowidAlias,
+            rowidConflict: this.rowidConflict,
         });
     }
 }
