@@ -196,3 +196,71 @@ fn readsWithoutRowidTables() -> Result<void, TestFailure> {
         SELECT rowid FROM kv
         """);
 }
+
+@test
+fn windowFunctionsMatchSqlite() -> Result<void, TestFailure> {
+    let path = "out/query-windows.db";
+    makeDatabase(path, """
+        CREATE TABLE s(id INTEGER PRIMARY KEY, grp TEXT, v INT, r REAL, name TEXT COLLATE NOCASE);
+        INSERT INTO s(grp, v, r, name) VALUES
+            ('a', 1, 1.5, 'x'), ('a', 3, 2.5, 'Y'), ('a', 3, NULL, 'z'), ('a', 7, 0.5, 'y'),
+            ('b', 2, 4.0, 'p'), ('b', NULL, 1.0, 'q'), ('b', 5, 2.0, 'P'),
+            ('c', 10, 3.0, 'm'), (NULL, 4, 9.0, 'n');
+        """)?;
+    return sameAnswers(path, """
+        SELECT id, row_number() OVER (ORDER BY id DESC), rank() OVER (ORDER BY v), dense_rank() OVER (ORDER BY v) FROM s ORDER BY id
+        SELECT id, grp, v, percent_rank() OVER (PARTITION BY grp ORDER BY v), cume_dist() OVER (PARTITION BY grp ORDER BY v) FROM s ORDER BY id
+        SELECT id, ntile(2) OVER (ORDER BY id), ntile(4) OVER (ORDER BY id), ntile(20) OVER (ORDER BY id) FROM s ORDER BY id
+        SELECT id, lag(v) OVER (ORDER BY id), lead(v, 2) OVER (ORDER BY id), lag(v, 1, -1) OVER (PARTITION BY grp ORDER BY id), lead(name, 0) OVER (ORDER BY id) FROM s ORDER BY id
+        SELECT id, first_value(v) OVER w, last_value(v) OVER w, nth_value(v, 2) OVER w FROM s WINDOW w AS (PARTITION BY grp ORDER BY id) ORDER BY id
+        SELECT id, sum(v) OVER (ORDER BY id), count(*) OVER (), count(v) OVER (PARTITION BY grp), avg(r) OVER (PARTITION BY grp ORDER BY id) FROM s ORDER BY id
+        SELECT id, sum(v) OVER (ORDER BY v), total(v) OVER (ORDER BY v DESC), max(name) OVER (ORDER BY id), min(r) OVER (PARTITION BY grp) FROM s ORDER BY id
+        SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING), sum(v) OVER (ORDER BY id ROWS BETWEEN 2 FOLLOWING AND UNBOUNDED FOLLOWING), sum(v) OVER (ORDER BY id ROWS 2 PRECEDING) FROM s ORDER BY id
+        SELECT id, v, sum(id) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING), sum(id) OVER (ORDER BY v DESC RANGE BETWEEN 2 PRECEDING AND CURRENT ROW), sum(id) OVER (ORDER BY r RANGE BETWEEN 0.5 PRECEDING AND 1.5 FOLLOWING) FROM s ORDER BY id
+        SELECT id, v, sum(id) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING), count(*) OVER (ORDER BY v GROUPS CURRENT ROW), group_concat(id, '.') OVER (ORDER BY v GROUPS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) FROM s ORDER BY id
+        SELECT id, v, group_concat(id, ',') OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW), group_concat(id, ',') OVER (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP), group_concat(id, ',') OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE TIES) FROM s ORDER BY id
+        SELECT id, first_value(id) OVER (ORDER BY v ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW), last_value(id) OVER (ORDER BY v RANGE BETWEEN CURRENT ROW AND CURRENT ROW EXCLUDE TIES) FROM s ORDER BY id
+        SELECT id, count(*) FILTER (WHERE v > 2) OVER (ORDER BY id), sum(v) FILTER (WHERE grp = 'a') OVER () FROM s ORDER BY id
+        SELECT grp, sum(v), rank() OVER (ORDER BY sum(v) DESC), sum(sum(v)) OVER (ORDER BY grp) FROM s GROUP BY grp ORDER BY grp
+        SELECT id, name, rank() OVER (ORDER BY name) FROM s ORDER BY id
+        SELECT id, row_number() OVER (PARTITION BY name ORDER BY id) FROM s ORDER BY id
+        SELECT id, v FROM s ORDER BY row_number() OVER (ORDER BY v DESC, id)
+        SELECT id, sum(v) OVER win FROM s WINDOW win AS (ORDER BY id), other AS (ORDER BY v) ORDER BY id
+        SELECT id, sum(v) OVER (win ROWS 1 PRECEDING) FROM s WINDOW win AS (PARTITION BY grp ORDER BY id) ORDER BY id
+        SELECT DISTINCT grp, count(*) OVER (PARTITION BY grp) FROM s ORDER BY 1
+        SELECT id, row_number() OVER () FROM s WHERE v > 2 ORDER BY id LIMIT 3
+        SELECT id, grp, row_number() OVER (PARTITION BY grp ORDER BY id DESC) FROM s
+        SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM s
+        SELECT id, sum(v) OVER (ORDER BY id RANGE BETWEEN 'x' PRECEDING AND CURRENT ROW) FROM s
+        SELECT ntile(0) OVER () FROM s
+        SELECT nth_value(v, 0) OVER () FROM s
+        SELECT lag(v, -1) OVER () FROM s
+        SELECT count(DISTINCT v) OVER () FROM s
+        SELECT row_number() FILTER (WHERE v > 1) OVER () FROM s
+        SELECT id FROM s WHERE row_number() OVER () > 1
+        SELECT sum(v) OVER nosuch FROM s
+        SELECT abs(v) OVER () FROM s
+        SELECT sum(v) OVER (ORDER BY v, id RANGE 1 PRECEDING) FROM s
+        """);
+}
+
+@test
+fn windowFunctionsInContext() -> Result<void, TestFailure> {
+    let path = "out/query-windows-context.db";
+    makeDatabase(path, """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, g INT, x INT);
+        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000)
+        INSERT INTO t SELECT i, i % 7, (i * 7919) % 1000 FROM n;
+        CREATE VIEW ranked AS SELECT id, g, x, rank() OVER (PARTITION BY g ORDER BY x DESC) AS rk FROM t;
+        """)?;
+    return sameAnswers(path, """
+        SELECT count(*), sum(rk), max(rk) FROM ranked
+        SELECT id, g, x FROM ranked WHERE rk = 1 ORDER BY g, id LIMIT 10
+        SELECT g, max(running) FROM (SELECT g, sum(x) OVER (PARTITION BY g ORDER BY id) AS running FROM t) GROUP BY g ORDER BY g
+        WITH w AS (SELECT id, lag(x) OVER (ORDER BY id) AS prev, x FROM t) SELECT count(*), sum(x - prev) FROM w WHERE prev IS NOT NULL
+        SELECT id, (SELECT count(*) FROM (SELECT row_number() OVER () FROM t WHERE g = o.g AND id < o.id)) FROM t AS o WHERE id < 6 ORDER BY id
+        SELECT sum(c) FROM (SELECT count(*) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING) AS c FROM t)
+        SELECT id, x, avg(x) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t WHERE id <= 8 ORDER BY id
+        SELECT 1, row_number() OVER () UNION ALL SELECT 2, rank() OVER (ORDER BY 1)
+        """);
+}

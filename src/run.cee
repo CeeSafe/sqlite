@@ -9,6 +9,8 @@ struct CoreSink {
     groupIndex: HashMap<Vector<u8>, usize>;
     /// Stop once this many rows are kept: a query with LIMIT and nothing that needs every row.
     stopAfter: usize?;
+    /// A core with window functions: its rows, kept until the windows are computed.
+    windowRows: Vector<WindowRow>;
 }
 
 struct GroupState {
@@ -372,8 +374,21 @@ fn acceptRow(
     return project(core, frame, db, sink);
 }
 
-/// Evaluates the result columns and sort keys for the current row, and keeps them.
+/// Evaluates the result columns and sort keys for the current row, and keeps them; with window functions, keeps
+/// the row until they are computed.
 fn project(
+    core: borrow CorePlan,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+    sink: borrow mut CoreSink,
+) -> Result<void, SqliteError> {
+    if (core.windows.length != 0) {
+        return keepWindowRow(core, frame, db, sink);
+    }
+    return projectRow(core, frame, db, sink);
+}
+
+fn projectRow(
     core: borrow CorePlan,
     frame: borrow mut Frame,
     db: borrow mut Session,
@@ -414,10 +429,15 @@ fn runCore(
         distinctSeen: if (core.distinct) HashMap<Vector<u8>, bool>.create() else null,
         groups: Vector<GroupState>.create(),
         groupIndex: HashMap<Vector<u8>, usize>.create(),
-        stopAfter: if (core.isAggregate || core.distinct || core.sortKeys.length != 0) null else stopAfter,
+        stopAfter: if (core.isAggregate || core.distinct || core.sortKeys.length != 0 || core.windows.length != 0) null
+            else stopAfter,
+        windowRows: Vector<WindowRow>.create(),
     };
     joinLevel(core, 0, frame, db, mut sink)?;
     if (!core.isAggregate) {
+        if (core.windows.length != 0) {
+            finishWindows(core, frame, db, mut sink)?;
+        }
         return Ok(sink.rows);
     }
     // An aggregate without GROUP BY gives one row even with no input: its bare columns are NULL.
@@ -457,6 +477,9 @@ fn runCore(
         project(core, frame, db, mut sink)?;
     }
     frame.aggregates = saved;
+    if (core.windows.length != 0) {
+        finishWindows(core, frame, db, mut sink)?;
+    }
     return Ok(sink.rows);
 }
 

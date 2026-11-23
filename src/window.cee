@@ -1,0 +1,628 @@
+// Window functions, run as SQLite runs them: after WHERE, GROUP BY and HAVING, over the rows the core would give.
+//
+// Each such row is kept (its sources' slots, its aggregates, and each window's inputs: partition and order keys,
+// arguments, FILTER); then each window sorts the rows by partition and order, computes its value for every row,
+// and the rows are projected with those values. Aggregates used as window functions step an Accumulator over
+// the frame's rows, through a slot that holds one row's arguments at a time: incrementally when the frame starts
+// at the partition's start and excludes nothing, else afresh for each row.
+
+/// One window's inputs for one row.
+struct WindowInput {
+    partition: Vector<SqliteValue>;
+    order: Vector<SqliteValue>;
+    args: Vector<SqliteValue>;
+    /// Whether the row passes the window's FILTER.
+    passes: bool;
+}
+
+/// A row of a core with window functions, kept until the windows are computed.
+struct WindowRow {
+    slots: Vector<Slot>;
+    aggregates: Vector<SqliteValue>;
+    inputs: Vector<WindowInput>;
+}
+
+/// Keeps the current row for the windows.
+fn keepWindowRow(
+    core: borrow CorePlan,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+    sink: borrow mut CoreSink,
+) -> Result<void, SqliteError> {
+    var inputs = Vector<WindowInput>.withCapacity(core.windows.length)?;
+    for (w in 0..core.windows.length) {
+        let spec = borrow core.windows[w];
+        var input = WindowInput {
+            partition: Vector<SqliteValue>.create(),
+            order: Vector<SqliteValue>.create(),
+            args: Vector<SqliteValue>.create(),
+            passes: true,
+        };
+        for (k in 0..spec.partitionBy.length) {
+            input.partition.push(evaluate(borrow spec.partitionBy[k], frame, db)?)?;
+        }
+        for (k in 0..spec.orderBy.length) {
+            input.order.push(evaluate(borrow spec.orderBy[k].expr, frame, db)?)?;
+        }
+        for (k in 0..spec.args.length) {
+            input.args.push(evaluate(borrow spec.args[k], frame, db)?)?;
+        }
+        if (borrow spec.filter is Some(f)) {
+            let v = evaluate(f, frame, db)?;
+            input.passes = isTrue(borrow v);
+        }
+        inputs.push(input)?;
+    }
+    var slots = Vector<Slot>.withCapacity(core.sources.length)?;
+    for (s in 0..core.sources.length) {
+        slots.push(copySlot(borrow frame.slots[core.sources[s].slot])?)?;
+    }
+    sink.windowRows.push(
+        WindowRow { slots: slots, aggregates: cloneValues(frame.aggregates.view())?, inputs: inputs },
+    )?;
+    return Ok();
+}
+
+/// Computes the windows of the kept rows, then projects each row with its windows' values. The rows go out in
+/// the order of the first window's partitions and order, as in SQLite.
+fn finishWindows(
+    core: borrow CorePlan,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+    sink: borrow mut CoreSink,
+) -> Result<void, SqliteError> {
+    var rows = replace(mut sink.windowRows, Vector<WindowRow>.create());
+    var values = Vector<Vector<SqliteValue>>.withCapacity(rows.length)?;
+    for (r in 0..rows.length) {
+        var row = Vector<SqliteValue>.withCapacity(core.windows.length)?;
+        for (w in 0..core.windows.length) {
+            row.push(SqliteValue.Null)?;
+        }
+        values.push(row)?;
+    }
+    var emitOrder = Vector<usize>.create();
+    // SQLite computes the windows last to first, each pass sorting the rows; they come out in the first's order.
+    var w = core.windows.length;
+    while (w > 0) {
+        w -= 1;
+        let sorted = computeWindow(core, w, borrow rows, mut values, frame, db)?;
+        if (w == 0) {
+            emitOrder = sorted;
+        }
+    }
+    let savedAggregates = replace(mut frame.aggregates, Vector<SqliteValue>.create());
+    let savedWindows = replace(mut frame.windows, Vector<SqliteValue>.create());
+    for (i in 0..emitOrder.length) {
+        let r = emitOrder[i];
+        var slots = replace(mut rows[r].slots, Vector<Slot>.create());
+        for (s in 0..slots.length) {
+            frame.slots[core.sources[s].slot] = replace(
+                mut slots[s],
+                Slot { values: Vector<SqliteValue>.create(), rowId: 0, isNull: true },
+            );
+        }
+        frame.aggregates = replace(mut rows[r].aggregates, Vector<SqliteValue>.create());
+        frame.windows = replace(mut values[r], Vector<SqliteValue>.create());
+        projectRow(core, frame, db, sink)?;
+    }
+    frame.aggregates = savedAggregates;
+    frame.windows = savedWindows;
+    return Ok();
+}
+
+/// Whether two rows' keys are equal, NULLs equal to each other, under the collations.
+fn sameKeys(a: Slice<SqliteValue>, b: Slice<SqliteValue>, collations: Slice<Collation>) -> bool {
+    for (i in 0..a.length) {
+        if (a[i].isNull() || b[i].isNull()) {
+            if (a[i].isNull() != b[i].isNull()) {
+                return false;
+            }
+            continue;
+        }
+        if (compareValues(borrow a[i], borrow b[i], collations[i]) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn compareWindowRows(spec: borrow WindowSpec, a: borrow WindowInput, b: borrow WindowInput) -> i32 {
+    for (k in 0..a.partition.length) {
+        let c = compareForOrder(borrow a.partition[k], borrow b.partition[k], spec.partitionCollations[k], false, true);
+        if (c != 0) {
+            return c;
+        }
+    }
+    for (k in 0..a.order.length) {
+        let t = borrow spec.orderBy[k];
+        let c = compareForOrder(borrow a.order[k], borrow b.order[k], t.collation, t.descending, t.nullsFirst);
+        if (c != 0) {
+            return c;
+        }
+    }
+    return 0;
+}
+
+/// Computes window `w` for every row into `values[row][w]`; gives the rows in the window's order.
+fn computeWindow(
+    core: borrow CorePlan,
+    w: usize,
+    rows: borrow Vector<WindowRow>,
+    values: borrow mut Vector<Vector<SqliteValue>>,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<usize>, SqliteError> {
+    let spec = borrow core.windows[w];
+    var order = Vector<usize>.withCapacity(rows.length)?;
+    for (r in 0..rows.length) {
+        order.push(r)?;
+    }
+    order.sortBy((a, b) => {
+        let c = compareWindowRows(spec, borrow rows[a].inputs[w], borrow rows[b].inputs[w]);
+        return if (c != 0) c else if (a < b) -1 else if (a > b) 1 else 0;
+    });
+    let offsets = frameOffsets(spec, frame, db)?;
+    var collations = Vector<Collation>.withCapacity(spec.orderBy.length)?;
+    for (k in 0..spec.orderBy.length) {
+        collations.push(spec.orderBy[k].collation)?;
+    }
+    var p: usize = 0;
+    while (p < order.length) {
+        var q = p + 1;
+        while (q < order.length && sameKeys(
+            rows[order[p]].inputs[w].partition.view(),
+            rows[order[q]].inputs[w].partition.view(),
+            spec.partitionCollations.view(),
+        )) {
+            q += 1;
+        }
+        computePartition(core, w, rows, order.view()[p..q], collations.view(), borrow offsets, values, frame, db)?;
+        p = q;
+    }
+    return Ok(order);
+}
+
+/// A frame's constant offsets, checked.
+struct FrameOffsets {
+    start: SqliteValue;
+    end: SqliteValue;
+}
+
+fn frameOffset(
+    e: borrow XExpr?,
+    mode: FrameMode,
+    which: StringView,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<SqliteValue, SqliteError> {
+    let Some(x) = e else {
+        return Ok(SqliteValue.Integer(0));
+    };
+    let v = evaluate(x, frame, db)?;
+    let numeric = applyColumnAffinity(v, Affinity.Numeric)?;
+    let ok = match (borrow numeric) {
+        SqliteValue.Integer(n) => n >= 0,
+        SqliteValue.Real(r) => mode == FrameMode.Range && r >= 0.0,
+        _ => false,
+    };
+    if (!ok) {
+        var message = String.from("frame ")?;
+        message.append(which)?;
+        message.append(" offset must be a non-negative ")?;
+        message.append(if (mode == FrameMode.Range) "number" else "integer")?;
+        return Err(SqliteError.Sql(message));
+    }
+    return Ok(numeric);
+}
+
+fn frameOffsets(
+    spec: borrow WindowSpec,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<FrameOffsets, SqliteError> {
+    let mode = if (borrow spec.frame is Some(f)) f.mode else FrameMode.Range;
+    return Ok(FrameOffsets {
+        start: frameOffset(borrow spec.startOffset, mode, "starting", frame, db)?,
+        end: frameOffset(borrow spec.endOffset, mode, "ending", frame, db)?,
+    });
+}
+
+fn offsetCount(v: borrow SqliteValue) -> i64 => match (v) {
+    SqliteValue.Integer(n) => n,
+    _ => 0,
+};
+
+/// The value `v ± offset` (a RANGE bound's target), or `null` when `v` is not a number.
+fn shifted(v: borrow SqliteValue, offset: borrow SqliteValue, add: bool) -> Result<SqliteValue?, SqliteError> {
+    if (!(v is SqliteValue.Integer(_) || v is SqliteValue.Real(_))) {
+        return Ok(null);
+    }
+    return Ok(arithmetic(if (add) ArithmeticOp.Add else ArithmeticOp.Subtract, v, offset));
+}
+
+/// Computes window `w` for the rows of one partition, `members`, in the window's order.
+fn computePartition(
+    core: borrow CorePlan,
+    w: usize,
+    rows: borrow Vector<WindowRow>,
+    members: Slice<usize>,
+    collations: Slice<Collation>,
+    offsets: borrow FrameOffsets,
+    values: borrow mut Vector<Vector<SqliteValue>>,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<void, SqliteError> {
+    let spec = borrow core.windows[w];
+    let m = members.length;
+    // Peer groups: rows whose ORDER BY keys are equal.
+    var peerStart = Vector<usize>.withCapacity(m)?;
+    var peerEnd = Vector<usize>.withCapacity(m)?;
+    var group = Vector<usize>.withCapacity(m)?;
+    var groupStarts = Vector<usize>.create();
+    for (i in 0..m) {
+        let isNew = i == 0 || !sameKeys(
+            rows[members[i]].inputs[w].order.view(),
+            rows[members[i - 1]].inputs[w].order.view(),
+            collations,
+        );
+        if (isNew) {
+            groupStarts.push(i)?;
+        }
+        peerStart.push(groupStarts[groupStarts.length - 1])?;
+        group.push(groupStarts.length - 1)?;
+    }
+    for (i in 0..m) {
+        let g = group[i];
+        peerEnd.push(if (g + 1 < groupStarts.length) groupStarts[g + 1] - 1 else m - 1)?;
+    }
+    match (spec.function) {
+        WindowFunction.RowNumber => {
+            for (i in 0..m) {
+                values[members[i]][w] = SqliteValue.Integer(truncate<i64>(i + 1));
+            }
+            return Ok();
+        }
+        WindowFunction.Rank => {
+            for (i in 0..m) {
+                values[members[i]][w] = SqliteValue.Integer(truncate<i64>(peerStart[i] + 1));
+            }
+            return Ok();
+        }
+        WindowFunction.DenseRank => {
+            for (i in 0..m) {
+                values[members[i]][w] = SqliteValue.Integer(truncate<i64>(group[i] + 1));
+            }
+            return Ok();
+        }
+        WindowFunction.PercentRank => {
+            for (i in 0..m) {
+                let v = if (m > 1) round<f64>(peerStart[i]) / round<f64>(m - 1) else 0.0;
+                values[members[i]][w] = SqliteValue.Real(v);
+            }
+            return Ok();
+        }
+        WindowFunction.CumeDist => {
+            for (i in 0..m) {
+                values[members[i]][w] = SqliteValue.Real(round<f64>(peerEnd[i] + 1) / round<f64>(m));
+            }
+            return Ok();
+        }
+        WindowFunction.Ntile => {
+            for (i in 0..m) {
+                let n = match (applyColumnAffinity(argAt(rows, members, w, i, 0).clone()?, Affinity.Integer)?) {
+                    SqliteValue.Integer(n) if (n > 0) => truncate<usize>(n),
+                    _ => { return Err(sqlError("argument of ntile must be a positive integer")); },
+                };
+                let size = m / n;
+                let large = m - n * size;
+                let bucket =
+                    if (size == 0) i + 1
+                        else if (i < large * (size + 1)) i / (size + 1) + 1
+                        else (i - large * (size + 1)) / size + large + 1;
+                values[members[i]][w] = SqliteValue.Integer(truncate<i64>(bucket));
+            }
+            return Ok();
+        }
+        WindowFunction.Lag | WindowFunction.Lead => {
+            let isLag = spec.function is WindowFunction.Lag;
+            for (i in 0..m) {
+                var offset: i64 = 1;
+                if (spec.args.length > 1) {
+                    match (applyColumnAffinity(argAt(rows, members, w, i, 1).clone()?, Affinity.Integer)?) {
+                        // A negative offset looks the other way, as in SQLite.
+                        SqliteValue.Integer(n) => { offset = n; }
+                        SqliteValue.Null => {
+                            values[members[i]][w] = SqliteValue.Null;
+                            continue;
+                        }
+                        _ => {
+                            values[members[i]][w] = SqliteValue.Null;
+                            continue;
+                        }
+                    }
+                }
+                let target = if (isLag) truncate<i64>(i) - offset else truncate<i64>(i) + offset;
+                if (target >= 0 && target < truncate<i64>(m)) {
+                    values[members[i]][w] = argAt(rows, members, w, truncate<usize>(target), 0).clone()?;
+                } else if (spec.args.length > 2) {
+                    values[members[i]][w] = argAt(rows, members, w, i, 2).clone()?;
+                } else {
+                    values[members[i]][w] = SqliteValue.Null;
+                }
+            }
+            return Ok();
+        }
+        _ => {}
+    }
+    // The functions of the frame.
+    var aggregate: AggregateSpec? = null;
+    if (spec.function is WindowFunction.Aggregate(f)) {
+        var argExprs = Vector<XExpr>.withCapacity(spec.args.length)?;
+        for (k in 0..spec.args.length) {
+            argExprs.push(XExpr.Column(core.windowSlot, k))?;
+        }
+        aggregate = AggregateSpec {
+            function: f,
+            args: argExprs,
+            distinct: false,
+            filter: null,
+            collation: spec.collation,
+            star: false,
+        };
+    }
+    let isNth = spec.function is WindowFunction.NthValue;
+    let isLast = spec.function is WindowFunction.LastValue;
+    let mode = if (borrow spec.frame is Some(f)) f.mode else FrameMode.Range;
+    let startKind = if (borrow spec.frame is Some(f)) f.start else FrameBoundKind.UnboundedPreceding;
+    let endKind = if (borrow spec.frame is Some(f)) f.end else FrameBoundKind.CurrentRow;
+    let exclude = if (borrow spec.frame is Some(f)) f.exclude else FrameExclude.NoOthers;
+    let incremental =
+        aggregate.isSome() && startKind == FrameBoundKind.UnboundedPreceding && exclude == FrameExclude.NoOthers;
+    var running: Accumulator? = null;
+    var stepped: i64 = -1;
+    for (i in 0..m) {
+        // The frame: rows lo..=hi of the partition (empty when lo > hi), less those EXCLUDE leaves out.
+        var lo: i64 = 0;
+        var hi: i64 = truncate<i64>(m) - 1;
+        let at = truncate<i64>(i);
+        lo = frameEdge(
+            startKind,
+            true,
+            mode,
+            at,
+            borrow offsets.start,
+            rows,
+            members,
+            w,
+            spec,
+            peerStart.view(),
+            peerEnd.view(),
+            group.view(),
+            groupStarts.view(),
+        )?;
+        hi = frameEdge(
+            endKind,
+            false,
+            mode,
+            at,
+            borrow offsets.end,
+            rows,
+            members,
+            w,
+            spec,
+            peerStart.view(),
+            peerEnd.view(),
+            group.view(),
+            groupStarts.view(),
+        )?;
+        lo = lo.max(0);
+        hi = hi.min(truncate<i64>(m) - 1);
+        let excluded = (j: i64) => match (exclude) {
+            FrameExclude.NoOthers => false,
+            FrameExclude.CurrentRow => j == at,
+            FrameExclude.Group => truncate<usize>(j) >= peerStart[i] && truncate<usize>(j) <= peerEnd[i],
+            FrameExclude.Ties => j != at && truncate<usize>(j) >= peerStart[i] && truncate<usize>(j) <= peerEnd[i],
+        };
+        match (spec.function) {
+            WindowFunction.FirstValue | WindowFunction.LastValue | WindowFunction.NthValue => {
+                var wanted: i64 = 1;
+                if (isNth) {
+                    wanted = match (applyColumnAffinity(argAt(rows, members, w, i, 1).clone()?, Affinity.Integer)?) {
+                        SqliteValue.Integer(n) if (n > 0) => n,
+                        _ => { return Err(sqlError("second argument to nth_value must be a positive integer")); },
+                    };
+                }
+                var found: SqliteValue = SqliteValue.Null;
+                var seen: i64 = 0;
+                var j = lo;
+                while (j <= hi) {
+                    if (!excluded(j)) {
+                        seen += 1;
+                        let take = isLast || seen == wanted;
+                        if (take) {
+                            found = argAt(rows, members, w, truncate<usize>(j), 0).clone()?;
+                            if (!isLast) {
+                                break;
+                            }
+                        }
+                    }
+                    j += 1;
+                }
+                values[members[i]][w] = found;
+            }
+            _ => {
+                let Some(agg) = borrow aggregate else {
+                    return Err(sqlError("unsupported window function"));
+                };
+                if (incremental) {
+                    if (running.isNull()) {
+                        running = Accumulator.create(agg);
+                    }
+                    if (borrow mut running is Some(acc)) {
+                        while (stepped < hi) {
+                            stepped += 1;
+                            stepRow(
+                                agg,
+                                borrow rows[members[truncate<usize>(stepped)]].inputs[w],
+                                core.windowSlot,
+                                acc,
+                                frame,
+                                db,
+                            )?;
+                        }
+                        values[members[i]][w] = acc.finish(agg)?;
+                    }
+                } else {
+                    var fresh = Accumulator.create(agg);
+                    var j = lo;
+                    while (j <= hi) {
+                        if (!excluded(j)) {
+                            stepRow(
+                                agg,
+                                borrow rows[members[truncate<usize>(j)]].inputs[w],
+                                core.windowSlot,
+                                mut fresh,
+                                frame,
+                                db,
+                            )?;
+                        }
+                        j += 1;
+                    }
+                    values[members[i]][w] = fresh.finish(agg)?;
+                }
+            }
+        }
+    }
+    return Ok();
+}
+
+/// Steps an aggregate with one row's arguments.
+fn stepRow(
+    agg: borrow AggregateSpec,
+    input: borrow WindowInput,
+    slot: usize,
+    accumulator: borrow mut Accumulator,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<void, SqliteError> {
+    if (!input.passes) {
+        return Ok();
+    }
+    frame.slots[slot] = Slot { values: cloneValues(input.args.view())?, rowId: 0, isNull: false };
+    let _ = accumulator.step(agg, frame, db)?;
+    return Ok();
+}
+
+/// One edge of row `at`'s frame: the first row (`isStart`) or the last, as a position in the partition (may lie
+/// outside it).
+fn frameEdge(
+    kind: FrameBoundKind,
+    isStart: bool,
+    mode: FrameMode,
+    at: i64,
+    offset: borrow SqliteValue,
+    rows: borrow Vector<WindowRow>,
+    members: Slice<usize>,
+    w: usize,
+    spec: borrow WindowSpec,
+    peerStart: Slice<usize>,
+    peerEnd: Slice<usize>,
+    group: Slice<usize>,
+    groupStarts: Slice<usize>,
+) -> Result<i64, SqliteError> {
+    let m = truncate<i64>(members.length);
+    let i = truncate<usize>(at);
+    match (kind) {
+        FrameBoundKind.UnboundedPreceding => { return Ok(0); }
+        FrameBoundKind.UnboundedFollowing => { return Ok(m - 1); }
+        FrameBoundKind.CurrentRow => {
+            if (mode == FrameMode.Rows) {
+                return Ok(at);
+            }
+            return Ok(truncate<i64>(if (isStart) peerStart[i] else peerEnd[i]));
+        }
+        _ => {}
+    }
+    let preceding = kind == FrameBoundKind.Preceding;
+    match (mode) {
+        FrameMode.Rows => {
+            let n = offsetCount(offset);
+            return Ok(if (preceding) at.saturatingSub(n) else at.saturatingAdd(n));
+        }
+        FrameMode.Groups => {
+            let n = offsetCount(offset);
+            let g = truncate<i64>(group[i]);
+            let target = if (preceding) g.saturatingSub(n) else g.saturatingAdd(n);
+            let groups = truncate<i64>(groupStarts.length);
+            if (target < 0) {
+                return Ok(if (isStart) 0 else -1);
+            }
+            if (target >= groups) {
+                return Ok(if (isStart) m else m - 1);
+            }
+            let t = truncate<usize>(target);
+            if (isStart) {
+                return Ok(truncate<i64>(groupStarts[t]));
+            }
+            return Ok(if (t + 1 < groupStarts.length) truncate<i64>(groupStarts[t + 1]) - 1 else m - 1);
+        }
+        FrameMode.Range => {
+            let term = borrow spec.orderBy[0];
+            let key = borrow rows[members[i]].inputs[w].order[0];
+            // Toward the partition's start is down the order: a smaller key ascending, a larger one descending.
+            let add = preceding == term.descending;
+            let Some(target) = shifted(key, offset, add)? else {
+                // A NULL or non-numeric key: the frame edge is the peer group's.
+                return Ok(truncate<i64>(if (isStart) peerStart[i] else peerEnd[i]));
+            };
+            if (isStart) {
+                // The first row not before the target.
+                var j: i64 = 0;
+                while (j < m) {
+                    let other = borrow rows[members[truncate<usize>(j)]].inputs[w].order[0];
+                    if (!other.isNull() || !term.nullsFirst) {
+                        if (other.isNull() || compareForOrder(
+                            other,
+                            borrow target,
+                            term.collation,
+                            term.descending,
+                            term.nullsFirst,
+                        ) >= 0) {
+                            return Ok(j);
+                        }
+                    }
+                    j += 1;
+                }
+                return Ok(m);
+            }
+            // The last row not after the target.
+            var j = m - 1;
+            while (j >= 0) {
+                let other = borrow rows[members[truncate<usize>(j)]].inputs[w].order[0];
+                if (!other.isNull() || term.nullsFirst) {
+                    if (!other.isNull() && compareForOrder(
+                        other,
+                        borrow target,
+                        term.collation,
+                        term.descending,
+                        term.nullsFirst,
+                    ) <= 0) {
+                        return Ok(j);
+                    }
+                }
+                j -= 1;
+            }
+            return Ok(-1);
+        }
+    }
+}
+
+/// Argument `k` of window `w` for row `r` of a partition.
+fn argAt(
+    rows: borrow Vector<WindowRow>,
+    members: Slice<usize>,
+    w: usize,
+    r: usize,
+    k: usize,
+) -> borrow(rows) SqliteValue =>
+    borrow rows[members[r]].inputs[w].args[k];

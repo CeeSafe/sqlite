@@ -27,7 +27,8 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Date and time functions | `Exec/Functions` (date/time part) | `datetime.cee` | done: a port of SQLite's date.c; 'localtime' and 'utc' are an error where they need the time zone, which CeeSafe lacks |
 | printf() and format() | `Exec/Functions` (`Printf`) | `printf.cee` | done: a port of SQLite's `sqlite3_str_vappendf`, every conversion and flag of the SQL path |
 | JSON functions | `Exec/Json`, `Functions` (JSON1) | `json.cee` | done: SQLite 3.53.4's text JSON functions, `->`, `->>`, `json_group_array` and `json_group_object`, JSON5 input, JSONB blobs as input; the `jsonb_*` functions and the table-valued `json_each` and `json_tree` are not ported and are "no such function" |
-| SELECT: joins, subqueries, views, CTEs, grouping, compounds | `Exec/QueryExecutor` | `select.cee`, `run.cee` | done but RIGHT/FULL joins, window functions, table functions, index seeks (rowid seeks done) |
+| SELECT: joins, subqueries, views, CTEs, grouping, compounds | `Exec/QueryExecutor` | `select.cee`, `run.cee` | done but RIGHT/FULL joins, table functions, index seeks (rowid seeks done) |
+| Window functions | `Exec/WindowEvaluator` | `window.cee` | done: every built-in window function, aggregates over frames, ROWS/RANGE/GROUPS, EXCLUDE, named windows |
 | INSERT, UPDATE, DELETE | `Exec/QueryExecutor` (DML), `InMemoryDatabase` | `dml.cee` | done: constraints, conflict actions, RETURNING, AUTOINCREMENT, upserts, triggers, foreign keys, UPDATE … FROM; WITHOUT ROWID tables read and written |
 | CREATE and DROP of tables, indexes and views | `Exec/QueryExecutor` (DDL) | `ddl.cee` | done |
 | Triggers | `Exec/QueryExecutor` (`FireTriggers`) | `triggers.cee` | BEFORE and AFTER on tables done; INSTEAD OF on views next |
@@ -243,10 +244,18 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   the scalar min and max, unary `+`, CAST, COLLATE, `->` and the JSON aggregates, but not into a subquery.
 - **Unpaired surrogates.** SQLite decodes `"\ud800"` to the bytes ED A0 80, which are not UTF-8. Text values here
   are valid UTF-8, so each such byte becomes U+FFFD.
-- **Window functions.** json_group_array() and json_group_object() as window functions wait for window functions
-  in general.
+- **Window functions.** json_group_array() and json_group_object() run as window functions, but their arguments
+  lose the JSON subtype on the way through the window, so a JSON argument is quoted as text.
 - **Nesting depth.** The limit is 3.53.4's 1000 levels; the `sqlite3` shell the tests run (3.54.0 on macOS) was
   built with 800, so the tests stay on depths where the two agree.
+
+- **Window functions** follow SQLite's rules where the C# made its own (`windowFunctionsMatchSqlite`,
+  `windowFunctionsInContext`): rows come out in the first window's order when there is no ORDER BY; a negative
+  lag()/lead() offset looks the other way; RANGE offsets need one numeric ORDER BY term and compare in its
+  direction, with NULL and non-numeric keys framed by their peers; frame offsets are checked with SQLite's
+  messages; DISTINCT and FILTER on non-aggregates are refused as in SQLite; window arguments in an aggregate query
+  may hold aggregates (`sum(sum(v)) OVER (…)`). Frames that do not start at the partition's start are summed
+  afresh for each row (no inverse step yet), so a sliding frame costs its width per row.
 
 ## Known gaps (inherited from the C# engine, refused by name rather than misparsed)
 

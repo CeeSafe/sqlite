@@ -773,8 +773,15 @@ impl Compiler {
         let partition = if (useNamedPartition) borrow named[at].spec.partitionBy else borrow over.partitionBy;
         let order = if (useNamedOrder) borrow named[at].spec.orderBy else borrow over.orderBy;
         let frame = if (useNamedFrame) borrow named[at].spec.frame else borrow over.frame;
+        if (call.distinct) {
+            return Err(sqlError("DISTINCT is not supported for window functions"));
+        }
+        if (call.filter.isSome() && !(function is WindowFunction.Aggregate(_))) {
+            return Err(sqlError("FILTER clause may only be used with aggregate window functions"));
+        }
+        // The arguments are per row of the query: in an aggregate query they may hold aggregates.
         let saved = this.context;
-        this.context = CallContext.InsideAggregate;
+        this.context = if (saved == CallContext.Aggregates) CallContext.Aggregates else CallContext.Plain;
         let savedWindows = this.windowsAllowed;
         this.windowsAllowed = false;
         var args = Vector<XExpr>.create();
@@ -810,6 +817,13 @@ impl Compiler {
                 endOffset = this.compile(o, db)?;
             }
             compiledFrame = XFrame { mode: f.mode, start: f.start.kind, end: f.end.kind, exclude: f.exclude };
+            let hasOffset =
+                f.start.kind == FrameBoundKind.Preceding ||
+                    f.start.kind == FrameBoundKind.Following ||
+                    f.end.kind == FrameBoundKind.Preceding || f.end.kind == FrameBoundKind.Following;
+            if (f.mode == FrameMode.Range && hasOffset && orderBy.length != 1) {
+                return Err(sqlError("RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression"));
+            }
         }
         this.windowsAllowed = savedWindows;
         this.namedWindows = named;

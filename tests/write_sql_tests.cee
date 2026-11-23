@@ -416,3 +416,17 @@ fn withoutRowidTablesChangeLikeSqlite() -> Result<void, TestFailure> {
         SELECT count(*) FROM big
         """);
 }
+
+@test
+fn windowFunctionsFeedWrites() -> Result<void, TestFailure> {
+    return sameScript("window-writes", """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT, v INT)
+        INSERT INTO t(g, v) VALUES ('a', 5), ('a', 3), ('b', 9), ('b', 1), ('b', 4)
+        CREATE TABLE r(id INT, pos INT)
+        INSERT INTO r SELECT id, row_number() OVER (PARTITION BY g ORDER BY v) FROM t
+        UPDATE t SET v = (SELECT pos FROM r WHERE r.id = t.id) * 100
+        DELETE FROM t WHERE id IN (SELECT id FROM (SELECT id, rank() OVER (ORDER BY v DESC) AS rk FROM t) WHERE rk <= 2)
+        SELECT * FROM t ORDER BY id
+        SELECT * FROM r ORDER BY id
+        """);
+}

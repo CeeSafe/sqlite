@@ -74,6 +74,9 @@ struct CorePlan {
     /// The one min() or max() whose row bare columns come from.
     minMax: usize?;
     distinct: bool;
+    /// The window functions of the result columns and ORDER BY, and the slot their arguments go through.
+    windows: Vector<WindowSpec>;
+    windowSlot: usize;
 }
 
 /// ORDER BY of a compound SELECT: a result column.
@@ -1041,12 +1044,16 @@ fn compileCoreBody(
     for (i in 0..orderBy.length) {
         isAggregate = isAggregate || containsAggregate(borrow orderBy[i].expr);
     }
-    for (i in 0..core.columns.length) {
-        if (borrow core.columns[i] is ResultColumn.Expr(e, _)) {
-            if (containsWindow(e)) {
-                return Err(unsupported("window functions are not supported yet"));
+    // The WINDOW clause: definitions OVER may name.
+    for (w in 0..core.windows.length) {
+        for (k in 0..w) {
+            if (core.windows[k].name.view().equalsIgnoreAsciiCase(core.windows[w].name.view())) {
+                return Err(namedError("duplicate WINDOW name: ", core.windows[w].name.view()));
             }
         }
+        compiler.namedWindows.push(
+            NamedWindow { name: core.windows[w].name.clone()?, spec: cloneOver(borrow core.windows[w].spec)? },
+        )?;
     }
     var outputExprsIn = Vector<XExpr>.create();
     // Result-column aliases, which WHERE, GROUP BY, HAVING and ORDER BY may name (but not other result columns).
@@ -1063,9 +1070,10 @@ fn compileCoreBody(
     if (borrow core.filter is Some(w)) {
         filter = compiler.compile(w, db)?;
     }
-    // The result columns.
+    // The result columns: window functions may appear here and in ORDER BY.
     compiler.useAliases = false;
     compiler.context = if (isAggregate) CallContext.Aggregates else CallContext.Plain;
+    compiler.windowsAllowed = true;
     for (i in 0..core.columns.length) {
         match (borrow core.columns[i]) {
             ResultColumn.Star => {
@@ -1129,6 +1137,7 @@ fn compileCoreBody(
             }
         }
     }
+    compiler.windowsAllowed = false;
     compiler.useAliases = true;
     compiler.aliasesFirst = false;
     // GROUP BY: ordinals name result columns.
@@ -1163,6 +1172,7 @@ fn compileCoreBody(
     }
     // ORDER BY of a simple SELECT: ordinals and aliases name result columns.
     compiler.aliasesFirst = true;
+    compiler.windowsAllowed = true;
     var sortKeys = Vector<XOrderTerm>.create();
     for (t in 0..orderBy.length) {
         let term = borrow orderBy[t];
@@ -1193,8 +1203,15 @@ fn compileCoreBody(
             collation: collation ?? c.collation ?? Collation.Binary,
         })?;
     }
+    compiler.windowsAllowed = false;
     compiler.useAliases = false;
     let aggregates = replace(mut compiler.aggregates, Vector<AggregateSpec>.create());
+    let windows = replace(mut compiler.windows, Vector<WindowSpec>.create());
+    // A slot for the window functions' arguments, row by row.
+    let windowSlot = compiler.slotsInUse;
+    if (windows.length != 0) {
+        compiler.slotsInUse += 1;
+    }
     // Bare columns come from the row of the min() or max(), when there is exactly one.
     var minMax: usize? = null;
     if (aggregates.length == 1 &&
@@ -1238,6 +1255,8 @@ fn compileCoreBody(
         isAggregate: isAggregate,
         minMax: minMax,
         distinct: core.distinct,
+        windows: windows,
+        windowSlot: windowSlot,
     });
 }
 
