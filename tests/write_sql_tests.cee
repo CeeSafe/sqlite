@@ -270,3 +270,25 @@ fn alterTableRewritesDefinitions() -> Result<void, TestFailure> {
         ALTER TABLE u RENAME TO child
         """);
 }
+
+@test
+fn upsertsFollowSqlite() -> Result<void, TestFailure> {
+    return sameScript("upsert", """
+        CREATE TABLE kv(k TEXT PRIMARY KEY, v INT, hits INT DEFAULT 0)
+        CREATE TABLE n(id INTEGER PRIMARY KEY, name TEXT UNIQUE, c INT)
+        INSERT INTO kv(k, v) VALUES ('a', 1), ('b', 2)
+        INSERT INTO kv(k, v) VALUES ('a', 10) ON CONFLICT(k) DO UPDATE SET v = excluded.v, hits = hits + 1
+        INSERT INTO kv(k, v) VALUES ('b', 20) ON CONFLICT DO NOTHING
+        INSERT INTO kv(k, v) VALUES ('c', 3) ON CONFLICT(k) DO UPDATE SET v = 0
+        INSERT INTO kv(k, v) VALUES ('a', 5) ON CONFLICT(k) DO UPDATE SET v = excluded.v WHERE excluded.v > v
+        INSERT INTO kv(k, v) VALUES ('a', 50) ON CONFLICT(k) DO UPDATE SET v = excluded.v WHERE excluded.v > v RETURNING k, v, hits
+        SELECT * FROM kv ORDER BY k
+        INSERT INTO kv(k, v) VALUES ('a', 1) ON CONFLICT(v) DO NOTHING
+        INSERT INTO n VALUES (1, 'x', 0)
+        INSERT INTO n VALUES (1, 'y', 0) ON CONFLICT(id) DO UPDATE SET c = c + 1
+        INSERT INTO n VALUES (2, 'x', 0) ON CONFLICT(name) DO UPDATE SET c = c + 10
+        INSERT INTO n VALUES (3, 'x', 0) ON CONFLICT(id) DO NOTHING
+        INSERT INTO n VALUES (3, 'x', 0) ON CONFLICT(id) DO NOTHING ON CONFLICT(name) DO UPDATE SET c = -1
+        SELECT * FROM n ORDER BY id
+        """);
+}

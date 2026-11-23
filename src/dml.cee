@@ -612,6 +612,38 @@ impl TableWriter {
         return Ok(true);
     }
 
+    /// The first PRIMARY KEY or UNIQUE constraint the row in the slot (not yet written) would break.
+    fn firstConflict(
+        borrow this,
+        frame: borrow mut Frame,
+        db: borrow mut Session,
+    ) -> Result<ConflictFound?, SqliteError> {
+        let rowId = frame.slots[this.slot].rowId;
+        if (seekTableRow(mut db.pager, this.read.root, rowId)?.isSome()) {
+            return Ok(ConflictFound { index: null, rowId: rowId });
+        }
+        for (i in 0..this.indexes.length) {
+            let index = borrow this.indexes[i];
+            if (!index.unique) {
+                continue;
+            }
+            if (index.stale.get()) {
+                let saved = copySlot(borrow frame.slots[this.slot])?;
+                this.rebuildIndex(index, frame, db)?;
+                frame.slots[this.slot] = saved;
+                index.stale.set(false);
+            }
+            let Some(entry) = this.entryFor(index, frame, db)? else {
+                continue;
+            };
+            let others = this.conflictsIn(index, borrow entry, rowId, db)?;
+            if (others.length != 0) {
+                return Ok(ConflictFound { index: i, rowId: others[0] });
+            }
+        }
+        return Ok(null);
+    }
+
     /// OR REPLACE: deletes the row `victim` that the new row (in the slot) conflicts with.
     fn replaceRow(
         borrow this,
@@ -746,9 +778,6 @@ fn executeInsert(
     params: Slice<SqliteValue>,
     db: borrow mut Session,
 ) -> Result<QueryResult, SqliteError> {
-    if (stmt.upserts.length != 0) {
-        return Err(unsupported("upserts (ON CONFLICT … DO) are not supported yet"));
-    }
     var compiler = Compiler.create();
     let writer = TableWriter.create(mut compiler, stmt.table.name.view(), db)?;
     let table = borrow writer.table;
@@ -784,6 +813,9 @@ fn executeInsert(
         }
     }
     let returning = compileReturning(mut compiler, borrow stmt.returning, borrow writer, db)?;
+    let excludedSlot = compiler.slotsInUse;
+    compiler.slotsInUse += 1;
+    let upserts = compileUpserts(mut compiler, stmt, borrow writer, excludedSlot, db)?;
     if (borrow stmt.with is Some(with)) {
         let _ = compileWith(mut compiler, with, db)?;
     }
@@ -860,6 +892,40 @@ fn executeInsert(
         writer.computeGeneratedColumns(mut frame, db)?;
         if (!writer.checkRow(action, mut frame, db)?) {
             continue;
+        }
+        if (upserts.length != 0) {
+            if (writer.firstConflict(mut frame, db)? is Some(conflict)) {
+                var chosen: usize? = null;
+                for (u in 0..upserts.length) {
+                    if (chosen.isNull() && (upserts[u].anyConflict || upserts[u].index == conflict.index)) {
+                        chosen = u;
+                    }
+                }
+                if (chosen is Some(u)) {
+                    let plan = borrow upserts[u];
+                    if (plan.doNothing) {
+                        continue;
+                    }
+                    // DO UPDATE: the proposed row is "excluded"; the existing one is updated.
+                    frame.slots[excludedSlot] = copySlot(borrow frame.slots[writer.slot])?;
+                    if (!writer.loadRow(conflict.rowId, mut frame, db)?) {
+                        continue;
+                    }
+                    if (borrow plan.filter is Some(f)) {
+                        let ok = evaluate(f, mut frame, db)?;
+                        if (!isTrue(borrow ok)) {
+                            continue;
+                        }
+                    }
+                    if (updateLoadedRow(borrow writer, borrow plan.set, ConflictAction.Abort, mut frame, db)?) {
+                        count += 1;
+                        if (returning.length != 0) {
+                            output.push(returningRow(borrow returning, mut frame, db)?)?;
+                        }
+                    }
+                    continue;
+                }
+            }
         }
         if (!writer.resolveConflicts(action, null, mut frame, db)?) {
             continue;
@@ -996,6 +1062,115 @@ fn executeDelete(
     return Ok(QueryResult { columns: returningNames(borrow stmt.returning, borrow writer.table)?, rows: output });
 }
 
+/// The columns an UPDATE (or an upsert's DO UPDATE) sets, and their new values.
+struct Assignments {
+    /// Column positions; the table's column count stands for the rowid itself.
+    targets: Vector<usize>;
+    values: Vector<XExpr>;
+}
+
+/// Compiles SET column = value, …, each value in the scope the compiler has.
+fn compileAssignments(
+    compiler: borrow mut Compiler,
+    list: borrow Vector<Assignment>,
+    table: borrow TableSchema,
+    db: borrow mut Session,
+) -> Result<Assignments, SqliteError> {
+    var out = Assignments { targets: Vector<usize>.create(), values: Vector<XExpr>.create() };
+    for (a in 0..list.length) {
+        let name = list[a].column.view();
+        var at = table.indexOf(name);
+        if (at.isNull() && isRowidName(name)) {
+            at = table.rowidAlias ?? table.columns.length;
+        }
+        let found = at ?? {
+            return Err(namedError("no such column: ", name));
+        };
+        if (found < table.columns.length && table.columns[found].generated.isSome()) {
+            var message = String.from("cannot UPDATE generated column \"")?;
+            message.append(name)?;
+            message.append("\"")?;
+            return Err(SqliteError.Sql(message));
+        }
+        out.targets.push(found)?;
+        out.values.push(compiler.compile(borrow list[a].value, db)?)?;
+    }
+    return Ok(out);
+}
+
+/// Updates the row loaded in the writer's slot: the new values (all computed from the old row), constraints,
+/// conflicts, index entries. False when OR IGNORE skipped it.
+fn updateLoadedRow(
+    writer: borrow TableWriter,
+    set: borrow Assignments,
+    action: ConflictAction,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<bool, SqliteError> {
+    let table = borrow writer.table;
+    let oldRowid = frame.slots[writer.slot].rowId;
+    var newValues = Vector<SqliteValue>.withCapacity(set.values.length)?;
+    for (a in 0..set.values.length) {
+        newValues.push(evaluate(borrow set.values[a], frame, db)?)?;
+    }
+    let oldSlot = copySlot(borrow frame.slots[writer.slot])?;
+    var newRowid = oldRowid;
+    for (a in 0..set.targets.length) {
+        let at = set.targets[a];
+        let v = replace(mut newValues[a], SqliteValue.Null);
+        if (at == table.columns.length || table.rowidAlias == Some(at)) {
+            match (applyColumnAffinity(v, Affinity.Integer)?) {
+                SqliteValue.Integer(n) => { newRowid = n; }
+                _ => { return Err(sqlError("datatype mismatch")); }
+            }
+            if (at < table.columns.length) {
+                frame.slots[writer.slot].values[at] = SqliteValue.Integer(newRowid);
+            }
+        } else {
+            frame.slots[writer.slot].values[at] = applyColumnAffinity(v, table.columns[at].affinity)?;
+        }
+    }
+    frame.slots[writer.slot].rowId = newRowid;
+    writer.computeGeneratedColumns(frame, db)?;
+    if (!writer.checkRow(action, frame, db)?) {
+        frame.slots[writer.slot] = oldSlot;
+        return Ok(false);
+    }
+    if (!writer.resolveConflicts(action, oldRowid, frame, db)?) {
+        frame.slots[writer.slot] = oldSlot;
+        return Ok(false);
+    }
+    // Out with the old row's entries (and the row, when its rowid changes), then in with the new.
+    let newSlot = replace(mut frame.slots[writer.slot], oldSlot);
+    if (newRowid != oldRowid) {
+        writer.deleteRow(oldRowid, frame, db)?;
+    } else {
+        for (x in 0..writer.indexes.length) {
+            let index = borrow writer.indexes[x];
+            var ops = Vector<IndexOp>.create();
+            if (writer.entryFor(index, frame, db)? is Some(entry)) {
+                ops.push(IndexOp { entry: entry, remove: true })?;
+            }
+            writer.applyIndexOps(index, ops, frame, db)?;
+        }
+    }
+    frame.slots[writer.slot] = newSlot;
+    writer.writeRow(frame, db)?;
+    return Ok(true);
+}
+
+fn returningRow(
+    returning: borrow Vector<XExpr>,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<SqliteValue>, SqliteError> {
+    var out = Vector<SqliteValue>.withCapacity(returning.length)?;
+    for (i in 0..returning.length) {
+        out.push(evaluate(borrow returning[i], frame, db)?)?;
+    }
+    return Ok(out);
+}
+
 /// UPDATE.
 fn executeUpdate(
     stmt: borrow UpdateStmt,
@@ -1010,33 +1185,15 @@ fn executeUpdate(
     if (borrow stmt.with is Some(with)) {
         let _ = compileWith(mut compiler, with, db)?;
     }
-    let table = borrow writer.table;
-    var targets = Vector<usize>.create();
-    var setsRowid = false;
-    var values = Vector<XExpr>.create();
-    for (a in 0..stmt.assignments.length) {
-        let name = stmt.assignments[a].column.view();
-        var at = table.indexOf(name);
-        if (at.isNull() && isRowidName(name)) {
-            at = table.rowidAlias ?? table.columns.length;
-        }
-        let found = at ?? {
-            return Err(namedError("no such column: ", name));
-        };
-        if (found < table.columns.length && table.columns[found].generated.isSome()) {
-            var message = String.from("cannot UPDATE generated column \"")?;
-            message.append(name)?;
-            message.append("\"")?;
-            return Err(SqliteError.Sql(message));
-        }
-        setsRowid = setsRowid || found == table.columns.length || table.rowidAlias == Some(found);
-        targets.push(found)?;
-        values.push(compileInTable(mut compiler, borrow stmt.assignments[a].value, table, writer.slot, db)?)?;
-    }
+    let saved = replace(mut compiler.scopes, Vector<Scope>.create());
+    compiler.scopes.push(tableScope(borrow writer.table, writer.slot)?)?;
+    let set = compileAssignments(mut compiler, borrow stmt.assignments, borrow writer.table, db);
     var filter: XExpr? = null;
     if (borrow stmt.filter is Some(f)) {
-        filter = compileInTable(mut compiler, f, table, writer.slot, db)?;
+        filter = compiler.compile(f, db)?;
     }
+    compiler.scopes = saved;
+    let assignments = set?;
     let returning = compileReturning(mut compiler, borrow stmt.returning, borrow writer, db)?;
     var frame = newFrame(mut compiler, params)?;
     let rowids = matchingRows(borrow writer, borrow filter, mut frame, db)?;
@@ -1044,68 +1201,135 @@ fn executeUpdate(
     var output = Vector<Vector<SqliteValue>>.create();
     var count: i64 = 0;
     for (i in 0..rowids.length) {
-        let oldRowid = rowids[i];
-        if (!writer.loadRow(oldRowid, mut frame, db)?) {
+        if (!writer.loadRow(rowids[i], mut frame, db)?) {
             continue;
         }
-        // Every new value is computed from the old row.
-        var newValues = Vector<SqliteValue>.withCapacity(values.length)?;
-        for (a in 0..values.length) {
-            newValues.push(evaluate(borrow values[a], mut frame, db)?)?;
-        }
-        let oldSlot = copySlot(borrow frame.slots[writer.slot])?;
-        var newRowid = oldRowid;
-        for (a in 0..targets.length) {
-            let at = targets[a];
-            let v = replace(mut newValues[a], SqliteValue.Null);
-            if (at == table.columns.length || table.rowidAlias == Some(at)) {
-                match (applyColumnAffinity(v, Affinity.Integer)?) {
-                    SqliteValue.Integer(n) => { newRowid = n; }
-                    _ => { return Err(sqlError("datatype mismatch")); }
-                }
-                if (at < table.columns.length) {
-                    frame.slots[writer.slot].values[at] = SqliteValue.Integer(newRowid);
-                }
-            } else {
-                frame.slots[writer.slot].values[at] = applyColumnAffinity(v, table.columns[at].affinity)?;
-            }
-        }
-        frame.slots[writer.slot].rowId = newRowid;
-        writer.computeGeneratedColumns(mut frame, db)?;
-        if (!writer.checkRow(action, mut frame, db)?) {
+        if (!updateLoadedRow(borrow writer, borrow assignments, action, mut frame, db)?) {
             continue;
         }
-        if (!writer.resolveConflicts(action, oldRowid, mut frame, db)?) {
-            continue;
-        }
-        // Out with the old row's entries (and the row, when its rowid changes), then in with the new.
-        let newSlot = replace(mut frame.slots[writer.slot], oldSlot);
-        if (newRowid != oldRowid) {
-            writer.deleteRow(oldRowid, mut frame, db)?;
-        } else {
-            for (x in 0..writer.indexes.length) {
-                let index = borrow writer.indexes[x];
-                var ops = Vector<IndexOp>.create();
-                if (writer.entryFor(index, mut frame, db)? is Some(entry)) {
-                    ops.push(IndexOp { entry: entry, remove: true })?;
-                }
-                writer.applyIndexOps(index, ops, mut frame, db)?;
-            }
-        }
-        frame.slots[writer.slot] = newSlot;
-        writer.writeRow(mut frame, db)?;
-        let _ = setsRowid;
         count += 1;
         if (returning.length != 0) {
-            var out = Vector<SqliteValue>.withCapacity(returning.length)?;
-            for (k in 0..returning.length) {
-                out.push(evaluate(borrow returning[k], mut frame, db)?)?;
-            }
-            output.push(out)?;
+            output.push(returningRow(borrow returning, mut frame, db)?)?;
         }
     }
     writer.finish(mut frame, db)?;
     db.changes = count;
     db.totalChanges += count;
     return Ok(QueryResult { columns: returningNames(borrow stmt.returning, borrow writer.table)?, rows: output });
+}
+
+/// An upsert clause compiled: the constraint it answers (a unique index, or the rowid; any for none), and what
+/// it does.
+struct UpsertPlan {
+    /// The index it targets, by position in the writer's indexes; `null` for the rowid; `anyConflict` for a bare
+    /// ON CONFLICT.
+    index: usize?;
+    anyConflict: bool;
+    doNothing: bool;
+    set: Assignments;
+    filter: XExpr?;
+}
+
+/// Compiles the ON CONFLICT clauses of an INSERT. `excludedSlot` holds the proposed row.
+fn compileUpserts(
+    compiler: borrow mut Compiler,
+    stmt: borrow InsertStmt,
+    writer: borrow TableWriter,
+    excludedSlot: usize,
+    db: borrow mut Session,
+) -> Result<Vector<UpsertPlan>, SqliteError> {
+    var plans = Vector<UpsertPlan>.create();
+    let table = borrow writer.table;
+    for (u in 0..stmt.upserts.length) {
+        let clause = borrow stmt.upserts[u];
+        var index: usize? = null;
+        var any = clause.target.length == 0;
+        if (any && u + 1 != stmt.upserts.length) {
+            return Err(sqlError("ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"));
+        }
+        if (!any) {
+            // The target must name exactly the columns of the rowid's alias or of a unique index.
+            var found = false;
+            if (clause.target.length == 1 && table.rowidAlias.isSome() &&
+                table.columns[table.rowidAlias!].name.view().equalsIgnoreAsciiCase(
+                    clause.target[0].view(),
+                )) {
+                found = true;
+            }
+            for (x in 0..writer.indexes.length) {
+                if (found) {
+                    break;
+                }
+                let candidate = borrow writer.indexes[x];
+                if (!candidate.unique ||
+                    candidate.columns.length != clause.target.length || candidate.filter.isSome()) {
+                    continue;
+                }
+                var same = true;
+                for (k in 0..clause.target.length) {
+                    var named = false;
+                    for (c in 0..candidate.columns.length) {
+                        if (candidate.columns[c].column is Some(at) &&
+                            table.columns[at].name.view().equalsIgnoreAsciiCase(
+                                clause.target[k].view(),
+                            )) {
+                            named = true;
+                        }
+                    }
+                    same = same && named;
+                }
+                if (same) {
+                    index = x;
+                    found = true;
+                }
+            }
+            if (!found) {
+                return Err(sqlError("ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"));
+            }
+        }
+        // DO UPDATE sees the existing row by the table's name and the proposed one as "excluded".
+        let saved = replace(mut compiler.scopes, Vector<Scope>.create());
+        var scope = tableScope(table, writer.slot)?;
+        // Unqualified names are the table's: "excluded" is named only when written.
+        var hidden = Vector<String>.create();
+        for (c in 0..table.columns.length) {
+            hidden.push(table.columns[c].name.clone()?)?;
+        }
+        scope.sources.push(
+            ScopeSource {
+                name: String.from("excluded")?,
+                columns: tableScopeColumns(table)?,
+                slot: excludedSlot,
+                hasRowid: true,
+                rowidAlias: table.rowidAlias,
+                merged: hidden,
+            },
+        )?;
+        compiler.scopes.push(scope)?;
+        let set = compileAssignments(compiler, borrow clause.assignments, table, db);
+        var filter: Result<XExpr?, SqliteError> = Ok(null);
+        if (borrow clause.filter is Some(f)) {
+            filter = match (compiler.compile(f, db)) {
+                Ok(x) => Ok(x),
+                Err(e) => Err(e),
+            };
+        }
+        compiler.scopes = saved;
+        plans.push(
+            UpsertPlan {
+                index: index,
+                anyConflict: any,
+                doNothing: clause.assignments.length == 0,
+                set: set?,
+                filter: filter?,
+            },
+        )?;
+    }
+    return Ok(plans);
+}
+
+/// A constraint a proposed row breaks: the index (`null` for the rowid) and the row already there.
+struct ConflictFound {
+    index: usize?;
+    rowId: i64;
 }
