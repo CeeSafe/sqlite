@@ -35,6 +35,11 @@ struct Pager {
             return Err(notADatabase("file is too small to be a SQLite database"));
         }
         let header = DatabaseHeader.parse(headerBytes[..])?;
+        // A journal with something in it is a commit that was interrupted: the file holds part of it. Reading
+        // needs no write access, so the caller undoes it first (`Journal.recover`), as a connection does.
+        if (Journal.exists(path)?) {
+            return Err(unsupported("the database has a rollback journal: an interrupted commit must be undone first"));
+        }
         // Until the WAL reader is ported, a database with frames waiting in its write-ahead log is refused:
         // reading the main file alone would silently return rows as they were before those commits.
         var walPath = String.from(path)?;

@@ -18,7 +18,8 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | SQL writer | `Sql/SqlWriter` | `sqlwriter.cee` | expressions only, by design (see below) |
 | Schema catalog, affinity | `Engine/Schema`, `Exec/Affinity` | `schema.cee` | done |
 | Database writer, b-tree builder | `Storage/DatabaseWriter`, `BTreeBuilder`, `PageStore` | `writer.cee`, `builder.cee` | done: files pass `PRAGMA integrity_check` in `sqlite3` |
-| B-tree mutators, writable pager, rollback journal | `Storage/BTreeMutator`, `IndexMutator`, `IndexRebuilder`, `WritablePager`, `JournaledFile` | | next |
+| Rollback journal, commit of a page image | `Storage/JournaledFile` | `journal.cee` | done: either engine undoes the other's interrupted commit |
+| Writable pager, b-tree mutators | `Storage/WritablePager`, `BTreeMutator`, `IndexMutator`, `IndexRebuilder` | | next |
 | WAL | `Storage/Wal*`, `Shm*` | | until then a database with a non-empty `-wal` file is refused |
 | Executor, functions, JSON | `Engine/Exec` | | |
 | Connection, command, pool | `SqliteConnection`, `SqliteCommand`, `SqliteConnectionPool` | | |
@@ -104,12 +105,31 @@ The port fixes what was wrong in the source instead of copying it. Each item has
 - **Header fields.** The change counter, schema cookie, user version and application id are passed in, so a
   rewrite can carry them over; the C# reset them on every rewrite.
 
+- **The journal's format.** The C# writes a journal format of its own under the name SQLite uses for its
+  rollback journal. After a crash in the middle of a commit, the stock library finds a journal it cannot read,
+  sets it aside and opens a database with half a commit in it. The journal here is SQLite's, checksums included,
+  so `sqlite3` undoes this engine's interrupted commit and this engine undoes `sqlite3`'s
+  (`sqliteUndoesThisEnginesInterruptedCommit`, `thisEngineUndoesSqlitesInterruptedCommit`).
+- **A journal cut short.** The C# trusts the entry count in its journal's header, so a journal cut off while
+  being written, before the database was touched, makes the database impossible to open. Playback here stops at
+  the first record that is short or fails its checksum (`aJournalCutShortIsHarmless`).
+- **Durability of the journal itself.** The directory is synced when the journal is made and when it is removed;
+  the journal is written a record at a time rather than held in memory.
+- **Reading beside a hot journal.** A database with a journal is not read as it is: the interrupted commit is
+  undone first.
+
 ## Known gaps (inherited from the C# engine, refused by name rather than misparsed)
 
 `CREATE TABLE … AS SELECT`, `CREATE VIRTUAL TABLE`, `ALTER TABLE … DROP COLUMN`, `EXPLAIN`, parenthesized joins
 in FROM, aliases on the target of INSERT, UPDATE and DELETE, and `ORDER BY` inside an aggregate's arguments.
 `ON CONFLICT` clauses on column and table constraints are read and not applied, and collations other than
 BINARY, NOCASE and RTRIM are refused.
+
+## Limits
+
+- **One process at a time.** The engine does not take SQLite's file locks, which CeeSafe's library does not
+  offer, so it must not have a database open while another process writes it. (The C# engine has the same
+  limit.)
 
 ## Tests
 

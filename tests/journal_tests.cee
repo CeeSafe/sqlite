@@ -1,0 +1,167 @@
+// The rollback journal: interrupted commits are undone by this engine and by the sqlite3 shell alike.
+
+const JOURNAL_FIXTURE_SQL: StringView = """
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER, label TEXT);
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 5000)
+    INSERT INTO t SELECT i, i, 'row number ' || i FROM c;
+    CREATE INDEX t_n ON t(n);
+    """;
+
+fn wholeFile(path: StringView) -> Vector<u8> {
+    var file = File.open(path)!;
+    var bytes = Vector<u8>.create();
+    bytes.resize(truncate<usize>(file.length()!), 0)!;
+    Check.isTrue(readFully(mut file, bytes.viewMut(), 0)!, "the file is read whole")!;
+    return bytes;
+}
+
+/// Leaves the database as a crash in the middle of a commit would: every page journalled, the journal durable,
+/// and then some pages overwritten and the file grown, with the journal still there.
+fn interruptACommit(path: StringView, original: Slice<u8>) {
+    let pageSize: usize = 4096;
+    let pages = original.length / pageSize;
+    var journal = JournalWriter.begin(path, pageSize, truncate<u32>(pages))!;
+    for (i in 0..pages) {
+        journal.add(truncate<u32>(i + 1), original[i * pageSize..(i + 1) * pageSize])!;
+    }
+    journal.finish()!;
+    var file = File.openReadWrite(path)!;
+    var junk = Vector<u8>.create();
+    junk.resize(pageSize, 0x5A)!;
+    var page: usize = 1;
+    while (page < pages) {
+        file.writeAt(junk.view(), (page * pageSize) as u64)!;
+        page += 3;
+    }
+    file.setLength(((pages + 7) * pageSize) as u64)!;
+}
+
+fn sumOfN(path: StringView) -> Result<i64, TestFailure> {
+    var reader = DatabaseReader.open(path)!;
+    var cursor = reader.scanTable("t")!;
+    var sum: i64 = 0;
+    while (reader.nextRow(mut cursor)! is Some(row)) {
+        sum += integerAt(row, 1)?;
+    }
+    return Ok(sum);
+}
+
+@test
+fn thisEngineUndoesAnInterruptedCommit() -> Result<void, TestFailure> {
+    let path = "out/journal-own.db";
+    makeDatabase(path, JOURNAL_FIXTURE_SQL)?;
+    let original = wholeFile(path);
+    interruptACommit(path, original.view());
+    Check.isTrue(DatabaseReader.open(path) is Err(SqliteError.Unsupported(_)), "a database with a hot journal is not read as it is")?;
+    Check.isTrue(Journal.recover(path)!, "the journal is played back")?;
+    Check.isTrue(!Journal.exists(path)!, "and removed")?;
+    Check.equalBytes(original.view(), wholeFile(path).view())?;
+    Check.equalI64(5000 * 5001 / 2, sumOfN(path)?)?;
+    Check.isTrue(!Journal.recover(path)!, "there is nothing to undo twice")?;
+    return Ok();
+}
+
+@test
+fn sqliteUndoesThisEnginesInterruptedCommit() -> Result<void, TestFailure> {
+    // The C# engine's journal was a format SQLite could not read.
+    let path = "out/journal-for-sqlite.db";
+    makeDatabase(path, JOURNAL_FIXTURE_SQL)?;
+    let original = wholeFile(path);
+    interruptACommit(path, original.view());
+    Check.equalText("ok\n5000|12502500\n", askSqlite(path, "PRAGMA integrity_check; SELECT count(*), sum(n) FROM t")?.view())?;
+    Check.isTrue(!Journal.exists(path)!, "sqlite3 removed the journal it played back")?;
+    Check.equalBytes(original.view(), wholeFile(path).view())?;
+    return Ok();
+}
+
+@test
+fn thisEngineUndoesSqlitesInterruptedCommit() -> Result<void, TestFailure> {
+    let path = "out/journal-from-sqlite.db";
+    makeDatabase(path, JOURNAL_FIXTURE_SQL)?;
+    let original = wholeFile(path);
+    // A cache of one page that may spill makes sqlite3 write changed pages to the file before the commit; then it is killed.
+    var arguments = Vector<StringView>.create();
+    arguments.push(path)!;
+    arguments.push("PRAGMA cache_size = 1; PRAGMA cache_spill = 1; BEGIN; UPDATE t SET n = n + 1000000, label = label || ' changed';")!;
+    arguments.push(".shell kill -9 $PPID")!;
+    let _ = Process.run("sqlite3", borrow arguments);
+    Check.isTrue(Journal.exists(path)!, "the killed shell left its journal")?;
+    Check.isTrue(wholeFile(path).view() != original.view(), "and a file with part of its transaction in it")?;
+    Check.isTrue(Journal.recover(path)!, "the journal is played back")?;
+    Check.equalBytes(original.view(), wholeFile(path).view())?;
+    Check.equalI64(5000 * 5001 / 2, sumOfN(path)?)?;
+    return Ok();
+}
+
+@test
+fn aJournalCutShortIsHarmless() -> Result<void, TestFailure> {
+    // The journal is made durable before the database is touched, so one that was cut off while being written
+    // stands beside an unchanged database. The C# engine could not open such a database again.
+    let path = "out/journal-truncated.db";
+    makeDatabase(path, JOURNAL_FIXTURE_SQL)?;
+    let original = wholeFile(path);
+    let pageSize: usize = 4096;
+    var journal = JournalWriter.begin(path, pageSize, truncate<u32>(original.length / pageSize))!;
+    for (i in 0..10) {
+        journal.add(truncate<u32>(i + 1), original.view()[i * pageSize..(i + 1) * pageSize])!;
+    }
+    journal.finish()!;
+    {
+        var file = File.openReadWrite("out/journal-truncated.db-journal")!;
+        let length = file.length()!;
+        file.setLength(length - 3000)!;
+    }
+    let _ = Journal.recover(path)!;
+    Check.isTrue(!Journal.exists(path)!, "the journal is gone")?;
+    Check.equalBytes(original.view(), wholeFile(path).view())?;
+
+    // A file that is not a journal at all is removed, and the database left alone.
+    var notAJournal = File.create("out/journal-truncated.db-journal")!;
+    notAJournal.write("this is not a rollback journal, whatever its name says".bytes())!;
+    Check.isTrue(!Journal.recover(path)!, "nothing is played back")?;
+    Check.equalBytes(original.view(), wholeFile(path).view())?;
+    return Ok();
+}
+
+fn writerWithRows(count: i64, pageSize: usize) -> DatabaseWriter {
+    var options = WriterOptions.defaults();
+    options.pageSize = pageSize;
+    var writer = DatabaseWriter.create(options)!;
+    let t = writer.addTable("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER, label TEXT)")!;
+    for (i in 1i64..count + 1) {
+        writer.addRow(t, i, rowOf3(SqliteValue.Null, SqliteValue.Integer(i), SqliteValue.Text(numbered("row number ", i))))!;
+    }
+    writer.addIndex("CREATE INDEX t_n ON t(n)", null)!;
+    return writer;
+}
+
+@test
+fn commitsAnImageByItsChangedPages() -> Result<void, TestFailure> {
+    let path = "out/journal-image.db";
+    freshPath(path);
+    var first = writerWithRows(5000, 4096);
+    let firstPages = first.buildPages()!;
+    Check.equalU64(firstPages.pages.length as u64, commitImage(path, firstPages)!)?;
+    expectIntact(path)?;
+    Check.equalU64(0, commitImage(path, firstPages)!)?;
+
+    // A few more rows change the last pages of each b-tree and little else.
+    var second = writerWithRows(5010, 4096);
+    let secondPages = second.buildPages()!;
+    let written = commitImage(path, secondPages)!;
+    Check.isTrue(written > 0 && written < 20, "only the pages that differ are written")?;
+    Check.isTrue(!Journal.exists(path)!, "the journal is removed after the commit")?;
+    expectIntact(path)?;
+    Check.equalText("5010\n", askSqlite(path, "SELECT count(*) FROM t")?.view())?;
+
+    // A shorter image, and then one with another page size.
+    var third = writerWithRows(100, 4096);
+    let _ = commitImage(path, third.buildPages()!)!;
+    expectIntact(path)?;
+    Check.equalText("100\n", askSqlite(path, "SELECT count(*) FROM t")?.view())?;
+    var fourth = writerWithRows(3000, 1024);
+    let _ = commitImage(path, fourth.buildPages()!)!;
+    expectIntact(path)?;
+    Check.equalText("1024|3000\n", askSqlite(path, "SELECT (SELECT * FROM pragma_page_size), count(*) FROM t")?.view())?;
+    return Ok();
+}

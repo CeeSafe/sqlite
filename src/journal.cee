@@ -1,0 +1,342 @@
+// The rollback journal: before a commit changes a page of the database, the page as it was goes into
+// `<database>-journal`. A commit that is interrupted is undone from it the next time the database is opened.
+// https://www.sqlite.org/fileformat2.html#the_rollback_journal
+//
+// Differences from the C# engine, which this replaces:
+// - the journal is SQLite's own format. The C# wrote a format of its own ("CSQLJRN1") under the name SQLite
+//   uses, so after a crash the stock library found a journal it could not read, set it aside, and opened a
+//   database with half a commit in it. Now either engine undoes the other's interrupted commit;
+// - every record carries SQLite's checksum, and playback stops at the first record that is short or fails it.
+//   The C# trusted the entry count in its header, so a journal cut off while being written (before the database
+//   had been touched) made the database impossible to open;
+// - the journal is written a record at a time. The C# held every page's old image in memory, and read a whole
+//   journal into memory to play it back;
+// - the directory is synced when the journal is made and when it is removed, so the journal's existence is as
+//   durable as its contents;
+// - a hot journal that names a super-journal which no longer exists belongs to a commit that finished, and is
+//   removed without being played back, as SQLite does.
+
+const JOURNAL_SUFFIX: StringView = "-journal";
+
+const JOURNAL_MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+
+/// The journal's header fills one sector, so a torn write cannot damage it and a record together.
+const JOURNAL_SECTOR_SIZE: usize = 512;
+
+/// The byte at which SQLite's locks lie; the page that holds it is never used.
+const PENDING_BYTE: u64 = 0x40000000;
+
+fn withSuffix(path: StringView, suffix: StringView) -> Result<String, AllocError> {
+    var name = String.from(path)?;
+    name.append(suffix)?;
+    return Ok(name);
+}
+
+/// The directory that holds `path`.
+fn directoryOf(path: StringView) -> StringView => match (path.lastIndexOf("/")) {
+    Some(0) => "/",
+    Some(slash) => path[0..slash],
+    null => ".",
+};
+
+/// The length of the file at `path`, or `null` when there is none.
+fn fileLength(path: StringView) -> Result<u64?, SqliteError> {
+    match (File.open(path)) {
+        Ok(file) => { return Ok(file.length()?); }
+        Err(IoError.NotFound) => { return Ok(null); }
+        Err(e) => { return Err(SqliteError.Io(e)); }
+    }
+}
+
+/// SQLite's checksum of a journalled page: the nonce plus every 200th byte, counted down from 200 before the end.
+fn journalChecksum(nonce: u32, image: Slice<u8>) -> u32 {
+    var sum = nonce;
+    var i = image.length;
+    while (i > 200) {
+        i -= 200;
+        sum = sum.wrappingAdd(image[i] as u32);
+    }
+    return sum;
+}
+
+fn isPowerOfTwoBetween(value: usize, low: usize, high: usize) -> bool =>
+    value >= low && value <= high && (value & (value - 1)) == 0;
+
+/// Writes a journal, a record at a time.
+struct JournalWriter {
+    private file: File;
+    private directory: String;
+    private nonce: u32;
+    private pageSize: usize;
+    private records: u32;
+    private record: Vector<u8>;
+
+    /// Starts the journal of the database at `path`, which has `initialPages` pages of `pageSize` bytes now.
+    fn begin(path: StringView, pageSize: usize, initialPages: u32) -> Result<JournalWriter, SqliteError> {
+        let name = withSuffix(path, JOURNAL_SUFFIX)?;
+        var file = File.create(name.view())?;
+        let nonce = truncate<u32>(Random.below(0x1_0000_0000)?);
+        var header = Vector<u8>.create();
+        header.resize(JOURNAL_SECTOR_SIZE, 0)?;
+        header.viewMut()[0..8].copyFrom(JOURNAL_MAGIC[..]);
+        // The record count (offset 8) is filled in by `finish`: until then the journal holds nothing to undo.
+        header.writeBE(12, nonce);
+        header.writeBE(16, initialPages);
+        header.writeBE(20, truncate<u32>(JOURNAL_SECTOR_SIZE));
+        header.writeBE(24, truncate<u32>(pageSize));
+        file.write(header.view())?;
+        return Ok(JournalWriter {
+            file: file,
+            directory: String.from(directoryOf(path))?,
+            nonce: nonce,
+            pageSize: pageSize,
+            records: 0,
+            record: Vector<u8>.create(),
+        });
+    }
+
+    /// Records page `pageNumber` as it is before the commit.
+    fn add(borrow mut this, pageNumber: u32, image: Slice<u8>) -> Result<void, SqliteError> {
+        assert(image.length == this.pageSize, "a journalled page is one page long");
+        this.record.clear();
+        this.record.pushBE(pageNumber)?;
+        this.record.extend(image)?;
+        this.record.pushBE(journalChecksum(this.nonce, image))?;
+        this.file.write(this.record.view())?;
+        this.records += 1;
+        return Ok();
+    }
+
+    /// Makes the journal durable. Only after this may the database be changed.
+    fn finish(this) -> Result<void, SqliteError> {
+        var me = this;
+        var count = [0u8; 4];
+        count[..].writeBE(0, me.records);
+        me.file.writeAt(count[..], 8)?;
+        me.file.syncAll()?;
+        Directory.sync(me.directory.view())?;
+        return Ok();
+    }
+}
+
+struct Journal {
+    /// Whether the database at `path` has a journal with something in it: a commit that may need undoing.
+    fn exists(path: StringView) -> Result<bool, SqliteError> {
+        let name = withSuffix(path, JOURNAL_SUFFIX)?;
+        return Ok((fileLength(name.view())? ?? 0) > 0);
+    }
+
+    /// Removes the journal: the commit it guarded is complete.
+    fn remove(path: StringView) -> Result<void, SqliteError> {
+        let name = withSuffix(path, JOURNAL_SUFFIX)?;
+        match (File.remove(name.view())) {
+            Ok() => {}
+            Err(IoError.NotFound) => { return Ok(); }
+            Err(e) => { return Err(SqliteError.Io(e)); }
+        }
+        Directory.sync(directoryOf(path))?;
+        return Ok();
+    }
+
+    /// Undoes an interrupted commit of the database at `path`, if its journal shows one, and removes the
+    /// journal. True when pages were put back.
+    fn recover(path: StringView) -> Result<bool, SqliteError> {
+        let name = withSuffix(path, JOURNAL_SUFFIX)?;
+        var journal = match (File.open(name.view())) {
+            Ok(file) => file,
+            Err(IoError.NotFound) => { return Ok(false); }
+            Err(e) => { return Err(SqliteError.Io(e)); }
+        };
+        let size = journal.length()?;
+        var rolledBack = false;
+        if (size >= 28 && !Journal.superJournalIsGone(mut journal, size)?) {
+            match (File.openReadWrite(path)) {
+                Ok(database) => {
+                    var db = database;
+                    rolledBack = Journal.playBack(mut journal, size, mut db)?;
+                }
+                // A journal without its database has nothing to undo.
+                Err(IoError.NotFound) => {}
+                Err(e) => { return Err(SqliteError.Io(e)); }
+            }
+        }
+        Journal.remove(path)?;
+        return Ok(rolledBack);
+    }
+
+    /// Whether the journal ends with the name of a super-journal that is no longer there: the sign of a commit
+    /// across several databases that completed.
+    private fn superJournalIsGone(journal: borrow mut File, size: u64) -> Result<bool, SqliteError> {
+        if (size < 16) {
+            return Ok(false);
+        }
+        var tail = [0u8; 16];
+        if (!readFully(journal, mut tail[..], size - 16)? || tail[8..16] != JOURNAL_MAGIC[..]) {
+            return Ok(false);
+        }
+        let length = tail[..].readBE<u32>(0) as u64;
+        if (length == 0 || length > 4096 || length + 16 > size) {
+            return Ok(false);
+        }
+        var name = Vector<u8>.create();
+        name.resize(truncate<usize>(length), 0)?;
+        if (!readFully(journal, name.viewMut(), size - 16 - length)?) {
+            return Ok(false);
+        }
+        var sum: u32 = 0;
+        for (b in name) {
+            sum = sum.wrappingAdd(b as u32);
+        }
+        if (sum != tail[..].readBE<u32>(4)) {
+            return Ok(false);
+        }
+        let Some(text) = StringView.fromUtf8(name.view()) else {
+            return Ok(false);
+        };
+        return Ok(fileLength(text)?.isNull());
+    }
+
+    /// Writes the journal's pages back and cuts the database to its old length. True when the journal had a
+    /// header to go by.
+    private fn playBack(journal: borrow mut File, size: u64, db: borrow mut File) -> Result<bool, SqliteError> {
+        var offset: u64 = 0;
+        var initialPages: u32 = 0;
+        var pageSize: usize = 0;
+        var seen = false;
+        var header = [0u8; 28];
+        var record = Vector<u8>.create();
+        var intact = true;
+        while (intact && offset + 28 <= size) {
+            if (!readFully(journal, mut header[..], offset)? || header[0..8] != JOURNAL_MAGIC[..]) {
+                break;
+            }
+            let nonce = header[..].readBE<u32>(12);
+            let sector = header[..].readBE<u32>(20) as usize;
+            let thisPageSize = header[..].readBE<u32>(24) as usize;
+            if (!isPowerOfTwoBetween(sector, 32, 65536) || !isPowerOfTwoBetween(thisPageSize, 512, 65536)) {
+                break;
+            }
+            if (!seen) {
+                seen = true;
+                initialPages = header[..].readBE<u32>(16);
+                pageSize = thisPageSize;
+            } else if (thisPageSize != pageSize) {
+                break;
+            }
+            let recordSize = (pageSize + 8) as u64;
+            var position = offset + (sector as u64);
+            var count = header[..].readBE<u32>(8) as u64;
+            // A count of all ones means "as many as the file holds".
+            if (count == 0xFFFF_FFFF) {
+                count = if (size > position) (size - position) / recordSize else 0;
+            }
+            record.resize(pageSize + 8, 0)?;
+            let pendingPage = PENDING_BYTE / (pageSize as u64) + 1;
+            var done: u64 = 0;
+            while (done < count) {
+                if (position + recordSize > size || !readFully(journal, record.viewMut(), position)?) {
+                    intact = false;
+                    break;
+                }
+                let pageNumber = record.readBE<u32>(0);
+                let image = record.view()[4..4 + pageSize];
+                if (journalChecksum(nonce, image) != record.readBE<u32>(4 + pageSize)) {
+                    intact = false;
+                    break;
+                }
+                if (pageNumber != 0 && pageNumber <= initialPages && (pageNumber as u64) != pendingPage) {
+                    db.writeAt(image, ((pageNumber - 1) as u64) * (pageSize as u64))?;
+                }
+                position += recordSize;
+                done += 1;
+            }
+            // The next header, if the journal has one, starts on a sector boundary.
+            let sectorSize = sector as u64;
+            offset = (position + sectorSize - 1) / sectorSize * sectorSize;
+        }
+        if (!seen) {
+            return Ok(false);
+        }
+        db.setLength((initialPages as u64) * (pageSize as u64))?;
+        db.syncAll()?;
+        return Ok(true);
+    }
+}
+
+/// Makes the file at `path` hold exactly the pages of `store`, as one commit: an interrupted one is undone from
+/// the journal. Pages that are already what `store` holds are not written. Returns the number of pages written.
+fn commitImage(path: StringView, store: borrow PageStore) -> Result<u64, SqliteError> {
+    let _ = Journal.recover(path)?;
+    let wal = withSuffix(path, "-wal")?;
+    if ((fileLength(wal.view())? ?? 0) > 0) {
+        return Err(unsupported("the database has a write-ahead log that must be checkpointed first"));
+    }
+    let pageSize = store.pageSize;
+    let newCount = store.pages.length as u64;
+    let oldLength = fileLength(path)? ?? 0;
+    if (oldLength == 0) {
+        // Nothing to preserve: write beside the name and move into place, so the database appears whole.
+        let temporary = withSuffix(path, ".tmp")?;
+        {
+            var file = File.create(temporary.view())?;
+            for (i in 0..store.pages.length) {
+                file.write(store.pages[i].view())?;
+            }
+            file.syncAll()?;
+        }
+        File.rename(temporary.view(), path)?;
+        Directory.sync(directoryOf(path))?;
+        return Ok(newCount);
+    }
+    var file = File.openReadWrite(path)?;
+    var headerBytes = [0u8; 100];
+    let oldPageSize: usize = if (readFully(
+        mut file,
+        mut headerBytes[..],
+        0,
+    )?) DatabaseHeader.parse(headerBytes[..])?.pageSize else {
+        return Err(notADatabase("the file to replace is not a SQLite database"));
+    };
+    let oldCount = oldLength / (oldPageSize as u64);
+    if (oldCount > 0xFFFF_FFFE) {
+        return Err(corrupt("database file has more pages than the format allows"));
+    }
+    var journal = JournalWriter.begin(path, oldPageSize, truncate<u32>(oldCount))?;
+    var old = Vector<u8>.create();
+    old.resize(oldPageSize, 0)?;
+    // Which pages to write: all of them when the page size changes, else those that differ.
+    var changed = Vector<bool>.create();
+    changed.resize(store.pages.length, true)?;
+    for (i in 0..oldCount) {
+        if (!readFully(mut file, old.viewMut(), i * (oldPageSize as u64))?) {
+            return Err(corrupt("database file ends inside a page"));
+        }
+        let index = truncate<usize>(i);
+        if (oldPageSize == pageSize && i < newCount && old.view() == store.pages[index].view()) {
+            changed[index] = false;
+            continue;
+        }
+        journal.add(truncate<u32>(i + 1), old.view())?;
+    }
+    var written: u64 = 0;
+    for (i in 0..changed.length) {
+        if (changed[i]) {
+            written += 1;
+        }
+    }
+    if (written == 0 && newCount == oldCount) {
+        // The file already is the image: there is nothing to commit.
+        Journal.remove(path)?;
+        return Ok(0);
+    }
+    journal.finish()?;
+    for (i in 0..store.pages.length) {
+        if (changed[i]) {
+            file.writeAt(store.pages[i].view(), (i as u64) * (pageSize as u64))?;
+        }
+    }
+    file.setLength(newCount * (pageSize as u64))?;
+    file.syncAll()?;
+    Journal.remove(path)?;
+    return Ok(written);
+}
