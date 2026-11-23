@@ -1861,7 +1861,16 @@ fn executeUpdateFrom(
         return Err(sqlError("UPDATE … FROM without a FROM clause"));
     };
     var joins = Vector<Join>.withCapacity(from.joins.length + 1)?;
-    joins.push(Join { kind: JoinKind.Comma, natural: false, item: from.source, constraint: JoinConstraint.None })?;
+    joins.push(
+        Join {
+            kind: JoinKind.Comma,
+            natural: false,
+            item: from.source,
+            constraint: JoinConstraint.None,
+            group: 0,
+            groupOn: null,
+        },
+    )?;
     for (j in 0..from.joins.length) {
         joins.push(cloneJoin(borrow from.joins[j])?)?;
     }

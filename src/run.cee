@@ -13,6 +13,10 @@ struct CoreSink {
     windowRows: Vector<WindowRow>;
     /// For each RIGHT JOIN source: which of its rows (by their place in its scan) matched.
     rightMatched: Vector<Vector<bool>>;
+    /// For each LEFT JOIN group (by its first source): whether a row of the whole group met its ON, and whether
+    /// the group is being made NULL.
+    groupReached: Vector<bool>;
+    groupNulled: Vector<bool>;
 }
 
 struct GroupState {
@@ -250,11 +254,17 @@ fn joinLevel(
     db: borrow mut Session,
     sink: borrow mut CoreSink,
 ) -> Result<void, SqliteError> {
+    if (!groupsEnd(core, level, frame, db, sink)?) {
+        return Ok();
+    }
     if (level == core.sources.length) {
         return acceptRow(core, frame, db, sink);
     }
     let source = borrow core.sources[level];
     var matched = false;
+    if (source.group > 1) {
+        sink.groupReached[level] = false;
+    }
     match (borrow source.kind) {
         SourceKind.Table(table) => {
             if (borrow source.indexSeek is Some(seek)) {
@@ -314,6 +324,33 @@ fn joinLevel(
         }
     }
     return finishLeft(core, level, matched, frame, db, sink);
+}
+
+/// At `level`, the LEFT JOIN groups that end there: a row of a whole group must meet the group's ON, which then
+/// counts the group as matched. False when one refuses the row. A group being made NULL is not checked.
+fn groupsEnd(
+    core: borrow CorePlan,
+    level: usize,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+    sink: borrow mut CoreSink,
+) -> Result<bool, SqliteError> {
+    var g = level;
+    while (g > 0) {
+        g -= 1;
+        let source = borrow core.sources[g];
+        if (source.group <= 1 || g + source.group != level || sink.groupNulled[g]) {
+            continue;
+        }
+        if (borrow source.groupOn is Some(on)) {
+            let ok = evaluate(on, frame, db)?;
+            if (!isTrue(borrow ok)) {
+                return Ok(false);
+            }
+        }
+        sink.groupReached[g] = true;
+    }
+    return Ok(true);
 }
 
 /// The nested loop at `level` through an index: the rows its range of entries names.
@@ -457,6 +494,19 @@ fn finishLeft(
     sink: borrow mut CoreSink,
 ) -> Result<void, SqliteError> {
     let source = borrow core.sources[level];
+    if (source.group > 1) {
+        // A LEFT JOIN group: NULL for all its sources when no row of the whole group met its ON.
+        if (sink.groupReached[level]) {
+            return Ok();
+        }
+        for (s in level..level + source.group) {
+            frame.slots[core.sources[s].slot] = Slot { values: Vector<SqliteValue>.create(), rowId: 0, isNull: true };
+        }
+        sink.groupNulled[level] = true;
+        let result = joinLevel(core, level + source.group, frame, db, sink);
+        sink.groupNulled[level] = false;
+        return result;
+    }
     if (matched || !source.left) {
         return Ok();
     }
@@ -576,9 +626,13 @@ fn runCore(
             else stopAfter,
         windowRows: Vector<WindowRow>.create(),
         rightMatched: Vector<Vector<bool>>.create(),
+        groupReached: Vector<bool>.create(),
+        groupNulled: Vector<bool>.create(),
     };
     for (s in 0..core.sources.length) {
         sink.rightMatched.push(Vector<bool>.create())?;
+        sink.groupReached.push(false)?;
+        sink.groupNulled.push(false)?;
     }
     joinLevel(core, 0, frame, db, mut sink)?;
     unmatchedRightRows(core, frame, db, mut sink)?;

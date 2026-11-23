@@ -706,7 +706,16 @@ struct Parser {
     ) -> Result<void, SqliteError> {
         var inner = group;
         if (inner.joins.length == 0) {
-            clause.joins.push(Join { kind: kind, natural: natural, item: inner.source, constraint: constraint })?;
+            clause.joins.push(
+                Join {
+                    kind: kind,
+                    natural: natural,
+                    item: inner.source,
+                    constraint: constraint,
+                    group: 0,
+                    groupOn: null,
+                },
+            )?;
             return Ok();
         }
         var allInner = kind == JoinKind.Inner || kind == JoinKind.Comma || kind == JoinKind.Cross;
@@ -714,10 +723,54 @@ struct Parser {
             let k = inner.joins[j].kind;
             allInner = allInner && (k == JoinKind.Inner || k == JoinKind.Comma || k == JoinKind.Cross);
         }
-        if (!allInner || natural || constraint is JoinConstraint.Using(_)) {
-            return Err(unsupported("a parenthesized join other than inner joins is not supported"));
+        if (!allInner && kind == JoinKind.Left && !natural && !(constraint is JoinConstraint.Using(_))) {
+            // `LEFT JOIN (b … c) ON cond`: the group's items in line, the first marked with the group's size and ON.
+            for (j in 0..inner.joins.length) {
+                let k = inner.joins[j].kind;
+                if (k == JoinKind.Right || k == JoinKind.Full || inner.joins[j].group != 0) {
+                    return Err(unsupported("a RIGHT or FULL join inside a parenthesized join is not supported"));
+                }
+            }
+            let size = inner.joins.length + 1;
+            var groupOn: Expr? = null;
+            if (constraint is JoinConstraint.On(_)) {
+                let JoinConstraint.On(outer) = constraint else {
+                    return Ok();
+                };
+                groupOn = outer;
+            }
+            clause.joins.push(
+                Join {
+                    kind: JoinKind.Left,
+                    natural: false,
+                    item: inner.source,
+                    constraint: JoinConstraint.None,
+                    group: size,
+                    groupOn: groupOn,
+                },
+            )?;
+            for (j in 0..inner.joins.length) {
+                clause.joins.push(Parser.takeJoin(mut inner.joins, j))?;
+            }
+            return Ok();
         }
-        clause.joins.push(Join { kind: kind, natural: false, item: inner.source, constraint: JoinConstraint.None })?;
+        if (!allInner || natural || constraint is JoinConstraint.Using(_)) {
+            return Err(
+                unsupported(
+                    "a parenthesized join that a RIGHT or FULL join takes, or joined by NATURAL or USING, is not supported",
+                ),
+            );
+        }
+        clause.joins.push(
+            Join {
+                kind: kind,
+                natural: false,
+                item: inner.source,
+                constraint: JoinConstraint.None,
+                group: 0,
+                groupOn: null,
+            },
+        )?;
         let count = inner.joins.length;
         for (j in 0..count) {
             clause.joins.push(
@@ -729,7 +782,7 @@ struct Parser {
                         item: FromItem.TableFunction(
                             TableFunctionSource { name: String.create(), args: Vector<Expr>.create(), alias: null },
                         ),
-                        constraint: JoinConstraint.None,
+                        constraint: JoinConstraint.None, group: 0, groupOn: null,
                     },
                 ),
             )?;
@@ -752,6 +805,21 @@ struct Parser {
         }
         return Ok();
     }
+
+    /// Join `j` of `joins`, moved out (a placeholder takes its place).
+    private fn takeJoin(joins: borrow mut Vector<Join>, j: usize) -> Join => replace(
+        mut joins[j],
+        Join {
+            kind: JoinKind.Comma,
+            natural: false,
+            item: FromItem.TableFunction(
+                TableFunctionSource { name: String.create(), args: Vector<Expr>.create(), alias: null },
+            ),
+            constraint: JoinConstraint.None,
+            group: 0,
+            groupOn: null,
+        },
+    );
 
     private fn fromClause(borrow mut this) -> Result<FromClause, SqliteError> {
         var clause = FromClause {
@@ -780,7 +848,7 @@ struct Parser {
                         kind: JoinKind.Comma,
                         natural: false,
                         item: this.fromItem()?,
-                        constraint: JoinConstraint.None,
+                        constraint: JoinConstraint.None, group: 0, groupOn: null,
                     },
                 )?;
                 continue;
@@ -828,7 +896,9 @@ struct Parser {
             if (group is Some(g)) {
                 Parser.addJoinGroup(mut clause, g, kind, natural, constraint)?;
             } else if (item is Some(it)) {
-                clause.joins.push(Join { kind: kind, natural: natural, item: it, constraint: constraint })?;
+                clause.joins.push(
+                    Join { kind: kind, natural: natural, item: it, constraint: constraint, group: 0, groupOn: null },
+                )?;
             }
         }
     }

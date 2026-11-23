@@ -569,3 +569,29 @@ fn badTokensAreReportedAsSqliteReportsThem() -> Result<void, TestFailure> {
         SELECT 1;;
         """);
 }
+
+@test
+fn leftJoinsOfGroupsMatchSqlite() -> Result<void, TestFailure> {
+    let path = "out/query-left-groups.db";
+    makeDatabase(path, """
+        CREATE TABLE a(id INTEGER PRIMARY KEY, x);
+        CREATE TABLE b(id INTEGER PRIMARY KEY, aid, y);
+        CREATE TABLE c(id INTEGER PRIMARY KEY, bid, z);
+        CREATE TABLE d(id INTEGER PRIMARY KEY, cid, w);
+        INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3'), (4, 'a4');
+        INSERT INTO b VALUES (1, 1, 'b1'), (2, 1, 'b2'), (3, 2, 'b3'), (4, 4, 'b4');
+        INSERT INTO c VALUES (1, 1, 'c1'), (2, 3, 'c3'), (3, 9, 'c9'), (4, 4, NULL);
+        INSERT INTO d VALUES (1, 1, 'd1');
+        CREATE INDEX c_bid ON c(bid);
+        """)?;
+    return sameAnswers(path, """
+        SELECT x, y, z FROM a LEFT JOIN (b JOIN c ON c.bid = b.id) ON b.aid = a.id ORDER BY 1, 2, 3
+        SELECT x, y, z FROM a LEFT JOIN (b JOIN c ON c.bid = b.id) ON b.aid = a.id AND z <> 'c3' ORDER BY 1, 2, 3
+        SELECT x, y, z FROM a LEFT JOIN (b JOIN c ON c.bid = b.id) ON b.aid = a.id WHERE z IS NULL ORDER BY 1, 2, 3
+        SELECT x, y, z FROM a LEFT JOIN (b JOIN c ON c.bid = b.id) ON b.aid = a.id WHERE c.id IS NULL ORDER BY 1, 2, 3
+        SELECT x, y, z, w FROM a LEFT JOIN (b LEFT JOIN c ON c.bid = b.id) ON b.aid = a.id LEFT JOIN d ON d.cid = c.id ORDER BY 1, 2, 3
+        SELECT x, y, z, w FROM a LEFT JOIN (b JOIN c ON c.bid = b.id JOIN d ON d.cid = c.id) ON b.aid = a.id ORDER BY 1, 2, 3
+        SELECT x, count(z) FROM a LEFT JOIN (b JOIN c ON c.bid = b.id) ON b.aid = a.id GROUP BY x ORDER BY 1
+        SELECT x, y, z FROM a LEFT JOIN (b, c) ON c.bid = b.id AND b.aid = a.id ORDER BY 1, 2, 3
+        """);
+}

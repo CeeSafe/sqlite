@@ -64,6 +64,10 @@ struct SourcePlan {
     rowidSeek: XExpr?;
     /// Else an index that narrows the scan.
     indexSeek: IndexSeek?;
+    /// The first source of a LEFT JOIN group (`LEFT JOIN (b JOIN c …) ON cond`): how many sources the group has,
+    /// and its ON, checked once a row of the whole group is made.
+    group: usize;
+    groupOn: XExpr?;
 }
 
 struct CorePlan {
@@ -753,6 +757,8 @@ fn compileFromItem(
                             on: null,
                             rowidSeek: null,
                             indexSeek: null,
+                            group: 0,
+                            groupOn: null,
                         },
                     )?;
                     return Ok();
@@ -788,6 +794,8 @@ fn compileFromItem(
                         on: null,
                         rowidSeek: null,
                         indexSeek: null,
+                        group: 0,
+                        groupOn: null,
                     },
                 )?;
                 return Ok();
@@ -817,6 +825,8 @@ fn compileFromItem(
                         on: null,
                         rowidSeek: null,
                         indexSeek: null,
+                        group: 0,
+                        groupOn: null,
                     },
                 )?;
                 return Ok();
@@ -854,6 +864,8 @@ fn compileFromItem(
                         on: null,
                         rowidSeek: null,
                         indexSeek: null,
+                        group: 0,
+                        groupOn: null,
                     },
                 )?;
                 return Ok();
@@ -889,6 +901,8 @@ fn compileFromItem(
                     on: null,
                     rowidSeek: null,
                     indexSeek: null,
+                    group: 0,
+                    groupOn: null,
                 },
             )?;
             return Ok();
@@ -947,6 +961,8 @@ fn compileFromItem(
                     on: null,
                     rowidSeek: null,
                     indexSeek: null,
+                    group: 0,
+                    groupOn: null,
                 },
             )?;
             return Ok();
@@ -1102,6 +1118,12 @@ fn compileCoreBody(
                 let compiled = compiler.compile(on, db)?;
                 let existing = replace(mut sources[j + 1].on, null);
                 sources[j + 1].on = andWith(existing, compiled)?;
+            }
+            if (from.joins[j].group > 1) {
+                sources[j + 1].group = from.joins[j].group;
+                if (borrow from.joins[j].groupOn is Some(on)) {
+                    sources[j + 1].groupOn = compiler.compile(on, db)?;
+                }
             }
         }
     }
@@ -1313,7 +1335,10 @@ fn compileCoreBody(
     if (borrow filter is Some(f)) {
         for (s in 0..sources.length) {
             // A RIGHT JOIN source is scanned whole: its rows are known by their place in the scan.
-            if (!sources[s].right && sources[s].kind is SourceKind.Table(TablePlan { withoutRowid: false, .. })) {
+            if (!sources[s].right && !inLeftGroup(
+                sources.view(),
+                s,
+            ) && sources[s].kind is SourceKind.Table(TablePlan { withoutRowid: false, .. })) {
                 sources[s].rowidSeek = rowidEqualityFor(f, sources[s].slot)?;
             }
         }
@@ -1346,7 +1371,7 @@ fn compileCoreBody(
         let table = db.catalog.tableCopy(plan.name.view())?;
         var bounds = Vector<ColumnBound>.create();
         if (borrow filter is Some(f)) {
-            columnBounds(f, sources[s].slot, !sources[s].left, mut bounds)?;
+            columnBounds(f, sources[s].slot, !sources[s].left && !inLeftGroup(sources.view(), s), mut bounds)?;
         }
         if (borrow sources[s].on is Some(on)) {
             columnBounds(on, sources[s].slot, true, mut bounds)?;
@@ -1543,3 +1568,13 @@ fn schemaTableSchema() -> Result<TableSchema, SqliteError> {
 }
 
 fn isLiteral(e: borrow Expr) -> bool => e is Expr.Literal(_);
+
+/// Whether source `s` is inside a LEFT JOIN group, where a row of NULLs can stand for it as for a LEFT JOIN's.
+fn inLeftGroup(sources: Slice<SourcePlan>, s: usize) -> bool {
+    for (g in 0..s) {
+        if (sources[g].group > 1 && s < g + sources[g].group) {
+            return true;
+        }
+    }
+    return false;
+}

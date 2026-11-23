@@ -42,7 +42,16 @@ fn selectFromView(
     }
     var joins = Vector<Join>.create();
     if (from is Some(f)) {
-        joins.push(Join { kind: JoinKind.Comma, natural: false, item: f.source, constraint: JoinConstraint.None })?;
+        joins.push(
+            Join {
+                kind: JoinKind.Comma,
+                natural: false,
+                item: f.source,
+                constraint: JoinConstraint.None,
+                group: 0,
+                groupOn: null,
+            },
+        )?;
         for (j in 0..f.joins.length) {
             joins.push(cloneJoin(borrow f.joins[j])?)?;
         }
