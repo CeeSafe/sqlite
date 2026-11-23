@@ -98,3 +98,14 @@ Workaround: `withoutCollate(e) -> borrow Expr` (`src/select.cee`).
 `replace(mut rows[i], Vector.create())`, or repeated `remove(0)`, which is quadratic.
 
 Workaround: `takeRow` (`src/run.cee`).
+
+### 14. Text that is not UTF-8 has no text type
+
+`String` and `StringView` hold valid UTF-8 only, and there is no text type for bytes that are mostly UTF-8 (C's
+`char *`, Rust's `OsString`/`bstr`). SQLite's TEXT may hold any bytes: its JSON functions decode `"\ud800"` to
+ED A0 80, an unpaired surrogate, and `CAST(x'ff' AS TEXT)` keeps the byte. A value type built on `String` cannot
+carry those bytes through.
+
+Workaround: `textFromBytesLossy` (`src/value.cee`) turns each byte of an invalid sequence into U+FFFD, and the
+difference is listed in README.md. A byte-string type with UTF-8 views on demand would let the engine keep
+SQLite's bytes.

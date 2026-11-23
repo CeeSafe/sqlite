@@ -1,0 +1,3326 @@
+// The JSON functions: a port of SQLite's json.c (3.53.4).
+//
+// As in SQLite, a JSON argument is first translated into JSONB, SQLite's binary encoding of JSON; the functions
+// search and edit the JSONB, and the JSON text of a result is generated from it. Keeping SQLite's intermediate form
+// keeps every output byte the same as SQLite's: a number keeps the spelling it had in the input, JSON5 forms are
+// rewritten as SQLite rewrites them, an object keeps duplicate labels, and an edit lands where SQLite's lands. A
+// blob argument that looks like JSONB is read as JSONB, as SQLite reads it; the jsonb_* functions, which return
+// JSONB, and the table-valued json_each and json_tree are not ported.
+//
+// SQLite marks the text a JSON function returns with a subtype, so that json_array(json('[1]')) nests the array
+// instead of quoting it as a string. A SqliteValue carries no subtype in this engine. Instead the arguments of the
+// JSON functions are evaluated by evaluateWithSubtype, which knows the expressions that give JSON: a JSON function's
+// result, and the expressions SQLite passes a subtype through (CASE, coalesce, ifnull, iif, nullif, likely,
+// unlikely, the scalar min and max, unary +, CAST and COLLATE). The result of json_group_array and
+// json_group_object is wrapped at compile time in the internal function JsonSubtype, which marks its argument. A
+// scalar subquery's result loses the mark here, where SQLite keeps it.
+//
+// Differences from the C# engine, which this replaces (each checked against sqlite3 3.54; README.md has the list):
+// - malformed JSON is the "malformed JSON" error, where the C# returned NULL;
+// - JSON5 input is accepted (comments, unquoted labels, single quotes, hex, Infinity, NaN, trailing commas) and
+//   written out as RFC 8259 JSON, as SQLite does; the C# rejected it;
+// - numbers keep their spelling (`json('1.50')` is `1.50`), where the C# reformatted them;
+// - path syntax follows SQLite: `."quoted"` labels, `[#-N]`, and "bad JSON path" errors for a malformed path;
+// - json_set() and json_insert() create nested objects and arrays along a missing path, and the argument counts
+//   and blob arguments are checked as SQLite checks them;
+// - the subtype rule nests JSON results, so json_array(json_array(1)) is [[1]] and not ["[1]"];
+// - json_valid() takes SQLite's FLAGS argument, and json_pretty() and json_array_insert() exist.
+
+// ── JSONB ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+const JSONB_NULL: u8 = 0;
+const JSONB_TRUE: u8 = 1;
+const JSONB_FALSE: u8 = 2;
+const JSONB_INT: u8 = 3;
+const JSONB_INT5: u8 = 4;
+const JSONB_FLOAT: u8 = 5;
+const JSONB_FLOAT5: u8 = 6;
+const JSONB_TEXT: u8 = 7;
+const JSONB_TEXTJ: u8 = 8;
+const JSONB_TEXT5: u8 = 9;
+const JSONB_TEXTRAW: u8 = 10;
+const JSONB_ARRAY: u8 = 11;
+const JSONB_OBJECT: u8 = 12;
+
+/// How deep JSON may nest (JSON_MAX_DEPTH).
+const JSON_MAX_DEPTH: i64 = 1000;
+
+/// What jsonUnescapeOneChar gives for an escape it cannot read.
+const JSON_INVALID_CHAR: u32 = 0x99999;
+
+/// The edits a path lookup can make (JEDIT_*).
+const JEDIT_DEL: u8 = 1;
+const JEDIT_REPL: u8 = 2;
+const JEDIT_INS: u8 = 3;
+const JEDIT_SET: u8 = 4;
+const JEDIT_AINS: u8 = 5;
+
+/// What a path lookup returns when it finds no element (JSON_LOOKUP_*).
+const JSON_LOOKUP_ERROR: usize = 0xFFFF_FFFF;
+const JSON_LOOKUP_NOTFOUND: usize = 0xFFFF_FFFE;
+const JSON_LOOKUP_NOTARRAY: usize = 0xFFFF_FFFD;
+const JSON_LOOKUP_TOODEEP: usize = 0xFFFF_FFFC;
+const JSON_LOOKUP_PATHERROR: usize = 0xFFFF_FFFB;
+
+fn jsonLookupIsError(x: usize) -> bool => x >= JSON_LOOKUP_PATHERROR;
+
+/// The flags of json_extract() and the arrow operators.
+const JSON_JSON: u8 = 1;
+const JSON_SQL: u8 = 2;
+const JSON_ABPATH: u8 = 3;
+
+/// The results of jsonMergePatch.
+const JSON_MERGE_OK: u8 = 0;
+const JSON_MERGE_BADTARGET: u8 = 1;
+const JSON_MERGE_BADPATCH: u8 = 2;
+const JSON_MERGE_TOODEEP: u8 = 4;
+
+/// The name json_type() gives each JSONB element type.
+fn jsonbTypeName(t: u8) -> StringView => match (t) {
+    0 => "null",
+    1 => "true",
+    2 => "false",
+    3 | 4 => "integer",
+    5 | 6 => "real",
+    7 | 8 | 9 | 10 => "text",
+    11 => "array",
+    12 => "object",
+    _ => "",
+};
+
+// ── characters ───────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The byte at `i`, or 0 past the end: SQLite's parser reads a NUL-terminated string.
+fn jsonAt(z: Slice<u8>, i: usize) -> u8 => if (i < z.length) z[i] else 0;
+
+/// z[from..to], cut to the bytes that exist.
+fn jsonBytes(z: Slice<u8>, from: usize, to: usize) -> Slice<u8> {
+    let end = to.min(z.length);
+    let start = from.min(end);
+    return z[start..end];
+}
+
+/// JSON's white space (jsonIsspace).
+fn jsonIsSpace(c: u8) -> bool => c == 0x09 || c == 0x0A || c == 0x0D || c == 0x20;
+
+/// A byte that needs no escape in a JSON string (jsonIsOk).
+fn jsonIsOk(c: u8) -> bool => c >= 0x20 && c != '"' && c != '\\' && c != '\'';
+
+fn jsonIsDigit(c: u8) -> bool => c >= '0' && c <= '9';
+
+fn jsonIsAlpha(c: u8) -> bool => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+
+fn jsonIsAlnum(c: u8) -> bool => jsonIsAlpha(c) || jsonIsDigit(c);
+
+/// sqlite3JsonId1: a byte that may start an unquoted JSON5 label.
+fn jsonIdStart(c: u8) -> bool => jsonIsAlpha(c) || c == '$' || c == '_' || c >= 0x80;
+
+/// sqlite3JsonId2: a byte that may continue one.
+fn jsonIdPart(c: u8) -> bool => jsonIdStart(c) || jsonIsDigit(c);
+
+fn jsonHexToInt(h: u8) -> u32 {
+    let x = h as u32;
+    return (x + 9 * (1 & (x >> 6))) & 0xF;
+}
+
+fn jsonHexToInt4(z: Slice<u8>, at: usize) -> u32 =>
+    (jsonHexToInt(jsonAt(z, at)) << 12) + (jsonHexToInt(jsonAt(z, at + 1)) << 8) + (jsonHexToInt(
+        jsonAt(z, at + 2),
+    ) << 4) + jsonHexToInt(jsonAt(z, at + 3));
+
+fn jsonIs2Hex(z: Slice<u8>, at: usize) -> bool => isSqlHexDigit(jsonAt(z, at)) && isSqlHexDigit(jsonAt(z, at + 1));
+
+fn jsonIs4Hex(z: Slice<u8>, at: usize) -> bool => jsonIs2Hex(z, at) && jsonIs2Hex(z, at + 2);
+
+/// Whether `z` holds `word` at `at`, byte for byte (strncmp(…) == 0).
+fn jsonStartsWith(z: Slice<u8>, at: usize, word: StringView) -> bool {
+    let w = word.bytes();
+    for (k in 0..w.length) {
+        if (jsonAt(z, at + k) != w[k]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Whether `z` holds `word` at `at`, ignoring the case of ASCII letters (sqlite3StrNICmp(…) == 0).
+fn jsonStartsNoCase(z: Slice<u8>, at: usize, word: StringView) -> bool {
+    let w = word.bytes();
+    for (k in 0..w.length) {
+        if (foldAscii(jsonAt(z, at + k)) != foldAscii(w[k])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// How many bytes of JSON5 white space and comments start z[start..] (json5Whitespace).
+fn json5Whitespace(z: Slice<u8>, start: usize) -> usize {
+    var n = start;
+    loop {
+        let c = jsonAt(z, n);
+        if (c == 0x09 || c == 0x0A || c == 0x0B || c == 0x0C || c == 0x0D || c == 0x20) {
+            n += 1;
+            continue;
+        }
+        if (c == '/') {
+            if (jsonAt(z, n + 1) == '*' && jsonAt(z, n + 2) != 0) {
+                var j = n + 3;
+                var closed = false;
+                loop {
+                    if (jsonAt(z, j) == '/' && jsonAt(z, j - 1) == '*') {
+                        closed = true;
+                        break;
+                    }
+                    if (jsonAt(z, j) == 0) {
+                        break;
+                    }
+                    j += 1;
+                }
+                if (!closed) {
+                    break;
+                }
+                n = j + 1;
+                continue;
+            }
+            if (jsonAt(z, n + 1) == '/') {
+                var j = n + 2;
+                loop {
+                    let d = jsonAt(z, j);
+                    if (d == 0 || d == '\n' || d == '\r') {
+                        break;
+                    }
+                    if (d == 0xE2 && jsonAt(
+                        z,
+                        j + 1,
+                    ) == 0x80 && (jsonAt(z, j + 2) == 0xA8 || jsonAt(z, j + 2) == 0xA9)) {
+                        j += 2;
+                        break;
+                    }
+                    j += 1;
+                }
+                n = j;
+                if (jsonAt(z, n) != 0) {
+                    n += 1;
+                }
+                continue;
+            }
+            break;
+        }
+        if (c == 0xC2) {
+            if (jsonAt(z, n + 1) == 0xA0) {
+                n += 2;
+                continue;
+            }
+            break;
+        }
+        if (c == 0xE1) {
+            if (jsonAt(z, n + 1) == 0x9A && jsonAt(z, n + 2) == 0x80) {
+                n += 3;
+                continue;
+            }
+            break;
+        }
+        if (c == 0xE2) {
+            if (jsonAt(z, n + 1) == 0x80) {
+                let d = jsonAt(z, n + 2);
+                if (d >= 0x80 && (d <= 0x8A || d == 0xA8 || d == 0xA9 || d == 0xAF)) {
+                    n += 3;
+                    continue;
+                }
+            } else if (jsonAt(z, n + 1) == 0x81 && jsonAt(z, n + 2) == 0x9F) {
+                n += 3;
+                continue;
+            }
+            break;
+        }
+        if (c == 0xE3) {
+            if (jsonAt(z, n + 1) == 0x80 && jsonAt(z, n + 2) == 0x80) {
+                n += 3;
+                continue;
+            }
+            break;
+        }
+        if (c == 0xEF) {
+            if (jsonAt(z, n + 1) == 0xBB && jsonAt(z, n + 2) == 0xBF) {
+                n += 3;
+                continue;
+            }
+            break;
+        }
+        break;
+    }
+    return n - start;
+}
+
+/// A character read from an escape or from UTF-8, and how many bytes it took.
+struct JsonChar {
+    size: usize;
+    c: u32;
+}
+
+/// sqlite3Utf8ReadLimited: one UTF-8 character from at most four bytes of `z`, which is not empty.
+fn jsonUtf8ReadLimited(z: Slice<u8>) -> JsonChar {
+    var c = z[0] as u32;
+    var i: usize = 1;
+    if (c >= 0xC0) {
+        c =
+            if (c < 0xE0) c - 0xC0
+                else if (c < 0xF0) c - 0xE0
+                else if (c < 0xF8) c - 0xF0
+                else if (c < 0xFC) c - 0xF8
+                else if (c < 0xFE) c - 0xFC
+                else 0;
+        let n = z.length.min(4);
+        while (i < n && (z[i] & 0xC0) == 0x80) {
+            c = (c << 6) + (0x3F & (z[i] as u32));
+            i += 1;
+        }
+    }
+    return JsonChar { size: i, c: c };
+}
+
+/// How many bytes of escaped newlines start `z` (jsonBytesToBypass).
+fn jsonBytesToBypass(z: Slice<u8>) -> usize {
+    let n = z.length;
+    var i: usize = 0;
+    while (i + 1 < n) {
+        if (z[i] != '\\') {
+            return i;
+        }
+        if (z[i + 1] == '\n') {
+            i += 2;
+            continue;
+        }
+        if (z[i + 1] == '\r') {
+            i += if (i + 2 < n && z[i + 2] == '\n') 3 else 2;
+            continue;
+        }
+        if (z[i + 1] == 0xE2 && i + 3 < n && z[i + 2] == 0x80 && (z[i + 3] == 0xA8 || z[i + 3] == 0xA9)) {
+            i += 4;
+            continue;
+        }
+        break;
+    }
+    return i;
+}
+
+/// The character of the escape that starts `z` with its backslash (jsonUnescapeOneChar).
+fn jsonUnescapeOneChar(z: Slice<u8>) -> JsonChar {
+    let n = z.length;
+    if (n < 2) {
+        return JsonChar { size: n, c: JSON_INVALID_CHAR };
+    }
+    let e = z[1];
+    if (e == 'u') {
+        if (n < 6) {
+            return JsonChar { size: n, c: JSON_INVALID_CHAR };
+        }
+        let v = jsonHexToInt4(z, 2);
+        if ((v & 0xFC00) == 0xD800 && n >= 12 && z[6] == '\\' && z[7] == 'u') {
+            let low = jsonHexToInt4(z, 8);
+            if ((low & 0xFC00) == 0xDC00) {
+                return JsonChar { size: 12, c: ((v & 0x3FF) << 10) + (low & 0x3FF) + 0x10000 };
+            }
+        }
+        return JsonChar { size: 6, c: v };
+    }
+    if (e == 'b') {
+        return JsonChar { size: 2, c: 8 };
+    }
+    if (e == 'f') {
+        return JsonChar { size: 2, c: 12 };
+    }
+    if (e == 'n') {
+        return JsonChar { size: 2, c: 10 };
+    }
+    if (e == 'r') {
+        return JsonChar { size: 2, c: 13 };
+    }
+    if (e == 't') {
+        return JsonChar { size: 2, c: 9 };
+    }
+    if (e == 'v') {
+        return JsonChar { size: 2, c: 11 };
+    }
+    if (e == '0') {
+        // JSON5 forbids a digit after \0.
+        return JsonChar { size: 2, c: if (n > 2 && jsonIsDigit(z[2])) JSON_INVALID_CHAR else 0 };
+    }
+    if (e == '\'' || e == '"' || e == '/' || e == '\\') {
+        return JsonChar { size: 2, c: e as u32 };
+    }
+    if (e == 'x') {
+        if (n < 4) {
+            return JsonChar { size: n, c: JSON_INVALID_CHAR };
+        }
+        return JsonChar { size: 4, c: (jsonHexToInt(z[2]) << 4) | jsonHexToInt(z[3]) };
+    }
+    if (e == 0xE2 || e == '\r' || e == '\n') {
+        let skip = jsonBytesToBypass(z);
+        if (skip == 0) {
+            return JsonChar { size: n, c: JSON_INVALID_CHAR };
+        }
+        if (skip == n) {
+            return JsonChar { size: n, c: 0 };
+        }
+        if (z[skip] == '\\') {
+            let inner = jsonUnescapeOneChar(z[skip..]);
+            return JsonChar { size: skip + inner.size, c: inner.c };
+        }
+        let inner = jsonUtf8ReadLimited(z[skip..]);
+        return JsonChar { size: skip + inner.size, c: inner.c };
+    }
+    return JsonChar { size: 2, c: JSON_INVALID_CHAR };
+}
+
+/// Whether two object labels are the same once their escapes are read (jsonLabelCompare). A raw label has no
+/// escapes.
+fn jsonLabelCompare(left: Slice<u8>, rawLeft: bool, right: Slice<u8>, rawRight: bool) -> bool {
+    if (rawLeft && rawRight) {
+        return left == right;
+    }
+    var l: usize = 0;
+    var r: usize = 0;
+    loop {
+        var cl: u32 = 0;
+        if (l < left.length) {
+            if (rawLeft || left[l] != '\\') {
+                cl = left[l] as u32;
+                if (cl >= 0xC0) {
+                    let u = jsonUtf8ReadLimited(left[l..]);
+                    cl = u.c;
+                    l += u.size;
+                } else {
+                    l += 1;
+                }
+            } else {
+                let u = jsonUnescapeOneChar(left[l..]);
+                cl = u.c;
+                l += u.size;
+            }
+        }
+        var cr: u32 = 0;
+        if (r < right.length) {
+            if (rawRight || right[r] != '\\') {
+                cr = right[r] as u32;
+                if (cr >= 0xC0) {
+                    let u = jsonUtf8ReadLimited(right[r..]);
+                    cr = u.c;
+                    r += u.size;
+                } else {
+                    r += 1;
+                }
+            } else {
+                let u = jsonUnescapeOneChar(right[r..]);
+                cr = u.c;
+                r += u.size;
+            }
+        }
+        if (cl != cr) {
+            return false;
+        }
+        if (cl == 0) {
+            return true;
+        }
+    }
+}
+
+// ── JSONB blobs ──────────────────────────────────────────────────────────────────────────────────────────────
+
+/// An element's header: its size `n` (0 when the header is malformed) and the size of its payload.
+struct JsonbHeader {
+    n: usize;
+    sz: usize;
+}
+
+fn jsonbBigEndian(blob: Slice<u8>, at: usize, count: usize) -> usize {
+    var v: usize = 0;
+    for (k in 0..count) {
+        v = (v << 8) + (blob[at + k] as usize);
+    }
+    return v;
+}
+
+/// The header at `i`, without checking that its payload fits.
+fn jsonbHeaderAt(blob: Slice<u8>, i: usize) -> JsonbHeader {
+    let bad = JsonbHeader { n: 0, sz: 0 };
+    let nBlob = blob.length;
+    if (i >= nBlob) {
+        return bad;
+    }
+    let x = blob[i] >> 4;
+    if (x <= 11) {
+        return JsonbHeader { n: 1, sz: x as usize };
+    }
+    if (x == 12) {
+        if (i + 1 >= nBlob) {
+            return bad;
+        }
+        return JsonbHeader { n: 2, sz: blob[i + 1] as usize };
+    }
+    if (x == 13) {
+        if (i + 2 >= nBlob) {
+            return bad;
+        }
+        return JsonbHeader { n: 3, sz: jsonbBigEndian(blob, i + 1, 2) };
+    }
+    if (x == 14) {
+        if (i + 4 >= nBlob) {
+            return bad;
+        }
+        return JsonbHeader { n: 5, sz: jsonbBigEndian(blob, i + 1, 4) };
+    }
+    if (i + 8 >= nBlob || blob[i + 1] != 0 || blob[i + 2] != 0 || blob[i + 3] != 0 || blob[i + 4] != 0) {
+        return bad;
+    }
+    return JsonbHeader { n: 9, sz: jsonbBigEndian(blob, i + 5, 4) };
+}
+
+/// The header at `i`, or a malformed one when its payload runs past the blob (jsonbPayloadSize). `delta` is the
+/// change of size of an edit in progress, which the enclosing headers do not show yet.
+fn jsonbPayloadSize(blob: Slice<u8>, delta: i64, i: usize) -> JsonbHeader {
+    let h = jsonbHeaderAt(blob, i);
+    if (h.n == 0) {
+        return h;
+    }
+    let end = truncate<i64>(i + h.sz + h.n);
+    let length = truncate<i64>(blob.length);
+    if (end > length && end > length - delta) {
+        return JsonbHeader { n: 0, sz: 0 };
+    }
+    return h;
+}
+
+/// Appends an element's header for a payload of `size` bytes (jsonBlobAppendNode).
+fn jsonbAppendHeader(blob: borrow mut Vector<u8>, eType: u8, size: usize) -> Result<void, AllocError> {
+    if (size <= 11) {
+        return blob.push(eType | truncate<u8>(size << 4));
+    }
+    if (size <= 0xFF) {
+        blob.push(eType | 0xC0)?;
+        return blob.push(truncate<u8>(size));
+    }
+    if (size <= 0xFFFF) {
+        blob.push(eType | 0xD0)?;
+        blob.push(truncate<u8>(size >> 8))?;
+        return blob.push(truncate<u8>(size));
+    }
+    blob.push(eType | 0xE0)?;
+    blob.push(truncate<u8>(size >> 24))?;
+    blob.push(truncate<u8>(size >> 16))?;
+    blob.push(truncate<u8>(size >> 8))?;
+    return blob.push(truncate<u8>(size));
+}
+
+fn jsonbAppendNode(blob: borrow mut Vector<u8>, eType: u8, payload: Slice<u8>) -> Result<void, AllocError> {
+    jsonbAppendHeader(blob, eType, payload.length)?;
+    return blob.extend(payload);
+}
+
+/// Makes room for `count` bytes at `at`.
+fn jsonInsertBytes(v: borrow mut Vector<u8>, at: usize, count: usize) -> Result<void, AllocError> {
+    let old = v.length;
+    v.resize(old + count, 0)?;
+    v.copyWithin(at, at + count, old - at);
+    return Ok();
+}
+
+/// Removes `count` bytes at `at`.
+fn jsonRemoveBytes(v: borrow mut Vector<u8>, at: usize, count: usize) {
+    let old = v.length;
+    v.copyWithin(at + count, at, old - at - count);
+    v.truncate(old - count);
+}
+
+/// Copies `src` into `dst` at `at`, as far as `dst` reaches.
+fn jsonCopyInto(dst: borrow mut Vector<u8>, at: usize, src: Slice<u8>) {
+    var k: usize = 0;
+    while (k < src.length && at + k < dst.length) {
+        dst[at + k] = src[k];
+        k += 1;
+    }
+}
+
+/// Rewrites the header at `i` for a payload of `size` bytes, growing or shrinking it as needed
+/// (jsonBlobChangePayloadSize). Returns the change in the header's size.
+fn jsonbChangePayloadSize(blob: borrow mut Vector<u8>, i: usize, size: usize) -> Result<i64, AllocError> {
+    if (i >= blob.length) {
+        return Ok(0);
+    }
+    let szType = blob[i] >> 4;
+    let nExtra: usize =
+        if (szType <= 11) 0 else if (szType == 12) 1 else if (szType == 13) 2 else if (szType == 14) 4 else 8;
+    let nNeeded: usize = if (size <= 11) 0 else if (size <= 0xFF) 1 else if (size <= 0xFFFF) 2 else 4;
+    if (nNeeded > nExtra) {
+        jsonInsertBytes(blob, i + 1, nNeeded - nExtra)?;
+    } else if (nNeeded < nExtra) {
+        let count = (nExtra - nNeeded).min(blob.length - i - 1);
+        jsonRemoveBytes(blob, i + 1, count);
+    }
+    let low = blob[i] & 0x0F;
+    if (nNeeded == 0) {
+        blob[i] = low | truncate<u8>(size << 4);
+    } else if (nNeeded == 1) {
+        blob[i] = low | 0xC0;
+        blob[i + 1] = truncate<u8>(size);
+    } else if (nNeeded == 2) {
+        blob[i] = low | 0xD0;
+        blob[i + 1] = truncate<u8>(size >> 8);
+        blob[i + 2] = truncate<u8>(size);
+    } else {
+        blob[i] = low | 0xE0;
+        blob[i + 1] = truncate<u8>(size >> 24);
+        blob[i + 2] = truncate<u8>(size >> 16);
+        blob[i + 3] = truncate<u8>(size >> 8);
+        blob[i + 4] = truncate<u8>(size);
+    }
+    return Ok(truncate<i64>(nNeeded) - truncate<i64>(nExtra));
+}
+
+/// Replaces the `nDel` bytes at `iDel` with `nIns` bytes, copied from `ins` when it is not empty (jsonBlobEdit).
+/// The change of size accumulates in `delta`.
+fn jsonbEdit(
+    blob: borrow mut Vector<u8>,
+    delta: borrow mut i64,
+    iDel: usize,
+    nDel: usize,
+    ins: Slice<u8>,
+    nIns: usize,
+) -> Result<void, AllocError> {
+    let start = iDel.min(blob.length);
+    let removed = nDel.min(blob.length - start);
+    if (nIns > removed) {
+        jsonInsertBytes(blob, start + removed, nIns - removed)?;
+    } else if (nIns < removed) {
+        jsonRemoveBytes(blob, start + nIns, removed - nIns);
+    }
+    delta += truncate<i64>(nIns) - truncate<i64>(removed);
+    if (ins.length > 0) {
+        jsonCopyInto(blob, start, jsonBytes(ins, 0, nIns));
+    }
+    return Ok();
+}
+
+/// The number of elements of the array at `iRoot` (jsonbArrayCount).
+fn jsonbArrayCount(blob: Slice<u8>, delta: i64, iRoot: usize) -> u64 {
+    let h = jsonbPayloadSize(blob, delta, iRoot);
+    let iEnd = iRoot + h.n + h.sz;
+    var k: u64 = 0;
+    var i = iRoot + h.n;
+    var n = h.n;
+    while (n > 0 && i < iEnd) {
+        let e = jsonbPayloadSize(blob, delta, i);
+        n = e.n;
+        i += e.sz + e.n;
+        k += 1;
+    }
+    return k;
+}
+
+/// Checks the element at z[i..iEnd] (jsonbValidityCheck): 0 when it is well-formed, else the 1-based offset of the
+/// error.
+fn jsonbValidityCheck(z: Slice<u8>, i: usize, iEnd: usize, depth: u32) -> usize {
+    if (depth as i64 > JSON_MAX_DEPTH) {
+        return i + 1;
+    }
+    let h = jsonbPayloadSize(z, 0, i);
+    let n = h.n;
+    let sz = h.sz;
+    if (n == 0 || i + n + sz != iEnd) {
+        return i + 1;
+    }
+    let x = z[i] & 0x0F;
+    if (x == JSONB_NULL || x == JSONB_TRUE || x == JSONB_FALSE) {
+        return if (n + sz == 1) 0 else i + 1;
+    }
+    if (x == JSONB_INT) {
+        if (sz < 1) {
+            return i + 1;
+        }
+        var j = i + n;
+        if (z[j] == '-') {
+            j += 1;
+            if (sz < 2) {
+                return i + 1;
+            }
+        }
+        let k = i + n + sz;
+        while (j < k) {
+            if (!jsonIsDigit(z[j])) {
+                return j + 1;
+            }
+            j += 1;
+        }
+        return 0;
+    }
+    if (x == JSONB_INT5) {
+        if (sz < 3) {
+            return i + 1;
+        }
+        var j = i + n;
+        if (z[j] == '-') {
+            if (sz < 4) {
+                return i + 1;
+            }
+            j += 1;
+        }
+        if (z[j] != '0') {
+            return i + 1;
+        }
+        if (z[j + 1] != 'x' && z[j + 1] != 'X') {
+            return j + 2;
+        }
+        j += 2;
+        let k = i + n + sz;
+        while (j < k) {
+            if (!isSqlHexDigit(z[j])) {
+                return j + 1;
+            }
+            j += 1;
+        }
+        return 0;
+    }
+    if (x == JSONB_FLOAT || x == JSONB_FLOAT5) {
+        // 0: initial, 1: '.' seen, 2: 'e' seen.
+        var seen: u8 = 0;
+        if (sz < 2) {
+            return i + 1;
+        }
+        var j = i + n;
+        let k = j + sz;
+        if (z[j] == '-') {
+            j += 1;
+            if (sz < 3) {
+                return i + 1;
+            }
+        }
+        if (z[j] == '.') {
+            if (x == JSONB_FLOAT) {
+                return j + 1;
+            }
+            if (!jsonIsDigit(jsonAt(z, j + 1))) {
+                return j + 1;
+            }
+            j += 2;
+            seen = 1;
+        } else if (z[j] == '0' && x == JSONB_FLOAT) {
+            if (j + 3 > k) {
+                return j + 1;
+            }
+            if (z[j + 1] != '.' && z[j + 1] != 'e' && z[j + 1] != 'E') {
+                return j + 1;
+            }
+            j += 1;
+        }
+        while (j < k) {
+            let c = z[j];
+            if (jsonIsDigit(c)) {
+                j += 1;
+                continue;
+            }
+            if (c == '.') {
+                if (seen > 0) {
+                    return j + 1;
+                }
+                if (x == JSONB_FLOAT && (j == k - 1 || !jsonIsDigit(z[j + 1]))) {
+                    return j + 1;
+                }
+                seen = 1;
+                j += 1;
+                continue;
+            }
+            if (c == 'e' || c == 'E') {
+                if (seen == 2) {
+                    return j + 1;
+                }
+                if (j == k - 1) {
+                    return j + 1;
+                }
+                if (z[j + 1] == '+' || z[j + 1] == '-') {
+                    j += 1;
+                    if (j == k - 1) {
+                        return j + 1;
+                    }
+                }
+                seen = 2;
+                j += 1;
+                continue;
+            }
+            return j + 1;
+        }
+        if (seen == 0) {
+            return i + 1;
+        }
+        return 0;
+    }
+    if (x == JSONB_TEXT) {
+        var j = i + n;
+        let k = j + sz;
+        while (j < k) {
+            if (!jsonIsOk(z[j]) && z[j] != '\'') {
+                return j + 1;
+            }
+            j += 1;
+        }
+        return 0;
+    }
+    if (x == JSONB_TEXTJ || x == JSONB_TEXT5) {
+        var j = i + n;
+        let k = j + sz;
+        while (j < k) {
+            let c = z[j];
+            if (!jsonIsOk(c) && c != '\'') {
+                if (c == '"') {
+                    if (x == JSONB_TEXTJ) {
+                        return j + 1;
+                    }
+                } else if (c <= 0x1F) {
+                    // Control characters are allowed in JSON5 strings.
+                    if (x == JSONB_TEXTJ) {
+                        return j + 1;
+                    }
+                } else if (j + 1 >= k) {
+                    return j + 1;
+                } else {
+                    let e = z[j + 1];
+                    // strchr() also finds the terminating NUL.
+                    if (e == '"' ||
+                        e == '\\' || e == '/' || e == 'b' || e == 'f' || e == 'n' || e == 'r' || e == 't' || e == 0) {
+                        j += 1;
+                    } else if (e == 'u') {
+                        if (j + 5 >= k) {
+                            return j + 1;
+                        }
+                        if (!jsonIs4Hex(z, j + 2)) {
+                            return j + 1;
+                        }
+                        j += 1;
+                    } else if (x != JSONB_TEXT5) {
+                        return j + 1;
+                    } else {
+                        let u = jsonUnescapeOneChar(z[j..k]);
+                        if (u.c == JSON_INVALID_CHAR) {
+                            return j + 1;
+                        }
+                        j += u.size - 1;
+                    }
+                }
+            }
+            j += 1;
+        }
+        return 0;
+    }
+    if (x == JSONB_TEXTRAW) {
+        return 0;
+    }
+    if (x == JSONB_ARRAY) {
+        var j = i + n;
+        let k = j + sz;
+        while (j < k) {
+            let e = jsonbPayloadSize(z, 0, j);
+            if (e.n == 0) {
+                return j + 1;
+            }
+            if (j + e.n + e.sz > k) {
+                return j + 1;
+            }
+            let sub = jsonbValidityCheck(z, j, j + e.n + e.sz, depth + 1);
+            if (sub != 0) {
+                return sub;
+            }
+            j += e.n + e.sz;
+        }
+        return 0;
+    }
+    if (x == JSONB_OBJECT) {
+        var count: u32 = 0;
+        var j = i + n;
+        let k = j + sz;
+        while (j < k) {
+            let e = jsonbPayloadSize(z, 0, j);
+            if (e.n == 0) {
+                return j + 1;
+            }
+            if (j + e.n + e.sz > k) {
+                return j + 1;
+            }
+            if ((count & 1) == 0) {
+                let label = z[j] & 0x0F;
+                if (label < JSONB_TEXT || label > JSONB_TEXTRAW) {
+                    return j + 1;
+                }
+            }
+            let sub = jsonbValidityCheck(z, j, j + e.n + e.sz, depth + 1);
+            if (sub != 0) {
+                return sub;
+            }
+            count += 1;
+            j += e.n + e.sz;
+        }
+        if ((count & 1) != 0) {
+            return j + 1;
+        }
+        return 0;
+    }
+    return i + 1;
+}
+
+/// Whether a blob argument is JSONB (jsonArgIsJsonb): its first element fills it exactly, and a short one is
+/// checked in full, since it might be JSON text cast to a blob.
+fn jsonArgIsJsonb(blob: Slice<u8>) -> bool {
+    if (blob.length == 0) {
+        return false;
+    }
+    let c = blob[0];
+    if ((c & 0x0F) > JSONB_OBJECT) {
+        return false;
+    }
+    let h = jsonbPayloadSize(blob, 0, 0);
+    if (h.n == 0 || h.sz + h.n != blob.length) {
+        return false;
+    }
+    if ((c & 0x0F) <= JSONB_FALSE && h.sz != 0) {
+        return false;
+    }
+    return h.sz > 7 || (c != 0x7B && c != 0x5B && !jsonIsDigit(c)) || jsonbValidityCheck(blob, 0, blob.length, 1) == 0;
+}
+
+// ── JSON text out ────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The flags of JsonString.eErr.
+const JSTRING_MALFORMED: u8 = 2;
+const JSTRING_TOODEEP: u8 = 4;
+const JSTRING_ERR: u8 = 8;
+
+/// The error a JSON function has reported, which becomes its result.
+enum JsonFailure {
+    Nothing,
+    Malformed,
+    TooDeep,
+    Blob,
+}
+
+fn jsonFailureError(failure: JsonFailure) -> SqliteError => match (failure) {
+    JsonFailure.TooDeep => sqlError("JSON nested too deep"),
+    JsonFailure.Blob => sqlError("JSON cannot hold BLOB values"),
+    _ => sqlError("malformed JSON"),
+};
+
+/// JSON text under construction (JsonString).
+struct JsonOut {
+    buf: Vector<u8>;
+    err: u8;
+    failure: JsonFailure;
+
+    fn create() -> JsonOut => JsonOut { buf: Vector<u8>.create(), err: 0, failure: JsonFailure.Nothing };
+
+    fn raw(borrow mut this, bytes: Slice<u8>) -> Result<void, AllocError> => this.buf.extend(bytes);
+
+    fn text(borrow mut this, bytes: StringView) -> Result<void, AllocError> => this.buf.extend(bytes.bytes());
+
+    fn byte(borrow mut this, c: u8) -> Result<void, AllocError> => this.buf.push(c);
+
+    /// Removes the last byte, unless an error has been seen (jsonStringTrimOneChar).
+    fn trimOne(borrow mut this) {
+        if (this.err == 0) {
+            let _ = this.buf.pop();
+        }
+    }
+
+    /// A comma, unless the text so far ends a '[' or '{' (jsonAppendSeparator).
+    fn separator(borrow mut this) -> Result<void, AllocError> {
+        if (this.buf.length == 0) {
+            return Ok();
+        }
+        let c = this.buf[this.buf.length - 1];
+        if (c == '[' || c == '{') {
+            return Ok();
+        }
+        return this.buf.push(',');
+    }
+
+    /// Reports JSON nested too deep (jsonStringTooDeep).
+    fn tooDeep(borrow mut this) {
+        this.err |= JSTRING_TOODEEP;
+        this.failure = JsonFailure.TooDeep;
+        this.buf.clear();
+    }
+
+    /// A control character, escaped (jsonAppendControlChar).
+    fn controlChar(borrow mut this, c: u8) -> Result<void, AllocError> {
+        let special: u8 =
+            if (c == 8) 'b'
+                else if (c == 9) 't'
+                else if (c == 10) 'n'
+                else if (c == 12) 'f'
+                else if (c == 13) 'r'
+                else 0;
+        this.buf.push('\\')?;
+        if (special != 0) {
+            return this.buf.push(special);
+        }
+        let digits = "0123456789abcdef".bytes();
+        this.text("u00")?;
+        this.buf.push(digits[(c >> 4) as usize])?;
+        return this.buf.push(digits[(c & 0xF) as usize]);
+    }
+
+    /// Bytes as a JSON string, quoted and escaped (jsonAppendString).
+    fn quoted(borrow mut this, z: Slice<u8>) -> Result<void, AllocError> {
+        this.buf.push('"')?;
+        for (k in 0..z.length) {
+            let c = z[k];
+            if (c == '"' || c == '\\') {
+                this.buf.push('\\')?;
+                this.buf.push(c)?;
+            } else if (jsonIsOk(c) || c == '\'') {
+                this.buf.push(c)?;
+            } else {
+                this.controlChar(c)?;
+            }
+        }
+        return this.buf.push('"');
+    }
+
+    /// An SQL value as JSON (jsonAppendSqlValue): text marked as JSON goes in as it is, other text as a string.
+    fn sqlValue(borrow mut this, value: borrow SqliteValue, isJson: bool) -> Result<void, AllocError> {
+        match (value) {
+            SqliteValue.Null => { return this.text("null"); }
+            SqliteValue.Integer(i) => {
+                var t = String.create();
+                t.appendNumber(i)?;
+                return this.raw(t.view().bytes());
+            }
+            SqliteValue.Real(r) => {
+                // "%!0.17g": the zero flag writes infinity as 9.0e+999.
+                if (r > 1.7976931348623157e308) {
+                    return this.text("9.0e+999");
+                }
+                if (r < -1.7976931348623157e308) {
+                    return this.text("-9.0e+999");
+                }
+                var t = String.create();
+                appendReal(mut t, r)?;
+                return this.raw(t.view().bytes());
+            }
+            SqliteValue.Text(s) => {
+                if (isJson) {
+                    return this.raw(s.view().bytes());
+                }
+                return this.quoted(s.view().bytes());
+            }
+            SqliteValue.Blob(b) => {
+                if (jsonArgIsJsonb(b.view())) {
+                    var depth: i64 = 0;
+                    let _ = jsonTranslateBlobToText(b.view(), mut depth, 0, this)?;
+                } else if (this.err == 0) {
+                    this.err = JSTRING_ERR;
+                    this.failure = JsonFailure.Blob;
+                    this.buf.clear();
+                }
+                return Ok();
+            }
+        }
+    }
+
+    /// The text as a function's result, or the error it reported (jsonReturnString).
+    fn finish(borrow mut this, json: bool) -> Result<JsonValue, SqliteError> {
+        if (this.err == 0) {
+            return Ok(JsonValue { value: SqliteValue.Text(textFromBytesLossy(this.buf.view())?), json: json });
+        }
+        if ((this.err & JSTRING_TOODEEP) == 0 && (this.err & JSTRING_MALFORMED) != 0) {
+            this.failure = JsonFailure.Malformed;
+        }
+        return Err(jsonFailureError(this.failure));
+    }
+}
+
+/// Appends the JSON text of the JSONB element at `i` (jsonTranslateBlobToText), and returns the index past it.
+fn jsonTranslateBlobToText(
+    blob: Slice<u8>,
+    depth: borrow mut i64,
+    i: usize,
+    out: borrow mut JsonOut,
+) -> Result<usize, AllocError> {
+    let h = jsonbPayloadSize(blob, 0, i);
+    if (h.n == 0) {
+        out.err |= JSTRING_MALFORMED;
+        return Ok(blob.length + 1);
+    }
+    let n = h.n;
+    let sz = h.sz;
+    let payload = jsonBytes(blob, i + n, i + n + sz);
+    let t = blob[i] & 0x0F;
+    if (t == JSONB_NULL) {
+        out.text("null")?;
+        return Ok(i + 1);
+    }
+    if (t == JSONB_TRUE) {
+        out.text("true")?;
+        return Ok(i + 1);
+    }
+    if (t == JSONB_FALSE) {
+        out.text("false")?;
+        return Ok(i + 1);
+    }
+    if (t == JSONB_INT || t == JSONB_FLOAT) {
+        if (sz == 0) {
+            out.err |= JSTRING_MALFORMED;
+        } else {
+            out.raw(payload)?;
+        }
+    } else if (t == JSONB_INT5) {
+        // Hexadecimal: written in decimal.
+        if (sz == 0) {
+            out.err |= JSTRING_MALFORMED;
+        } else {
+            var k: usize = 2;
+            var u: u64 = 0;
+            var overflow = false;
+            if (jsonAt(payload, 0) == '-') {
+                out.byte('-')?;
+                k += 1;
+            } else if (jsonAt(payload, 0) == '+') {
+                k += 1;
+            }
+            while (k < payload.length) {
+                if (!isSqlHexDigit(payload[k])) {
+                    out.err |= JSTRING_MALFORMED;
+                    break;
+                } else if ((u >> 60) != 0) {
+                    overflow = true;
+                } else {
+                    u = u * 16 + (jsonHexToInt(payload[k]) as u64);
+                }
+                k += 1;
+            }
+            if (overflow) {
+                out.text("9.0e999")?;
+            } else {
+                var d = String.create();
+                d.appendNumber(u)?;
+                out.raw(d.view().bytes())?;
+            }
+        }
+    } else if (t == JSONB_FLOAT5) {
+        // A real missing digits beside its point: they are added.
+        var malformed = sz == 0;
+        var k: usize = 0;
+        if (!malformed && jsonAt(payload, 0) == '-') {
+            out.byte('-')?;
+            if (sz <= 1) {
+                malformed = true;
+            }
+            k = 1;
+        }
+        if (malformed) {
+            out.err |= JSTRING_MALFORMED;
+        } else {
+            if (jsonAt(payload, k) == '.') {
+                out.byte('0')?;
+            }
+            while (k < payload.length) {
+                out.byte(payload[k])?;
+                if (payload[k] == '.' && (k + 1 == payload.length || !jsonIsDigit(payload[k + 1]))) {
+                    out.byte('0')?;
+                }
+                k += 1;
+            }
+        }
+    } else if (t == JSONB_TEXT || t == JSONB_TEXTJ) {
+        out.byte('"')?;
+        out.raw(payload)?;
+        out.byte('"')?;
+    } else if (t == JSONB_TEXT5) {
+        jsonTranslateText5(payload, out)?;
+    } else if (t == JSONB_TEXTRAW) {
+        out.quoted(payload)?;
+    } else if (t == JSONB_ARRAY) {
+        out.byte('[')?;
+        var j = i + n;
+        let iEnd = j + sz;
+        depth += 1;
+        if (depth > JSON_MAX_DEPTH) {
+            out.tooDeep();
+        }
+        while (j < iEnd && out.err == 0) {
+            j = jsonTranslateBlobToText(blob, depth, j, out)?;
+            out.byte(',')?;
+        }
+        depth -= 1;
+        if (j > iEnd) {
+            out.err |= JSTRING_MALFORMED;
+        }
+        if (sz > 0) {
+            out.trimOne();
+        }
+        out.byte(']')?;
+    } else if (t == JSONB_OBJECT) {
+        var x: u32 = 0;
+        out.byte('{')?;
+        var j = i + n;
+        let iEnd = j + sz;
+        depth += 1;
+        if (depth > JSON_MAX_DEPTH) {
+            out.tooDeep();
+        }
+        while (j < iEnd && out.err == 0) {
+            j = jsonTranslateBlobToText(blob, depth, j, out)?;
+            out.byte(if ((x & 1) != 0) ',' else ':')?;
+            x += 1;
+        }
+        depth -= 1;
+        if ((x & 1) != 0 || j > iEnd) {
+            out.err |= JSTRING_MALFORMED;
+        }
+        if (sz > 0) {
+            out.trimOne();
+        }
+        out.byte('}')?;
+    } else {
+        out.err |= JSTRING_MALFORMED;
+    }
+    return Ok(i + n + sz);
+}
+
+/// A JSON5 string's payload as an RFC 8259 string.
+fn jsonTranslateText5(payload: Slice<u8>, out: borrow mut JsonOut) -> Result<void, AllocError> {
+    out.byte('"')?;
+    var at: usize = 0;
+    var left = payload.length;
+    while (left > 0) {
+        var k: usize = 0;
+        while (k < left && (jsonIsOk(payload[at + k]) || payload[at + k] == '\'')) {
+            k += 1;
+        }
+        if (k > 0) {
+            out.raw(payload[at..at + k])?;
+            if (k >= left) {
+                break;
+            }
+            at += k;
+            left -= k;
+        }
+        let c = payload[at];
+        if (c == '"') {
+            out.text("\\\"")?;
+            at += 1;
+            left -= 1;
+            continue;
+        }
+        if (c <= 0x1F) {
+            out.controlChar(c)?;
+            at += 1;
+            left -= 1;
+            continue;
+        }
+        // A backslash.
+        if (left < 2) {
+            out.err |= JSTRING_MALFORMED;
+            break;
+        }
+        let e = payload[at + 1];
+        if (e == '\'') {
+            out.byte('\'')?;
+        } else if (e == 'v') {
+            out.text("\\u000b")?;
+        } else if (e == 'x') {
+            if (left < 4) {
+                out.err |= JSTRING_MALFORMED;
+                left = 2;
+            } else {
+                out.text("\\u00")?;
+                out.raw(payload[at + 2..at + 4])?;
+                at += 2;
+                left -= 2;
+            }
+        } else if (e == '0') {
+            out.text("\\u0000")?;
+        } else if (e == '\r') {
+            if (left > 2 && payload[at + 2] == '\n') {
+                at += 1;
+                left -= 1;
+            }
+        } else if (e == '\n') {
+            // An escaped newline is nothing.
+        } else if (e == 0xE2) {
+            // An escaped U+2028 or U+2029 is nothing.
+            if (left < 4 || payload[at + 2] != 0x80 || (payload[at + 3] != 0xA8 && payload[at + 3] != 0xA9)) {
+                out.err |= JSTRING_MALFORMED;
+                left = 2;
+            } else {
+                at += 2;
+                left -= 2;
+            }
+        } else {
+            out.raw(payload[at..at + 2])?;
+        }
+        at += 2;
+        left -= 2;
+    }
+    return out.byte('"');
+}
+
+/// Appends `level` copies of the indentation.
+fn jsonPrettyIndent(out: borrow mut JsonOut, indent: Slice<u8>, level: u32) -> Result<void, AllocError> {
+    for (k in 0..level) {
+        out.raw(indent)?;
+    }
+    return Ok();
+}
+
+/// jsonTranslateBlobToText with line breaks and indentation, for json_pretty() (jsonTranslateBlobToPrettyText).
+fn jsonTranslateBlobToPrettyText(
+    blob: Slice<u8>,
+    depth: borrow mut i64,
+    indent: Slice<u8>,
+    level: borrow mut u32,
+    i: usize,
+    out: borrow mut JsonOut,
+) -> Result<usize, AllocError> {
+    let h = jsonbPayloadSize(blob, 0, i);
+    if (h.n == 0) {
+        out.err |= JSTRING_MALFORMED;
+        return Ok(blob.length + 1);
+    }
+    let t = blob[i] & 0x0F;
+    if (t == JSONB_ARRAY) {
+        var j = i + h.n;
+        let iEnd = j + h.sz;
+        out.byte('[')?;
+        if (j < iEnd) {
+            out.byte('\n')?;
+            level += 1;
+            if (level as i64 >= JSON_MAX_DEPTH) {
+                out.tooDeep();
+            }
+            while (out.err == 0) {
+                jsonPrettyIndent(out, indent, level)?;
+                j = jsonTranslateBlobToPrettyText(blob, depth, indent, level, j, out)?;
+                if (j >= iEnd) {
+                    break;
+                }
+                out.text(",\n")?;
+            }
+            out.byte('\n')?;
+            level -= 1;
+            jsonPrettyIndent(out, indent, level)?;
+        }
+        out.byte(']')?;
+        return Ok(iEnd);
+    }
+    if (t == JSONB_OBJECT) {
+        var j = i + h.n;
+        let iEnd = j + h.sz;
+        out.byte('{')?;
+        if (j < iEnd) {
+            out.byte('\n')?;
+            level += 1;
+            if (level as i64 >= JSON_MAX_DEPTH) {
+                out.tooDeep();
+            }
+            depth = level as i64;
+            while (out.err == 0) {
+                jsonPrettyIndent(out, indent, level)?;
+                j = jsonTranslateBlobToText(blob, depth, j, out)?;
+                if (j > iEnd) {
+                    out.err |= JSTRING_MALFORMED;
+                    break;
+                }
+                out.text(": ")?;
+                j = jsonTranslateBlobToPrettyText(blob, depth, indent, level, j, out)?;
+                if (j >= iEnd) {
+                    break;
+                }
+                out.text(",\n")?;
+            }
+            out.byte('\n')?;
+            level -= 1;
+            jsonPrettyIndent(out, indent, level)?;
+        }
+        out.byte('}')?;
+        return Ok(iEnd);
+    }
+    return jsonTranslateBlobToText(blob, depth, i, out);
+}
+
+// ── parsing and editing ──────────────────────────────────────────────────────────────────────────────────────
+
+/// The JSONB to insert at the end of a path, and the lookup's result (jsonCreateEditSubstructure).
+struct JsonSubstructure {
+    rc: usize;
+    blob: Vector<u8>;
+}
+
+/// A JSON value as JSONB, being searched or edited (JsonParse).
+struct JsonParse {
+    blob: Vector<u8>;
+    /// Where the text parser saw an error.
+    iErr: usize;
+    depth: i64;
+    /// The text did not parse (kept only for json_valid()).
+    failed: bool;
+    /// The text used JSON5.
+    hasNonstd: bool;
+    /// The edit a lookup makes (JEDIT_*), and the JSONB it inserts.
+    edit: u8;
+    ins: Vector<u8>;
+    /// The change in size of an edit in progress.
+    delta: i64;
+
+    fn create() -> JsonParse => JsonParse {
+        blob: Vector<u8>.create(),
+        iErr: 0,
+        depth: 0,
+        failed: false,
+        hasNonstd: false,
+        edit: 0,
+        ins: Vector<u8>.create(),
+        delta: 0,
+    };
+
+    /// Translates the JSON text element at z[start..] into JSONB, appended to the blob (jsonTranslateTextToBlob).
+    /// Returns the index past it, or 0 at the end of the text, -1 for an error, and -2, -3, -4 and -5 for a '}',
+    /// ']', ',' or ':', whose place is then in iErr.
+    fn translateText(borrow mut this, z: Slice<u8>, start: usize) -> Result<i64, AllocError> {
+        var i = start;
+        loop {
+            let c = jsonAt(z, i);
+            if (c == '{') {
+                return this.translateObject(z, i);
+            }
+            if (c == '[') {
+                return this.translateArray(z, i);
+            }
+            if (c == '"' || c == '\'') {
+                if (c == '\'') {
+                    this.hasNonstd = true;
+                }
+                return this.translateString(z, i);
+            }
+            if (c == 't') {
+                if (jsonStartsWith(z, i, "true") && !jsonIsAlnum(jsonAt(z, i + 4))) {
+                    this.blob.push(JSONB_TRUE)?;
+                    return Ok(truncate<i64>(i + 4));
+                }
+                this.iErr = i;
+                return Ok(-1);
+            }
+            if (c == 'f') {
+                if (jsonStartsWith(z, i, "false") && !jsonIsAlnum(jsonAt(z, i + 5))) {
+                    this.blob.push(JSONB_FALSE)?;
+                    return Ok(truncate<i64>(i + 5));
+                }
+                this.iErr = i;
+                return Ok(-1);
+            }
+            if (c == '+' || c == '.' || c == '-' || jsonIsDigit(c)) {
+                return this.translateNumber(z, i);
+            }
+            if (c == '}') {
+                this.iErr = i;
+                return Ok(-2);
+            }
+            if (c == ']') {
+                this.iErr = i;
+                return Ok(-3);
+            }
+            if (c == ',') {
+                this.iErr = i;
+                return Ok(-4);
+            }
+            if (c == ':') {
+                this.iErr = i;
+                return Ok(-5);
+            }
+            if (c == 0) {
+                return Ok(0);
+            }
+            if (jsonIsSpace(c)) {
+                i += 1;
+                while (jsonIsSpace(jsonAt(z, i))) {
+                    i += 1;
+                }
+                continue;
+            }
+            if (c == 0x0B || c == 0x0C || c == '/' || c == 0xC2 || c == 0xE1 || c == 0xE2 || c == 0xE3 || c == 0xEF) {
+                let skip = json5Whitespace(z, i);
+                if (skip > 0) {
+                    i += skip;
+                    this.hasNonstd = true;
+                    continue;
+                }
+                this.iErr = i;
+                return Ok(-1);
+            }
+            if (c == 'n' && jsonStartsWith(z, i, "null") && !jsonIsAlnum(jsonAt(z, i + 4))) {
+                this.blob.push(JSONB_NULL)?;
+                return Ok(truncate<i64>(i + 4));
+            }
+            return this.translateName(z, i);
+        }
+    }
+
+    /// Infinity, NaN and their kin (aNanInfName).
+    private fn translateName(borrow mut this, z: Slice<u8>, i: usize) -> Result<i64, AllocError> {
+        let c = foldAscii(jsonAt(z, i));
+        let names = ["inf", "infinity", "NaN", "QNaN", "SNaN"];
+        for (k in 0..names.length) {
+            let name = names[k];
+            if (c != foldAscii(name[0])) {
+                continue;
+            }
+            if (!jsonStartsNoCase(z, i, name)) {
+                continue;
+            }
+            if (jsonIsAlnum(jsonAt(z, i + name.length))) {
+                continue;
+            }
+            if (k < 2) {
+                jsonbAppendNode(mut this.blob, JSONB_FLOAT, "9e999".bytes())?;
+            } else {
+                this.blob.push(JSONB_NULL)?;
+            }
+            this.hasNonstd = true;
+            return Ok(truncate<i64>(i + name.length));
+        }
+        this.iErr = i;
+        return Ok(-1);
+    }
+
+    private fn translateObject(borrow mut this, z: Slice<u8>, i: usize) -> Result<i64, AllocError> {
+        let iThis = this.blob.length;
+        jsonbAppendHeader(mut this.blob, JSONB_OBJECT, z.length - i)?;
+        this.depth += 1;
+        if (this.depth > JSON_MAX_DEPTH) {
+            this.iErr = i;
+            return Ok(-1);
+        }
+        let iStart = this.blob.length;
+        var j = i + 1;
+        loop {
+            let iBlob = this.blob.length;
+            var x = this.translateText(z, j)?;
+            if (x <= 0) {
+                if (x == -2) {
+                    j = this.iErr;
+                    if (this.blob.length != iStart) {
+                        this.hasNonstd = true;
+                    }
+                    break;
+                }
+                // An unquoted label.
+                j += json5Whitespace(z, j);
+                var op = JSONB_TEXT;
+                let escapedStart = jsonAt(z, j) == '\\' && jsonAt(z, j + 1) == 'u' && jsonIs4Hex(z, j + 2);
+                if (jsonIdStart(jsonAt(z, j)) || escapedStart) {
+                    if (!jsonIdStart(jsonAt(z, j))) {
+                        op = JSONB_TEXTJ;
+                    }
+                    var k = j + 1;
+                    loop {
+                        let d = jsonAt(z, k);
+                        if (jsonIdPart(d) && json5Whitespace(z, k) == 0) {
+                            k += 1;
+                            continue;
+                        }
+                        if (d == '\\' && jsonAt(z, k + 1) == 'u' && jsonIs4Hex(z, k + 2)) {
+                            op = JSONB_TEXTJ;
+                            k += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    jsonbAppendNode(mut this.blob, op, z[j..k])?;
+                    this.hasNonstd = true;
+                    x = truncate<i64>(k);
+                } else {
+                    if (x != -1) {
+                        this.iErr = j;
+                    }
+                    return Ok(-1);
+                }
+            }
+            let t = jsonAt(this.blob.view(), iBlob) & 0x0F;
+            if (t < JSONB_TEXT || t > JSONB_TEXTRAW) {
+                this.iErr = j;
+                return Ok(-1);
+            }
+            j = truncate<usize>(x);
+            if (jsonAt(z, j) == ':') {
+                j += 1;
+            } else {
+                var colon = false;
+                if (jsonIsSpace(jsonAt(z, j))) {
+                    loop {
+                        j += 1;
+                        if (!jsonIsSpace(jsonAt(z, j))) {
+                            break;
+                        }
+                    }
+                    if (jsonAt(z, j) == ':') {
+                        j += 1;
+                        colon = true;
+                    }
+                }
+                if (!colon) {
+                    x = this.translateText(z, j)?;
+                    if (x != -5) {
+                        if (x != -1) {
+                            this.iErr = j;
+                        }
+                        return Ok(-1);
+                    }
+                    j = this.iErr + 1;
+                }
+            }
+            // The value.
+            x = this.translateText(z, j)?;
+            if (x <= 0) {
+                if (x != -1) {
+                    this.iErr = j;
+                }
+                return Ok(-1);
+            }
+            j = truncate<usize>(x);
+            if (jsonAt(z, j) == ',') {
+                j += 1;
+                continue;
+            }
+            if (jsonAt(z, j) == '}') {
+                break;
+            }
+            if (jsonIsSpace(jsonAt(z, j))) {
+                j += 1;
+                while (jsonIsSpace(jsonAt(z, j))) {
+                    j += 1;
+                }
+                if (jsonAt(z, j) == ',') {
+                    j += 1;
+                    continue;
+                }
+                if (jsonAt(z, j) == '}') {
+                    break;
+                }
+            }
+            x = this.translateText(z, j)?;
+            if (x == -4) {
+                j = this.iErr + 1;
+                continue;
+            }
+            if (x == -2) {
+                j = this.iErr;
+                break;
+            }
+            this.iErr = j;
+            return Ok(-1);
+        }
+        let size = this.blob.length - iStart;
+        let _ = jsonbChangePayloadSize(mut this.blob, iThis, size)?;
+        this.depth -= 1;
+        return Ok(truncate<i64>(j + 1));
+    }
+
+    private fn translateArray(borrow mut this, z: Slice<u8>, i: usize) -> Result<i64, AllocError> {
+        let iThis = this.blob.length;
+        jsonbAppendHeader(mut this.blob, JSONB_ARRAY, z.length - i)?;
+        let iStart = this.blob.length;
+        this.depth += 1;
+        if (this.depth > JSON_MAX_DEPTH) {
+            this.iErr = i;
+            return Ok(-1);
+        }
+        var j = i + 1;
+        loop {
+            var x = this.translateText(z, j)?;
+            if (x <= 0) {
+                if (x == -3) {
+                    j = this.iErr;
+                    if (this.blob.length != iStart) {
+                        this.hasNonstd = true;
+                    }
+                    break;
+                }
+                if (x != -1) {
+                    this.iErr = j;
+                }
+                return Ok(-1);
+            }
+            j = truncate<usize>(x);
+            if (jsonAt(z, j) == ',') {
+                j += 1;
+                continue;
+            }
+            if (jsonAt(z, j) == ']') {
+                break;
+            }
+            if (jsonIsSpace(jsonAt(z, j))) {
+                j += 1;
+                while (jsonIsSpace(jsonAt(z, j))) {
+                    j += 1;
+                }
+                if (jsonAt(z, j) == ',') {
+                    j += 1;
+                    continue;
+                }
+                if (jsonAt(z, j) == ']') {
+                    break;
+                }
+            }
+            x = this.translateText(z, j)?;
+            if (x == -4) {
+                j = this.iErr + 1;
+                continue;
+            }
+            if (x == -3) {
+                j = this.iErr;
+                break;
+            }
+            this.iErr = j;
+            return Ok(-1);
+        }
+        let size = this.blob.length - iStart;
+        let _ = jsonbChangePayloadSize(mut this.blob, iThis, size)?;
+        this.depth -= 1;
+        return Ok(truncate<i64>(j + 1));
+    }
+
+    private fn translateString(borrow mut this, z: Slice<u8>, i: usize) -> Result<i64, AllocError> {
+        var opcode = JSONB_TEXT;
+        let delimiter = z[i];
+        var j = i + 1;
+        loop {
+            if (jsonIsOk(jsonAt(z, j))) {
+                if (!jsonIsOk(jsonAt(z, j + 1))) {
+                    j += 1;
+                } else if (!jsonIsOk(jsonAt(z, j + 2))) {
+                    j += 2;
+                } else {
+                    j += 3;
+                    continue;
+                }
+            }
+            let c = jsonAt(z, j);
+            if (c == delimiter) {
+                break;
+            }
+            if (c == '\\') {
+                j += 1;
+                let e = jsonAt(z, j);
+                if (e == '"' || e == '\\' || e == '/' || e == 'b' || e == 'f' || e == 'n' || e == 'r' || e == 't' ||
+                    (e == 'u' && jsonIs4Hex(
+                        z,
+                        j + 1,
+                    ))) {
+                    if (opcode == JSONB_TEXT) {
+                        opcode = JSONB_TEXTJ;
+                    }
+                } else if (e == '\'' || e == 'v' || e == '\n' || (e == '0' && !jsonIsDigit(
+                    jsonAt(z, j + 1),
+                )) || (e == 0xE2 && jsonAt(
+                    z,
+                    j + 1,
+                ) == 0x80 && (jsonAt(
+                    z,
+                    j + 2,
+                ) == 0xA8 || jsonAt(z, j + 2) == 0xA9)) || (e == 'x' && jsonIs2Hex(z, j + 1))) {
+                    opcode = JSONB_TEXT5;
+                    this.hasNonstd = true;
+                } else if (e == '\r') {
+                    if (jsonAt(z, j + 1) == '\n') {
+                        j += 1;
+                    }
+                    opcode = JSONB_TEXT5;
+                    this.hasNonstd = true;
+                } else {
+                    this.iErr = j;
+                    return Ok(-1);
+                }
+            } else if (c <= 0x1F) {
+                if (c == 0) {
+                    this.iErr = j;
+                    return Ok(-1);
+                }
+                // Control characters are allowed in JSON5 strings only.
+                opcode = JSONB_TEXT5;
+                this.hasNonstd = true;
+            } else if (c == '"') {
+                opcode = JSONB_TEXT5;
+            }
+            j += 1;
+        }
+        jsonbAppendNode(mut this.blob, opcode, z[i + 1..j])?;
+        return Ok(truncate<i64>(j + 1));
+    }
+
+    private fn translateNumber(borrow mut this, z: Slice<u8>, start: usize) -> Result<i64, AllocError> {
+        var i = start;
+        // Bit 1: JSON5. Bit 2: a real.
+        var t: u8 = 0;
+        var seenE = false;
+        var j: usize = 0;
+        // 0: from the start; 1: at parse_number_2; 2: at parse_number_finish.
+        var stage: u8 = 0;
+        let first = jsonAt(z, i);
+        if (first == '+') {
+            this.hasNonstd = true;
+        } else if (first == '.') {
+            if (!jsonIsDigit(jsonAt(z, i + 1))) {
+                this.iErr = i;
+                return Ok(-1);
+            }
+            this.hasNonstd = true;
+            t = 0x03;
+            stage = 1;
+        }
+        if (stage == 0) {
+            let c = jsonAt(z, i);
+            if (c <= '0') {
+                if (c == '0') {
+                    if ((jsonAt(z, i + 1) == 'x' || jsonAt(z, i + 1) == 'X') && isSqlHexDigit(jsonAt(z, i + 2))) {
+                        this.hasNonstd = true;
+                        t = 0x01;
+                        j = i + 3;
+                        while (isSqlHexDigit(jsonAt(z, j))) {
+                            j += 1;
+                        }
+                        stage = 2;
+                    } else if (jsonIsDigit(jsonAt(z, i + 1))) {
+                        this.iErr = i + 1;
+                        return Ok(-1);
+                    }
+                } else if (!jsonIsDigit(jsonAt(z, i + 1))) {
+                    // "+Infinity" and "-Infinity", in any case, and "+inf" and "-inf".
+                    let d = jsonAt(z, i + 1);
+                    if ((d == 'I' || d == 'i') && jsonStartsNoCase(z, i + 1, "inf")) {
+                        this.hasNonstd = true;
+                        if (c == '-') {
+                            jsonbAppendNode(mut this.blob, JSONB_FLOAT, "-9e999".bytes())?;
+                        } else {
+                            jsonbAppendNode(mut this.blob, JSONB_FLOAT, "9e999".bytes())?;
+                        }
+                        return Ok(truncate<i64>(i + (if (jsonStartsNoCase(z, i + 4, "inity")) 9 else 4)));
+                    }
+                    if (d == '.') {
+                        this.hasNonstd = true;
+                        t |= 0x01;
+                        stage = 1;
+                    } else {
+                        this.iErr = i;
+                        return Ok(-1);
+                    }
+                } else if (jsonAt(z, i + 1) == '0') {
+                    if (jsonIsDigit(jsonAt(z, i + 2))) {
+                        this.iErr = i + 1;
+                        return Ok(-1);
+                    }
+                    if ((jsonAt(z, i + 2) == 'x' || jsonAt(z, i + 2) == 'X') && isSqlHexDigit(jsonAt(z, i + 3))) {
+                        this.hasNonstd = true;
+                        t |= 0x01;
+                        j = i + 4;
+                        while (isSqlHexDigit(jsonAt(z, j))) {
+                            j += 1;
+                        }
+                        stage = 2;
+                    }
+                }
+            }
+        }
+        if (stage < 2) {
+            j = i + 1;
+            loop {
+                let c = jsonAt(z, j);
+                if (jsonIsDigit(c)) {
+                    j += 1;
+                    continue;
+                }
+                if (c == '.') {
+                    if ((t & 0x02) != 0) {
+                        this.iErr = j;
+                        return Ok(-1);
+                    }
+                    t |= 0x02;
+                    j += 1;
+                    continue;
+                }
+                if (c == 'e' || c == 'E') {
+                    if (jsonAt(z, j - 1) < '0') {
+                        if (jsonAt(z, j - 1) == '.' && j >= i + 2 && jsonIsDigit(jsonAt(z, j - 2))) {
+                            this.hasNonstd = true;
+                            t |= 0x01;
+                        } else {
+                            this.iErr = j;
+                            return Ok(-1);
+                        }
+                    }
+                    if (seenE) {
+                        this.iErr = j;
+                        return Ok(-1);
+                    }
+                    t |= 0x02;
+                    seenE = true;
+                    var e = jsonAt(z, j + 1);
+                    if (e == '+' || e == '-') {
+                        j += 1;
+                        e = jsonAt(z, j + 1);
+                    }
+                    if (e < '0' || e > '9') {
+                        this.iErr = j;
+                        return Ok(-1);
+                    }
+                    j += 1;
+                    continue;
+                }
+                break;
+            }
+            if (jsonAt(z, j - 1) < '0') {
+                if (jsonAt(z, j - 1) == '.' && j >= i + 2 && jsonIsDigit(jsonAt(z, j - 2))) {
+                    this.hasNonstd = true;
+                    t |= 0x01;
+                } else {
+                    this.iErr = j;
+                    return Ok(-1);
+                }
+            }
+        }
+        if (jsonAt(z, i) == '+') {
+            i += 1;
+        }
+        jsonbAppendNode(mut this.blob, JSONB_INT + t, jsonBytes(z, i, j))?;
+        return Ok(truncate<i64>(j));
+    }
+
+    /// Parses a whole JSON text (jsonConvertTextToBlob). False when it is malformed; iErr then says where.
+    fn convertText(borrow mut this, z: Slice<u8>) -> Result<bool, AllocError> {
+        let r = this.translateText(z, 0)?;
+        if (r > 0) {
+            var i = truncate<usize>(r);
+            while (jsonIsSpace(jsonAt(z, i))) {
+                i += 1;
+            }
+            if (jsonAt(z, i) != 0) {
+                i += json5Whitespace(z, i);
+                if (jsonAt(z, i) != 0) {
+                    this.blob.clear();
+                    return Ok(false);
+                }
+                this.hasNonstd = true;
+            }
+            return Ok(true);
+        }
+        this.blob.clear();
+        return Ok(false);
+    }
+
+    /// Corrects the size of the element at `iRoot` after an edit inside it (jsonAfterEditSizeAdjust).
+    fn afterEditSizeAdjust(borrow mut this, iRoot: usize) -> Result<void, AllocError> {
+        let h = jsonbHeaderAt(this.blob.view(), iRoot);
+        let size = truncate<i64>(h.sz) + this.delta;
+        let grown = jsonbChangePayloadSize(mut this.blob, iRoot, saturatingTruncate<usize>(size))?;
+        this.delta += grown;
+        return Ok();
+    }
+
+    /// The JSONB a lookup inserts where the rest of the path, from `tail`, does not exist yet
+    /// (jsonCreateEditSubstructure): the value itself, or the objects and arrays that lead to it.
+    private fn createEditSubstructure(
+        borrow mut this,
+        path: Slice<u8>,
+        tail: usize,
+    ) -> Result<JsonSubstructure, AllocError> {
+        if (jsonAt(path, tail) == 0) {
+            return Ok(JsonSubstructure { rc: 0, blob: this.ins.clone()? });
+        }
+        var sub = JsonParse.create();
+        sub.blob.push(if (jsonAt(path, tail) == '.') JSONB_OBJECT else JSONB_ARRAY)?;
+        sub.edit = this.edit;
+        sub.ins = this.ins.clone()?;
+        sub.depth = this.depth + 1;
+        if (sub.depth >= JSON_MAX_DEPTH) {
+            return Ok(JsonSubstructure { rc: JSON_LOOKUP_TOODEEP, blob: Vector<u8>.create() });
+        }
+        let rc = sub.lookupStep(0, path, tail, 0)?;
+        this.depth -= 1;
+        return Ok(JsonSubstructure { rc: rc, blob: sub.blob });
+    }
+
+    /// Follows the path from path[at..] down from the element at `iRoot`, making the parse's edit at its end
+    /// (jsonLookupStep). Returns the index of the element found, or a JSON_LOOKUP_* code. `iLabel` is the label of
+    /// `iRoot` when it is an object's value.
+    fn lookupStep(
+        borrow mut this,
+        iRootIn: usize,
+        path: Slice<u8>,
+        at: usize,
+        iLabel: usize,
+    ) -> Result<usize, AllocError> {
+        var iRoot = iRootIn;
+        let c0 = jsonAt(path, at);
+        if (c0 == 0) {
+            if (this.edit != 0) {
+                let h = jsonbPayloadSize(this.blob.view(), this.delta, iRoot);
+                var sz = h.sz + h.n;
+                if (this.edit == JEDIT_DEL) {
+                    if (iLabel > 0) {
+                        sz += iRoot - iLabel;
+                        iRoot = iLabel;
+                    }
+                    jsonbEdit(mut this.blob, mut this.delta, iRoot, sz, [], 0)?;
+                } else if (this.edit == JEDIT_INS) {
+                    // It exists already: json_insert() leaves it.
+                } else if (this.edit == JEDIT_AINS) {
+                    if (at == 0 || path[at - 1] != ']') {
+                        return Ok(JSON_LOOKUP_NOTARRAY);
+                    }
+                    let count = this.ins.length;
+                    jsonbEdit(mut this.blob, mut this.delta, iRoot, 0, this.ins.view(), count)?;
+                } else {
+                    let count = this.ins.length;
+                    jsonbEdit(mut this.blob, mut this.delta, iRoot, sz, this.ins.view(), count)?;
+                }
+            }
+            return Ok(iRoot);
+        }
+        if (c0 == '.') {
+            return this.lookupLabel(iRoot, path, at + 1);
+        }
+        if (c0 == '[') {
+            return this.lookupIndex(iRoot, path, at);
+        }
+        return Ok(JSON_LOOKUP_PATHERROR);
+    }
+
+    /// `.label` or `."label"`, from path[at..] just after the dot.
+    private fn lookupLabel(borrow mut this, iRoot: usize, path: Slice<u8>, at: usize) -> Result<usize, AllocError> {
+        var rawKey = true;
+        let x0 = jsonAt(this.blob.view(), iRoot);
+        var keyStart = at;
+        var nKey: usize = 0;
+        var i: usize = 0;
+        if (jsonAt(path, at) == '"') {
+            keyStart = at + 1;
+            i = 1;
+            while (jsonAt(path, at + i) != 0 && jsonAt(path, at + i) != '"') {
+                if (jsonAt(path, at + i) == '\\' && jsonAt(path, at + i + 1) != 0) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            nKey = i - 1;
+            if (jsonAt(path, at + i) == 0) {
+                return Ok(JSON_LOOKUP_PATHERROR);
+            }
+            i += 1;
+            rawKey = path[keyStart..keyStart + nKey].indexOfByte('\\').isNull();
+        } else {
+            while (jsonAt(path, at + i) != 0 && jsonAt(path, at + i) != '.' && jsonAt(path, at + i) != '[') {
+                i += 1;
+            }
+            nKey = i;
+            if (nKey == 0) {
+                return Ok(JSON_LOOKUP_PATHERROR);
+            }
+        }
+        let key = path[keyStart..keyStart + nKey];
+        if ((x0 & 0x0F) != JSONB_OBJECT) {
+            return Ok(JSON_LOOKUP_NOTFOUND);
+        }
+        let h = jsonbPayloadSize(this.blob.view(), this.delta, iRoot);
+        var j = iRoot + h.n;
+        let iEnd = j + h.sz;
+        while (j < iEnd) {
+            let blob = this.blob.view();
+            let x = jsonAt(blob, j) & 0x0F;
+            if (x < JSONB_TEXT || x > JSONB_TEXTRAW) {
+                return Ok(JSON_LOOKUP_ERROR);
+            }
+            let hl = jsonbPayloadSize(blob, this.delta, j);
+            if (hl.n == 0) {
+                return Ok(JSON_LOOKUP_ERROR);
+            }
+            let k = j + hl.n;
+            if (k + hl.sz >= iEnd) {
+                return Ok(JSON_LOOKUP_ERROR);
+            }
+            let rawLabel = x == JSONB_TEXT || x == JSONB_TEXTRAW;
+            if (jsonLabelCompare(key, rawKey, jsonBytes(blob, k, k + hl.sz), rawLabel)) {
+                let v = k + hl.sz;
+                if ((jsonAt(blob, v) & 0x0F) > JSONB_OBJECT) {
+                    return Ok(JSON_LOOKUP_ERROR);
+                }
+                let hv = jsonbPayloadSize(blob, this.delta, v);
+                if (hv.n == 0 || v + hv.n + hv.sz > iEnd) {
+                    return Ok(JSON_LOOKUP_ERROR);
+                }
+                this.depth += 1;
+                if (this.depth >= JSON_MAX_DEPTH) {
+                    return Ok(JSON_LOOKUP_TOODEEP);
+                }
+                let rc = this.lookupStep(v, path, at + i, j)?;
+                this.depth -= 1;
+                if (this.delta != 0) {
+                    this.afterEditSizeAdjust(iRoot)?;
+                }
+                return Ok(rc);
+            }
+            j = k + hl.sz;
+            if ((jsonAt(blob, j) & 0x0F) > JSONB_OBJECT) {
+                return Ok(JSON_LOOKUP_ERROR);
+            }
+            let hv = jsonbPayloadSize(blob, this.delta, j);
+            if (hv.n == 0) {
+                return Ok(JSON_LOOKUP_ERROR);
+            }
+            j += hv.n + hv.sz;
+        }
+        if (j > iEnd) {
+            return Ok(JSON_LOOKUP_ERROR);
+        }
+        if (this.edit >= JEDIT_INS) {
+            // json_array_insert() needs the rest of the path to end at an array element.
+            if (this.edit == JEDIT_AINS && (at + i >= path.length || path[path.length - 1] != ']')) {
+                return Ok(JSON_LOOKUP_NOTARRAY);
+            }
+            // The label, then the value.
+            var label = Vector<u8>.create();
+            jsonbAppendHeader(mut label, if (rawKey) JSONB_TEXTRAW else JSONB_TEXT5, nKey)?;
+            let sub = this.createEditSubstructure(path, at + i)?;
+            if (!jsonLookupIsError(sub.rc)) {
+                let nIns = label.length + nKey + sub.blob.length;
+                jsonbEdit(mut this.blob, mut this.delta, j, 0, [], nIns)?;
+                jsonCopyInto(mut this.blob, j, label.view());
+                jsonCopyInto(mut this.blob, j + label.length, key);
+                jsonCopyInto(mut this.blob, j + label.length + nKey, sub.blob.view());
+                if (this.delta != 0) {
+                    this.afterEditSizeAdjust(iRoot)?;
+                }
+            }
+            return Ok(sub.rc);
+        }
+        return Ok(JSON_LOOKUP_NOTFOUND);
+    }
+
+    /// `[N]`, `[#]` or `[#-N]`, from path[at..] at the bracket.
+    private fn lookupIndex(borrow mut this, iRoot: usize, path: Slice<u8>, at: usize) -> Result<usize, AllocError> {
+        var kk: u64 = 0;
+        if ((jsonAt(this.blob.view(), iRoot) & 0x0F) != JSONB_ARRAY) {
+            return Ok(JSON_LOOKUP_NOTFOUND);
+        }
+        let h = jsonbPayloadSize(this.blob.view(), this.delta, iRoot);
+        var i: usize = 1;
+        while (jsonIsDigit(jsonAt(path, at + i))) {
+            // Past any array's size, so that the answer is NOTFOUND rather than PATHERROR, without overflow.
+            if (kk < 0xFFFF_FFFF) {
+                kk = kk * 10 + ((jsonAt(path, at + i) - '0') as u64);
+            }
+            i += 1;
+        }
+        if (i < 2 || jsonAt(path, at + i) != ']') {
+            if (jsonAt(path, at + 1) != '#') {
+                return Ok(JSON_LOOKUP_PATHERROR);
+            }
+            kk = jsonbArrayCount(this.blob.view(), this.delta, iRoot);
+            i = 2;
+            if (jsonAt(path, at + 2) == '-' && jsonIsDigit(jsonAt(path, at + 3))) {
+                var nn: u64 = 0;
+                i = 3;
+                loop {
+                    if (nn < 0xFFFF_FFFF) {
+                        nn = nn * 10 + ((jsonAt(path, at + i) - '0') as u64);
+                    }
+                    i += 1;
+                    if (!jsonIsDigit(jsonAt(path, at + i))) {
+                        break;
+                    }
+                }
+                if (nn > kk) {
+                    return Ok(JSON_LOOKUP_NOTFOUND);
+                }
+                kk -= nn;
+            }
+            if (jsonAt(path, at + i) != ']') {
+                return Ok(JSON_LOOKUP_PATHERROR);
+            }
+        }
+        var j = iRoot + h.n;
+        let iEnd = j + h.sz;
+        while (j < iEnd) {
+            if (kk == 0) {
+                this.depth += 1;
+                if (this.depth >= JSON_MAX_DEPTH) {
+                    return Ok(JSON_LOOKUP_TOODEEP);
+                }
+                let rc = this.lookupStep(j, path, at + i + 1, 0)?;
+                this.depth -= 1;
+                if (this.delta != 0) {
+                    this.afterEditSizeAdjust(iRoot)?;
+                }
+                return Ok(rc);
+            }
+            kk -= 1;
+            let e = jsonbPayloadSize(this.blob.view(), this.delta, j);
+            if (e.n == 0) {
+                return Ok(JSON_LOOKUP_ERROR);
+            }
+            j += e.n + e.sz;
+        }
+        if (j > iEnd) {
+            return Ok(JSON_LOOKUP_ERROR);
+        }
+        if (kk > 0) {
+            return Ok(JSON_LOOKUP_NOTFOUND);
+        }
+        if (this.edit >= JEDIT_INS) {
+            let sub = this.createEditSubstructure(path, at + i + 1)?;
+            if (!jsonLookupIsError(sub.rc)) {
+                let count = sub.blob.length;
+                jsonbEdit(mut this.blob, mut this.delta, j, 0, sub.blob.view(), count)?;
+            }
+            if (this.delta != 0) {
+                this.afterEditSizeAdjust(iRoot)?;
+            }
+            return Ok(sub.rc);
+        }
+        return Ok(JSON_LOOKUP_NOTFOUND);
+    }
+}
+
+/// RFC 7396 MergePatch of the patch element at patch[iPatch] into the target element at `iTarget`
+/// (jsonMergePatch).
+fn jsonMergePatch(
+    target: borrow mut JsonParse,
+    iTarget: usize,
+    patch: Slice<u8>,
+    iPatch: usize,
+    depth: i64,
+) -> Result<u8, AllocError> {
+    if ((jsonAt(patch, iPatch) & 0x0F) != JSONB_OBJECT) {
+        // The patch replaces the target.
+        let hp = jsonbPayloadSize(patch, 0, iPatch);
+        let szPatch = hp.n + hp.sz;
+        let ht = jsonbPayloadSize(target.blob.view(), target.delta, iTarget);
+        let szTarget = ht.n + ht.sz;
+        jsonbEdit(
+            mut target.blob,
+            mut target.delta,
+            iTarget,
+            szTarget,
+            jsonBytes(patch, iPatch, iPatch + szPatch),
+            szPatch,
+        )?;
+        return Ok(JSON_MERGE_OK);
+    }
+    if ((jsonAt(target.blob.view(), iTarget) & 0x0F) != JSONB_OBJECT) {
+        // The target becomes an empty object.
+        let h = jsonbPayloadSize(target.blob.view(), target.delta, iTarget);
+        jsonbEdit(mut target.blob, mut target.delta, iTarget + h.n, h.sz, [], 0)?;
+        if (iTarget < target.blob.length) {
+            let b = target.blob[iTarget];
+            target.blob[iTarget] = (b & 0xF0) | JSONB_OBJECT;
+        }
+    }
+    let hp = jsonbPayloadSize(patch, 0, iPatch);
+    if (hp.n == 0) {
+        return Ok(JSON_MERGE_BADPATCH);
+    }
+    var iPCursor = iPatch + hp.n;
+    let iPEnd = iPCursor + hp.sz;
+    let ht = jsonbPayloadSize(target.blob.view(), target.delta, iTarget);
+    if (ht.n == 0) {
+        return Ok(JSON_MERGE_BADTARGET);
+    }
+    let iTStart = iTarget + ht.n;
+    let iTEndBE = iTStart + ht.sz;
+    var iTLabel: usize = 0;
+    var nTLabel: usize = 0;
+    var szTLabel: usize = 0;
+    var iTValue: usize = 0;
+    var nTValue: usize = 0;
+    var szTValue: usize = 0;
+    while (iPCursor < iPEnd) {
+        let iPLabel = iPCursor;
+        let ePLabel = jsonAt(patch, iPCursor) & 0x0F;
+        if (ePLabel < JSONB_TEXT || ePLabel > JSONB_TEXTRAW) {
+            return Ok(JSON_MERGE_BADPATCH);
+        }
+        let hpl = jsonbPayloadSize(patch, 0, iPCursor);
+        if (hpl.n == 0) {
+            return Ok(JSON_MERGE_BADPATCH);
+        }
+        let nPLabel = hpl.n;
+        let szPLabel = hpl.sz;
+        let iPValue = iPCursor + nPLabel + szPLabel;
+        if (iPValue >= iPEnd) {
+            return Ok(JSON_MERGE_BADPATCH);
+        }
+        let hpv = jsonbPayloadSize(patch, 0, iPValue);
+        if (hpv.n == 0) {
+            return Ok(JSON_MERGE_BADPATCH);
+        }
+        let nPValue = hpv.n;
+        let szPValue = hpv.sz;
+        iPCursor = iPValue + nPValue + szPValue;
+        if (iPCursor > iPEnd) {
+            return Ok(JSON_MERGE_BADPATCH);
+        }
+        var iTCursor = iTStart;
+        let iTEnd = saturatingTruncate<usize>(truncate<i64>(iTEndBE) + target.delta);
+        while (iTCursor < iTEnd) {
+            let blob = target.blob.view();
+            iTLabel = iTCursor;
+            let eTLabel = jsonAt(blob, iTCursor) & 0x0F;
+            if (eTLabel < JSONB_TEXT || eTLabel > JSONB_TEXTRAW) {
+                return Ok(JSON_MERGE_BADTARGET);
+            }
+            let htl = jsonbPayloadSize(blob, target.delta, iTCursor);
+            if (htl.n == 0) {
+                return Ok(JSON_MERGE_BADTARGET);
+            }
+            nTLabel = htl.n;
+            szTLabel = htl.sz;
+            iTValue = iTLabel + nTLabel + szTLabel;
+            if (iTValue >= iTEnd) {
+                return Ok(JSON_MERGE_BADTARGET);
+            }
+            let htv = jsonbPayloadSize(blob, target.delta, iTValue);
+            if (htv.n == 0) {
+                return Ok(JSON_MERGE_BADTARGET);
+            }
+            nTValue = htv.n;
+            szTValue = htv.sz;
+            if (iTValue + nTValue + szTValue > iTEnd) {
+                return Ok(JSON_MERGE_BADTARGET);
+            }
+            let same = jsonLabelCompare(
+                jsonBytes(patch, iPLabel + nPLabel, iPLabel + nPLabel + szPLabel),
+                ePLabel == JSONB_TEXT || ePLabel == JSONB_TEXTRAW,
+                jsonBytes(blob, iTLabel + nTLabel, iTLabel + nTLabel + szTLabel),
+                eTLabel == JSONB_TEXT || eTLabel == JSONB_TEXTRAW,
+            );
+            if (same) {
+                break;
+            }
+            iTCursor = iTValue + nTValue + szTValue;
+        }
+        let x = jsonAt(patch, iPValue) & 0x0F;
+        if (iTCursor < iTEnd) {
+            // The label is in the target.
+            if (x == JSONB_NULL) {
+                jsonbEdit(mut target.blob, mut target.delta, iTLabel, nTLabel + szTLabel + nTValue + szTValue, [], 0)?;
+            } else {
+                let savedDelta = target.delta;
+                target.delta = 0;
+                if (depth >= JSON_MAX_DEPTH) {
+                    return Ok(JSON_MERGE_TOODEEP);
+                }
+                let rc = jsonMergePatch(target, iTValue, patch, iPValue, depth + 1)?;
+                if (rc != JSON_MERGE_OK) {
+                    return Ok(rc);
+                }
+                target.delta += savedDelta;
+            }
+        } else if (x != JSONB_NULL) {
+            // A new label: appended.
+            let szNew = szPLabel + nPLabel;
+            if (x != JSONB_OBJECT) {
+                jsonbEdit(mut target.blob, mut target.delta, iTEnd, 0, [], szPValue + nPValue + szNew)?;
+                jsonCopyInto(mut target.blob, iTEnd, jsonBytes(patch, iPLabel, iPLabel + szNew));
+                jsonCopyInto(mut target.blob, iTEnd + szNew, jsonBytes(patch, iPValue, iPValue + szPValue + nPValue));
+            } else {
+                jsonbEdit(mut target.blob, mut target.delta, iTEnd, 0, [], szNew + 1)?;
+                jsonCopyInto(mut target.blob, iTEnd, jsonBytes(patch, iPLabel, iPLabel + szNew));
+                if (iTEnd + szNew < target.blob.length) {
+                    target.blob[iTEnd + szNew] = JSONB_NULL;
+                }
+                let savedDelta = target.delta;
+                target.delta = 0;
+                if (depth >= JSON_MAX_DEPTH) {
+                    return Ok(JSON_MERGE_TOODEEP);
+                }
+                let rc = jsonMergePatch(target, iTEnd + szNew, patch, iPValue, depth + 1)?;
+                if (rc != JSON_MERGE_OK) {
+                    return Ok(rc);
+                }
+                target.delta += savedDelta;
+            }
+        }
+    }
+    if (target.delta != 0) {
+        target.afterEditSizeAdjust(iTarget)?;
+    }
+    return Ok(JSON_MERGE_OK);
+}
+
+// ── values ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// A function's argument or result, with SQLite's JSON subtype: text a JSON function made, which another JSON
+/// function takes as JSON rather than as a string.
+struct JsonValue {
+    value: SqliteValue;
+    json: bool;
+}
+
+fn jsonPlain(value: SqliteValue) -> JsonValue => JsonValue { value: value, json: false };
+
+fn jsonNull() -> JsonValue => JsonValue { value: SqliteValue.Null, json: false };
+
+/// A path argument as the C string SQLite reads: NULL is `null`, and the text ends at a NUL.
+fn jsonPathBytes(value: borrow SqliteValue) -> Result<Vector<u8>?, AllocError> {
+    if (value.isNull()) {
+        return Ok(null);
+    }
+    var bytes = valueBytes(value)?;
+    if (bytes.view().indexOfByte(0) is Some(at)) {
+        bytes.truncate(at);
+    }
+    return Ok(bytes);
+}
+
+/// The message for a lookup that failed on `path` (jsonBadPathError).
+fn jsonBadPathError(path: Slice<u8>, rc: usize) -> SqliteError {
+    if (rc == JSON_LOOKUP_ERROR) {
+        return sqlError("malformed JSON");
+    }
+    if (rc == JSON_LOOKUP_TOODEEP) {
+        return sqlError("JSON path too deep");
+    }
+    var message = String.create();
+    let text = match (textFromBytesLossy(path)) {
+        Ok(t) => t,
+        Err(e) => {
+            return SqliteError.Alloc(e);
+        }
+    };
+    let prefix = if (rc == JSON_LOOKUP_NOTARRAY) "not an array element: " else "bad JSON path: ";
+    let built = message.append(prefix).isOk() && SqlWriter.appendStringLiteral(mut message, text.view()).isOk();
+    if (!built) {
+        return sqlError("out of memory");
+    }
+    return SqliteError.Sql(message);
+}
+
+/// A JSON argument parsed into JSONB (jsonParseFuncArg): NULL is `null`. Malformed JSON is an error, or, with
+/// `keepError`, a parse marked as failed.
+fn jsonParseArgument(value: borrow SqliteValue, keepError: bool) -> Result<JsonParse?, SqliteError> {
+    if (value.isNull()) {
+        return Ok(null);
+    }
+    var p = JsonParse.create();
+    if (value is SqliteValue.Blob(b)) {
+        if (jsonArgIsJsonb(b.view())) {
+            p.blob.extend(b.view())?;
+            return Ok(p);
+        }
+        // Not JSONB: read as text, as SQLite does for compatibility.
+    }
+    let text = valueBytes(value)?;
+    if (text.length == 0 || !p.convertText(text.view())?) {
+        if (keepError) {
+            p.failed = true;
+            return Ok(p);
+        }
+        return Err(sqlError("malformed JSON"));
+    }
+    return Ok(p);
+}
+
+/// An argument as the JSONB to insert into JSON (jsonFunctionArgToBlob).
+fn jsonValueToBlob(arg: borrow JsonValue) -> Result<Vector<u8>, SqliteError> {
+    var blob = Vector<u8>.create();
+    match (borrow arg.value) {
+        SqliteValue.Null => { blob.push(JSONB_NULL)?; }
+        SqliteValue.Blob(b) => {
+            if (!jsonArgIsJsonb(b.view())) {
+                return Err(sqlError("JSON cannot hold BLOB values"));
+            }
+            blob.extend(b.view())?;
+        }
+        SqliteValue.Text(s) => {
+            if (arg.json) {
+                var p = JsonParse.create();
+                if (!p.convertText(s.view().bytes())?) {
+                    return Err(sqlError("malformed JSON"));
+                }
+                return Ok(p.blob);
+            }
+            jsonbAppendNode(mut blob, JSONB_TEXTRAW, s.view().bytes())?;
+        }
+        SqliteValue.Real(r) => {
+            let text = realText(r)?;
+            let z = text.view().bytes();
+            if (z[0] == 'I') {
+                jsonbAppendNode(mut blob, JSONB_FLOAT, "9e999".bytes())?;
+            } else if (z[0] == '-' && z[1] == 'I') {
+                jsonbAppendNode(mut blob, JSONB_FLOAT, "-9e999".bytes())?;
+            } else {
+                jsonbAppendNode(mut blob, JSONB_FLOAT, z)?;
+            }
+        }
+        SqliteValue.Integer(i) => {
+            var text = String.create();
+            text.appendNumber(i)?;
+            jsonbAppendNode(mut blob, JSONB_INT, text.view().bytes())?;
+        }
+    }
+    return Ok(blob);
+}
+
+/// The JSON text of a parse, as a function's result (jsonReturnParse).
+fn jsonReturnParse(p: borrow mut JsonParse) -> Result<JsonValue, SqliteError> {
+    var out = JsonOut.create();
+    p.delta = 0;
+    var depth = p.depth;
+    let _ = jsonTranslateBlobToText(p.blob.view(), mut depth, 0, mut out)?;
+    p.depth = depth;
+    return out.finish(true);
+}
+
+/// sqlite3DecOrHexToI64's result: 0 a whole integer that fits, 1 text after it, 2 too large, 3 exactly 2^63.
+struct JsonInteger {
+    code: i32;
+    bits: u64;
+}
+
+/// sqlite3Atoi64 on UTF-8 text.
+fn jsonAtoi64(z: Slice<u8>) -> JsonInteger {
+    var i: usize = 0;
+    while (i < z.length && isNumberSpace(z[i])) {
+        i += 1;
+    }
+    var negative = false;
+    if (i < z.length && (z[i] == '-' || z[i] == '+')) {
+        negative = z[i] == '-';
+        i += 1;
+    }
+    let digitsStart = i;
+    while (i < z.length && z[i] == '0') {
+        i += 1;
+    }
+    let significant = i;
+    var u: u64 = 0;
+    var count: usize = 0;
+    while (significant + count < z.length && jsonIsDigit(z[significant + count])) {
+        if (count < 19) {
+            u = u * 10 + ((z[significant + count] - '0') as u64);
+        }
+        count += 1;
+    }
+    var code: i32 = 0;
+    if (count == 0 && significant == digitsStart) {
+        code = -1;
+    } else {
+        var k = significant + count;
+        while (k < z.length) {
+            if (!isNumberSpace(z[k])) {
+                code = 1;
+                break;
+            }
+            k += 1;
+        }
+    }
+    let largest: u64 = 9223372036854775807;
+    if (count < 19 || (count == 19 && u <= largest)) {
+        let value = if (negative) 0 - truncate<i64>(u) else truncate<i64>(u);
+        return JsonInteger { code: code, bits: truncate<u64>(value) };
+    }
+    let saturated: i64 = if (negative) -9223372036854775808 else 9223372036854775807;
+    if (count > 19 || u > largest + 1) {
+        return JsonInteger { code: 2, bits: truncate<u64>(saturated) };
+    }
+    // Exactly 9223372036854775808: fits when negative.
+    return JsonInteger { code: if (negative) code else 3, bits: truncate<u64>(saturated) };
+}
+
+/// sqlite3DecOrHexToI64: decimal, or hexadecimal after "0x".
+fn jsonDecOrHexToI64(z: Slice<u8>) -> JsonInteger {
+    if (jsonAt(z, 0) == '0' && (jsonAt(z, 1) == 'x' || jsonAt(z, 1) == 'X')) {
+        var i: usize = 2;
+        while (jsonAt(z, i) == '0') {
+            i += 1;
+        }
+        var k = i;
+        var u: u64 = 0;
+        while (isSqlHexDigit(jsonAt(z, k))) {
+            if (k - i < 16) {
+                u = u * 16 + (jsonHexToInt(jsonAt(z, k)) as u64);
+            }
+            k += 1;
+        }
+        let code: i32 = if (k - i > 16) 2 else if (jsonAt(z, k) != 0) 1 else 0;
+        return JsonInteger { code: code, bits: u };
+    }
+    var n: usize = 0;
+    while (n < z.length) {
+        let c = z[n];
+        if (!(c == '+' || c == '-' || c == ' ' || c == '\n' || c == '\t' || jsonIsDigit(c))) {
+            break;
+        }
+        n += 1;
+    }
+    if (jsonAt(z, n) != 0) {
+        n += 1;
+    }
+    return jsonAtoi64(jsonBytes(z, 0, n));
+}
+
+/// A real from its text, or malformed JSON (sqlite3AtoF must take all of it).
+fn jsonRealFromText(z: Slice<u8>) -> Result<SqliteValue, SqliteError> {
+    let parsed = RealParse.of(z);
+    if (!parsed.hasPrefix || !parsed.pure) {
+        return Err(sqlError("malformed JSON"));
+    }
+    return Ok(SqliteValue.Real(parsed.value));
+}
+
+/// The element at `i` as an SQL value (jsonReturnFromBlob): an array or object as JSON text.
+fn jsonReturnFromBlob(blob: Slice<u8>, i: usize) -> Result<SqliteValue, SqliteError> {
+    let h = jsonbPayloadSize(blob, 0, i);
+    if (h.n == 0) {
+        return Err(sqlError("malformed JSON"));
+    }
+    let n = h.n;
+    let sz = h.sz;
+    let payload = jsonBytes(blob, i + n, i + n + sz);
+    let t = blob[i] & 0x0F;
+    if (t == JSONB_NULL || t == JSONB_TRUE || t == JSONB_FALSE) {
+        if (sz != 0) {
+            return Err(sqlError("malformed JSON"));
+        }
+        return Ok(
+            if (t == JSONB_NULL) SqliteValue.Null else SqliteValue.Integer(if (t == JSONB_TRUE) 1 else 0),
+        );
+    }
+    if (t == JSONB_INT || t == JSONB_INT5) {
+        if (sz == 0) {
+            return Err(sqlError("malformed JSON"));
+        }
+        var digits = payload;
+        let negative = jsonAt(payload, 0) == '-';
+        if (negative) {
+            if (sz < 2) {
+                return Err(sqlError("malformed JSON"));
+            }
+            digits = payload[1..];
+        }
+        let r = jsonDecOrHexToI64(digits);
+        if (r.code == 0) {
+            let value = truncate<i64>(r.bits);
+            if (value < 0) {
+                // Hexadecimal with the top bit set: too large for an integer.
+                let real = round<f64>(r.bits);
+                return Ok(SqliteValue.Real(if (negative) 0.0 - real else real));
+            }
+            return Ok(SqliteValue.Integer(if (negative) 0 - value else value));
+        }
+        if (r.code == 3 && negative) {
+            return Ok(SqliteValue.Integer(-9223372036854775808));
+        }
+        if (r.code == 1) {
+            return Err(sqlError("malformed JSON"));
+        }
+        return jsonRealFromText(payload);
+    }
+    if (t == JSONB_FLOAT || t == JSONB_FLOAT5) {
+        if (sz == 0) {
+            return Err(sqlError("malformed JSON"));
+        }
+        return jsonRealFromText(payload);
+    }
+    if (t == JSONB_TEXT || t == JSONB_TEXTRAW) {
+        return Ok(SqliteValue.Text(textFromBytesLossy(payload)?));
+    }
+    if (t == JSONB_TEXT5 || t == JSONB_TEXTJ) {
+        var bytes = Vector<u8>.withCapacity(payload.length)?;
+        var k: usize = 0;
+        while (k < payload.length) {
+            let c = payload[k];
+            if (c != '\\') {
+                bytes.push(c)?;
+                k += 1;
+                continue;
+            }
+            let u = jsonUnescapeOneChar(payload[k..]);
+            let v = u.c;
+            if (v <= 0x7F) {
+                bytes.push(truncate<u8>(v))?;
+            } else if (v <= 0x7FF) {
+                bytes.push(truncate<u8>(0xC0 | (v >> 6)))?;
+                bytes.push(truncate<u8>(0x80 | (v & 0x3F)))?;
+            } else if (v < 0x10000) {
+                bytes.push(truncate<u8>(0xE0 | (v >> 12)))?;
+                bytes.push(truncate<u8>(0x80 | ((v >> 6) & 0x3F)))?;
+                bytes.push(truncate<u8>(0x80 | (v & 0x3F)))?;
+            } else if (v == JSON_INVALID_CHAR) {
+                // Silently ignored, as in SQLite.
+            } else {
+                bytes.push(truncate<u8>(0xF0 | (v >> 18)))?;
+                bytes.push(truncate<u8>(0x80 | ((v >> 12) & 0x3F)))?;
+                bytes.push(truncate<u8>(0x80 | ((v >> 6) & 0x3F)))?;
+                bytes.push(truncate<u8>(0x80 | (v & 0x3F)))?;
+            }
+            k += u.size.max(1);
+        }
+        return Ok(SqliteValue.Text(textFromBytesLossy(bytes.view())?));
+    }
+    if (t == JSONB_ARRAY || t == JSONB_OBJECT) {
+        var out = JsonOut.create();
+        var depth: i64 = 0;
+        let _ = jsonTranslateBlobToText(jsonBytes(blob, i, i + n + sz), mut depth, 0, mut out)?;
+        let text = out.finish(true)?;
+        return Ok(text.value);
+    }
+    return Err(sqlError("malformed JSON"));
+}
+
+// ── the functions ────────────────────────────────────────────────────────────────────────────────────────────
+
+/// json(X) (jsonRemoveFunc with one argument): X minified.
+fn jsonFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
+    var p = jsonParseArgument(borrow args[0].value, false)? ?? {
+        return Ok(jsonNull());
+    };
+    return jsonReturnParse(mut p);
+}
+
+/// json_array(V, …).
+fn jsonArrayFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
+    var out = JsonOut.create();
+    out.byte('[')?;
+    for (k in 0..args.length) {
+        out.separator()?;
+        out.sqlValue(borrow args[k].value, args[k].json)?;
+    }
+    out.byte(']')?;
+    return out.finish(true);
+}
+
+/// json_object(LABEL, VALUE, …).
+fn jsonObjectFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
+    if (args.length % 2 == 1) {
+        return Err(sqlError("json_object() requires an even number of arguments"));
+    }
+    var out = JsonOut.create();
+    out.byte('{')?;
+    var k: usize = 0;
+    while (k < args.length) {
+        let SqliteValue.Text(label) = borrow args[k].value else {
+            return Err(sqlError("json_object() labels must be TEXT"));
+        };
+        out.separator()?;
+        out.quoted(label.view().bytes())?;
+        out.byte(':')?;
+        out.sqlValue(borrow args[k + 1].value, args[k + 1].json)?;
+        k += 2;
+    }
+    out.byte('}')?;
+    return out.finish(true);
+}
+
+/// json_quote(V).
+fn jsonQuoteFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
+    var out = JsonOut.create();
+    out.sqlValue(borrow args[0].value, args[0].json)?;
+    return out.finish(true);
+}
+
+/// json_array_length(J [, PATH]).
+fn jsonArrayLengthFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
+    var p = jsonParseArgument(borrow args[0].value, false)? ?? {
+        return Ok(jsonNull());
+    };
+    var i: usize = 0;
+    var notFound = false;
+    if (args.length == 2) {
+        let path = jsonPathBytes(borrow args[1].value)? ?? {
+            return Ok(jsonNull());
+        };
+        let found = if (jsonAt(path.view(), 0) == '$') p.lookupStep(0, path.view(), 1, 0)? else p.lookupStep(
+            0,
+            "@".bytes(),
+            0,
+            0,
+        )?;
+        if (jsonLookupIsError(found)) {
+            if (found != JSON_LOOKUP_NOTFOUND) {
+                return Err(jsonBadPathError(path.view(), found));
+            }
+            notFound = true;
+        } else {
+            i = found;
+        }
+    }
+    if (notFound) {
+        return Ok(jsonNull());
+    }
+    var count: u64 = 0;
+    if ((jsonAt(p.blob.view(), i) & 0x0F) == JSONB_ARRAY) {
+        count = jsonbArrayCount(p.blob.view(), p.delta, i);
+    }
+    return Ok(jsonPlain(SqliteValue.Integer(truncate<i64>(count))));
+}
+
+/// Whether the text is letters, digits and underscores (jsonAllAlphanum).
+fn jsonAllAlphanum(z: Slice<u8>) -> bool {
+    for (k in 0..z.length) {
+        if (!(jsonIsAlnum(z[k]) || z[k] == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// json_extract(J, PATH, …), `->` (JSON_JSON) and `->>` (JSON_SQL), which also take abbreviated paths.
+fn jsonExtractFunction(args: Slice<JsonValue>, flags: u8) -> Result<JsonValue, SqliteError> {
+    if (args.length < 2) {
+        return Ok(jsonNull());
+    }
+    var p = jsonParseArgument(borrow args[0].value, false)? ?? {
+        return Ok(jsonNull());
+    };
+    let many = args.length > 2;
+    var out = JsonOut.create();
+    if (many) {
+        out.byte('[')?;
+    }
+    for (k in 1..args.length) {
+        let path = jsonPathBytes(borrow args[k].value)? ?? {
+            return Ok(jsonNull());
+        };
+        let z = path.view();
+        var j: usize = 0;
+        if (jsonAt(z, 0) == '$') {
+            j = p.lookupStep(0, z, 1, 0)?;
+        } else if ((flags & JSON_ABPATH) != 0) {
+            // NUMBER is $[NUMBER] ($[#NUMBER] when negative), LABEL is $.LABEL, and [NUMBER] is $[NUMBER].
+            var full = Vector<u8>.create();
+            if (args[k].value is SqliteValue.Integer(_)) {
+                full.push('[')?;
+                if (jsonAt(z, 0) == '-') {
+                    full.push('#')?;
+                }
+                full.extend(z)?;
+                full.push(']')?;
+            } else if (jsonAllAlphanum(z)) {
+                full.push('.')?;
+                full.extend(z)?;
+            } else if (jsonAt(z, 0) == '[' && z.length >= 3 && z[z.length - 1] == ']') {
+                full.extend(z)?;
+            } else {
+                full.extend(".\"".bytes())?;
+                full.extend(z)?;
+                full.push('"')?;
+            }
+            j = p.lookupStep(0, full.view(), 0, 0)?;
+        } else {
+            return Err(jsonBadPathError(z, 0));
+        }
+        if (j < p.blob.length) {
+            if (!many) {
+                if ((flags & JSON_JSON) != 0) {
+                    var one = JsonOut.create();
+                    var depth = p.depth;
+                    let _ = jsonTranslateBlobToText(p.blob.view(), mut depth, j, mut one)?;
+                    return one.finish(true);
+                }
+                let value = jsonReturnFromBlob(p.blob.view(), j)?;
+                let container = (p.blob[j] & 0x0F) >= JSONB_ARRAY;
+                return Ok(JsonValue { value: value, json: (flags & JSON_SQL) == 0 && container });
+            }
+            out.separator()?;
+            var depth = p.depth;
+            let _ = jsonTranslateBlobToText(p.blob.view(), mut depth, j, mut out)?;
+        } else if (j == JSON_LOOKUP_NOTFOUND) {
+            if (!many) {
+                return Ok(jsonNull());
+            }
+            out.separator()?;
+            out.text("null")?;
+        } else {
+            return Err(jsonBadPathError(z, j));
+        }
+    }
+    out.byte(']')?;
+    return out.finish(true);
+}
+
+/// json_insert(), json_replace(), json_set() and json_array_insert() (jsonInsertIntoBlob).
+fn jsonEditFunction(args: Slice<JsonValue>, edit: u8, name: StringView) -> Result<JsonValue, SqliteError> {
+    if (args.length < 1) {
+        return Ok(jsonNull());
+    }
+    if (args.length % 2 == 0) {
+        var message = String.from("json_")?;
+        message.append(name)?;
+        message.append("() needs an odd number of arguments")?;
+        return Err(SqliteError.Sql(message));
+    }
+    var p = jsonParseArgument(borrow args[0].value, false)? ?? {
+        return Ok(jsonNull());
+    };
+    var rc: usize = 0;
+    var k: usize = 1;
+    while (k + 1 < args.length) {
+        let maybePath = jsonPathBytes(borrow args[k].value)?;
+        let path = maybePath ?? {
+            k += 2;
+            continue;
+        };
+        let z = path.view();
+        if (jsonAt(z, 0) != '$') {
+            return Err(jsonBadPathError(z, rc));
+        }
+        let ins = jsonValueToBlob(borrow args[k + 1])?;
+        if (jsonAt(z, 1) == 0) {
+            if (edit == JEDIT_REPL || edit == JEDIT_SET) {
+                let whole = p.blob.length;
+                let count = ins.length;
+                jsonbEdit(mut p.blob, mut p.delta, 0, whole, ins.view(), count)?;
+            }
+            rc = 0;
+        } else {
+            p.edit = edit;
+            p.ins = ins;
+            p.delta = 0;
+            p.depth = 0;
+            rc = p.lookupStep(0, z, 1, 0)?;
+        }
+        k += 2;
+        if (rc == JSON_LOOKUP_NOTFOUND) {
+            continue;
+        }
+        if (jsonLookupIsError(rc)) {
+            return Err(jsonBadPathError(z, rc));
+        }
+    }
+    return jsonReturnParse(mut p);
+}
+
+/// json_remove(J, PATH, …).
+fn jsonRemoveFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
+    if (args.length < 1) {
+        return Ok(jsonNull());
+    }
+    var p = jsonParseArgument(borrow args[0].value, false)? ?? {
+        return Ok(jsonNull());
+    };
+    for (k in 1..args.length) {
+        let path = jsonPathBytes(borrow args[k].value)? ?? {
+            return Ok(jsonNull());
+        };
+        let z = path.view();
+        if (jsonAt(z, 0) != '$') {
+            return Err(jsonBadPathError(z, 0));
+        }
+        if (jsonAt(z, 1) == 0) {
+            // json_remove(J, '$') is NULL.
+            return Ok(jsonNull());
+        }
+        p.edit = JEDIT_DEL;
+        p.delta = 0;
+        let rc = p.lookupStep(0, z, 1, 0)?;
+        if (jsonLookupIsError(rc)) {
+            if (rc == JSON_LOOKUP_NOTFOUND) {
+                continue;
+            }
+            return Err(jsonBadPathError(z, rc));
+        }
+    }
+    return jsonReturnParse(mut p);
+}
+
+/// json_type(J [, PATH]).
+fn jsonTypeFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
+    var p = jsonParseArgument(borrow args[0].value, false)? ?? {
+        return Ok(jsonNull());
+    };
+    var i: usize = 0;
+    if (args.length == 2) {
+        let path = jsonPathBytes(borrow args[1].value)? ?? {
+            return Ok(jsonNull());
+        };
+        let z = path.view();
+        if (jsonAt(z, 0) != '$') {
+            return Err(jsonBadPathError(z, 0));
+        }
+        i = p.lookupStep(0, z, 1, 0)?;
+        if (jsonLookupIsError(i)) {
+            if (i == JSON_LOOKUP_NOTFOUND) {
+                return Ok(jsonNull());
+            }
+            return Err(jsonBadPathError(z, i));
+        }
+    }
+    return Ok(jsonPlain(SqliteValue.text(jsonbTypeName(jsonAt(p.blob.view(), i) & 0x0F))?));
+}
+
+/// json_pretty(J [, INDENT]).
+fn jsonPrettyFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
+    var p = jsonParseArgument(borrow args[0].value, false)? ?? {
+        return Ok(jsonNull());
+    };
+    var indent = Vector<u8>.create();
+    let custom = if (args.length == 2) jsonPathBytes(borrow args[1].value)? else null;
+    match (custom) {
+        Some(text) => { indent = text; }
+        null => { indent.extend("    ".bytes())?; }
+    }
+    var out = JsonOut.create();
+    var level: u32 = 0;
+    var depth = p.depth;
+    let _ = jsonTranslateBlobToPrettyText(p.blob.view(), mut depth, indent.view(), mut level, 0, mut out)?;
+    p.depth = depth;
+    return out.finish(false);
+}
+
+/// json_valid(J [, FLAGS]).
+fn jsonValidFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
+    var flags: u8 = 1;
+    if (args.length == 2) {
+        let f = integerValue(borrow args[1].value);
+        if (f < 1 || f > 15) {
+            return Err(sqlError("FLAGS parameter to json_valid() must be between 1 and 15"));
+        }
+        flags = truncate<u8>(f) & 0x0F;
+    }
+    let value = borrow args[0].value;
+    if (value.isNull()) {
+        return Ok(jsonNull());
+    }
+    if (value is SqliteValue.Blob(b)) {
+        if (jsonArgIsJsonb(b.view())) {
+            var valid = false;
+            if ((flags & 0x04) != 0) {
+                // Superficial: the check jsonArgIsJsonb made.
+                valid = true;
+            } else if ((flags & 0x08) != 0) {
+                valid = jsonbValidityCheck(b.view(), 0, b.length, 1) == 0;
+            }
+            return Ok(jsonPlain(SqliteValue.Integer(if (valid) 1 else 0)));
+        }
+    }
+    if ((flags & 0x03) == 0) {
+        return Ok(jsonPlain(SqliteValue.Integer(0)));
+    }
+    let p = jsonParseArgument(value, true)? ?? {
+        return Ok(jsonNull());
+    };
+    let valid = !p.failed && ((flags & 0x02) != 0 || !p.hasNonstd);
+    return Ok(jsonPlain(SqliteValue.Integer(if (valid) 1 else 0)));
+}
+
+/// json_error_position(J): 0, or the 1-based character where the text stops being JSON.
+fn jsonErrorPositionFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
+    let value = borrow args[0].value;
+    if (value is SqliteValue.Blob(b)) {
+        if (jsonArgIsJsonb(b.view())) {
+            let at = jsonbValidityCheck(b.view(), 0, b.length, 1);
+            return Ok(jsonPlain(SqliteValue.Integer(truncate<i64>(at))));
+        }
+    }
+    if (value.isNull()) {
+        return Ok(jsonNull());
+    }
+    let text = valueBytes(value)?;
+    let z = text.view();
+    var s = JsonParse.create();
+    if (s.convertText(z)?) {
+        return Ok(jsonPlain(SqliteValue.Integer(0)));
+    }
+    // The byte offset as a character offset.
+    var position: i64 = 0;
+    var k: usize = 0;
+    while (k < s.iErr && jsonAt(z, k) != 0) {
+        if ((z[k] & 0xC0) != 0x80) {
+            position += 1;
+        }
+        k += 1;
+    }
+    return Ok(jsonPlain(SqliteValue.Integer(position + 1)));
+}
+
+/// json_patch(TARGET, PATCH).
+fn jsonPatchFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
+    var target = jsonParseArgument(borrow args[0].value, false)? ?? {
+        return Ok(jsonNull());
+    };
+    let patch = jsonParseArgument(borrow args[1].value, false)? ?? {
+        return Ok(jsonNull());
+    };
+    let rc = jsonMergePatch(mut target, 0, patch.blob.view(), 0, 0)?;
+    if (rc == JSON_MERGE_OK) {
+        return jsonReturnParse(mut target);
+    }
+    if (rc == JSON_MERGE_TOODEEP) {
+        return Err(sqlError("JSON nested too deep"));
+    }
+    return Err(sqlError("malformed JSON"));
+}
+
+// ── evaluation ───────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Whether `function` is one of the JSON functions computed here.
+fn isJsonFunction(function: ScalarFunction) -> bool => match (function) {
+    ScalarFunction.Json | ScalarFunction.JsonArray | ScalarFunction.JsonArrayInsert | ScalarFunction.JsonArrayLength | ScalarFunction.JsonErrorPosition | ScalarFunction.JsonExtract | ScalarFunction.JsonInsert | ScalarFunction.JsonObject | ScalarFunction.JsonPatch | ScalarFunction.JsonPretty | ScalarFunction.JsonQuote | ScalarFunction.JsonRemove | ScalarFunction.JsonReplace | ScalarFunction.JsonSet | ScalarFunction.JsonType | ScalarFunction.JsonValid | ScalarFunction.JsonSubtype =>
+        true,
+    _ => false,
+};
+
+/// A JSON function applied to its arguments.
+fn jsonCall(function: ScalarFunction, args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> => match (function) {
+    ScalarFunction.Json => jsonFunction(args),
+    ScalarFunction.JsonArray => jsonArrayFunction(args),
+    ScalarFunction.JsonArrayInsert => jsonEditFunction(args, JEDIT_AINS, "array_insert"),
+    ScalarFunction.JsonArrayLength => jsonArrayLengthFunction(args),
+    ScalarFunction.JsonErrorPosition => jsonErrorPositionFunction(args),
+    ScalarFunction.JsonExtract => jsonExtractFunction(args, 0),
+    ScalarFunction.JsonInsert => jsonEditFunction(args, JEDIT_INS, "insert"),
+    ScalarFunction.JsonObject => jsonObjectFunction(args),
+    ScalarFunction.JsonPatch => jsonPatchFunction(args),
+    ScalarFunction.JsonPretty => jsonPrettyFunction(args),
+    ScalarFunction.JsonQuote => jsonQuoteFunction(args),
+    ScalarFunction.JsonRemove => jsonRemoveFunction(args),
+    ScalarFunction.JsonReplace => jsonEditFunction(args, JEDIT_REPL, "replace"),
+    ScalarFunction.JsonSet => jsonEditFunction(args, JEDIT_SET, "set"),
+    ScalarFunction.JsonType => jsonTypeFunction(args),
+    ScalarFunction.JsonValid => jsonValidFunction(args),
+    _ => Ok(jsonNull()),
+};
+
+/// Calls a JSON function: its arguments keep their subtype.
+fn callJsonFunction(
+    call: borrow XCall,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<JsonValue, SqliteError> {
+    let args = call.args.view();
+    if (call.function == ScalarFunction.JsonSubtype) {
+        let v = evaluate(borrow args[0], frame, db)?;
+        return Ok(JsonValue { value: v, json: true });
+    }
+    var values = Vector<JsonValue>.withCapacity(args.length)?;
+    for (k in 0..args.length) {
+        values.push(evaluateWithSubtype(borrow args[k], frame, db)?)?;
+    }
+    return jsonCall(call.function, values.view());
+}
+
+/// `->` and `->>`.
+fn jsonArrowValue(left: borrow SqliteValue, right: borrow SqliteValue, asSql: bool) -> Result<JsonValue, SqliteError> {
+    var args = Vector<JsonValue>.withCapacity(2)?;
+    args.push(jsonPlain(left.clone()?))?;
+    args.push(jsonPlain(right.clone()?))?;
+    return jsonExtractFunction(args.view(), if (asSql) JSON_SQL else JSON_JSON);
+}
+
+/// `->` and `->>` as XExpr.JsonGet evaluates them.
+fn jsonArrow(left: borrow SqliteValue, right: borrow SqliteValue, asSql: bool) -> Result<SqliteValue, SqliteError> {
+    let r = jsonArrowValue(left, right, asSql)?;
+    return Ok(r.value);
+}
+
+/// The expression for a JSON aggregate's result, marked as JSON.
+fn jsonMarked(expr: XExpr) -> Result<XExpr, AllocError> {
+    var args = Vector<XExpr>.create();
+    args.push(expr)?;
+    return Ok(
+        XExpr.Call(
+            Box.create(XCall { function: ScalarFunction.JsonSubtype, args: args, collation: Collation.Binary })?,
+        ),
+    );
+}
+
+/// Evaluates an expression, and says whether its value has SQLite's JSON subtype.
+fn evaluateWithSubtype(
+    expr: borrow XExpr,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<JsonValue, SqliteError> {
+    match (expr) {
+        XExpr.Call(call) => { return callWithSubtype(call, frame, db); }
+        XExpr.JsonGet(left, right, asSql) => {
+            let a = evaluate(left, frame, db)?;
+            let b = evaluate(right, frame, db)?;
+            return jsonArrowValue(borrow a, borrow b, asSql);
+        }
+        XExpr.Plus(operand) => { return evaluateWithSubtype(operand, frame, db); }
+        XExpr.Cast(operand, affinity) => {
+            let v = evaluateWithSubtype(operand, frame, db)?;
+            let json = v.json;
+            return Ok(JsonValue { value: castValue(v.value, affinity)?, json: json });
+        }
+        XExpr.Case(c) => {
+            match (chooseCase(c, frame, db)?) {
+                CaseChoice.Branch(k) => { return evaluateWithSubtype(borrow c.branches[k].then, frame, db); }
+                CaseChoice.Otherwise => {
+                    if (borrow c.otherwise is Some(e)) {
+                        return evaluateWithSubtype(e, frame, db);
+                    }
+                    return Ok(jsonNull());
+                }
+            }
+        }
+        _ => { return Ok(jsonPlain(evaluate(expr, frame, db)?)); }
+    }
+}
+
+/// A function call whose result may carry its arguments' subtype, as SQLite's sqlite3_result_value() passes it.
+fn callWithSubtype(
+    call: borrow XCall,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<JsonValue, SqliteError> {
+    let args = call.args.view();
+    match (call.function) {
+        ScalarFunction.Coalesce | ScalarFunction.IfNull => {
+            for (k in 0..args.length) {
+                let v = evaluateWithSubtype(borrow args[k], frame, db)?;
+                if (!v.value.isNull()) {
+                    return Ok(v);
+                }
+            }
+            return Ok(jsonNull());
+        }
+        ScalarFunction.Iif => {
+            var k: usize = 0;
+            while (k + 1 < args.length) {
+                let condition = evaluate(borrow args[k], frame, db)?;
+                if (isTrue(borrow condition)) {
+                    return evaluateWithSubtype(borrow args[k + 1], frame, db);
+                }
+                k += 2;
+            }
+            if (k < args.length) {
+                return evaluateWithSubtype(borrow args[k], frame, db);
+            }
+            return Ok(jsonNull());
+        }
+        ScalarFunction.NullIf => {
+            let first = evaluateWithSubtype(borrow args[0], frame, db)?;
+            let second = evaluate(borrow args[1], frame, db)?;
+            if (!first.value.isNull() && !second.isNull() && compareValues(
+                borrow first.value,
+                borrow second,
+                call.collation,
+            ) == 0) {
+                return Ok(jsonNull());
+            }
+            return Ok(first);
+        }
+        ScalarFunction.Likely | ScalarFunction.Unlikely => {
+            return evaluateWithSubtype(borrow args[0], frame, db);
+        }
+        ScalarFunction.Max | ScalarFunction.Min => {
+            var values = Vector<JsonValue>.withCapacity(args.length)?;
+            for (k in 0..args.length) {
+                values.push(evaluateWithSubtype(borrow args[k], frame, db)?)?;
+            }
+            var best: usize = 0;
+            for (k in 0..values.length) {
+                if (values[k].value.isNull()) {
+                    return Ok(jsonNull());
+                }
+                if (k == 0) {
+                    continue;
+                }
+                let c = compareValues(borrow values[best].value, borrow values[k].value, call.collation);
+                if ((call.function == ScalarFunction.Min && c >= 0) || (call.function == ScalarFunction.Max && c < 0)) {
+                    best = k;
+                }
+            }
+            return Ok(values.swapRemove(best));
+        }
+        _ => {}
+    }
+    if (isJsonFunction(call.function)) {
+        return callJsonFunction(call, frame, db);
+    }
+    return Ok(jsonPlain(callFunction(call, frame, db)?));
+}
+
+// ── aggregates ───────────────────────────────────────────────────────────────────────────────────────────────
+
+/// One row of json_group_array(V) (jsonArrayStep) or json_group_object(LABEL, V) (jsonObjectStep). An error a
+/// row reports stops the statement, as in SQLite.
+fn jsonGroupStep(
+    isObject: bool,
+    out: borrow mut JsonOut,
+    started: borrow mut bool,
+    first: borrow JsonValue,
+    second: borrow JsonValue?,
+) -> Result<void, SqliteError> {
+    if (!started) {
+        started = true;
+        out.byte(if (isObject) '{' else '[')?;
+    } else if (out.buf.length > 1) {
+        out.byte(',')?;
+    }
+    if (!isObject) {
+        out.sqlValue(borrow first.value, first.json)?;
+    } else if (first.value.isNull()) {
+        // A NULL label adds nothing; SQLite marks its place with '@' for the window functions' inverse.
+        if (out.buf.length > 0) {
+            out.buf[0] = '@';
+        }
+        out.byte('@')?;
+    } else {
+        let label = valueBytes(borrow first.value)?;
+        out.quoted(beforeNul(label.view()))?;
+        out.byte(':')?;
+        if (second is Some(v)) {
+            out.sqlValue(borrow v.value, v.json)?;
+        }
+    }
+    if (out.failure != JsonFailure.Nothing) {
+        return Err(jsonFailureError(out.failure));
+    }
+    return Ok();
+}
+
+/// The final value of json_group_array() or json_group_object() (jsonArrayCompute, jsonObjectCompute).
+fn jsonGroupFinish(isObject: bool, group: borrow JsonOut, started: bool) -> Result<SqliteValue, SqliteError> {
+    if (!started) {
+        return Ok(SqliteValue.text(if (isObject) "{}" else "[]")?);
+    }
+    var out = JsonOut { buf: group.buf.clone()?, err: group.err, failure: group.failure };
+    out.byte(if (isObject) '}' else ']')?;
+    if (out.err != 0) {
+        let failed = out.finish(true)?;
+        return Ok(failed.value);
+    }
+    if (isObject && out.buf[0] != '{') {
+        // Remove the '@' marks of NULL labels, with their commas.
+        var z = out.buf;
+        z[0] = '{';
+        var inString = false;
+        var i: usize = 1;
+        var j: usize = 1;
+        while (i < z.length) {
+            let c = z[i];
+            if (c == '"') {
+                inString = !inString;
+                z[j] = '"';
+                j += 1;
+            } else if (c == '\\') {
+                z[j] = '\\';
+                j += 1;
+                i += 1;
+                z[j] = jsonAt(z.view(), i);
+                j += 1;
+            } else if (c == '@' && !inString) {
+                if (jsonAt(z.view(), i + 1) == ',') {
+                    i += 1;
+                } else if (z[j - 1] == ',') {
+                    j -= 1;
+                }
+            } else {
+                z[j] = c;
+                j += 1;
+            }
+            i += 1;
+        }
+        z.truncate(j);
+        return Ok(SqliteValue.Text(textFromBytesLossy(z.view())?));
+    }
+    return Ok(SqliteValue.Text(textFromBytesLossy(out.buf.view())?));
+}

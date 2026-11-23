@@ -664,6 +664,8 @@ impl Compiler {
                 return Err(functionNameError("DISTINCT aggregates must have exactly one argument", "", ""));
             }
             let index = this.aggregates.length;
+            let givesJson =
+                function == AggregateFunction.JsonGroupArray || function == AggregateFunction.JsonGroupObject;
             this.aggregates.push(
                 AggregateSpec {
                     function: function,
@@ -674,6 +676,10 @@ impl Compiler {
                     star: call.star,
                 },
             )?;
+            if (givesJson) {
+                // The result has the JSON subtype, which json.cee's evaluateWithSubtype sees through this mark.
+                return Ok(plain(jsonMarked(XExpr.Aggregate(index))?));
+            }
             return Ok(plain(XExpr.Aggregate(index)));
         }
         if (windowOnlyFunctionNamed(name).isSome()) {

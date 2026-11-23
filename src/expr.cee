@@ -314,33 +314,15 @@ fn evaluate(expr: borrow XExpr, frame: borrow mut Frame, db: borrow mut Session)
         XExpr.In(i) => { return evaluateIn(i, frame, db); }
         XExpr.Like(l) => { return evaluateLike(l, frame, db); }
         XExpr.Case(c) => {
-            if (borrow c.operand is Some(base)) {
-                let x = evaluate(base, frame, db)?;
-                for (k in 0..c.branches.length) {
-                    let branch = borrow c.branches[k];
-                    let w = evaluate(borrow branch.when, frame, db)?;
-                    if (compareOp(
-                        CompareOp.Equal,
-                        borrow x,
-                        borrow w,
-                        branch.affinity,
-                        branch.collation,
-                    )? == Some(true)) {
-                        return evaluate(borrow branch.then, frame, db);
+            match (chooseCase(c, frame, db)?) {
+                CaseChoice.Branch(k) => { return evaluate(borrow c.branches[k].then, frame, db); }
+                CaseChoice.Otherwise => {
+                    if (borrow c.otherwise is Some(e)) {
+                        return evaluate(e, frame, db);
                     }
-                }
-            } else {
-                for (k in 0..c.branches.length) {
-                    let w = evaluate(borrow c.branches[k].when, frame, db)?;
-                    if (isTrue(borrow w)) {
-                        return evaluate(borrow c.branches[k].then, frame, db);
-                    }
+                    return Ok(SqliteValue.Null);
                 }
             }
-            if (borrow c.otherwise is Some(e)) {
-                return evaluate(e, frame, db);
-            }
-            return Ok(SqliteValue.Null);
         }
         XExpr.Cast(operand, affinity) => {
             let v = evaluate(operand, frame, db)?;
@@ -371,6 +353,34 @@ fn evaluate(expr: borrow XExpr, frame: borrow mut Frame, db: borrow mut Session)
         XExpr.Now(kind) => { return nowText(kind, frame.nowMillis); }
         XExpr.RowValue(_) => { return Err(sqlError("row value misused")); }
     }
+}
+
+/// The result a CASE takes: a branch's THEN, or the ELSE (which may be missing).
+enum CaseChoice {
+    Branch(usize),
+    Otherwise,
+}
+
+/// The first branch of a CASE whose WHEN holds. Shared by evaluate and json.cee's evaluateWithSubtype.
+fn chooseCase(c: borrow XCase, frame: borrow mut Frame, db: borrow mut Session) -> Result<CaseChoice, SqliteError> {
+    if (borrow c.operand is Some(base)) {
+        let x = evaluate(base, frame, db)?;
+        for (k in 0..c.branches.length) {
+            let branch = borrow c.branches[k];
+            let w = evaluate(borrow branch.when, frame, db)?;
+            if (compareOp(CompareOp.Equal, borrow x, borrow w, branch.affinity, branch.collation)? == Some(true)) {
+                return Ok(CaseChoice.Branch(k));
+            }
+        }
+    } else {
+        for (k in 0..c.branches.length) {
+            let w = evaluate(borrow c.branches[k].when, frame, db)?;
+            if (isTrue(borrow w)) {
+                return Ok(CaseChoice.Branch(k));
+            }
+        }
+    }
+    return Ok(CaseChoice.Otherwise);
 }
 
 /// The result of a comparison operator: `null` when it is NULL.
