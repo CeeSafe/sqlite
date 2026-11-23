@@ -56,7 +56,14 @@ public struct Session {
     activeTriggers: Vector<String>;
 
     /// Opens the database file at `path`, making an empty database if there is none.
-    public fn open(path: StringView) -> Result<Session, SqliteError> {
+    public fn open(name: StringView) -> Result<Session, SqliteError> {
+        // `:memory:` and the empty name: a private database, a file of its own removed when the session closes.
+        let isPrivate = name.length == 0 || name == ":memory:";
+        var privatePath = String.create();
+        if (isPrivate) {
+            privatePath = privateDatabasePath("sqlite-memory-")?;
+        }
+        let path = if (isPrivate) privatePath.view() else name;
         if ((fileLength(path)? ?? 0) == 0) {
             var writer = DatabaseWriter.create(WriterOptions.defaults())?;
             writer.writeToFile(path)?;
@@ -71,7 +78,7 @@ public struct Session {
         var paths = Vector<String>.create();
         paths.push(String.from(path)?)?;
         var shownPaths = Vector<String>.create();
-        shownPaths.push(String.from(path)?)?;
+        shownPaths.push(String.from(if (isPrivate) "" else path)?)?;
         return Ok(Session {
             pager: pager,
             catalog: catalog,
@@ -116,14 +123,24 @@ public struct Session {
     public fn close(this) -> Result<void, SqliteError> {
         var me = this;
         me.closeOthers()?;
-        return me.pager.close();
+        let isPrivate = me.databaseShownPaths[0].length == 0;
+        let path = me.databasePaths[0].clone()?;
+        me.pager.close()?;
+        if (isPrivate) {
+            removeDatabaseFiles(path.view())?;
+        }
+        return Ok();
     }
 
     /// What `close` does, for an owner that keeps the session (a connection with a drop block).
     fn closeLog(borrow mut this) -> Result<void, SqliteError> {
         this.inTransaction = false;
         this.closeOthers()?;
-        return this.pager.closeLog();
+        this.pager.closeLog()?;
+        if (this.databaseShownPaths[0].length == 0) {
+            removeDatabaseFiles(this.databasePaths[0].view())?;
+        }
+        return Ok();
     }
 
     /// Reads the schema again, after a statement changed it.
@@ -631,16 +648,7 @@ impl Session {
         if (this.tempIndex is Some(i)) {
             return Ok(i);
         }
-        var path = String.from(Environment.variable("TMPDIR") ?? "/tmp")?;
-        if (!path.view().endsWith("/")) {
-            path.append("/")?;
-        }
-        path.append("sqlite-temp-")?;
-        let bytes = randomBytes(8)?;
-        for (b in bytes.view()) {
-            path.appendNumber(b as u64)?;
-        }
-        path.append(".db")?;
+        let path = privateDatabasePath("sqlite-temp-")?;
         let state = openDatabaseState(path.view())?;
         this.attachState("temp", path.view(), state)?;
         this.databaseShownPaths.push(String.create())?;
@@ -834,16 +842,7 @@ impl Session {
         var path = file.clone()?;
         var shown = file.clone()?;
         if (file.length == 0 || file.view() == ":memory:") {
-            path = String.from(Environment.variable("TMPDIR") ?? "/tmp")?;
-            if (!path.view().endsWith("/")) {
-                path.append("/")?;
-            }
-            path.append("sqlite-attached-")?;
-            let bytes = randomBytes(8)?;
-            for (b in bytes.view()) {
-                path.appendNumber(b as u64)?;
-            }
-            path.append(".db")?;
+            path = privateDatabasePath("sqlite-attached-")?;
             shown = String.create();
         }
         let state = openDatabaseState(path.view())?;
@@ -916,4 +915,27 @@ impl Session {
         this.tempIndex = null;
         return Ok();
     }
+}
+
+/// A file name in `$TMPDIR` for a private database (TEMP, `:memory:`, `ATTACH ''`), starting with `prefix`.
+fn privateDatabasePath(prefix: StringView) -> Result<String, AllocError> {
+    var path = String.from(Environment.variable("TMPDIR") ?? "/tmp")?;
+    if (!path.view().endsWith("/")) {
+        path.append("/")?;
+    }
+    path.append(prefix)?;
+    let bytes = randomBytes(8).ok() ?? Vector<u8>.create();
+    for (b in bytes.view()) {
+        path.appendNumber(b as u64)?;
+    }
+    path.append(".db")?;
+    return Ok(path);
+}
+
+/// Removes a private database's file and the journal or log beside it.
+fn removeDatabaseFiles(path: StringView) -> Result<void, SqliteError> {
+    let _ = File.remove(path);
+    let _ = File.remove(withSuffix(path, "-journal")?.view());
+    let _ = File.remove(withSuffix(path, "-wal")?.view());
+    return Ok();
 }

@@ -32,6 +32,10 @@ public struct ConnectionPool {
     /// A pool for the database file at `path`, making an empty database if there is none. One connection is
     /// opened at once, so a file that cannot be opened is an error here; the rest are opened as they are needed.
     public fn open(path: StringView, maxConnections: usize) -> Result<ConnectionPool, SqliteError> {
+        // Each connection to `:memory:` is a database of its own: a pool of them would share nothing.
+        if (path.length == 0 || path == ":memory:") {
+            return Err(unsupported("a pool of private (in-memory) databases shares nothing; give a file's path"));
+        }
         let max = maxConnections.max(1);
         let gate = Channel<GateToken>.create(1)?;
         let _ = gate.trySend(GateToken {});

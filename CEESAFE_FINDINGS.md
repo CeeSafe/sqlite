@@ -133,7 +133,7 @@ Workaround: `static PRAGMA_COLUMNS_n` (`src/pragma.cee`).
 
 ### 18. More common names are reserved
 
-Besides `drop` and `own` (finding 10), `internal` and `match` cannot be used as names (a field `internal`, a
+Besides `drop` and `own` (finding 10), `internal`, `match` and `private` cannot be used as names (a field `internal`, a
 function `match`), and the error does not say the word is reserved.
 
 ### 19. Text that is not UTF-8 has no text type

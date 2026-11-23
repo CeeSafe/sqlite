@@ -246,7 +246,18 @@ fn executeScalarAndCounts() -> Result<void, TestFailure> {
     // A query's result is its last statement's.
     let last = connection.query("SELECT 1; SELECT 2 AS two", borrow none)!;
     Check.equalText("two", last.columns[0].view())?;
-    Check.isTrue(Connection.open(":memory:").isErr(), "api_tests.cee line 237")?;
+    // `:memory:` is a database of the connection's own, gone when it closes.
+    var memory = Connection.open(":memory:")!;
+    let _ = memory.execute("CREATE TABLE m(x); INSERT INTO m VALUES (1), (2)", borrow none)!;
+    let counted = memory.scalar("SELECT count(*) FROM m", borrow none)!;
+    Check.isTrue(counted is Some(SqliteValue.Integer(2)), "a :memory: database holds its rows")?;
+    let names = memory.query("SELECT name, file FROM pragma_database_list", borrow none)!;
+    Check.equalText("main|\n", listText(borrow names).view())?;
+    memory.close()!;
+    var other = Connection.open(":memory:")!;
+    Check.isTrue(other.query("SELECT * FROM m", borrow none).isErr(), "each :memory: connection is its own database")?;
+    other.close()!;
+    Check.isTrue(ConnectionPool.open(":memory:", 2).isErr(), "a pool of :memory: databases is refused")?;
     connection.close()!;
     return expectIntact(path);
 }

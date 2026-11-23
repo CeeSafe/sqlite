@@ -496,7 +496,8 @@ Choices where the C# concept does not fit CeeSafe:
   no process-wide statics to share a gate through, and no file locks: CEESAFE_FINDINGS.md 3 and 24). Use one pool
   per file. Settings a borrower changes with PRAGMA (foreign_keys, busy_timeout) stay with the connection for the
   next borrower, as in other pools.
-- **Configuration.** There is no connection string; a path is given. `:memory:`, the empty name and `file:` URIs
+- **Configuration.** There is no connection string; a path is given. `:memory:` and the empty name give a
+  private database of the connection's own (a file removed when it closes); a pool refuses them, and `file:` URIs
   are refused.
 
 ## Front ends
