@@ -10,7 +10,7 @@
 //   that is not constant) with SQLite's messages, and puts the column after the last column definition.
 //
 // Not yet supported, and refused by name: renaming a table or column that a view or a trigger refers to (SQLite
-// rewrites those too), and DROP COLUMN.
+// rewrites those too).
 
 /// A replacement of `[start, end)` in a text.
 struct TextEdit {
@@ -212,6 +212,7 @@ fn executeAlterTable(
         AlterAction.RenameTo(newName) => { renameTable(name.view(), newName.view(), db)?; }
         AlterAction.RenameColumn(from, to) => { renameColumn(name.view(), from.view(), to.view(), db)?; }
         AlterAction.AddColumn(column) => { addColumn(name.view(), column, sql, db)?; }
+        AlterAction.DropColumn(column) => { dropColumn(name.view(), column.view(), db)?; }
     }
     db.pager.bumpSchemaCookie()?;
     return db.reloadSchema();
@@ -477,5 +478,213 @@ fn referencedColumnEdits(
         }
         i += 1;
     }
+    return Ok();
+}
+
+/// Where each column definition of a CREATE TABLE statement starts (its name's first byte), in order; and where the
+/// last one ends.
+struct ColumnSpans {
+    starts: Vector<usize>;
+    lastEnd: usize;
+}
+
+fn columnSpans(sql: StringView) -> Result<ColumnSpans, SqliteError> {
+    let tokens = Tokenizer.tokenize(sql)?;
+    var spans = ColumnSpans { starts: Vector<usize>.create(), lastEnd: 0 };
+    var depth: usize = 0;
+    var itemStart = false;
+    var inConstraints = false;
+    for (i in 0..tokens.length) {
+        let t = borrow tokens[i];
+        let before = depth;
+        if (t.isOp("(")) {
+            depth += 1;
+            if (before == 0) {
+                itemStart = true;
+                continue;
+            }
+        } else if (t.isOp(")")) {
+            depth = depth.saturatingSub(1);
+            if (before == 1) {
+                return Ok(spans);
+            }
+        } else if (before == 1 && t.isOp(",")) {
+            itemStart = true;
+            continue;
+        }
+        if (before == 0) {
+            continue;
+        }
+        if (itemStart) {
+            itemStart = false;
+            inConstraints = inConstraints || t.isWord(
+                "CONSTRAINT",
+            ) || t.isWord("PRIMARY") || t.isWord("UNIQUE") || t.isWord("CHECK") || t.isWord("FOREIGN");
+            if (!inConstraints) {
+                spans.starts.push(t.offset)?;
+            }
+        }
+        if (!inConstraints) {
+            spans.lastEnd = t.end;
+        }
+    }
+    return Ok(spans);
+}
+
+fn afterDropError(kind: StringView, name: StringView, cause: borrow SqliteError) -> Result<SqliteError, AllocError> {
+    var message = String.from("error in ")?;
+    message.append(kind)?;
+    message.append(" ")?;
+    message.append(name)?;
+    message.append(" after drop column: ")?;
+    message.append(cause.message())?;
+    return Ok(SqliteError.Sql(message));
+}
+
+/// ALTER TABLE … DROP COLUMN, as SQLite does it: the column's definition leaves the statement (with its own
+/// constraints), what still names it is an error, and every row loses its value.
+fn dropColumn(tableName: StringView, column: StringView, db: borrow mut Session) -> Result<void, SqliteError> {
+    let table = db.catalog.tableCopy(tableName)?;
+    let at = table.indexOf(column) ?? {
+        var message = String.from("no such column: \"")?;
+        message.append(column)?;
+        message.append("\"")?;
+        return Err(SqliteError.Sql(message));
+    };
+    let columnName = table.columns[at].name.clone()?;
+    let quotedColumn = quotedName(columnName.view())?;
+    var inKey = table.rowidAlias == Some(at);
+    for (k in 0..table.primaryKey.length) {
+        inKey = inKey || table.primaryKey[k].name.view().equalsIgnoreAsciiCase(column);
+    }
+    if (inKey) {
+        return Err(namedError("cannot drop PRIMARY KEY column: ", quotedColumn.view()));
+    }
+    for (k in 0..table.keys.length) {
+        for (c in 0..table.keys[k].columns.length) {
+            if (table.keys[k].columns[c].name.view().equalsIgnoreAsciiCase(column)) {
+                return Err(
+                    namedError(
+                        if (table.keys[k].primaryKey) "cannot drop PRIMARY KEY column: "
+                            else "cannot drop UNIQUE column: ",
+                        quotedColumn.view(),
+                    ),
+                );
+            }
+        }
+    }
+    if (table.columns.length == 1) {
+        var message = String.from("cannot drop column ")?;
+        message.append(quotedColumn.view())?;
+        message.append(": no other columns exist")?;
+        return Err(SqliteError.Sql(message));
+    }
+    refuseIfReferenced(db, tableName)?;
+    // The statement without the column: up to the next column's name, or for the last, from the comma before it.
+    var rows = schemaRows(db)?;
+    for (r in 0..rows.length) {
+        let isTable = valueTextOf(
+            borrow rows[r].values[0],
+        ) == "table" && valueTextOf(borrow rows[r].values[1]).equalsIgnoreAsciiCase(tableName);
+        if (!isTable) {
+            continue;
+        }
+        let sqlText = String.from(valueTextOf(borrow rows[r].values[4]))?;
+        let spans = columnSpans(sqlText.view())?;
+        if (spans.starts.length != table.columns.length) {
+            return Err(corrupt("a table's definition does not match its columns"));
+        }
+        var start = spans.starts[at];
+        var end = spans.lastEnd;
+        if (at + 1 < spans.starts.length) {
+            end = spans.starts[at + 1];
+        } else {
+            while (start > 0 && sqlText.view()[start] != ',') {
+                start -= 1;
+            }
+        }
+        var edits = Vector<TextEdit>.create();
+        edits.push(TextEdit { start: start, end: end, text: String.create() })?;
+        rows[r].values[4] = SqliteValue.Text(applyEdits(sqlText.view(), mut edits)?);
+        writeSchemaRow(db, borrow rows[r])?;
+    }
+    db.pager.bumpSchemaCookie()?;
+    db.reloadSchema()?;
+    // What still names the column: the table's CHECKs, generated columns and defaults, then its indexes.
+    let changed = db.catalog.tableCopy(tableName)?;
+    var compiler = newCompiler(db)?;
+    let slot = compiler.slotsInUse;
+    compiler.slotsInUse += 1;
+    for (k in 0..changed.checks.length) {
+        if (compileInTable(mut compiler, borrow changed.checks[k].expr, borrow changed, slot, db) is Err(e)) {
+            return Err(afterDropError("table", changed.name.view(), borrow e)?);
+        }
+    }
+    for (c in 0..changed.columns.length) {
+        if (borrow changed.columns[c].generated is Some(g)) {
+            if (compileInTable(mut compiler, borrow g.expr, borrow changed, slot, db) is Err(e)) {
+                return Err(afterDropError("table", changed.name.view(), borrow e)?);
+            }
+        }
+    }
+    for (i in 0..db.catalog.indexes.length) {
+        if (!db.catalog.indexes[i].table.view().equalsIgnoreAsciiCase(tableName)) {
+            continue;
+        }
+        let indexName = db.catalog.indexes[i].name.clone()?;
+        let Some(indexSql) = db.indexSql(indexName.view())? else {
+            continue;
+        };
+        let Stmt.CreateIndex(stmt) = Parser.parseStatement(indexSql.view())? else {
+            continue;
+        };
+        for (c in 0..stmt.columns.length) {
+            var failure: SqliteError? = null;
+            if (borrow stmt.columns[c].expression is Some(x)) {
+                if (compileInTable(mut compiler, x, borrow changed, slot, db) is Err(e)) {
+                    failure = e;
+                }
+            } else if (changed.indexOf(stmt.columns[c].name.view()).isNull()) {
+                failure = namedError("no such column: ", stmt.columns[c].name.view());
+            }
+            if (borrow failure is Some(e)) {
+                return Err(afterDropError("index", indexName.view(), e)?);
+            }
+        }
+        if (borrow stmt.filter is Some(f)) {
+            if (compileInTable(mut compiler, f, borrow changed, slot, db) is Err(e)) {
+                return Err(afterDropError("index", indexName.view(), borrow e)?);
+            }
+        }
+    }
+    // The rows: a VIRTUAL generated column has no place in them.
+    let plan = tablePlan(borrow table, mut compiler, slot, db)?;
+    let Some(position) = plan.recordPosition[at] else {
+        return Ok();
+    };
+    if (table.withoutRowid) {
+        var records = Vector<Vector<u8>>.create();
+        var cursor = RowCursor.scan(borrow plan);
+        while (cursor.next(mut db.pager)? is Some(row)) {
+            var values = row.columns;
+            if (position < values.length) {
+                let _ = values.remove(position);
+            }
+            records.push(Record.encode(values.view())?)?;
+        }
+        IndexMutator.rebuild(mut db.pager, table.rootPage, records.view())?;
+        return Ok();
+    }
+    var ops = Vector<TableOp>.create();
+    var cursor = TableCursor.scan(table.rootPage);
+    while (cursor.next(mut db.pager)? is Some(row)) {
+        if (position >= row.columns.length) {
+            continue;
+        }
+        var values = row.columns;
+        let _ = values.remove(position);
+        ops.push(TableOp { rowId: row.rowId, record: Record.encode(values.view())? })?;
+    }
+    TableMutator.applyBatch(mut db.pager, table.rootPage, ops.view())?;
     return Ok();
 }

@@ -136,16 +136,20 @@ struct BTreeBuilder {
         }
         Varint.append(truncate<i64>(record.length), mut cell)?;
         BTreeBuilder.appendPayload(store, mut cell, record, BTreeBuilder.indexMaxLocal(store))?;
+        // A cell takes at least 4 bytes, as SQLite counts it (cellSizePtr): room for a freeblock when it goes.
+        while (cell.length < 4) {
+            cell.push(0)?;
+        }
         return Ok(cell);
     }
 
     /// The room an index cell takes in its page, its 2-byte pointer included.
     fn indexCellSize<S: PageSink>(store: borrow S, length: usize, interior: bool) -> usize =>
-        (if (interior) 4 else 0) + Varint.length(truncate<i64>(length)) + BTreeBuilder.portionSize(
+        ((if (interior) 4 else 0) + Varint.length(truncate<i64>(length)) + BTreeBuilder.portionSize(
             store,
             length,
             BTreeBuilder.indexMaxLocal(store),
-        ) + 2;
+        )).max(4) + 2;
 
     /// Lays `cells` out in a page: pointers after the header, contents packed against the page's end.
     /// `rightMost` makes it an interior page.

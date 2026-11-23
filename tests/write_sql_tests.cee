@@ -475,3 +475,49 @@ fn createTableAsSelectLikeSqlite() -> Result<void, TestFailure> {
         SELECT rowid, * FROM s
         """);
 }
+
+@test
+fn dropColumnLikeSqlite() -> Result<void, TestFailure> {
+    return sameScript("drop-column", """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b TEXT UNIQUE, c REAL CHECK (c > 0), d DEFAULT 4, e AS (a * 2), f, g, h AS (g || 'x') STORED, CHECK (f <> 1))
+        CREATE INDEX t_g ON t(g)
+        CREATE INDEX t_part ON t(f) WHERE d > 0
+        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500) INSERT INTO t(id, a, b, c, f, g) SELECT i, i, 'b' || i, i + 0.5, i + 1, i * 3 FROM n
+        ALTER TABLE t DROP COLUMN id
+        ALTER TABLE t DROP COLUMN b
+        ALTER TABLE t DROP COLUMN a
+        ALTER TABLE t DROP COLUMN f
+        ALTER TABLE t DROP COLUMN g
+        ALTER TABLE t DROP COLUMN nope
+        ALTER TABLE t DROP COLUMN d
+        ALTER TABLE t DROP COLUMN c
+        ALTER TABLE t DROP COLUMN h
+        ALTER TABLE t DROP e
+        SELECT name, sql FROM sqlite_schema ORDER BY name
+        SELECT * FROM t WHERE rowid IN (1, 250, 500)
+        SELECT count(*), sum(a), sum(g) FROM t
+        CREATE TABLE one(x)
+        ALTER TABLE one DROP COLUMN x
+        CREATE TABLE p(x PRIMARY KEY, y, z) WITHOUT ROWID
+        INSERT INTO p VALUES (1, 2, 3), (4, 5, 6)
+        ALTER TABLE p DROP COLUMN y
+        SELECT sql FROM sqlite_schema WHERE name = 'p'
+        SELECT * FROM p
+        ALTER TABLE p ADD COLUMN w DEFAULT 'w'
+        ALTER TABLE p DROP COLUMN z
+        SELECT * FROM p
+        """);
+}
+
+@test
+fn tinyIndexCellsTakeFourBytes() -> Result<void, TestFailure> {
+    return sameScript("tiny-cells", """
+        CREATE TABLE flags(x PRIMARY KEY) WITHOUT ROWID
+        INSERT INTO flags VALUES (0), (1), (NULL)
+        CREATE TABLE t(a INT, b INT)
+        CREATE INDEX t_a ON t(a)
+        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) INSERT INTO flags SELECT i FROM n WHERE i > 1
+        DELETE FROM flags WHERE x % 3 = 0
+        SELECT count(*), sum(x) FROM flags
+        """);
+}

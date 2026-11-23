@@ -1212,8 +1212,9 @@ struct Parser {
             this.expectWord("TO")?;
             return Ok(AlterTableStmt { table: table, action: AlterAction.RenameColumn(from, this.name()?) });
         }
-        if (this.isWord("DROP")) {
-            return Err(unsupported("ALTER TABLE … DROP COLUMN is not supported"));
+        if (this.acceptWord("DROP")) {
+            let _ = this.acceptWord("COLUMN");
+            return Ok(AlterTableStmt { table: table, action: AlterAction.DropColumn(this.name()?) });
         }
         this.expectWord("ADD")?;
         let _ = this.acceptWord("COLUMN");

@@ -536,6 +536,10 @@ struct IndexMutator {
             }
             var cell = Vector<u8>.withCapacity(end - offset)?;
             cell.extend(page[offset..end])?;
+            // At least 4 bytes, as SQLite counts a cell.
+            while (cell.length < 4) {
+                cell.push(0)?;
+            }
             cells.push(cell)?;
         }
         return Ok(cells);
