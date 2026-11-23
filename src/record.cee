@@ -1,0 +1,242 @@
+// SQLite's record format: the serialized form of a row's values, in table and index cells alike. A record is a
+// header (its own length as a varint, then one varint "serial type" per column) and a body (the values, one after
+// another). https://www.sqlite.org/fileformat2.html#record_format
+
+/// How a database stores text (header offset 56).
+public enum TextEncoding {
+    Utf8,
+    Utf16LE,
+    Utf16BE,
+}
+
+struct Record {
+    /// Decodes every column of `payload`.
+    fn decode(payload: Slice<u8>, encoding: TextEncoding) -> Result<Vector<SqliteValue>, SqliteError> =>
+        Record.decodeMasked(payload, encoding, []);
+
+    /// Decodes the columns of `payload` whose slot in `wanted` is true; the others stay NULL and their bodies are
+    /// skipped, so no text or blob is copied for them. An empty mask decodes everything.
+    fn decodeMasked(
+        payload: Slice<u8>,
+        encoding: TextEncoding,
+        wanted: Slice<bool>,
+    ) -> Result<Vector<SqliteValue>, SqliteError> {
+        let header = Varint.read(payload, 0)?;
+        let headerLength = checkedTruncate<usize>(header.value) ?? {
+            return Err(corrupt("record header length is negative"));
+        };
+        if (headerLength > payload.length) {
+            return Err(corrupt("record header runs past the payload"));
+        }
+        var columnCount: usize = 0;
+        var p = header.length;
+        while (p < headerLength) {
+            p += Varint.read(payload, p)?.length;
+            columnCount += 1;
+        }
+        var values = Vector<SqliteValue>.withCapacity(columnCount)?;
+        var headerPos = header.length;
+        var bodyPos = headerLength;
+        for (i in 0..columnCount) {
+            let serial = Varint.read(payload, headerPos)?;
+            headerPos += serial.length;
+            let size = Record.serialTypeSize(serial.value);
+            if (bodyPos + size > payload.length) {
+                return Err(corrupt("record body runs past the payload"));
+            }
+            if (wanted.length != 0 && (i >= wanted.length || !wanted[i])) {
+                values.push(SqliteValue.Null)?;
+            } else {
+                values.push(Record.readValue(payload[bodyPos..bodyPos + size], serial.value, encoding)?)?;
+            }
+            bodyPos += size;
+        }
+        return Ok(values);
+    }
+
+    /// The number of body bytes a serial type takes.
+    fn serialTypeSize(serialType: i64) -> usize => match (serialType) {
+        0 | 8 | 9 | 10 | 11 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 4,
+        5 => 6,
+        6 | 7 => 8,
+        _ => if (serialType < 0) 0 else truncate<usize>((serialType - (if (serialType % 2 == 0) 12 else 13)) / 2),
+    };
+
+    fn readValue(body: Slice<u8>, serialType: i64, encoding: TextEncoding) -> Result<SqliteValue, SqliteError> {
+        match (serialType) {
+            0 | 10 | 11 => { return Ok(SqliteValue.Null); }
+            1..=6 => { return Ok(SqliteValue.Integer(Record.readIntBE(body))); }
+            7 => { return Ok(SqliteValue.Real(f64.fromBits(Record.readRawBE(body)))); }
+            8 => { return Ok(SqliteValue.Integer(0)); }
+            9 => { return Ok(SqliteValue.Integer(1)); }
+            _ => {}
+        }
+        if (serialType < 0) {
+            return Ok(SqliteValue.Null);
+        }
+        if (serialType % 2 == 0) {
+            return Ok(SqliteValue.blob(body)?);
+        }
+        return Ok(SqliteValue.Text(decodeText(body, encoding)?));
+    }
+
+    /// A big-endian two's-complement signed integer of `body.length` bytes (1 to 8).
+    fn readIntBE(body: Slice<u8>) -> i64 {
+        var v = Record.readRawBE(body);
+        let bits = truncate<u32>(body.length * 8);
+        if (bits < 64 && (v & (1u64 << (bits - 1))) != 0) {
+            v = v | (0xFFFF_FFFF_FFFF_FFFF << bits);
+        }
+        return truncate<i64>(v);
+    }
+
+    fn readRawBE(body: Slice<u8>) -> u64 {
+        var v: u64 = 0;
+        for (b in body) {
+            v = (v << 8) | (b as u64);
+        }
+        return v;
+    }
+
+    /// Encodes a row. Each value gets the smallest serial type that holds it exactly, as SQLite chooses. Text is
+    /// written as UTF-8.
+    fn encode(columns: Slice<SqliteValue>) -> Result<Vector<u8>, SqliteError> {
+        var serialBytes: usize = 0;
+        var bodyLength: usize = 0;
+        for (i in 0..columns.length) {
+            let st = Record.serialTypeOf(columns[i]);
+            serialBytes += Varint.length(st);
+            bodyLength += Record.serialTypeSize(st);
+        }
+        // The header's length counts the varint that holds it, so find the size at which it agrees with itself.
+        var headerLenSize: usize = 1;
+        var headerLength = serialBytes + headerLenSize;
+        while (Varint.length(truncate<i64>(headerLength)) != headerLenSize) {
+            headerLenSize += 1;
+            headerLength = serialBytes + headerLenSize;
+        }
+        var record = Vector<u8>.withCapacity(headerLength + bodyLength)?;
+        Varint.append(truncate<i64>(headerLength), mut record)?;
+        for (i in 0..columns.length) {
+            Varint.append(Record.serialTypeOf(columns[i]), mut record)?;
+        }
+        for (i in 0..columns.length) {
+            match (borrow columns[i]) {
+                SqliteValue.Null => {}
+                SqliteValue.Integer(v) => {
+                    Record.appendIntBE(
+                        mut record,
+                        truncate<u64>(v),
+                        Record.serialTypeSize(Record.integerSerialType(v)),
+                    )?;
+                }
+                SqliteValue.Real(r) => { Record.appendIntBE(mut record, r.bits(), 8)?; }
+                SqliteValue.Text(s) => { record.extend(s.view().bytes())?; }
+                SqliteValue.Blob(b) => { record.extend(b.view())?; }
+            }
+        }
+        return Ok(record);
+    }
+
+    fn integerSerialType(i: i64) -> i64 {
+        if (i == 0) {
+            return 8;
+        }
+        if (i == 1) {
+            return 9;
+        }
+        if (i >= -128 && i <= 127) {
+            return 1;
+        }
+        if (i >= -32768 && i <= 32767) {
+            return 2;
+        }
+        if (i >= -8388608 && i <= 8388607) {
+            return 3;
+        }
+        if (i >= -2147483648 && i <= 2147483647) {
+            return 4;
+        }
+        if (i >= -140737488355328 && i <= 140737488355327) {
+            return 5;
+        }
+        return 6;
+    }
+
+    fn serialTypeOf(value: borrow SqliteValue) -> i64 => match (value) {
+        SqliteValue.Null => 0,
+        SqliteValue.Integer(i) => Record.integerSerialType(i),
+        SqliteValue.Real(_) => 7,
+        SqliteValue.Text(s) => truncate<i64>(s.length) * 2 + 13,
+        SqliteValue.Blob(b) => truncate<i64>(b.length) * 2 + 12,
+    };
+
+    fn appendIntBE(out: borrow mut Vector<u8>, value: u64, length: usize) -> Result<void, AllocError> {
+        var i = length;
+        while (i > 0) {
+            i -= 1;
+            out.push(truncate<u8>((value >> truncate<u32>(i * 8)) & 0xFF))?;
+        }
+        return Ok();
+    }
+}
+
+/// Text of a record in the database's encoding, as UTF-8.
+fn decodeText(bytes: Slice<u8>, encoding: TextEncoding) -> Result<String, AllocError> {
+    match (encoding) {
+        TextEncoding.Utf8 => { return textFromBytesLossy(bytes); }
+        TextEncoding.Utf16LE => { return textFromUtf16(bytes, false); }
+        TextEncoding.Utf16BE => { return textFromUtf16(bytes, true); }
+    }
+}
+
+/// UTF-16 bytes as UTF-8 text; an unpaired surrogate becomes U+FFFD.
+fn textFromUtf16(bytes: Slice<u8>, bigEndian: bool) -> Result<String, AllocError> {
+    var out = Vector<u8>.withCapacity(bytes.length)?;
+    var i: usize = 0;
+    while (i + 1 < bytes.length) {
+        var unit = utf16Unit(bytes, i, bigEndian);
+        i += 2;
+        var code: u32 = unit as u32;
+        if (unit >= 0xD800 && unit <= 0xDBFF && i + 1 < bytes.length) {
+            let low = utf16Unit(bytes, i, bigEndian);
+            if (low >= 0xDC00 && low <= 0xDFFF) {
+                code = 0x10000 + (((unit as u32) - 0xD800) << 10) + ((low as u32) - 0xDC00);
+                i += 2;
+            } else {
+                code = 0xFFFD;
+            }
+        } else if (unit >= 0xD800 && unit <= 0xDFFF) {
+            code = 0xFFFD;
+        }
+        appendUtf8(mut out, code)?;
+    }
+    return textFromBytesLossy(out.view());
+}
+
+fn utf16Unit(bytes: Slice<u8>, at: usize, bigEndian: bool) -> u16 =>
+    if (bigEndian) bytes.readBE<u16>(at) else bytes.readLE<u16>(at);
+
+/// Appends a Unicode scalar value as UTF-8.
+fn appendUtf8(out: borrow mut Vector<u8>, code: u32) -> Result<void, AllocError> {
+    if (code < 0x80) {
+        out.push(truncate<u8>(code))?;
+    } else if (code < 0x800) {
+        out.push(truncate<u8>(0xC0 | (code >> 6)))?;
+        out.push(truncate<u8>(0x80 | (code & 0x3F)))?;
+    } else if (code < 0x10000) {
+        out.push(truncate<u8>(0xE0 | (code >> 12)))?;
+        out.push(truncate<u8>(0x80 | ((code >> 6) & 0x3F)))?;
+        out.push(truncate<u8>(0x80 | (code & 0x3F)))?;
+    } else {
+        out.push(truncate<u8>(0xF0 | (code >> 18)))?;
+        out.push(truncate<u8>(0x80 | ((code >> 12) & 0x3F)))?;
+        out.push(truncate<u8>(0x80 | ((code >> 6) & 0x3F)))?;
+        out.push(truncate<u8>(0x80 | (code & 0x3F)))?;
+    }
+    return Ok();
+}

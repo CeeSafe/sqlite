@@ -1,0 +1,79 @@
+// The SQL tokenizer.
+
+/// The tokens of `sql` as "kind:text" joined by spaces, without the final Eof.
+fn tokenText(sql: StringView) -> String {
+    let tokens = Tokenizer.tokenize(sql)!;
+    var out = String.create();
+    for (i in 0..tokens.length - 1) {
+        if (i != 0) {
+            out.append(" ")!;
+        }
+        out.append(match (tokens[i].kind) {
+            TokenKind.Eof => "eof",
+            TokenKind.Word => "w",
+            TokenKind.QuotedId => "q",
+            TokenKind.StringLit => "s",
+            TokenKind.BlobLit => "b",
+            TokenKind.IntLit => "i",
+            TokenKind.FloatLit => "f",
+            TokenKind.Param => "p",
+            TokenKind.Op => "o",
+        })!;
+        out.append(":")!;
+        out.append(tokens[i].text.view())!;
+    }
+    return out;
+}
+
+fn refused(sql: StringView) -> bool => Tokenizer.tokenize(sql).isErr();
+
+@test
+fn tokenizesStatements() -> Result<void, TestFailure> {
+    Check.equalText("w:SELECT w:a o:, q:b c o:, q:d q:e w:FROM w:t w:WHERE w:x o:>= i:10 o:;", tokenText("SELECT a, \"b c\", [d] `e` FROM t WHERE x >= 10;").view())?;
+    Check.equalText("s:it's s: b:00ff b:", tokenText("'it''s' '' x'00ff' X''").view())?;
+    Check.equalText("q:a\"b", tokenText("\"a\"\"b\"").view())?;
+    Check.equalText("p:? p:?12 p::name p:@n p:$v1", tokenText("? ?12 :name @n $v1").view())?;
+    Check.equalText("w:a o:-> s:k o:->> s:j o:|| w:b o:<> w:c o:!= w:d o:== w:e o:<< i:1 o:>> i:2 o:<= w:f", tokenText("a->'k'->>'j'||b<>c!=d==e<<1>>2<=f").view())?;
+    Check.equalText("w:a w:b", tokenText("a -- comment\n /* block\n */ b /* open").view())?;
+    Check.equalText("w:x1 w:xyz w:x", tokenText("x1 xyz x").view())?;
+    return Ok();
+}
+
+@test
+fn tokenizesNumbers() -> Result<void, TestFailure> {
+    Check.equalText("i:123 f:1.5 f:.5 f:1. f:1e10 f:2.5E-3 i:0x1F f:1e+2", tokenText("123 1.5 .5 1. 1e10 2.5E-3 0x1F 1e+2").view())?;
+    Check.equalText("i:1000000 i:0xFFFF f:1000.25", tokenText("1_000_000 0xFF_FF 1_000.2_5").view())?;
+    Check.equalText("i:1 o:- i:2 o:. w:x", tokenText("1-2 .x").view())?;
+    return Ok();
+}
+
+@test
+fn identifiersFollowSqlite() -> Result<void, TestFailure> {
+    // `$` continues an identifier, and any character outside ASCII may be in one.
+    Check.equalText("w:a$b w:été w:_x9", tokenText("a$b été _x9").view())?;
+    // A digit from another script is not a digit: here it is part of a name.
+    Check.equalText("w:n٣", tokenText("n٣").view())?;
+    return Ok();
+}
+
+@test
+fn refusesMalformedTokens() -> Result<void, TestFailure> {
+    Check.isTrue(refused("x'abc'"), "a blob literal of an odd number of digits")?;
+    Check.isTrue(refused("x'zz'"), "a blob literal that is not hex")?;
+    Check.isTrue(refused("x'ab"), "an unterminated blob literal")?;
+    Check.isTrue(refused("0x"), "0x without digits")?;
+    Check.isTrue(refused("123abc"), "a number that runs into a name")?;
+    Check.isTrue(refused("1e"), "an exponent without digits")?;
+    Check.isTrue(refused("1__0"), "a doubled digit separator")?;
+    Check.isTrue(refused("1_"), "a trailing digit separator")?;
+    Check.isTrue(refused("'open"), "an unterminated string")?;
+    Check.isTrue(refused("[open"), "an unterminated bracket identifier")?;
+    Check.isTrue(refused("a : b"), "a parameter without a name")?;
+    Check.isTrue(refused("a ! b"), "a lone !")?;
+    Check.isTrue(refused("a # b"), "a character SQL does not use")?;
+    match (Tokenizer.tokenize("SELECT #")) {
+        Err(e) => { Check.equalText("SQL syntax error at offset 7: unexpected character", e.message())?; }
+        Ok(_) => { return Check.fail("expected an error"); }
+    }
+    return Ok();
+}

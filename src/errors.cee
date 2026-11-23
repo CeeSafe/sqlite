@@ -1,0 +1,45 @@
+// Errors. The C# engine throws; here every fallible operation returns `Result<T, SqliteError>`.
+
+/// What went wrong in the engine.
+public enum SqliteError {
+    /// Memory ran out.
+    @from Alloc(AllocError),
+    /// The file system refused an operation.
+    @from Io(IoError),
+    /// The database file does not follow the SQLite file format.
+    Corrupt(String),
+    /// The file is not a SQLite database at all.
+    NotADatabase(String),
+    /// The SQL text could not be parsed, or names something that does not exist.
+    Sql(String),
+    /// A constraint (NOT NULL, UNIQUE, CHECK, FOREIGN KEY, …) refused a change.
+    Constraint(String),
+    /// The engine does not support what was asked.
+    Unsupported(String),
+}
+
+impl SqliteError {
+    /// The error's message.
+    public fn message(borrow this) -> StringView => match (this) {
+        SqliteError.Alloc(_) => "out of memory",
+        SqliteError.Io(e) => e.message(),
+        SqliteError.Corrupt(m) => m.view(),
+        SqliteError.NotADatabase(m) => m.view(),
+        SqliteError.Sql(m) => m.view(),
+        SqliteError.Constraint(m) => m.view(),
+        SqliteError.Unsupported(m) => m.view(),
+    };
+}
+
+fn ownedMessage(message: StringView) -> String => match (String.from(message)) {
+    Ok(s) => s,
+    Err(_) => String.create(),
+};
+
+fn corrupt(message: StringView) -> SqliteError => SqliteError.Corrupt(ownedMessage(message));
+
+fn notADatabase(message: StringView) -> SqliteError => SqliteError.NotADatabase(ownedMessage(message));
+
+fn sqlError(message: StringView) -> SqliteError => SqliteError.Sql(ownedMessage(message));
+
+fn unsupported(message: StringView) -> SqliteError => SqliteError.Unsupported(ownedMessage(message));

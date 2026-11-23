@@ -1,0 +1,874 @@
+// The schema catalog: what the CREATE TABLE and CREATE INDEX statements stored in sqlite_schema say about the
+// database's tables and indexes. https://www.sqlite.org/lang_createtable.html
+//
+// The C# engine read column definitions from token *text*, re-split on spaces and commas. Here the tokens keep
+// their kinds, which removes these bugs of the source:
+// - `DEFAULT -1` recorded the default as "-": only one token after DEFAULT was taken;
+// - a name written as a quoted keyword ("unique", "check") was read as the constraint;
+// - `CONSTRAINT name` was not skipped, so a constraint named like a keyword was read as that constraint;
+// - a key column list was split on spaces, so a quoted name with a space or a comma in it broke apart;
+// - an index's columns were given the BINARY collation whatever the index or its table said, so an index on a
+//   NOCASE column was searched in the wrong order;
+// - a partial index and an index on an expression were recorded as plain indexes over their named columns;
+// - a declared type came back as `VARCHAR ( 10 )`;
+// - one entry of sqlite_schema that did not parse (a virtual table, say) made the whole database unreadable.
+// A definition this cannot read is now an error for that one table, which is then listed as unsupported.
+
+/// A column's type affinity. https://www.sqlite.org/datatype3.html#type_affinity
+enum Affinity {
+    Blob,
+    Text,
+    Numeric,
+    Integer,
+    Real,
+}
+
+fn containsIgnoringCase(text: StringView, word: StringView) -> bool {
+    if (word.length > text.length) {
+        return false;
+    }
+    for (start in 0..text.length - word.length + 1) {
+        var same = true;
+        for (i in 0..word.length) {
+            if (foldAscii(text[start + i]) != foldAscii(word[i])) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The affinity SQLite gives a column declared with `declaredType`: its five rules, in order.
+fn affinityOf(declaredType: StringView) -> Affinity {
+    if (declaredType.length == 0) {
+        return Affinity.Blob;
+    }
+    if (containsIgnoringCase(declaredType, "INT")) {
+        return Affinity.Integer;
+    }
+    if (containsIgnoringCase(
+        declaredType,
+        "CHAR",
+    ) || containsIgnoringCase(declaredType, "CLOB") || containsIgnoringCase(declaredType, "TEXT")) {
+        return Affinity.Text;
+    }
+    if (containsIgnoringCase(declaredType, "BLOB")) {
+        return Affinity.Blob;
+    }
+    if (containsIgnoringCase(
+        declaredType,
+        "REAL",
+    ) || containsIgnoringCase(declaredType, "FLOA") || containsIgnoringCase(declaredType, "DOUB")) {
+        return Affinity.Real;
+    }
+    return Affinity.Numeric;
+}
+
+enum ForeignKeyAction {
+    NoAction,
+    Restrict,
+    SetNull,
+    SetDefault,
+    Cascade,
+}
+
+struct ForeignKeySchema {
+    columns: Vector<String>;
+    refTable: String;
+    /// Empty when the parent's primary key is meant.
+    refColumns: Vector<String>;
+    onDelete: ForeignKeyAction;
+    onUpdate: ForeignKeyAction;
+    /// DEFERRABLE INITIALLY DEFERRED.
+    deferred: bool;
+}
+
+/// An expression of a definition, with the text it was written as.
+struct SchemaExpr {
+    text: String;
+    expr: Expr;
+}
+
+struct ColumnSchema {
+    name: String;
+    declaredType: String;
+    affinity: Affinity;
+    notNull: bool;
+    primaryKey: bool;
+    /// PRIMARY KEY DESC on the column.
+    pkDescending: bool;
+    unique: bool;
+    autoincrement: bool;
+    /// INTEGER PRIMARY KEY: the column is the rowid, and is stored as NULL in the record.
+    isRowidAlias: bool;
+    collation: Collation;
+    defaultValue: SchemaExpr?;
+    check: SchemaExpr?;
+    generated: SchemaExpr?;
+    generatedStored: bool;
+    foreignKey: ForeignKeySchema?;
+}
+
+struct KeyColumn {
+    name: String;
+    descending: bool;
+    /// The COLLATE written in the key's column list; `null` to use the table column's collation.
+    collation: Collation?;
+}
+
+/// A PRIMARY KEY or UNIQUE constraint, which SQLite enforces with an index of its own.
+struct KeyConstraint {
+    columns: Vector<KeyColumn>;
+    primaryKey: bool;
+}
+
+struct TableSchema {
+    name: String;
+    columns: Vector<ColumnSchema>;
+    rootPage: u32;
+    withoutRowid: bool;
+    strict: bool;
+    autoincrement: bool;
+    /// The primary key's columns in the order the key names them; empty when the rowid is the only key.
+    primaryKey: Vector<KeyColumn>;
+    /// Column CHECKs in declaration order, then the table's.
+    checks: Vector<SchemaExpr>;
+    /// The PRIMARY KEY (unless it is the rowid) and UNIQUE constraints, in SQLite's order: those written on
+    /// columns, column by column, then the table's. A constraint over the same columns and collations as an
+    /// earlier one is not repeated, as SQLite makes one index for both.
+    keys: Vector<KeyConstraint>;
+    foreignKeys: Vector<ForeignKeySchema>;
+    /// The column that is the rowid, if one is.
+    rowidAlias: usize?;
+
+    /// The index of the column called `name` (ASCII case is ignored).
+    fn indexOf(borrow this, name: StringView) -> usize? {
+        for (i in 0..this.columns.length) {
+            if (this.columns[i].name.view().equalsIgnoreAsciiCase(name)) {
+                return i;
+            }
+        }
+        return null;
+    }
+
+    /// The collation a key column sorts by: its own, or else its table column's.
+    fn keyCollation(borrow this, column: borrow KeyColumn) -> Collation {
+        if (column.collation is Some(written)) {
+            return written;
+        }
+        if (this.indexOf(column.name.view()) is Some(at)) {
+            return this.columns[at].collation;
+        }
+        return Collation.Binary;
+    }
+
+    /// Adds a key constraint unless an earlier one has the same columns and collations.
+    fn addKey(borrow mut this, columns: Vector<KeyColumn>, primaryKey: bool) -> Result<void, AllocError> {
+        for (k in 0..this.keys.length) {
+            if (this.keys[k].columns.length != columns.length) {
+                continue;
+            }
+            var same = true;
+            for (c in 0..columns.length) {
+                let a = borrow this.keys[k].columns[c];
+                let b = borrow columns[c];
+                if (!a.name.view().equalsIgnoreAsciiCase(
+                    b.name.view(),
+                ) || this.keyCollation(a) != this.keyCollation(b)) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) {
+                return Ok();
+            }
+        }
+        return this.keys.push(KeyConstraint { columns: columns, primaryKey: primaryKey });
+    }
+}
+
+struct IndexColumnSchema {
+    /// The column's name; empty for an expression.
+    name: String;
+    expression: Expr?;
+    descending: bool;
+    /// The index column's COLLATE, or else its table column's collation.
+    collation: Collation;
+}
+
+struct IndexSchema {
+    name: String;
+    table: String;
+    unique: bool;
+    rootPage: u32;
+    columns: Vector<IndexColumnSchema>;
+    /// A partial index's WHERE: only rows satisfying it are in the index.
+    filter: Expr?;
+
+    /// Whether every row of the table has an entry made of plain columns, so that the index can stand in for
+    /// the table in a search on those columns.
+    fn coversEveryRow(borrow this) -> bool {
+        if (this.filter.isSome()) {
+            return false;
+        }
+        for (i in 0..this.columns.length) {
+            if (this.columns[i].expression.isSome()) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+// ── reading definitions from tokens ──────────────────────────────────────────────────────────────────────────
+
+fn tokenIsWord(tokens: Slice<Token>, at: usize, word: StringView) -> bool =>
+    at < tokens.length && tokens[at].isWord(word);
+
+fn tokenIsOp(tokens: Slice<Token>, at: usize, op: StringView) -> bool => at < tokens.length && tokens[at].isOp(op);
+
+fn definitionError(tokens: Slice<Token>, at: usize) -> SqliteError {
+    var text = String.create();
+    if (at < tokens.length) {
+        let _ = text.append("near \"");
+        let _ = text.append(tokens[at].text.view());
+        let _ = text.append("\": syntax error");
+    } else {
+        let _ = text.append("incomplete input");
+    }
+    return SqliteError.Sql(text);
+}
+
+fn cloneToken(token: borrow Token) -> Result<Token, AllocError> =>
+    Ok(Token { kind: token.kind, text: token.text.clone()?, offset: token.offset });
+
+/// A token as SQL text.
+fn appendToken(out: borrow mut String, token: borrow Token) -> Result<void, AllocError> {
+    match (token.kind) {
+        TokenKind.QuotedId => { return SqlWriter.appendIdentifier(out, token.text.view()); }
+        TokenKind.StringLit => { return SqlWriter.appendStringLiteral(out, token.text.view()); }
+        TokenKind.BlobLit => {
+            out.append("x'")?;
+            out.append(token.text.view())?;
+            return out.append("'");
+        }
+        _ => { return out.append(token.text.view()); }
+    }
+}
+
+/// Tokens as SQL text: one space between them, none inside parentheses' edges, before a comma or around a dot.
+fn renderTokens(tokens: Slice<Token>) -> Result<String, AllocError> {
+    var out = String.create();
+    for (i in 0..tokens.length) {
+        if (i != 0) {
+            let tight = tokens[i].isOp(
+                ")",
+            ) || tokens[i].isOp(",") || tokens[i].isOp(".") || tokens[i - 1].isOp("(") || tokens[i - 1].isOp(".");
+            let call = tokens[i].isOp(
+                "(",
+            ) && (tokens[i - 1].kind == TokenKind.Word || tokens[i - 1].kind == TokenKind.QuotedId);
+            if (!tight && !call) {
+                out.append(" ")?;
+            }
+        }
+        appendToken(mut out, borrow tokens[i])?;
+    }
+    return Ok(out);
+}
+
+/// The expression `tokens` spell, with its text.
+fn schemaExpr(tokens: Slice<Token>) -> Result<SchemaExpr, SqliteError> {
+    var copy = Vector<Token>.withCapacity(tokens.length + 1)?;
+    for (i in 0..tokens.length) {
+        copy.push(cloneToken(borrow tokens[i])?)?;
+    }
+    copy.push(Token { kind: TokenKind.Eof, text: String.create(), offset: 0 })?;
+    return Ok(SchemaExpr { text: renderTokens(tokens)?, expr: Parser.parseExpressionTokens(copy)? });
+}
+
+/// With `at` on an opening parenthesis, the index of the one that closes it.
+fn closingParenthesis(tokens: Slice<Token>, at: usize) -> Result<usize, SqliteError> {
+    if (!tokenIsOp(tokens, at, "(")) {
+        return Err(definitionError(tokens, at));
+    }
+    var depth: usize = 0;
+    for (i in at..tokens.length) {
+        if (tokens[i].isOp("(")) {
+            depth += 1;
+        } else if (tokens[i].isOp(")")) {
+            depth -= 1;
+            if (depth == 0) {
+                return Ok(i);
+            }
+        }
+    }
+    return Err(definitionError(tokens, tokens.length));
+}
+
+/// The name at `at`: a word, a quoted identifier or, as SQLite allows, a string.
+fn definitionName(tokens: Slice<Token>, at: usize) -> Result<String, SqliteError> {
+    if (at < tokens.length) {
+        let kind = tokens[at].kind;
+        if (kind == TokenKind.Word || kind == TokenKind.QuotedId || kind == TokenKind.StringLit) {
+            return Ok(tokens[at].text.clone()?);
+        }
+    }
+    return Err(definitionError(tokens, at));
+}
+
+fn collationNamed(name: StringView) -> Result<Collation, SqliteError> {
+    if (Collation.named(name) is Some(collation)) {
+        return Ok(collation);
+    }
+    var text = String.from("no such collation sequence: ")?;
+    text.append(name)?;
+    return Err(SqliteError.Unsupported(text));
+}
+
+/// Skips `ON CONFLICT action` at `at`; the action itself is not kept.
+fn skipConflictClause(tokens: Slice<Token>, at: usize) -> Result<usize, SqliteError> {
+    if (!(tokenIsWord(tokens, at, "ON") && tokenIsWord(tokens, at + 1, "CONFLICT"))) {
+        return Ok(at);
+    }
+    let action = at + 2;
+    if (tokenIsWord(
+        tokens,
+        action,
+        "ROLLBACK",
+    ) || tokenIsWord(
+        tokens,
+        action,
+        "ABORT",
+    ) || tokenIsWord(
+        tokens,
+        action,
+        "FAIL",
+    ) || tokenIsWord(tokens, action, "IGNORE") || tokenIsWord(tokens, action, "REPLACE")) {
+        return Ok(action + 1);
+    }
+    return Err(definitionError(tokens, action));
+}
+
+/// A parenthesized list of key columns, each `name [COLLATE c] [ASC|DESC]`. `at` is left after the list.
+fn keyColumns(tokens: Slice<Token>, at: borrow mut usize) -> Result<Vector<KeyColumn>, SqliteError> {
+    if (!tokenIsOp(tokens, *at, "(")) {
+        return Err(definitionError(tokens, *at));
+    }
+    var i = *at + 1;
+    var columns = Vector<KeyColumn>.create();
+    loop {
+        var column = KeyColumn { name: definitionName(tokens, i)?, descending: false, collation: null };
+        i += 1;
+        if (tokenIsWord(tokens, i, "COLLATE")) {
+            let collation = definitionName(tokens, i + 1)?;
+            column.collation = collationNamed(collation.view())?;
+            i += 2;
+        }
+        if (tokenIsWord(tokens, i, "DESC")) {
+            column.descending = true;
+            i += 1;
+        } else if (tokenIsWord(tokens, i, "ASC")) {
+            i += 1;
+        }
+        columns.push(column)?;
+        if (tokenIsOp(tokens, i, ",")) {
+            i += 1;
+            continue;
+        }
+        if (!tokenIsOp(tokens, i, ")")) {
+            return Err(definitionError(tokens, i));
+        }
+        at = i + 1;
+        return Ok(columns);
+    }
+}
+
+fn foreignKeyAction(tokens: Slice<Token>, at: borrow mut usize) -> Result<ForeignKeyAction, SqliteError> {
+    let i = *at;
+    if (tokenIsWord(tokens, i, "SET") && tokenIsWord(tokens, i + 1, "NULL")) {
+        at = i + 2;
+        return Ok(ForeignKeyAction.SetNull);
+    }
+    if (tokenIsWord(tokens, i, "SET") && tokenIsWord(tokens, i + 1, "DEFAULT")) {
+        at = i + 2;
+        return Ok(ForeignKeyAction.SetDefault);
+    }
+    if (tokenIsWord(tokens, i, "NO") && tokenIsWord(tokens, i + 1, "ACTION")) {
+        at = i + 2;
+        return Ok(ForeignKeyAction.NoAction);
+    }
+    if (tokenIsWord(tokens, i, "CASCADE")) {
+        at = i + 1;
+        return Ok(ForeignKeyAction.Cascade);
+    }
+    if (tokenIsWord(tokens, i, "RESTRICT")) {
+        at = i + 1;
+        return Ok(ForeignKeyAction.Restrict);
+    }
+    return Err(definitionError(tokens, i));
+}
+
+/// With `at` on REFERENCES: the parent table, its columns, and the clauses that follow. `at` is left after them.
+fn foreignKeyClause(
+    tokens: Slice<Token>,
+    at: borrow mut usize,
+    columns: Vector<String>,
+) -> Result<ForeignKeySchema, SqliteError> {
+    var i = *at + 1;
+    var key = ForeignKeySchema {
+        columns: columns,
+        refTable: definitionName(tokens, i)?,
+        refColumns: Vector<String>.create(),
+        onDelete: ForeignKeyAction.NoAction,
+        onUpdate: ForeignKeyAction.NoAction,
+        deferred: false,
+    };
+    i += 1;
+    if (tokenIsOp(tokens, i, "(")) {
+        let parent = keyColumns(tokens, mut i)?;
+        for (c in 0..parent.length) {
+            key.refColumns.push(parent[c].name.clone()?)?;
+        }
+    }
+    loop {
+        if (tokenIsWord(tokens, i, "ON") && tokenIsWord(tokens, i + 1, "DELETE")) {
+            i += 2;
+            key.onDelete = foreignKeyAction(tokens, mut i)?;
+        } else if (tokenIsWord(tokens, i, "ON") && tokenIsWord(tokens, i + 1, "UPDATE")) {
+            i += 2;
+            key.onUpdate = foreignKeyAction(tokens, mut i)?;
+        } else if (tokenIsWord(tokens, i, "MATCH")) {
+            let _ = definitionName(tokens, i + 1)?;
+            i += 2;
+        } else if (tokenIsWord(tokens, i, "DEFERRABLE") || (tokenIsWord(tokens, i, "NOT") && tokenIsWord(
+            tokens,
+            i + 1,
+            "DEFERRABLE",
+        ))) {
+            let negated = tokenIsWord(tokens, i, "NOT");
+            i += if (negated) 2 else 1;
+            if (tokenIsWord(tokens, i, "INITIALLY")) {
+                if (tokenIsWord(tokens, i + 1, "DEFERRED")) {
+                    key.deferred = !negated;
+                } else if (!tokenIsWord(tokens, i + 1, "IMMEDIATE")) {
+                    return Err(definitionError(tokens, i + 1));
+                }
+                i += 2;
+            }
+        } else {
+            at = i;
+            return Ok(key);
+        }
+    }
+}
+
+fn isColumnConstraintWord(token: borrow Token) -> bool =>
+    token.kind == TokenKind.Word && (token.isWord(
+        "CONSTRAINT",
+    ) || token.isWord(
+        "PRIMARY",
+    ) || token.isWord(
+        "NOT",
+    ) || token.isWord(
+        "NULL",
+    ) || token.isWord(
+        "UNIQUE",
+    ) || token.isWord(
+        "CHECK",
+    ) || token.isWord(
+        "DEFAULT",
+    ) || token.isWord("COLLATE") || token.isWord("REFERENCES") || token.isWord("GENERATED") || token.isWord("AS"));
+
+/// A column from its definition: a type, then constraints.
+fn buildColumnSchema(definition: borrow ColumnDef, withoutRowid: bool) -> Result<ColumnSchema, SqliteError> {
+    let tokens = definition.body.view();
+    var column = ColumnSchema {
+        name: definition.name.clone()?,
+        declaredType: String.create(),
+        affinity: Affinity.Blob,
+        notNull: false,
+        primaryKey: false,
+        pkDescending: false,
+        unique: false,
+        autoincrement: false,
+        isRowidAlias: false,
+        collation: Collation.Binary,
+        defaultValue: null,
+        check: null,
+        generated: null,
+        generatedStored: false,
+        foreignKey: null,
+    };
+    // The declared type: the tokens before the first constraint keyword.
+    var i: usize = 0;
+    while (i < tokens.length && !isColumnConstraintWord(borrow tokens[i])) {
+        i += 1;
+    }
+    column.declaredType = renderTokens(tokens[0..i])?;
+    column.affinity = affinityOf(column.declaredType.view());
+    while (i < tokens.length) {
+        if (tokenIsWord(tokens, i, "CONSTRAINT")) {
+            let _ = definitionName(tokens, i + 1)?;
+            i += 2;
+        } else if (tokenIsWord(tokens, i, "NOT") && tokenIsWord(tokens, i + 1, "NULL")) {
+            column.notNull = true;
+            i = skipConflictClause(tokens, i + 2)?;
+        } else if (tokenIsWord(tokens, i, "NULL")) {
+            i = skipConflictClause(tokens, i + 1)?;
+        } else if (tokenIsWord(tokens, i, "PRIMARY") && tokenIsWord(tokens, i + 1, "KEY")) {
+            column.primaryKey = true;
+            i += 2;
+            if (tokenIsWord(tokens, i, "DESC")) {
+                column.pkDescending = true;
+                i += 1;
+            } else if (tokenIsWord(tokens, i, "ASC")) {
+                i += 1;
+            }
+            i = skipConflictClause(tokens, i)?;
+            if (tokenIsWord(tokens, i, "AUTOINCREMENT")) {
+                column.autoincrement = true;
+                i += 1;
+            }
+        } else if (tokenIsWord(tokens, i, "UNIQUE")) {
+            column.unique = true;
+            i = skipConflictClause(tokens, i + 1)?;
+        } else if (tokenIsWord(tokens, i, "COLLATE")) {
+            let name = definitionName(tokens, i + 1)?;
+            column.collation = collationNamed(name.view())?;
+            i += 2;
+        } else if (tokenIsWord(tokens, i, "CHECK")) {
+            let close = closingParenthesis(tokens, i + 1)?;
+            column.check = schemaExpr(tokens[i + 2..close])?;
+            i = close + 1;
+        } else if (tokenIsWord(tokens, i, "DEFAULT")) {
+            i += 1;
+            var end = i + 1;
+            if (tokenIsOp(tokens, i, "(")) {
+                end = closingParenthesis(tokens, i)? + 1;
+            } else if (tokenIsOp(tokens, i, "-") || tokenIsOp(tokens, i, "+")) {
+                // A signed number: the C# engine kept only the sign.
+                if (!(i + 1 < tokens.length &&
+                    (tokens[i + 1].kind == TokenKind.IntLit || tokens[i + 1].kind == TokenKind.FloatLit))) {
+                    return Err(definitionError(tokens, i + 1));
+                }
+                end = i + 2;
+            } else if (i >= tokens.length || tokens[i].kind == TokenKind.Op) {
+                return Err(definitionError(tokens, i));
+            }
+            var value = schemaExpr(tokens[i..end])?;
+            // A bare word that is not a keyword literal is a string, as in SQLite: DEFAULT abc is 'abc'.
+            if (value.expr is Expr.Column(_) && end == i + 1) {
+                value.expr = Expr.Literal(Literal { kind: LiteralKind.String, text: tokens[i].text.clone()? });
+            }
+            column.defaultValue = value;
+            i = end;
+        } else if (tokenIsWord(tokens, i, "REFERENCES")) {
+            var columns = Vector<String>.create();
+            columns.push(definition.name.clone()?)?;
+            column.foreignKey = foreignKeyClause(tokens, mut i, columns)?;
+        } else if (tokenIsWord(tokens, i, "GENERATED") && tokenIsWord(
+            tokens,
+            i + 1,
+            "ALWAYS",
+        ) && tokenIsWord(tokens, i + 2, "AS")) {
+            i += 2;
+        } else if (tokenIsWord(tokens, i, "AS")) {
+            let close = closingParenthesis(tokens, i + 1)?;
+            column.generated = schemaExpr(tokens[i + 2..close])?;
+            i = close + 1;
+            if (tokenIsWord(tokens, i, "STORED")) {
+                column.generatedStored = true;
+                i += 1;
+            } else if (tokenIsWord(tokens, i, "VIRTUAL")) {
+                i += 1;
+            }
+        } else {
+            return Err(definitionError(tokens, i));
+        }
+    }
+    // The rowid alias: declared exactly INTEGER, with a column-level PRIMARY KEY that is not DESC. (SQLite's
+    // quirk: `INTEGER PRIMARY KEY DESC` on the column is an ordinary key, not the rowid.)
+    column.isRowidAlias =
+        column.primaryKey && !column.pkDescending && !withoutRowid && column.declaredType.view().equalsIgnoreAsciiCase(
+            "INTEGER",
+        );
+    return Ok(column);
+}
+
+fn cloneKeyColumns(columns: Slice<KeyColumn>) -> Result<Vector<KeyColumn>, AllocError> {
+    var copy = Vector<KeyColumn>.withCapacity(columns.length)?;
+    for (i in 0..columns.length) {
+        copy.push(
+            KeyColumn {
+                name: columns[i].name.clone()?,
+                descending: columns[i].descending,
+                collation: columns[i].collation,
+            },
+        )?;
+    }
+    return Ok(copy);
+}
+
+fn oneKeyColumn(name: StringView, descending: bool) -> Result<Vector<KeyColumn>, AllocError> {
+    var columns = Vector<KeyColumn>.create();
+    columns.push(KeyColumn { name: String.from(name)?, descending: descending, collation: null })?;
+    return Ok(columns);
+}
+
+fn cloneNames(columns: Slice<KeyColumn>) -> Result<Vector<String>, AllocError> {
+    var names = Vector<String>.withCapacity(columns.length)?;
+    for (i in 0..columns.length) {
+        names.push(columns[i].name.clone()?)?;
+    }
+    return Ok(names);
+}
+
+/// A table from its CREATE TABLE statement.
+fn buildTableSchema(stmt: borrow CreateTableStmt, name: StringView, rootPage: u32) -> Result<TableSchema, SqliteError> {
+    var table = TableSchema {
+        name: String.from(name)?,
+        columns: Vector<ColumnSchema>.create(),
+        rootPage: rootPage,
+        withoutRowid: stmt.withoutRowid,
+        strict: stmt.strict,
+        autoincrement: false,
+        primaryKey: Vector<KeyColumn>.create(),
+        checks: Vector<SchemaExpr>.create(),
+        keys: Vector<KeyConstraint>.create(),
+        foreignKeys: Vector<ForeignKeySchema>.create(),
+        rowidAlias: null,
+    };
+    for (i in 0..stmt.columns.length) {
+        var column = buildColumnSchema(borrow stmt.columns[i], stmt.withoutRowid)?;
+        if (column.autoincrement) {
+            table.autoincrement = true;
+        }
+        if (column.isRowidAlias && table.rowidAlias.isNull()) {
+            table.rowidAlias = i;
+        }
+        if (column.primaryKey) {
+            if (table.primaryKey.length != 0) {
+                return Err(sqlError("table has more than one primary key"));
+            }
+            table.primaryKey.push(
+                KeyColumn { name: column.name.clone()?, descending: column.pkDescending, collation: null },
+            )?;
+        }
+        let ownKey = column.primaryKey && !column.isRowidAlias;
+        let ownUnique = column.unique;
+        let keyName = column.name.clone()?;
+        let keyDescending = column.pkDescending;
+        // The table keeps the column's CHECK and REFERENCES with its own.
+        if (replace(mut column.check, null) is Some(check)) {
+            table.checks.push(check)?;
+        }
+        if (replace(mut column.foreignKey, null) is Some(key)) {
+            table.foreignKeys.push(key)?;
+        }
+        table.columns.push(column)?;
+        if (ownKey) {
+            table.addKey(oneKeyColumn(keyName.view(), keyDescending)?, true)?;
+        }
+        if (ownUnique) {
+            table.addKey(oneKeyColumn(keyName.view(), false)?, false)?;
+        }
+    }
+    for (c in 0..stmt.constraints.length) {
+        let tokens = stmt.constraints[c].view();
+        var i: usize = 0;
+        if (tokenIsWord(tokens, i, "CONSTRAINT")) {
+            let _ = definitionName(tokens, i + 1)?;
+            i += 2;
+        }
+        if (tokenIsWord(tokens, i, "CHECK")) {
+            let close = closingParenthesis(tokens, i + 1)?;
+            table.checks.push(schemaExpr(tokens[i + 2..close])?)?;
+            i = close + 1;
+        } else if (tokenIsWord(tokens, i, "FOREIGN") && tokenIsWord(tokens, i + 1, "KEY")) {
+            i += 2;
+            let columns = keyColumns(tokens, mut i)?;
+            if (!tokenIsWord(tokens, i, "REFERENCES")) {
+                return Err(definitionError(tokens, i));
+            }
+            table.foreignKeys.push(foreignKeyClause(tokens, mut i, cloneNames(columns.view())?)?)?;
+        } else if (tokenIsWord(tokens, i, "UNIQUE") || (tokenIsWord(tokens, i, "PRIMARY") && tokenIsWord(
+            tokens,
+            i + 1,
+            "KEY",
+        ))) {
+            let isPrimaryKey = tokenIsWord(tokens, i, "PRIMARY");
+            i += if (isPrimaryKey) 2 else 1;
+            let columns = keyColumns(tokens, mut i)?;
+            i = skipConflictClause(tokens, i)?;
+            for (k in 0..columns.length) {
+                if (table.indexOf(columns[k].name.view()).isNull()) {
+                    return Err(sqlError("a key names a column the table does not have"));
+                }
+            }
+            if (isPrimaryKey) {
+                if (table.primaryKey.length != 0) {
+                    return Err(sqlError("table has more than one primary key"));
+                }
+                let only = table.indexOf(columns[0].name.view())!;
+                // A one-column table-level PRIMARY KEY on a column declared exactly INTEGER is the rowid too,
+                // and here DESC does not prevent it (the other half of SQLite's quirk).
+                if (columns.length == 1 && !stmt.withoutRowid &&
+                    table.columns[only].declaredType.view().equalsIgnoreAsciiCase(
+                        "INTEGER",
+                    )) {
+                    table.columns[only].isRowidAlias = true;
+                    table.columns[only].primaryKey = true;
+                    table.rowidAlias = only;
+                    table.primaryKey = cloneKeyColumns(columns.view())?;
+                } else {
+                    for (k in 0..columns.length) {
+                        let at = table.indexOf(columns[k].name.view())!;
+                        table.columns[at].primaryKey = true;
+                    }
+                    table.primaryKey = cloneKeyColumns(columns.view())?;
+                    table.addKey(columns, true)?;
+                }
+            } else {
+                table.addKey(columns, false)?;
+            }
+        } else {
+            return Err(definitionError(tokens, i));
+        }
+        if (i != tokens.length) {
+            return Err(definitionError(tokens, i));
+        }
+    }
+    return Ok(table);
+}
+
+/// An index from its CREATE INDEX statement. `table` is the table it is on, for its columns' collations.
+fn buildIndexSchema(
+    stmt: CreateIndexStmt,
+    name: StringView,
+    rootPage: u32,
+    table: borrow TableSchema,
+) -> Result<IndexSchema, SqliteError> {
+    var index = IndexSchema {
+        name: String.from(name)?,
+        table: table.name.clone()?,
+        unique: stmt.unique,
+        rootPage: rootPage,
+        columns: Vector<IndexColumnSchema>.create(),
+        filter: stmt.filter,
+    };
+    var columns = stmt.columns;
+    // The columns are taken from the back, so they are put in order afterwards.
+    while (columns.pop() is Some(column)) {
+        var collation = Collation.Binary;
+        if (column.collation.length != 0) {
+            collation = collationNamed(column.collation.view())?;
+        } else if (column.expression.isNull()) {
+            let at = table.indexOf(column.name.view()) ?? {
+                return Err(sqlError("an index names a column its table does not have"));
+            };
+            collation = table.columns[at].collation;
+        }
+        index.columns.push(
+            IndexColumnSchema {
+                name: column.name,
+                expression: column.expression,
+                descending: column.descending,
+                collation: collation,
+            },
+        )?;
+    }
+    let count = index.columns.length;
+    for (i in 0..count / 2) {
+        index.columns.swap(i, count - 1 - i);
+    }
+    return Ok(index);
+}
+
+/// The tables and indexes of a database.
+struct SchemaCatalog {
+    tables: Vector<TableSchema>;
+    indexes: Vector<IndexSchema>;
+    /// The names of tables and indexes whose definitions this engine cannot read (a virtual table, say).
+    unsupported: Vector<String>;
+    private tablesByName: HashMap<String, usize>;
+
+    /// Reads the catalog from the database's sqlite_schema.
+    fn load(reader: borrow DatabaseReader) -> Result<SchemaCatalog, SqliteError> {
+        var catalog = SchemaCatalog {
+            tables: Vector<TableSchema>.create(),
+            indexes: Vector<IndexSchema>.create(),
+            unsupported: Vector<String>.create(),
+            tablesByName: HashMap<String, usize>.create(),
+        };
+        let entries = reader.schema();
+        // Tables first: an index needs its table's columns.
+        for (i in 0..entries.length) {
+            let entry = borrow entries[i];
+            if (entry.kind.view() != "table") {
+                continue;
+            }
+            let Some(sql) = borrow entry.sql else {
+                continue;
+            };
+            match (SchemaCatalog.tableFrom(sql.view(), entry.name.view(), entry.rootPage)) {
+                Ok(table) => {
+                    let key = asciiLower(entry.name.view())?;
+                    let at = catalog.tables.length;
+                    catalog.tables.push(table)?;
+                    let _ = catalog.tablesByName.put(key, at)?;
+                }
+                Err(SqliteError.Alloc(e)) => { return Err(SqliteError.Alloc(e)); }
+                Err(_) => { catalog.unsupported.push(entry.name.clone()?)?; }
+            }
+        }
+        for (i in 0..entries.length) {
+            let entry = borrow entries[i];
+            if (entry.kind.view() != "index") {
+                continue;
+            }
+            // An automatic index (for UNIQUE or PRIMARY KEY) has no statement.
+            let Some(sql) = borrow entry.sql else {
+                continue;
+            };
+            match (catalog.indexFrom(sql.view(), entry)) {
+                Ok(index) => { catalog.indexes.push(index)?; }
+                Err(SqliteError.Alloc(e)) => { return Err(SqliteError.Alloc(e)); }
+                Err(_) => { catalog.unsupported.push(entry.name.clone()?)?; }
+            }
+        }
+        return Ok(catalog);
+    }
+
+    private fn tableFrom(sql: StringView, name: StringView, rootPage: u32) -> Result<TableSchema, SqliteError> {
+        match (Parser.parseStatement(sql)?) {
+            Stmt.CreateTable(stmt) => { return buildTableSchema(stmt, name, rootPage); }
+            _ => { return Err(corrupt("a table's entry in sqlite_schema is not a CREATE TABLE statement")); }
+        }
+    }
+
+    private fn indexFrom(borrow this, sql: StringView, entry: borrow SchemaEntry) -> Result<IndexSchema, SqliteError> {
+        let table = this.table(entry.tableName.view())? ?? {
+            return Err(corrupt("an index in sqlite_schema is on a table that is not there"));
+        };
+        match (Parser.parseStatement(sql)?) {
+            Stmt.CreateIndex(stmt) => {
+                let owned: CreateIndexStmt = stmt;
+                return buildIndexSchema(owned, entry.name.view(), entry.rootPage, table);
+            }
+            _ => { return Err(corrupt("an index's entry in sqlite_schema is not a CREATE INDEX statement")); }
+        }
+    }
+
+    /// The table called `name` (ASCII case is ignored), or `null`.
+    fn table(borrow this, name: StringView) -> Result<borrow TableSchema?, AllocError> {
+        let key = asciiLower(name)?;
+        if (this.tablesByName.get(borrow key) is Some(at)) {
+            return Ok(borrow this.tables[*at]);
+        }
+        return Ok(null);
+    }
+}

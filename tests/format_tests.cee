@@ -1,0 +1,119 @@
+// The file format's codecs: varints and records.
+
+fn roundTripVarint(value: i64, expectedLength: usize) -> Result<void, TestFailure> {
+    var buf = [0u8; 9];
+    let written = Varint.write(value, mut buf[..], 0);
+    Check.equalU64(expectedLength as u64, written as u64)?;
+    Check.equalU64(expectedLength as u64, Varint.length(value) as u64)?;
+    match (Varint.read(buf[..], 0)) {
+        Ok(r) => {
+            Check.equalI64(value, r.value)?;
+            Check.equalU64(expectedLength as u64, r.length as u64)?;
+        }
+        Err(_) => { return Check.fail("varint did not read back"); }
+    }
+    return Ok();
+}
+
+@test
+fn varintRoundTrips() -> Result<void, TestFailure> {
+    roundTripVarint(0, 1)?;
+    roundTripVarint(127, 1)?;
+    roundTripVarint(128, 2)?;
+    roundTripVarint(16383, 2)?;
+    roundTripVarint(16384, 3)?;
+    roundTripVarint(0x00FF_FFFF_FFFF_FFFF, 8)?;
+    roundTripVarint(0x0100_0000_0000_0000, 9)?;
+    roundTripVarint(9223372036854775807, 9)?;
+    roundTripVarint(-1, 9)?;
+    return Ok();
+}
+
+@test
+fn varintTruncatedIsCorrupt() -> Result<void, TestFailure> {
+    let bytes = [0x81u8, 0x82];
+    Check.isTrue(Varint.read(bytes[..], 0).isErr(), "a varint cut short is an error")?;
+    return Ok();
+}
+
+@test
+fn recordKnownBytes() -> Result<void, TestFailure> {
+    // (1, 'hi', NULL) as sqlite3 writes it: header 04 09 11 00, body "hi".
+    var row = Vector<SqliteValue>.create();
+    row.push(SqliteValue.Integer(1))!;
+    row.push(SqliteValue.text("hi")!)!;
+    row.push(SqliteValue.Null)!;
+    let encoded = Record.encode(row.view())!;
+    let expected = [0x04u8, 0x09, 0x11, 0x00, 'h', 'i'];
+    Check.equalBytes(expected[..], encoded.view())?;
+    return Ok();
+}
+
+@test
+fn recordRoundTrips() -> Result<void, TestFailure> {
+    var row = Vector<SqliteValue>.create();
+    let integers = [0i64, 1, -1, 127, -128, 128, 32767, -32769, 8388607, 8388608, 2147483647, -2147483649, 140737488355327, 140737488355328, 9223372036854775807, -9223372036854775807];
+    for (v in integers) {
+        row.push(SqliteValue.Integer(v))!;
+    }
+    row.push(SqliteValue.Real(3.25))!;
+    row.push(SqliteValue.Real(-0.0))!;
+    row.push(SqliteValue.text("héllo, wörld")!)!;
+    row.push(SqliteValue.text("")!)!;
+    let blob = [0u8, 255, 1, 2];
+    row.push(SqliteValue.blob(blob[..])!)!;
+    row.push(SqliteValue.Null)!;
+
+    let encoded = Record.encode(row.view())!;
+    let decoded = Record.decode(encoded.view(), TextEncoding.Utf8)!;
+    Check.equalU64(row.length as u64, decoded.length as u64)?;
+    for (i in 0..integers.length) {
+        match (borrow decoded[i]) {
+            SqliteValue.Integer(v) => { Check.equalI64(integers[i], v)?; }
+            _ => { return Check.fail("expected an integer"); }
+        }
+    }
+    let at = integers.length;
+    match (borrow decoded[at]) {
+        SqliteValue.Real(r) => { Check.isTrue(r == 3.25, "3.25 reads back")?; }
+        _ => { return Check.fail("expected a real"); }
+    }
+    match (borrow decoded[at + 2]) {
+        SqliteValue.Text(s) => { Check.equalText("héllo, wörld", s.view())?; }
+        _ => { return Check.fail("expected text"); }
+    }
+    match (borrow decoded[at + 3]) {
+        SqliteValue.Text(s) => { Check.equalText("", s.view())?; }
+        _ => { return Check.fail("expected empty text"); }
+    }
+    match (borrow decoded[at + 4]) {
+        SqliteValue.Blob(b) => { Check.equalBytes(blob[..], b.view())?; }
+        _ => { return Check.fail("expected a blob"); }
+    }
+    Check.isTrue(decoded[at + 5].isNull(), "NULL reads back")?;
+    return Ok();
+}
+
+@test
+fn recordMaskSkipsColumns() -> Result<void, TestFailure> {
+    var row = Vector<SqliteValue>.create();
+    row.push(SqliteValue.text("skipped")!)!;
+    row.push(SqliteValue.Integer(42))!;
+    let encoded = Record.encode(row.view())!;
+    let mask = [false, true];
+    let decoded = Record.decodeMasked(encoded.view(), TextEncoding.Utf8, mask[..])!;
+    Check.isTrue(decoded[0].isNull(), "the masked column is NULL")?;
+    match (borrow decoded[1]) {
+        SqliteValue.Integer(v) => { Check.equalI64(42, v)?; }
+        _ => { return Check.fail("expected an integer"); }
+    }
+    return Ok();
+}
+
+@test
+fn utf16TextDecodes() -> Result<void, TestFailure> {
+    let le = [0x68u8, 0x00, 0xE9, 0x00, 0x3D, 0xD8, 0x00, 0xDE];
+    let text = decodeText(le[..], TextEncoding.Utf16LE)!;
+    Check.equalText("hé😀", text.view())?;
+    return Ok();
+}

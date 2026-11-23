@@ -1,0 +1,235 @@
+// Index b-trees, checked against what the sqlite3 shell answers for the same database.
+
+/// What the sqlite3 shell prints for `sql` on the database at `path`.
+fn askSqlite(path: StringView, sql: StringView) -> Result<String, TestFailure> {
+    var arguments = Vector<StringView>.create();
+    arguments.push(path)!;
+    arguments.push(sql)!;
+    match (Process.capture("sqlite3", borrow arguments, "".bytes())) {
+        Ok(output) => {
+            if (output.status != 0) {
+                Check.fail("sqlite3 refused the query")?;
+            }
+            return Ok(String.from(StringView.fromUtf8(output.stdout.view())!)!);
+        }
+        Err(_) => {
+            Check.fail("the sqlite3 shell is needed to check answers")?;
+            return Ok(String.create());
+        }
+    }
+}
+
+const INDEXED_SQL: StringView = """
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER, g INTEGER, name TEXT);
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 20000)
+    INSERT INTO t SELECT i, i * 3, i % 50, CASE WHEN i % 2 THEN 'name' ELSE 'NAME' END || (i % 300) FROM c;
+    CREATE INDEX t_n ON t(n);
+    CREATE INDEX t_g ON t(g);
+    CREATE INDEX t_gd ON t(g DESC, n);
+    CREATE INDEX t_name ON t(name COLLATE NOCASE);
+    """;
+
+fn orderOf(collation: Collation, descending: bool) -> IndexOrder {
+    var order = IndexOrder.plain();
+    order.collations.push(collation)!;
+    order.descending.push(descending)!;
+    return order;
+}
+
+fn keyOf(value: SqliteValue) -> Vector<SqliteValue> {
+    var key = Vector<SqliteValue>.create();
+    key.push(value)!;
+    return key;
+}
+
+/// The rowids of the index's entries in `range`, one a line, as the sqlite3 shell prints a column.
+fn rowIdsIn(reader: borrow mut DatabaseReader, index: StringView, range: IndexRange, backwards: bool) -> String {
+    let root = reader.findIndex(index)!!.rootPage;
+    var cursor = IndexCursor.create(root, range, backwards);
+    var out = String.create();
+    while (cursor.next(mut reader.pager)! is Some(entry)) {
+        out.appendNumber(indexEntryRowId(entry.view())!)!;
+        out.append("\n")!;
+    }
+    return out;
+}
+
+@test
+fn indexRangeMatchesSqlite() -> Result<void, TestFailure> {
+    let path = "out/index-range.db";
+    makeDatabase(path, INDEXED_SQL)?;
+    var reader = DatabaseReader.open(path)!;
+    var range = IndexRange.all(IndexOrder.plain());
+    range.min = keyOf(SqliteValue.Integer(300));
+    range.minInclusive = false;
+    range.max = keyOf(SqliteValue.Integer(900));
+    let ours = rowIdsIn(mut reader, "t_n", range, false);
+    let theirs = askSqlite(path, "SELECT id FROM t WHERE n > 300 AND n <= 900 ORDER BY n, id")?;
+    Check.equalText(theirs.view(), ours.view())?;
+    Check.isTrue(ours.length > 0, "the range is not empty")?;
+    return Ok();
+}
+
+@test
+fn indexWalksBackwards() -> Result<void, TestFailure> {
+    let path = "out/index-backwards.db";
+    makeDatabase(path, INDEXED_SQL)?;
+    var reader = DatabaseReader.open(path)!;
+    var range = IndexRange.all(IndexOrder.plain());
+    range.min = keyOf(SqliteValue.Integer(30000));
+    range.max = keyOf(SqliteValue.Integer(45000));
+    range.maxInclusive = false;
+    let ours = rowIdsIn(mut reader, "t_n", range, true);
+    let theirs = askSqlite(path, "SELECT id FROM t WHERE n >= 30000 AND n < 45000 ORDER BY n DESC, id DESC")?;
+    Check.equalText(theirs.view(), ours.view())?;
+
+    let everything = rowIdsIn(mut reader, "t_g", IndexRange.all(IndexOrder.plain()), true);
+    let all = askSqlite(path, "SELECT id FROM t ORDER BY g DESC, id DESC")?;
+    Check.equalText(all.view(), everything.view())?;
+    return Ok();
+}
+
+@test
+fn indexEqualityWithDuplicates() -> Result<void, TestFailure> {
+    let path = "out/index-equality.db";
+    makeDatabase(path, INDEXED_SQL)?;
+    var reader = DatabaseReader.open(path)!;
+    let key = keyOf(SqliteValue.Integer(7));
+    let ours = rowIdsIn(mut reader, "t_g", IndexRange.equalTo(IndexOrder.plain(), key.view())!, false);
+    let theirs = askSqlite(path, "SELECT id FROM t WHERE g = 7 ORDER BY id")?;
+    Check.equalText(theirs.view(), ours.view())?;
+
+    let absent = keyOf(SqliteValue.Integer(50));
+    let none = rowIdsIn(mut reader, "t_g", IndexRange.equalTo(IndexOrder.plain(), absent.view())!, false);
+    Check.equalText("", none.view())?;
+    return Ok();
+}
+
+@test
+fn descendingIndexColumns() -> Result<void, TestFailure> {
+    let path = "out/index-desc.db";
+    makeDatabase(path, INDEXED_SQL)?;
+    var reader = DatabaseReader.open(path)!;
+    // The C# engine's equality seek stopped at the first entry of a DESC index.
+    let key = keyOf(SqliteValue.Integer(7));
+    let equal = rowIdsIn(mut reader, "t_gd", IndexRange.equalTo(orderOf(Collation.Binary, true), key.view())!, false);
+    let expectedEqual = askSqlite(path, "SELECT id FROM t WHERE g = 7 ORDER BY n")?;
+    Check.equalText(expectedEqual.view(), equal.view())?;
+
+    // In the index's own order 12 comes before 10.
+    var range = IndexRange.all(orderOf(Collation.Binary, true));
+    range.min = keyOf(SqliteValue.Integer(12));
+    range.max = keyOf(SqliteValue.Integer(10));
+    let ours = rowIdsIn(mut reader, "t_gd", range, false);
+    let theirs = askSqlite(path, "SELECT id FROM t WHERE g BETWEEN 10 AND 12 ORDER BY g DESC, n")?;
+    Check.equalText(theirs.view(), ours.view())?;
+    return Ok();
+}
+
+@test
+fn noCaseIndex() -> Result<void, TestFailure> {
+    let path = "out/index-nocase.db";
+    makeDatabase(path, INDEXED_SQL)?;
+    var reader = DatabaseReader.open(path)!;
+    let key = keyOf(SqliteValue.text("nAmE5")!);
+    let ours = rowIdsIn(mut reader, "t_name", IndexRange.equalTo(orderOf(Collation.NoCase, false), key.view())!, false);
+    let theirs = askSqlite(path, "SELECT id FROM t WHERE name = 'name5' COLLATE NOCASE ORDER BY id")?;
+    Check.equalText(theirs.view(), ours.view())?;
+    Check.isTrue(ours.length > 0, "both cases are found")?;
+    return Ok();
+}
+
+fn countIn(reader: borrow mut DatabaseReader, index: StringView, range: IndexRange) -> u64 {
+    let root = reader.findIndex(index)!!.rootPage;
+    return countIndexRange(mut reader.pager, root, range)!;
+}
+
+@test
+fn countsRanges() -> Result<void, TestFailure> {
+    let path = "out/index-count.db";
+    makeDatabase(path, INDEXED_SQL)?;
+    var reader = DatabaseReader.open(path)!;
+    Check.equalU64(20000, countIn(mut reader, "t_n", IndexRange.all(IndexOrder.plain())))?;
+
+    // Exclusive bounds on a key with 400 duplicates: the C# engine counted the duplicates of the bound itself
+    // whenever one of them was an interior page's cell.
+    var exclusive = IndexRange.all(IndexOrder.plain());
+    exclusive.min = keyOf(SqliteValue.Integer(7));
+    exclusive.minInclusive = false;
+    exclusive.max = keyOf(SqliteValue.Integer(10));
+    exclusive.maxInclusive = false;
+    Check.equalU64(800, countIn(mut reader, "t_g", exclusive))?;
+
+    var inclusive = IndexRange.all(IndexOrder.plain());
+    inclusive.min = keyOf(SqliteValue.Integer(7));
+    inclusive.max = keyOf(SqliteValue.Integer(10));
+    Check.equalU64(1600, countIn(mut reader, "t_g", inclusive))?;
+
+    // Every exclusive pair of bounds agrees with a walk of the same range.
+    for (low in 0i64..50) {
+        var range = IndexRange.all(IndexOrder.plain());
+        range.min = keyOf(SqliteValue.Integer(low));
+        range.minInclusive = false;
+        range.max = keyOf(SqliteValue.Integer(low + 3));
+        range.maxInclusive = false;
+        let expected: u64 = if (low + 3 <= 50) 800 else truncate<u64>((49 - low).max(0)) * 400;
+        Check.equalU64(expected, countIn(mut reader, "t_g", range))?;
+    }
+
+    var onlyHigh = IndexRange.all(IndexOrder.plain());
+    onlyHigh.max = keyOf(SqliteValue.Integer(29999));
+    Check.equalU64(9999, countIn(mut reader, "t_n", onlyHigh))?;
+
+    var empty = IndexRange.all(IndexOrder.plain());
+    empty.min = keyOf(SqliteValue.Integer(10));
+    empty.max = keyOf(SqliteValue.Integer(5));
+    Check.equalU64(0, countIn(mut reader, "t_g", empty))?;
+    return Ok();
+}
+
+@test
+fn distinctLeadingValuesOfAnIndex() -> Result<void, TestFailure> {
+    let path = "out/index-distinct.db";
+    makeDatabase(path, INDEXED_SQL)?;
+    var reader = DatabaseReader.open(path)!;
+    let root = reader.findIndex("t_g")!!.rootPage;
+    let values = distinctLeadingValues(mut reader.pager, root, Collation.Binary, false)!;
+    Check.equalU64(50, values.length as u64)?;
+    for (i in 0..values.length) {
+        match (borrow values[i]) {
+            SqliteValue.Integer(v) => { Check.equalI64(truncate<i64>(i), v)?; }
+            _ => { return Check.fail("expected an integer"); }
+        }
+    }
+    let descRoot = reader.findIndex("t_gd")!!.rootPage;
+    let descending = distinctLeadingValues(mut reader.pager, descRoot, Collation.Binary, true)!;
+    Check.equalU64(50, descending.length as u64)?;
+    Check.isTrue(descending[0] is SqliteValue.Integer(49), "a DESC index starts at its largest value")?;
+    return Ok();
+}
+
+@test
+fn valuesCompareAsSqliteOrdersThem() -> Result<void, TestFailure> {
+    let big = SqliteValue.Integer(9007199254740993);
+    let rounded = SqliteValue.Real(9007199254740992.0);
+    Check.isTrue(compareValues(big, rounded, Collation.Binary) > 0, "an integer is not rounded to compare with a real")?;
+    Check.isTrue(compareValues(rounded, big, Collation.Binary) < 0, "and the other way round")?;
+    Check.isTrue(compareValues(SqliteValue.Integer(2), SqliteValue.Real(2.5), Collation.Binary) < 0, "2 < 2.5")?;
+    Check.isTrue(compareValues(SqliteValue.Integer(3), SqliteValue.Real(3.0), Collation.Binary) == 0, "3 = 3.0")?;
+    Check.isTrue(compareValues(SqliteValue.Null, SqliteValue.Integer(-5), Collation.Binary) < 0, "NULL sorts first")?;
+    let text = SqliteValue.text("a")!;
+    let blob = SqliteValue.blob("a".bytes())!;
+    Check.isTrue(compareValues(SqliteValue.Real(1.0e300), text, Collation.Binary) < 0, "numbers before text")?;
+    Check.isTrue(compareValues(text, blob, Collation.Binary) < 0, "text before blobs")?;
+    // U+FFFF sorts before U+1F600 in UTF-8 bytes; UTF-16 code units order them the other way.
+    let bmp = SqliteValue.text("\u{FFFF}")!;
+    let astral = SqliteValue.text("😀")!;
+    Check.isTrue(compareValues(bmp, astral, Collation.Binary) < 0, "text compares by UTF-8 bytes")?;
+    let padded = SqliteValue.text("abc  ")!;
+    let bare = SqliteValue.text("abc")!;
+    Check.isTrue(compareValues(padded, bare, Collation.RTrim) == 0, "RTRIM ignores trailing spaces")?;
+    Check.isTrue(compareValues(padded, bare, Collation.Binary) > 0, "BINARY does not")?;
+    let upper = SqliteValue.text("ABC")!;
+    Check.isTrue(compareValues(upper, bare, Collation.NoCase) == 0, "NOCASE folds ASCII")?;
+    return Ok();
+}

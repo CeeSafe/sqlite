@@ -1,0 +1,602 @@
+// Writing a whole database file from tables, indexes, views and triggers held in memory. The file is
+// byte-compatible with SQLite: the stock library opens it, and `PRAGMA integrity_check` passes.
+//
+// Differences from the C# engine, which this replaces:
+// - indexes are sorted in their own order. The C# sorted every index with BINARY, ascending: an index on a
+//   NOCASE column, an index with COLLATE, and the automatic index of `PRIMARY KEY (a DESC)` or `UNIQUE (a DESC)`
+//   came out in an order SQLite does not expect (integrity_check: "row missing from index");
+// - an index on a WITHOUT ROWID table ends with the primary key's columns that the index does not already
+//   have, as SQLite stores it. The C# appended every primary key column, repeating those already indexed;
+// - a rowid table's INTEGER PRIMARY KEY column is stored as NULL and indexed by its rowid whatever the caller
+//   put in the row, and a VIRTUAL generated column is left out of the record. The C# stored what it was given;
+// - two rows with one key in a UNIQUE or PRIMARY KEY index are refused. The C# wrote the damaged index;
+// - a partial or expression index needs its entries from the caller. Without them the C# wrote an empty index
+//   beside a table with rows, which SQLite reports as corruption;
+// - the file is replaced by an atomic rename, and its directory synced. The C# deleted the old file and then
+//   moved the new one into place, so a crash between the two left no database at all;
+// - a database with a rollback journal or a write-ahead log beside it is not replaced: SQLite would apply
+//   those to the new file;
+// - the change counter, schema cookie, user version and application id are the caller's to carry over. The C#
+//   reset them all on every rewrite.
+
+/// What the header of a written database says.
+struct WriterOptions {
+    pageSize: usize;
+    /// The file change counter. A rewrite passes the old file's plus one, so other connections see the change.
+    changeCounter: u32;
+    /// The schema cookie. A rewrite that changes the schema passes the old file's plus one.
+    schemaCookie: u32;
+    userVersion: u32;
+    applicationId: u32;
+
+    /// 4096-byte pages and a first version of everything.
+    fn defaults() -> WriterOptions =>
+        WriterOptions { pageSize: 4096, changeCounter: 1, schemaCookie: 1, userVersion: 0, applicationId: 0 };
+}
+
+struct WriterTable {
+    schema: TableSchema;
+    sql: String;
+    rows: Vector<TableRow>;
+}
+
+struct WriterIndex {
+    schema: IndexSchema;
+    sql: String;
+    /// A partial or expression index's entries, each its key columns and then its rowid; `null` for an index
+    /// whose entries come from its table's rows.
+    entries: Vector<Vector<SqliteValue>>?;
+}
+
+/// A view or a trigger: a row of sqlite_schema without a b-tree.
+struct WriterObject {
+    isTrigger: bool;
+    name: String;
+    table: String;
+    sql: String;
+}
+
+/// The SQLITE_VERSION_NUMBER recorded in files this writes: the release whose format they follow.
+const WRITER_SQLITE_VERSION: u32 = 3051000;
+
+fn constraintError(message: StringView, name: StringView) -> SqliteError {
+    var text = String.create();
+    let _ = text.append(message);
+    let _ = text.append(name);
+    return SqliteError.Constraint(text);
+}
+
+struct DatabaseWriter {
+    options: WriterOptions;
+    tables: Vector<WriterTable>;
+    indexes: Vector<WriterIndex>;
+    objects: Vector<WriterObject>;
+
+    fn create(options: WriterOptions) -> Result<DatabaseWriter, SqliteError> {
+        let size = options.pageSize;
+        if (size < 512 || size > 65536 || (size & (size - 1)) != 0) {
+            return Err(sqlError("the page size must be a power of two from 512 to 65536"));
+        }
+        return Ok(DatabaseWriter {
+            options: options,
+            tables: Vector<WriterTable>.create(),
+            indexes: Vector<WriterIndex>.create(),
+            objects: Vector<WriterObject>.create(),
+        });
+    }
+
+    /// Adds the table that `createSql` defines, and returns its number for `addRow`.
+    fn addTable(borrow mut this, createSql: StringView) -> Result<usize, SqliteError> {
+        let sql = createSql.trim();
+        let Stmt.CreateTable(stmt) = Parser.parseStatement(sql)? else {
+            return Err(sqlError("not a CREATE TABLE statement"));
+        };
+        let schema = buildTableSchema(stmt, stmt.name.name.view(), 0)?;
+        if (this.findTable(schema.name.view()).isSome()) {
+            return Err(constraintError("there is already a table named ", schema.name.view()));
+        }
+        this.tables.push(WriterTable { schema: schema, sql: String.from(sql)?, rows: Vector<TableRow>.create() })?;
+        return Ok(this.tables.length - 1);
+    }
+
+    /// Adds a row to table number `table`: one value for each declared column, in declaration order. Missing
+    /// trailing values are NULL. For a WITHOUT ROWID table the rowid is not used.
+    fn addRow(borrow mut this, table: usize, rowId: i64, values: Vector<SqliteValue>) -> Result<void, SqliteError> {
+        if (values.length > this.tables[table].schema.columns.length) {
+            return Err(sqlError("a row has more values than its table has columns"));
+        }
+        this.tables[table].rows.push(TableRow { rowId: rowId, columns: values })?;
+        return Ok();
+    }
+
+    /// Adds the index that `createSql` defines. A partial or expression index needs `entries`: for each row in
+    /// the index, its key columns' values and then its rowid.
+    fn addIndex(
+        borrow mut this,
+        createSql: StringView,
+        entries: Vector<Vector<SqliteValue>>?,
+    ) -> Result<void, SqliteError> {
+        let sql = createSql.trim();
+        let Stmt.CreateIndex(stmt) = Parser.parseStatement(sql)? else {
+            return Err(sqlError("not a CREATE INDEX statement"));
+        };
+        let owned: CreateIndexStmt = stmt;
+        let table = this.findTable(owned.table.view()) ?? {
+            return Err(sqlError("an index is on a table that was not added"));
+        };
+        let name = owned.name.name.clone()?;
+        let schema = buildIndexSchema(owned, name.view(), 0, borrow this.tables[table].schema)?;
+        if (!schema.coversEveryRow() && entries.isNull()) {
+            return Err(unsupported("a partial or expression index needs its entries"));
+        }
+        if (this.tables[table].schema.withoutRowid && entries.isSome()) {
+            return Err(unsupported("partial and expression indexes on WITHOUT ROWID tables are not supported"));
+        }
+        this.indexes.push(WriterIndex { schema: schema, sql: String.from(sql)?, entries: entries })?;
+        return Ok();
+    }
+
+    /// Adds a view, with the statement that defines it.
+    fn addView(borrow mut this, name: StringView, createSql: StringView) -> Result<void, SqliteError> {
+        this.objects.push(
+            WriterObject {
+                isTrigger: false,
+                name: String.from(name)?,
+                table: String.from(name)?,
+                sql: String.from(createSql.trim())?,
+            },
+        )?;
+        return Ok();
+    }
+
+    /// Adds a trigger on `table`, with the statement that defines it.
+    fn addTrigger(
+        borrow mut this,
+        name: StringView,
+        table: StringView,
+        createSql: StringView,
+    ) -> Result<void, SqliteError> {
+        this.objects.push(
+            WriterObject {
+                isTrigger: true,
+                name: String.from(name)?,
+                table: String.from(table)?,
+                sql: String.from(createSql.trim())?,
+            },
+        )?;
+        return Ok();
+    }
+
+    private fn findTable(borrow this, name: StringView) -> usize? {
+        for (i in 0..this.tables.length) {
+            if (this.tables[i].schema.name.view().equalsIgnoreAsciiCase(name)) {
+                return i;
+            }
+        }
+        return null;
+    }
+
+    // ── records and entries ──────────────────────────────────────────────────────────────────────────────────
+
+    /// The value of column `column` of `row` as an index sees it: the rowid for the rowid's alias.
+    private fn columnValue(
+        schema: borrow TableSchema,
+        row: borrow TableRow,
+        column: usize,
+    ) -> Result<SqliteValue, AllocError> {
+        if (schema.rowidAlias == Some(column)) {
+            return Ok(SqliteValue.Integer(row.rowId));
+        }
+        if (column < row.columns.length) {
+            return row.columns[column].clone();
+        }
+        return Ok(SqliteValue.Null);
+    }
+
+    /// Whether a column has a place in the table's record: a VIRTUAL generated column has none.
+    private fn isStored(column: borrow ColumnSchema) -> bool => column.generated.isNull() || column.generatedStored;
+
+    /// A rowid table's record for `row`: the stored columns in declaration order, the rowid's alias as NULL.
+    private fn tableRecord(schema: borrow TableSchema, row: borrow TableRow) -> Result<Vector<u8>, SqliteError> {
+        var values = Vector<SqliteValue>.withCapacity(schema.columns.length)?;
+        for (c in 0..schema.columns.length) {
+            if (!DatabaseWriter.isStored(borrow schema.columns[c])) {
+                continue;
+            }
+            if (schema.rowidAlias == Some(c) || c >= row.columns.length) {
+                values.push(SqliteValue.Null)?;
+            } else {
+                values.push(row.columns[c].clone()?)?;
+            }
+        }
+        return Record.encode(values.view());
+    }
+
+    /// The positions of a key's columns in the table.
+    private fn keyPositions(
+        schema: borrow TableSchema,
+        columns: Slice<KeyColumn>,
+    ) -> Result<Vector<usize>, SqliteError> {
+        var positions = Vector<usize>.withCapacity(columns.length)?;
+        for (k in 0..columns.length) {
+            let at = schema.indexOf(columns[k].name.view()) ?? {
+                return Err(sqlError("a key names a column its table does not have"));
+            };
+            positions.push(at)?;
+        }
+        return Ok(positions);
+    }
+
+    /// Sorts entries in `order` (whole entries: the columns past the order's are BINARY, ascending), encodes
+    /// them, and builds the index. With `uniqueColumns` not zero, two entries that agree on that many leading
+    /// columns, none of them NULL, are a constraint failure.
+    private fn buildSortedIndex(
+        store: borrow mut PageStore,
+        entries: borrow mut Vector<Vector<SqliteValue>>,
+        order: borrow IndexOrder,
+        uniqueColumns: usize,
+        name: StringView,
+    ) -> Result<u32, SqliteError> {
+        entries.sortBy((a, b) => order.comparePrefix(a.view(), b.view()));
+        var records = Vector<Vector<u8>>.withCapacity(entries.length)?;
+        for (i in 0..entries.length) {
+            if (uniqueColumns != 0 && i != 0) {
+                let key = entries[i].view()[0..uniqueColumns];
+                var hasNull = false;
+                for (k in 0..key.length) {
+                    if (key[k].isNull()) {
+                        hasNull = true;
+                    }
+                }
+                if (!hasNull && order.comparePrefix(entries[i - 1].view(), key) == 0) {
+                    return Err(constraintError("UNIQUE constraint failed: ", name));
+                }
+            }
+            records.push(Record.encode(entries[i].view())?)?;
+        }
+        return BTreeBuilder.buildIndex(store, records.view());
+    }
+
+    /// Builds an index over `columns` of a table from the table's rows.
+    private fn buildTableIndex(
+        store: borrow mut PageStore,
+        table: borrow WriterTable,
+        positions: Slice<usize>,
+        order: IndexOrder,
+        unique: bool,
+        name: StringView,
+    ) -> Result<u32, SqliteError> {
+        let schema = borrow table.schema;
+        var fullOrder = order;
+        // What ends an entry and names its row: the rowid, or on a WITHOUT ROWID table the primary key's
+        // columns that the index does not already have, each in the key's own collation and direction.
+        var tail = Vector<usize>.create();
+        if (schema.withoutRowid) {
+            for (k in 0..schema.primaryKey.length) {
+                let at = schema.indexOf(schema.primaryKey[k].name.view())!;
+                let collation = schema.keyCollation(borrow schema.primaryKey[k]);
+                var present = false;
+                for (p in 0..positions.length) {
+                    if (positions[p] == at && fullOrder.collations[p] == collation) {
+                        present = true;
+                    }
+                }
+                if (!present) {
+                    tail.push(at)?;
+                    fullOrder.collations.push(collation)?;
+                    fullOrder.descending.push(schema.primaryKey[k].descending)?;
+                }
+            }
+        }
+        var entries = Vector<Vector<SqliteValue>>.withCapacity(table.rows.length)?;
+        for (r in 0..table.rows.length) {
+            let row = borrow table.rows[r];
+            var entry = Vector<SqliteValue>.withCapacity(positions.length + tail.length + 1)?;
+            for (p in 0..positions.length) {
+                entry.push(DatabaseWriter.columnValue(schema, row, positions[p])?)?;
+            }
+            for (t in 0..tail.length) {
+                entry.push(DatabaseWriter.columnValue(schema, row, tail[t])?)?;
+            }
+            if (!schema.withoutRowid) {
+                entry.push(SqliteValue.Integer(row.rowId))?;
+            }
+            entries.push(entry)?;
+        }
+        return DatabaseWriter.buildSortedIndex(
+            store,
+            mut entries,
+            fullOrder,
+            if (unique) positions.length else 0,
+            name,
+        );
+    }
+
+    /// The order of a key constraint's index.
+    private fn keyOrder(schema: borrow TableSchema, columns: Slice<KeyColumn>) -> Result<IndexOrder, AllocError> {
+        var order = IndexOrder.plain();
+        for (k in 0..columns.length) {
+            order.collations.push(schema.keyCollation(borrow columns[k]))?;
+            order.descending.push(columns[k].descending)?;
+        }
+        return Ok(order);
+    }
+
+    /// A WITHOUT ROWID table is an index b-tree: each entry is the whole row, the primary key's columns first.
+    private fn buildWithoutRowidTable(
+        store: borrow mut PageStore,
+        table: borrow WriterTable,
+    ) -> Result<u32, SqliteError> {
+        let schema = borrow table.schema;
+        if (schema.primaryKey.length == 0) {
+            return Err(sqlError("PRIMARY KEY missing on a WITHOUT ROWID table"));
+        }
+        let keyPositions = DatabaseWriter.keyPositions(schema, schema.primaryKey.view())?;
+        var storage = keyPositions.clone()?;
+        for (c in 0..schema.columns.length) {
+            var isKey = false;
+            for (k in 0..keyPositions.length) {
+                if (keyPositions[k] == c) {
+                    isKey = true;
+                }
+            }
+            if (!isKey && DatabaseWriter.isStored(borrow schema.columns[c])) {
+                storage.push(c)?;
+            }
+        }
+        var entries = Vector<Vector<SqliteValue>>.withCapacity(table.rows.length)?;
+        for (r in 0..table.rows.length) {
+            var entry = Vector<SqliteValue>.withCapacity(storage.length)?;
+            for (s in 0..storage.length) {
+                let value = DatabaseWriter.columnValue(schema, borrow table.rows[r], storage[s])?;
+                if (s < keyPositions.length && value.isNull()) {
+                    return Err(constraintError("NOT NULL constraint failed: ", schema.columns[storage[s]].name.view()));
+                }
+                entry.push(value)?;
+            }
+            entries.push(entry)?;
+        }
+        let order = DatabaseWriter.keyOrder(schema, schema.primaryKey.view())?;
+        return DatabaseWriter.buildSortedIndex(store, mut entries, order, keyPositions.length, schema.name.view());
+    }
+
+    /// A rowid table: its rows in rowid order.
+    private fn buildRowidTable(store: borrow mut PageStore, table: borrow mut WriterTable) -> Result<u32, SqliteError> {
+        table.rows.sortBy((a, b) => compareI64(a.rowId, b.rowId));
+        var encoded = Vector<EncodedRow>.withCapacity(table.rows.length)?;
+        for (r in 0..table.rows.length) {
+            encoded.push(
+                EncodedRow {
+                    rowId: table.rows[r].rowId,
+                    record: DatabaseWriter.tableRecord(borrow table.schema, borrow table.rows[r])?,
+                },
+            )?;
+        }
+        return BTreeBuilder.buildTable(store, encoded.view());
+    }
+
+    // ── assembly ─────────────────────────────────────────────────────────────────────────────────────────────
+
+    /// Adds a row of sqlite_schema as a cell of its b-tree.
+    private fn schemaRow(
+        store: borrow mut PageStore,
+        cells: borrow mut Vector<Vector<u8>>,
+        rowIds: borrow mut Vector<i64>,
+        kind: StringView,
+        name: StringView,
+        table: StringView,
+        rootPage: u32,
+        sql: StringView?,
+    ) -> Result<void, SqliteError> {
+        var values = Vector<SqliteValue>.create();
+        values.push(SqliteValue.text(kind)?)?;
+        values.push(SqliteValue.text(name)?)?;
+        values.push(SqliteValue.text(table)?)?;
+        values.push(SqliteValue.Integer(rootPage as i64))?;
+        if (sql is Some(text)) {
+            values.push(SqliteValue.text(text)?)?;
+        } else {
+            values.push(SqliteValue.Null)?;
+        }
+        let record = Record.encode(values.view())?;
+        let rowId = truncate<i64>(cells.length) + 1;
+        cells.push(BTreeBuilder.tableLeafCell(store, rowId, record.view())?)?;
+        rowIds.push(rowId)?;
+        return Ok();
+    }
+
+    /// Builds every page of the database.
+    fn buildPages(borrow mut this) -> Result<PageStore, SqliteError> {
+        var store = PageStore.create(this.options.pageSize);
+        // Page 1: the database header and sqlite_schema's root, filled in last.
+        let _ = store.allocate()?;
+        var cells = Vector<Vector<u8>>.create();
+        var rowIds = Vector<i64>.create();
+        for (t in 0..this.tables.length) {
+            let root = if (this.tables[t].schema.withoutRowid) DatabaseWriter.buildWithoutRowidTable(
+                mut store,
+                borrow this.tables[t],
+            )? else DatabaseWriter.buildRowidTable(mut store, mut this.tables[t])?;
+            let table = borrow this.tables[t];
+            let schema = borrow table.schema;
+            DatabaseWriter.schemaRow(
+                mut store,
+                mut cells,
+                mut rowIds,
+                "table",
+                schema.name.view(),
+                schema.name.view(),
+                root,
+                table.sql.view(),
+            )?;
+            // The automatic indexes that enforce PRIMARY KEY and UNIQUE. A WITHOUT ROWID table is its own
+            // primary key index.
+            var sequence: u64 = 0;
+            for (k in 0..schema.keys.length) {
+                let key = borrow schema.keys[k];
+                if (key.primaryKey && schema.withoutRowid) {
+                    continue;
+                }
+                sequence += 1;
+                var name = String.from("sqlite_autoindex_")?;
+                name.append(schema.name.view())?;
+                name.append("_")?;
+                name.appendNumber(sequence)?;
+                let positions = DatabaseWriter.keyPositions(schema, key.columns.view())?;
+                let order = DatabaseWriter.keyOrder(schema, key.columns.view())?;
+                let indexRoot = DatabaseWriter.buildTableIndex(
+                    mut store,
+                    table,
+                    positions.view(),
+                    order,
+                    true,
+                    name.view(),
+                )?;
+                DatabaseWriter.schemaRow(
+                    mut store,
+                    mut cells,
+                    mut rowIds,
+                    "index",
+                    name.view(),
+                    schema.name.view(),
+                    indexRoot,
+                    null,
+                )?;
+            }
+        }
+        for (i in 0..this.indexes.length) {
+            let schema = borrow this.indexes[i].schema;
+            var order = IndexOrder.plain();
+            for (c in 0..schema.columns.length) {
+                order.collations.push(schema.columns[c].collation)?;
+                order.descending.push(schema.columns[c].descending)?;
+            }
+            let uniqueColumns = if (schema.unique) schema.columns.length else 0;
+            var root: u32 = 0;
+            if (replace(mut this.indexes[i].entries, null) is Some(given)) {
+                var entries = given;
+                for (e in 0..entries.length) {
+                    if (entries[e].length != schema.columns.length + 1 ||
+                        !(entries[e][schema.columns.length] is SqliteValue.Integer(_))) {
+                        return Err(sqlError("an index entry must be its key columns and then its rowid"));
+                    }
+                }
+                root = DatabaseWriter.buildSortedIndex(
+                    mut store,
+                    mut entries,
+                    order,
+                    uniqueColumns,
+                    schema.name.view(),
+                )?;
+            } else {
+                let table = borrow this.tables[this.findTable(schema.table.view())!];
+                var positions = Vector<usize>.create();
+                for (c in 0..schema.columns.length) {
+                    positions.push(table.schema.indexOf(schema.columns[c].name.view())!)?;
+                }
+                root = DatabaseWriter.buildTableIndex(
+                    mut store,
+                    table,
+                    positions.view(),
+                    order,
+                    schema.unique,
+                    schema.name.view(),
+                )?;
+            }
+            DatabaseWriter.schemaRow(
+                mut store,
+                mut cells,
+                mut rowIds,
+                "index",
+                schema.name.view(),
+                schema.table.view(),
+                root,
+                this.indexes[i].sql.view(),
+            )?;
+        }
+        for (o in 0..this.objects.length) {
+            let object = borrow this.objects[o];
+            DatabaseWriter.schemaRow(
+                mut store,
+                mut cells,
+                mut rowIds,
+                if (object.isTrigger) "trigger" else "view",
+                object.name.view(),
+                object.table.view(),
+                0,
+                object.sql.view(),
+            )?;
+        }
+        BTreeBuilder.buildRootOnPage1(mut store, cells.view(), rowIds.view())?;
+        let pageCount = store.count();
+        DatabaseWriter.writeHeader(store.page(1), this.options, pageCount);
+        return Ok(store);
+    }
+
+    private fn writeHeader(page: SliceMut<u8>, options: WriterOptions, pageCount: u32) {
+        page[0..DATABASE_MAGIC.length].copyFrom(DATABASE_MAGIC);
+        // A page size of 65536 is written as 1.
+        page.writeBE(16, if (options.pageSize == 65536) 1u16 else truncate<u16>(options.pageSize));
+        page[18] = 1;  // file format write version: rollback journal
+        page[19] = 1;  // file format read version
+        page[20] = 0;  // reserved space at the end of each page
+        page[21] = 64; // maximum embedded payload fraction
+        page[22] = 32; // minimum embedded payload fraction
+        page[23] = 32; // leaf payload fraction
+        page.writeBE(24, options.changeCounter);
+        page.writeBE(28, pageCount);
+        page.writeBE(32, 0u32); // first freelist trunk page
+        page.writeBE(36, 0u32); // freelist pages
+        page.writeBE(40, options.schemaCookie);
+        page.writeBE(44, 4u32); // schema format
+        page.writeBE(48, 0u32); // default page cache size
+        page.writeBE(52, 0u32); // largest root page: auto-vacuum is off
+        page.writeBE(56, 1u32); // text encoding: UTF-8
+        page.writeBE(60, options.userVersion);
+        page.writeBE(64, 0u32); // incremental vacuum
+        page.writeBE(68, options.applicationId);
+        page.writeBE(92, options.changeCounter); // version-valid-for: the in-header size is current
+        page.writeBE(96, WRITER_SQLITE_VERSION);
+    }
+
+    /// Writes the database to `path`, replacing a file that is there in one atomic step.
+    fn writeToFile(borrow mut this, path: StringView) -> Result<void, SqliteError> {
+        // A journal or a log beside the old file belongs to a transaction on it; SQLite would apply it to
+        // whatever file it finds there next.
+        if (DatabaseWriter.sidecarExists(path, "-journal")? || DatabaseWriter.sidecarExists(path, "-wal")?) {
+            return Err(
+                unsupported("the database has a rollback journal or a write-ahead log that must be recovered first"),
+            );
+        }
+        let store = this.buildPages()?;
+        var temporary = String.from(path)?;
+        temporary.append(".tmp")?;
+        {
+            var file = File.create(temporary.view())?;
+            for (i in 0..store.pages.length) {
+                file.write(store.pages[i].view())?;
+            }
+            file.syncAll()?;
+        }
+        File.rename(temporary.view(), path)?;
+        // The rename is durable once its directory is.
+        let directory: StringView = match (path.lastIndexOf("/")) {
+            Some(0) => "/",
+            Some(slash) => path[0..slash],
+            null => ".",
+        };
+        Directory.sync(directory)?;
+        return Ok();
+    }
+
+    /// Whether `path` with `suffix` is a file with something in it.
+    private fn sidecarExists(path: StringView, suffix: StringView) -> Result<bool, SqliteError> {
+        var name = String.from(path)?;
+        name.append(suffix)?;
+        match (File.open(name.view())) {
+            Ok(file) => { return Ok(file.length()? > 0); }
+            Err(IoError.NotFound) => { return Ok(false); }
+            Err(e) => { return Err(SqliteError.Io(e)); }
+        }
+    }
+}

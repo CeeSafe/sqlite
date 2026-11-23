@@ -1,0 +1,380 @@
+// Reading index b-trees. An index entry is a record of the indexed columns followed by the rowid; entries are
+// kept in order, and an interior page's cells are entries themselves, each between its left child's entries and
+// the next child's. https://www.sqlite.org/fileformat2.html#b_tree_pages
+//
+// Differences from the C# engine, which this replaces:
+// - one cursor serves every seek, in the index's own order: per-column collations and DESC columns. The C#
+//   equality seek compared with BINARY and assumed ascending order, so it missed rows of a DESC or NOCASE index;
+// - counting treats a child as wholly inside the range only when the entries that bound it satisfy the bounds
+//   as they are written. The C# accepted a bounding entry equal to an exclusive bound, and so counted entries
+//   equal to that bound when the index had duplicates of it;
+// - a record with fewer columns than the key, or without an integer rowid, is `Corrupt`, not a crash.
+
+/// The order of an index's entries: each column's collation, and whether it descends.
+struct IndexOrder {
+    collations: Vector<Collation>;
+    descending: Vector<bool>;
+
+    /// Every column BINARY and ascending.
+    fn plain() -> IndexOrder =>
+        IndexOrder { collations: Vector<Collation>.create(), descending: Vector<bool>.create() };
+
+    /// Compares the leading columns of `entry` with `key`, in the index's order.
+    fn comparePrefix(borrow this, entry: Slice<SqliteValue>, key: Slice<SqliteValue>) -> i32 {
+        let missing = SqliteValue.Null;
+        for (i in 0..key.length) {
+            let collation = if (i < this.collations.length) this.collations[i] else Collation.Binary;
+            var c = if (i < entry.length) compareValues(
+                borrow entry[i],
+                borrow key[i],
+                collation,
+            ) else compareValues(borrow missing, borrow key[i], collation);
+            if (i < this.descending.length && this.descending[i]) {
+                c = 0 - c;
+            }
+            if (c != 0) {
+                return c;
+            }
+        }
+        return 0;
+    }
+}
+
+/// The entries a seek wants: those whose leading columns lie between two keys, in the index's order.
+struct IndexRange {
+    order: IndexOrder;
+    /// The low key; `null` for none.
+    min: Vector<SqliteValue>?;
+    minInclusive: bool;
+    /// The high key; `null` for none.
+    max: Vector<SqliteValue>?;
+    maxInclusive: bool;
+
+    /// Every entry.
+    fn all(order: IndexOrder) -> IndexRange =>
+        IndexRange { order: order, min: null, minInclusive: true, max: null, maxInclusive: true };
+
+    /// The entries whose leading columns equal `key`.
+    fn equalTo(order: IndexOrder, key: Slice<SqliteValue>) -> Result<IndexRange, AllocError> => Ok(IndexRange {
+        order: order,
+        min: cloneValues(key)?,
+        minInclusive: true,
+        max: cloneValues(key)?,
+        maxInclusive: true,
+    });
+
+    /// Whether `entry` is not before the low key. True for a suffix of the entries.
+    fn satisfiesLow(borrow this, entry: Slice<SqliteValue>) -> bool {
+        if (borrow this.min is Some(key)) {
+            let c = this.order.comparePrefix(entry, key.view());
+            return if (this.minInclusive) c >= 0 else c > 0;
+        }
+        return true;
+    }
+
+    /// Whether `entry` is not after the high key. True for a prefix of the entries.
+    fn satisfiesHigh(borrow this, entry: Slice<SqliteValue>) -> bool {
+        if (borrow this.max is Some(key)) {
+            let c = this.order.comparePrefix(entry, key.view());
+            return if (this.maxInclusive) c <= 0 else c < 0;
+        }
+        return true;
+    }
+}
+
+/// The entry in the index cell whose payload length varint is at `offset`.
+fn decodeIndexEntry(
+    pager: borrow mut Pager,
+    page: Slice<u8>,
+    offset: usize,
+) -> Result<Vector<SqliteValue>, SqliteError> {
+    let length = Varint.read(page, offset)?;
+    let shape = PayloadShape.ofIndex(pager, length.value)?;
+    let start = offset + length.length;
+    let encoding = pager.textEncoding();
+    if (shape.isLocal()) {
+        if (start + shape.total > page.length) {
+            return Err(corrupt("a cell runs past the end of its page"));
+        }
+        return Record.decode(page[start..start + shape.total], encoding);
+    }
+    let payload = readOverflowPayload(pager, page, start, shape)?;
+    return Record.decode(payload.view(), encoding);
+}
+
+/// The entry of cell `index` of an index page.
+fn indexEntryAt(
+    pager: borrow mut Pager,
+    page: Slice<u8>,
+    header: borrow BTreePageHeader,
+    index: usize,
+) -> Result<Vector<SqliteValue>, SqliteError> {
+    let offset = header.cellOffset(page, index)?;
+    return decodeIndexEntry(pager, page, if (header.isLeaf()) offset else offset + 4);
+}
+
+/// The child of an interior index page before cell `index`; `cellCount` names the right-most child.
+fn indexChildAt(page: Slice<u8>, header: borrow BTreePageHeader, index: usize) -> Result<u32, SqliteError> {
+    if (index >= header.cellCount) {
+        return Ok(header.rightMost);
+    }
+    return Ok(page.readBE<u32>(header.cellOffset(page, index)?));
+}
+
+/// The rowid an index entry ends with.
+fn indexEntryRowId(entry: Slice<SqliteValue>) -> Result<i64, SqliteError> {
+    if (entry.length != 0 && entry[entry.length - 1] is SqliteValue.Integer(rowId)) {
+        return Ok(rowId);
+    }
+    return Err(corrupt("an index entry does not end with a rowid"));
+}
+
+fn readIndexPage(pager: borrow mut Pager, pageNumber: u32) -> Result<CursorFrame, SqliteError> {
+    let page = pager.readPage(pageNumber)?;
+    let header = BTreePageHeader.parse(page.view(), pageNumber)?;
+    if (header.kind != PAGE_LEAF_INDEX && header.kind != PAGE_INTERIOR_INDEX) {
+        return Err(corrupt("a page in an index b-tree is not an index page"));
+    }
+    return Ok(CursorFrame { page: page, header: header, index: 0 });
+}
+
+/// The number of cells at the start of the page that do not satisfy the range's low bound.
+fn cellsBelowLow(
+    pager: borrow mut Pager,
+    frame: borrow CursorFrame,
+    range: borrow IndexRange,
+) -> Result<usize, SqliteError> {
+    var low: usize = 0;
+    var high = frame.header.cellCount;
+    while (low < high) {
+        let middle = low + (high - low) / 2;
+        let entry = indexEntryAt(pager, frame.page.view(), frame.header, middle)?;
+        if (range.satisfiesLow(entry.view())) {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    return Ok(low);
+}
+
+/// The number of cells at the start of the page that satisfy the range's high bound.
+fn cellsWithinHigh(
+    pager: borrow mut Pager,
+    frame: borrow CursorFrame,
+    range: borrow IndexRange,
+) -> Result<usize, SqliteError> {
+    var low: usize = 0;
+    var high = frame.header.cellCount;
+    while (low < high) {
+        let middle = low + (high - low) / 2;
+        let entry = indexEntryAt(pager, frame.page.view(), frame.header, middle)?;
+        if (range.satisfiesHigh(entry.view())) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    return Ok(low);
+}
+
+/// A page on an index cursor's path. Its steps are numbered in order: a leaf's step `i` is cell `i`; an
+/// interior page's step `2i` is the child before cell `i` and step `2i + 1` is cell `i`.
+struct IndexFrame {
+    frame: CursorFrame;
+    /// Ascending: the next step. Descending: one more than the next step, so 0 means none is left.
+    position: usize;
+    /// The step at which this page was entered when a bound placed the cursor inside it: the child at that
+    /// step needs placing too, and no other does.
+    boundary: usize?;
+}
+
+/// Walks the entries of an index b-tree that lie in a range, in the index's order or against it.
+struct IndexCursor {
+    private root: u32;
+    private range: IndexRange;
+    private backwards: bool;
+    private stack: Vector<IndexFrame>;
+    private started: bool;
+
+    /// A cursor over the entries of the index rooted at `rootPage` that lie in `range`; `backwards` gives them
+    /// last first.
+    fn create(rootPage: u32, range: IndexRange, backwards: bool) -> IndexCursor => IndexCursor {
+        root: rootPage,
+        range: range,
+        backwards: backwards,
+        stack: Vector<IndexFrame>.create(),
+        started: false,
+    };
+
+    /// The next entry (the indexed columns, then the rowid), or `null` after the last.
+    fn next(borrow mut this, pager: borrow mut Pager) -> Result<Vector<SqliteValue>?, SqliteError> {
+        if (!this.started) {
+            this.started = true;
+            this.push(pager, this.root, true)?;
+        }
+        loop {
+            if (this.stack.length == 0) {
+                return Ok(null);
+            }
+            let top = this.stack.length - 1;
+            let leaf = this.stack[top].frame.header.isLeaf();
+            let cells = this.stack[top].frame.header.cellCount;
+            let steps = if (leaf) cells else cells * 2 + 1;
+            var step: usize = 0;
+            if (this.backwards) {
+                if (this.stack[top].position == 0) {
+                    let _ = this.stack.pop();
+                    continue;
+                }
+                this.stack[top].position -= 1;
+                step = this.stack[top].position;
+            } else {
+                if (this.stack[top].position >= steps) {
+                    let _ = this.stack.pop();
+                    continue;
+                }
+                step = this.stack[top].position;
+                this.stack[top].position += 1;
+            }
+            if (!leaf && step % 2 == 0) {
+                let child = indexChildAt(this.stack[top].frame.page.view(), this.stack[top].frame.header, step / 2)?;
+                let place = this.stack[top].boundary == Some(step);
+                this.push(pager, child, place)?;
+                continue;
+            }
+            let cell = if (leaf) step else step / 2;
+            let entry = indexEntryAt(pager, this.stack[top].frame.page.view(), this.stack[top].frame.header, cell)?;
+            // Walking forwards, the entries satisfying the high bound are a prefix, so the first that does not
+            // ends the walk; backwards, the same holds of the low bound.
+            let low = this.range.satisfiesLow(entry.view());
+            let high = this.range.satisfiesHigh(entry.view());
+            if ((this.backwards && !low) || (!this.backwards && !high)) {
+                this.stack.clear();
+                return Ok(null);
+            }
+            if (low && high) {
+                return Ok(entry);
+            }
+        }
+    }
+
+    /// Enters `pageNumber`. With `place`, the cursor starts at the first step the bound on its starting side
+    /// allows; without it, at the page's first (or, backwards, last) step.
+    private fn push(
+        borrow mut this,
+        pager: borrow mut Pager,
+        pageNumber: u32,
+        place: bool,
+    ) -> Result<void, SqliteError> {
+        if (this.stack.length >= BTREE_MAX_DEPTH) {
+            return Err(corrupt("an index b-tree's pages form a cycle"));
+        }
+        let frame = readIndexPage(pager, pageNumber)?;
+        let leaf = frame.header.isLeaf();
+        let cells = frame.header.cellCount;
+        var position: usize = if (!this.backwards) 0 else if (leaf) cells else cells * 2 + 1;
+        var boundary: usize? = null;
+        if (place && !this.backwards && this.range.min.isSome()) {
+            // Cells before `skip` are below the low bound, and so is everything in the children before them.
+            let skip = cellsBelowLow(pager, frame, this.range)?;
+            position = if (leaf) skip else skip * 2;
+            boundary = position;
+        } else if (place && this.backwards && this.range.max.isSome()) {
+            // Cells from `keep` on are above the high bound, and so is everything in the children after them.
+            let keep = cellsWithinHigh(pager, frame, this.range)?;
+            position = if (leaf) keep else keep * 2 + 1;
+            boundary = position - (if (position == 0) 0 else 1);
+        }
+        this.stack.push(IndexFrame { frame: frame, position: position, boundary: boundary })?;
+        return Ok();
+    }
+}
+
+/// The number of entries in the subtree rooted at `pageNumber`.
+fn countIndexSubtree(pager: borrow mut Pager, pageNumber: u32, depth: usize) -> Result<u64, SqliteError> {
+    if (depth >= BTREE_MAX_DEPTH) {
+        return Err(corrupt("an index b-tree's pages form a cycle"));
+    }
+    let frame = readIndexPage(pager, pageNumber)?;
+    let cells = frame.header.cellCount;
+    if (frame.header.isLeaf()) {
+        return Ok(cells as u64);
+    }
+    var total = cells as u64;
+    for (i in 0..cells + 1) {
+        total += countIndexSubtree(pager, indexChildAt(frame.page.view(), frame.header, i)?, depth + 1)?;
+    }
+    return Ok(total);
+}
+
+/// The number of entries under `pageNumber` in `range`. `checkLow` and `checkHigh` say which bounds this subtree
+/// may straddle: a subtree known to lie inside both is counted without decoding an entry.
+fn countIndexPage(
+    pager: borrow mut Pager,
+    pageNumber: u32,
+    range: borrow IndexRange,
+    checkLow: bool,
+    checkHigh: bool,
+    depth: usize,
+) -> Result<u64, SqliteError> {
+    if (!checkLow && !checkHigh) {
+        return countIndexSubtree(pager, pageNumber, depth);
+    }
+    if (depth >= BTREE_MAX_DEPTH) {
+        return Err(corrupt("an index b-tree's pages form a cycle"));
+    }
+    let frame = readIndexPage(pager, pageNumber)?;
+    let cells = frame.header.cellCount;
+    let first = if (checkLow) cellsBelowLow(pager, frame, range)? else 0;
+    let end = if (checkHigh) cellsWithinHigh(pager, frame, range)? else cells;
+    if (first > end) {
+        return Ok(0);
+    }
+    // Cells `first..end` are in the range.
+    var total = (end - first) as u64;
+    if (frame.header.isLeaf()) {
+        return Ok(total);
+    }
+    // The child before cell `i` holds the entries between cells `i - 1` and `i`. For `first < i < end` both of
+    // those cells are in the range, so the child is wholly inside it; the children at the two ends may not be.
+    for (i in first..end + 1) {
+        let child = indexChildAt(frame.page.view(), frame.header, i)?;
+        total += countIndexPage(pager, child, range, checkLow && i == first, checkHigh && i == end, depth + 1)?;
+    }
+    return Ok(total);
+}
+
+/// The number of entries of the index rooted at `rootPage` that lie in `range`.
+fn countIndexRange(pager: borrow mut Pager, rootPage: u32, range: borrow IndexRange) -> Result<u64, SqliteError> =>
+    countIndexPage(pager, rootPage, range, range.min.isSome(), range.max.isSome(), 0);
+
+/// Each distinct value of the index's first column, in the index's order, found with one seek a value.
+fn distinctLeadingValues(
+    pager: borrow mut Pager,
+    rootPage: u32,
+    collation: Collation,
+    descending: bool,
+) -> Result<Vector<SqliteValue>, SqliteError> {
+    var found = Vector<SqliteValue>.create();
+    loop {
+        var order = IndexOrder.plain();
+        order.collations.push(collation)?;
+        order.descending.push(descending)?;
+        var range = IndexRange.all(order);
+        if (found.length != 0) {
+            var after = Vector<SqliteValue>.create();
+            after.push(found[found.length - 1].clone()?)?;
+            range.min = after;
+            range.minInclusive = false;
+        }
+        var cursor = IndexCursor.create(rootPage, range, false);
+        let entry = cursor.next(pager)? ?? {
+            return Ok(found);
+        };
+        if (entry.length == 0) {
+            return Err(corrupt("an index entry has no columns"));
+        }
+        found.push(entry[0].clone()?)?;
+    }
+}

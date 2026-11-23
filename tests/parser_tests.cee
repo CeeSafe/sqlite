@@ -1,0 +1,344 @@
+// The SQL parser. Expressions are checked in the writer's canonical form, which shows how operators grouped.
+
+/// The canonical form of the expression `text`.
+fn shape(text: StringView) -> String {
+    var sql = String.from("SELECT ")!;
+    sql.append(text)!;
+    match (Parser.parseStatement(sql.view())) {
+        Ok(Stmt.Select(select)) => {
+            match (borrow select.cores[0].columns[0]) {
+                ResultColumn.Expr(expr, _) => { return SqlWriter.expression(expr)!; }
+                _ => { return String.from("<star>")!; }
+            }
+        }
+        Ok(_) => { return String.from("<not a select>")!; }
+        Err(e) => {
+            var message = String.from("error: ")!;
+            message.append(e.message())!;
+            return message;
+        }
+    }
+}
+
+fn parseError(sql: StringView) -> String => match (Parser.parseStatement(sql)) {
+    Ok(_) => String.from("<parsed>")!,
+    Err(e) => String.from(e.message())!,
+};
+
+fn textOf(value: borrow String?) -> StringView => match (value) {
+    Some(text) => text.view(),
+    null => "<null>",
+};
+
+fn exprText(value: borrow Expr?) -> String => match (value) {
+    Some(expr) => SqlWriter.expression(expr)!,
+    null => String.from("<null>")!,
+};
+
+fn selectOf(sql: StringView) -> Box<SelectStmt> {
+    match (Parser.parseStatement(sql)!) {
+        Stmt.Select(select) => { return select; }
+        _ => { panic("expected a SELECT"); }
+    }
+}
+
+@test
+fn precedenceIsSqlites() -> Result<void, TestFailure> {
+    Check.equalText("(1 + (2 * 3))", shape("1 + 2 * 3").view())?;
+    Check.equalText("((1 - 2) - 3)", shape("1 - 2 - 3").view())?;
+    Check.equalText("((\"a\" OR (\"b\" AND \"c\")) OR \"d\")", shape("a OR b AND c OR d").view())?;
+    Check.equalText("((NOT (\"a\" = \"b\")) AND \"c\")", shape("NOT a = b AND c").view())?;
+    Check.equalText("((\"a\" < \"b\") = (\"c\" > \"d\"))", shape("a < b = c > d").view())?;
+    Check.equalText("((\"a\" & \"b\") < (\"c\" + \"d\"))", shape("a & b < c + d").view())?;
+    Check.equalText("(\"a\" + (\"b\" || \"c\"))", shape("a + b || c").view())?;
+    Check.equalText("((-\"a\") * \"b\")", shape("-a * b").view())?;
+    Check.equalText("((~\"a\") || \"b\")", shape("~a || b").view())?;
+    // `->` and `->>` bind as tightly as `||`; the C# engine put them below `+`.
+    Check.equalText("(\"a\" + (\"j\" -> 'k'))", shape("a + j -> 'k'").view())?;
+    Check.equalText("((\"j\" -> 'a') ->> 'b')", shape("j -> 'a' ->> 'b'").view())?;
+    // COLLATE binds tighter than `||`; the C# engine collated the whole concatenation.
+    Check.equalText("(\"a\" || (\"b\" COLLATE \"NOCASE\"))", shape("a || b COLLATE NOCASE").view())?;
+    Check.equalText("((-\"a\") COLLATE \"NOCASE\")", shape("-a COLLATE NOCASE").view())?;
+    Check.equalText("((\"a\" COLLATE \"NOCASE\") = 'x')", shape("a COLLATE NOCASE = 'x'").view())?;
+    return Ok();
+}
+
+@test
+fn predicatesParse() -> Result<void, TestFailure> {
+    Check.equalText("((\"a\" BETWEEN 1 AND (2 + 3)) AND \"b\")", shape("a BETWEEN 1 AND 2 + 3 AND b").view())?;
+    Check.equalText("(\"a\" NOT BETWEEN 1 AND 2)", shape("a NOT BETWEEN 1 AND 2").view())?;
+    Check.equalText("(\"a\" IN (1, 2, 3))", shape("a IN (1, 2, 3)").view())?;
+    Check.equalText("(\"a\" NOT IN ())", shape("a NOT IN ()").view())?;
+    Check.equalText("(\"a\" IN \"main\".\"t\")", shape("a IN main.t").view())?;
+    Check.equalText("(\"a\" IN (SELECT …))", shape("a IN (VALUES (1), (2))").view())?;
+    Check.equalText("(\"a\" LIKE 'x%' ESCAPE '\\')", shape("a LIKE 'x%' ESCAPE '\\'").view())?;
+    Check.equalText("(\"a\" NOT GLOB '*')", shape("a NOT GLOB '*'").view())?;
+    Check.equalText("(\"a\" IS NULL)", shape("a ISNULL").view())?;
+    Check.equalText("(\"a\" IS NOT NULL)", shape("a NOTNULL").view())?;
+    Check.equalText("(\"a\" IS NOT NULL)", shape("a NOT NULL").view())?;
+    Check.equalText("(\"a\" IS NOT \"b\")", shape("a IS DISTINCT FROM b").view())?;
+    Check.equalText("(\"a\" IS \"b\")", shape("a IS NOT DISTINCT FROM b").view())?;
+    // NOT is a prefix operator wherever an operand may stand.
+    Check.equalText("(1 = (NOT 0))", shape("1 = NOT 0").view())?;
+    Check.equalText("(NOT NULL)", shape("NOT NULL").view())?;
+    Check.equalText("(NOT EXISTS (SELECT …))", shape("NOT EXISTS (SELECT 1)").view())?;
+    return Ok();
+}
+
+@test
+fn primariesParse() -> Result<void, TestFailure> {
+    Check.equalText("-9223372036854775808", shape("-9223372036854775808").view())?;
+    Check.equalText("(-9223372036854775807)", shape("-9223372036854775807").view())?;
+    Check.equalText("\"s\".\"t\".\"c\"", shape("s.t.c").view())?;
+    Check.equalText("(1, \"a\", 'x')", shape("(1, a, 'x')").view())?;
+    Check.equalText("CAST(\"a\" AS VARCHAR(10, 2))", shape("CAST(a AS VARCHAR(10, 2))").view())?;
+    Check.equalText("CASE \"a\" WHEN 1 THEN 'one' ELSE 'many' END", shape("CASE a WHEN 1 THEN 'one' ELSE 'many' END").view())?;
+    Check.equalText("count(*)", shape("count(*)").view())?;
+    Check.equalText("count(DISTINCT \"a\") FILTER (WHERE (\"a\" > 0))", shape("count(DISTINCT a) FILTER (WHERE a > 0)").view())?;
+    Check.equalText("sum(\"a\") OVER (PARTITION BY \"g\" ORDER BY \"a\" DESC NULLS LAST ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES)", shape("sum(a) OVER (PARTITION BY g ORDER BY a DESC NULLS LAST ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES)").view())?;
+    Check.equalText("rank() OVER (\"w\")", shape("rank() OVER w").view())?;
+    Check.equalText("rank() OVER (\"w\" ORDER BY \"a\")", shape("rank() OVER (w ORDER BY a)").view())?;
+    Check.equalText("TRUE", shape("true").view())?;
+    Check.equalText("\"true\".\"x\"", shape("true.x").view())?;
+    Check.equalText("x'00ff'", shape("x'00ff'").view())?;
+    Check.equalText(":name", shape(":name").view())?;
+    Check.equalText("RAISE(ABORT, 'no')", shape("RAISE(ABORT, 'no')").view())?;
+    Check.equalText("RAISE(IGNORE)", shape("RAISE(IGNORE)").view())?;
+    return Ok();
+}
+
+@test
+fn integerLiteralsFollowSqlite() -> Result<void, TestFailure> {
+    match (Parser.parseStatement("SELECT 9223372036854775807, 9223372036854775808, 0xFFFFFFFFFFFFFFFF")!) {
+        Stmt.Select(select) => {
+            let columns = borrow select.cores[0].columns;
+            Check.isTrue(columns[0] is ResultColumn.Expr(Expr.Literal(Literal { kind: LiteralKind.Integer, .. }), _), "the largest integer is an integer")?;
+            Check.isTrue(columns[1] is ResultColumn.Expr(Expr.Literal(Literal { kind: LiteralKind.Float, .. }), _), "one more is a real")?;
+            Check.isTrue(columns[2] is ResultColumn.Expr(Expr.Literal(Literal { kind: LiteralKind.Integer, .. }), _), "sixteen hex digits are an integer")?;
+        }
+        _ => { return Check.fail("expected a SELECT"); }
+    }
+    Check.equalText("hex literal too big", parseError("SELECT 0x10000000000000000").view())?;
+    return Ok();
+}
+
+@test
+fn selectsParse() -> Result<void, TestFailure> {
+    let select = selectOf("""
+        WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 5)
+        SELECT DISTINCT t.*, c.i AS n, upper(name) 'label'
+        FROM main.t AS t INDEXED BY t_n
+        LEFT OUTER JOIN c ON c.i = t.id
+        NATURAL JOIN u, (VALUES (1), (2)) AS v
+        WHERE t.n > ?1 GROUP BY 1, 2 HAVING count(*) > 1
+        WINDOW w AS (PARTITION BY g)
+        UNION SELECT 1, 2, 3
+        ORDER BY n DESC NULLS FIRST, 2 LIMIT 10 OFFSET 5
+        """);
+    let Some(with) = borrow select.with else {
+        return Check.fail("expected WITH");
+    };
+    Check.isTrue(with.recursive, "RECURSIVE")?;
+    Check.equalText("c", with.ctes[0].name.view())?;
+    Check.equalU64(1, with.ctes[0].columns.length as u64)?;
+    Check.equalU64(2, with.ctes[0].select.cores.length as u64)?;
+    Check.isTrue(with.ctes[0].select.compoundOps[0] == CompoundOp.UnionAll, "UNION ALL in the CTE")?;
+    Check.equalU64(2, select.cores.length as u64)?;
+    Check.isTrue(select.compoundOps[0] == CompoundOp.Union, "UNION")?;
+    let core = borrow select.cores[0];
+    Check.isTrue(core.distinct, "DISTINCT")?;
+    Check.equalU64(3, core.columns.length as u64)?;
+    Check.isTrue(core.columns[0] is ResultColumn.TableStar(_), "t.*")?;
+    match (borrow core.columns[2]) {
+        ResultColumn.Expr(_, Some(alias)) => { Check.equalText("label", alias.view())?; }
+        _ => { return Check.fail("a string literal is an alias"); }
+    }
+    let Some(from) = borrow core.from else {
+        return Check.fail("expected FROM");
+    };
+    match (borrow from.source) {
+        FromItem.Table(table) => {
+            Check.equalText("main", textOf(table.name.schema))?;
+            Check.equalText("t", table.name.name.view())?;
+            Check.equalText("t", textOf(table.alias))?;
+            Check.equalText("t_n", textOf(table.indexedBy))?;
+        }
+        _ => { return Check.fail("expected a table"); }
+    }
+    Check.equalU64(3, from.joins.length as u64)?;
+    Check.isTrue(from.joins[0].kind == JoinKind.Left && !from.joins[0].natural, "LEFT OUTER JOIN")?;
+    Check.isTrue(from.joins[0].constraint is JoinConstraint.On(_), "ON")?;
+    Check.isTrue(from.joins[1].kind == JoinKind.Inner && from.joins[1].natural, "NATURAL JOIN")?;
+    Check.isTrue(from.joins[2].kind == JoinKind.Comma, "a comma join")?;
+    match (borrow from.joins[2].item) {
+        FromItem.Subquery(sub) => {
+            Check.equalU64(2, sub.select.cores.length as u64)?;
+            Check.isTrue(sub.select.cores[0].isValues, "VALUES in FROM")?;
+            Check.equalText("v", textOf(sub.alias))?;
+        }
+        _ => { return Check.fail("expected a subquery"); }
+    }
+    Check.isTrue(core.filter.isSome() && core.having.isSome(), "WHERE and HAVING")?;
+    Check.equalU64(2, core.groupBy.length as u64)?;
+    Check.equalText("w", core.windows[0].name.view())?;
+    Check.equalU64(2, select.orderBy.length as u64)?;
+    Check.isTrue(select.orderBy[0].descending && select.orderBy[0].nullsFirst == Some(true), "DESC NULLS FIRST")?;
+    Check.isTrue(select.limit.isSome() && select.offset.isSome(), "LIMIT and OFFSET")?;
+
+    let comma = selectOf("SELECT 1 LIMIT 5, 10");
+    Check.equalText("10", exprText(comma.limit).view())?;
+    Check.equalText("5", exprText(comma.offset).view())?;
+    let tvf = selectOf("SELECT * FROM pragma_table_info('t') p, pragma_database_list");
+    let Some(functions) = borrow tvf.cores[0].from else {
+        return Check.fail("expected FROM");
+    };
+    Check.isTrue(functions.source is FromItem.TableFunction(_), "a table function")?;
+    Check.isTrue(functions.joins[0].item is FromItem.TableFunction(_), "a pragma function without parentheses")?;
+    let hinted = selectOf("SELECT * FROM t NOT INDEXED WHERE a = 1");
+    let Some(hint) = borrow hinted.cores[0].from else {
+        return Check.fail("expected FROM");
+    };
+    Check.isTrue(hint.source is FromItem.Table(TableSource { notIndexed: true, .. }), "NOT INDEXED")?;
+    return Ok();
+}
+
+@test
+fn dataChangesParse() -> Result<void, TestFailure> {
+    match (Parser.parseStatement("INSERT OR IGNORE INTO t (a, b) VALUES (1, 2), (3, 4) ON CONFLICT (a) DO UPDATE SET b = excluded.b WHERE b < 5 ON CONFLICT DO NOTHING RETURNING a, b AS c")!) {
+        Stmt.Insert(insert) => {
+            Check.isTrue(insert.conflict == Some(ConflictAction.Ignore), "OR IGNORE")?;
+            Check.equalU64(2, insert.columns.length as u64)?;
+            match (borrow insert.source) {
+                InsertSource.Values(rows) => { Check.equalU64(2, rows.length as u64)?; }
+                _ => { return Check.fail("expected VALUES"); }
+            }
+            Check.equalU64(2, insert.upserts.length as u64)?;
+            Check.equalText("a", insert.upserts[0].target[0].view())?;
+            Check.equalU64(1, insert.upserts[0].assignments.length as u64)?;
+            Check.isTrue(insert.upserts[0].filter.isSome(), "DO UPDATE … WHERE")?;
+            Check.equalU64(0, insert.upserts[1].assignments.length as u64)?;
+            Check.equalU64(2, insert.returning.length as u64)?;
+        }
+        _ => { return Check.fail("expected an INSERT"); }
+    }
+    Check.isTrue(Parser.parseStatement("REPLACE INTO t DEFAULT VALUES")! is Stmt.Insert(_), "REPLACE INTO")?;
+    // The C# engine took only SELECT here.
+    match (Parser.parseStatement("INSERT INTO t WITH c AS (SELECT 1) SELECT * FROM c")!) {
+        Stmt.Insert(insert) => { Check.isTrue(insert.source is InsertSource.Select(_), "INSERT … WITH … SELECT")?; }
+        _ => { return Check.fail("expected an INSERT"); }
+    }
+    match (Parser.parseStatement("INSERT INTO t VALUES (1) UNION SELECT 2")!) {
+        Stmt.Insert(insert) => { Check.isTrue(insert.source is InsertSource.Select(_), "VALUES as a compound's first arm")?; }
+        _ => { return Check.fail("expected an INSERT"); }
+    }
+    match (Parser.parseStatement("WITH c AS (SELECT 1) UPDATE OR REPLACE main.t SET a = 1, b = a + 1 FROM c WHERE t.id = c.i RETURNING *")!) {
+        Stmt.Update(update) => {
+            Check.isTrue(update.with.isSome() && update.from.isSome() && update.filter.isSome(), "WITH, FROM and WHERE")?;
+            Check.isTrue(update.conflict == Some(ConflictAction.Replace), "OR REPLACE")?;
+            Check.equalU64(2, update.assignments.length as u64)?;
+            Check.isTrue(update.returning[0] is ResultColumn.Star, "RETURNING *")?;
+        }
+        _ => { return Check.fail("expected an UPDATE"); }
+    }
+    Check.isTrue(Parser.parseStatement("DELETE FROM t WHERE a = 1 RETURNING a")! is Stmt.Delete(_), "DELETE")?;
+    Check.equalText("near \"SOMETIMES\": syntax error", parseError("INSERT OR SOMETIMES INTO t VALUES (1)").view())?;
+    return Ok();
+}
+
+@test
+fn schemaStatementsParse() -> Result<void, TestFailure> {
+    match (Parser.parseStatement("CREATE TEMP TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, n NUMERIC(10, 2) DEFAULT (1 + 2) NOT NULL, \"primary\" TEXT, PRIMARY KEY (id), CHECK (n > 0)) WITHOUT ROWID, STRICT")!) {
+        Stmt.CreateTable(table) => {
+            Check.isTrue(table.temporary && table.ifNotExists && table.withoutRowid && table.strict, "the table's flags")?;
+            Check.equalU64(3, table.columns.length as u64)?;
+            Check.equalText("n", table.columns[1].name.view())?;
+            Check.equalU64(14, table.columns[1].body.length as u64)?;
+            Check.equalText("primary", table.columns[2].name.view())?;
+            Check.equalU64(2, table.constraints.length as u64)?;
+        }
+        _ => { return Check.fail("expected CREATE TABLE"); }
+    }
+    match (Parser.parseStatement("CREATE UNIQUE INDEX i ON t (a COLLATE NOCASE DESC, lower(b)) WHERE a IS NOT NULL")!) {
+        Stmt.CreateIndex(index) => {
+            Check.isTrue(index.unique && index.filter.isSome(), "UNIQUE and WHERE")?;
+            Check.equalText("a", index.columns[0].name.view())?;
+            Check.equalText("NOCASE", index.columns[0].collation.view())?;
+            Check.isTrue(index.columns[0].descending, "DESC")?;
+            Check.isTrue(index.columns[1].expression.isSome(), "an expression column")?;
+        }
+        _ => { return Check.fail("expected CREATE INDEX"); }
+    }
+    match (Parser.parseStatement("CREATE TRIGGER tr AFTER UPDATE OF a, b ON t FOR EACH ROW WHEN new.a > 0 BEGIN UPDATE t SET b = 1; SELECT RAISE(ABORT, 'no'); END")!) {
+        Stmt.CreateTrigger(trigger) => {
+            Check.isTrue(trigger.timing == TriggerTiming.After && trigger.event == TriggerEvent.Update, "AFTER UPDATE")?;
+            Check.equalU64(2, trigger.updateOf.length as u64)?;
+            Check.equalU64(2, trigger.body.length as u64)?;
+            Check.isTrue(trigger.when.isSome(), "WHEN")?;
+        }
+        _ => { return Check.fail("expected CREATE TRIGGER"); }
+    }
+    Check.isTrue(Parser.parseStatement("CREATE VIEW v (a, b) AS SELECT 1, 2")! is Stmt.CreateView(_), "CREATE VIEW")?;
+    Check.isTrue(Parser.parseStatement("ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'x'")! is Stmt.AlterTable(_), "ADD COLUMN")?;
+    Check.isTrue(Parser.parseStatement("ALTER TABLE t RENAME a TO b")! is Stmt.AlterTable(_), "RENAME COLUMN")?;
+    Check.isTrue(Parser.parseStatement("DROP INDEX IF EXISTS main.i")! is Stmt.Drop(DropStmt { kind: DropKind.Index, ifExists: true, .. }), "DROP INDEX")?;
+    match (Parser.parseStatement("PRAGMA cache_size = -2000")!) {
+        Stmt.Pragma(pragma) => { Check.equalText("-2000", textOf(pragma.value))?; }
+        _ => { return Check.fail("expected PRAGMA"); }
+    }
+    match (Parser.parseStatement("PRAGMA table_info('t')")!) {
+        Stmt.Pragma(pragma) => {
+            Check.equalText("t", textOf(pragma.value))?;
+            Check.isTrue(pragma.parenthesized, "a pragma's argument in parentheses")?;
+        }
+        _ => { return Check.fail("expected PRAGMA"); }
+    }
+    Check.isTrue(Parser.parseStatement("BEGIN IMMEDIATE TRANSACTION")! is Stmt.Begin(TransactionKind.Immediate), "BEGIN IMMEDIATE")?;
+    Check.isTrue(Parser.parseStatement("ROLLBACK TO SAVEPOINT s")! is Stmt.Rollback(Some(_)), "ROLLBACK TO")?;
+    Check.isTrue(Parser.parseStatement("END;")! is Stmt.Commit, "END")?;
+    let program = Parser.parseProgram(";; BEGIN; INSERT INTO t VALUES (1);; COMMIT; ")!;
+    Check.equalU64(3, program.length as u64)?;
+    return Ok();
+}
+
+@test
+fn syntaxErrorsAreReported() -> Result<void, TestFailure> {
+    Check.equalText("near \"FROM\": syntax error", parseError("SELECT FROM t").view())?;
+    Check.equalText("incomplete input", parseError("SELECT 1 +").view())?;
+    Check.equalText("near \"2\": syntax error", parseError("SELECT 1 2").view())?;
+    Check.equalText("near \"(\": syntax error", parseError("SELECT 1 UNION (SELECT 2)").view())?;
+    Check.equalText("ORDER BY clause should come after UNION not before", parseError("SELECT 1 ORDER BY 1 UNION SELECT 2").view())?;
+    Check.equalText("LIMIT clause should come after UNION not before", parseError("SELECT 1 LIMIT 1 UNION SELECT 2").view())?;
+    Check.equalText("near \"select\": syntax error", parseError("CREATE TABLE t (select INT)").view())?;
+    Check.equalText("near \"x\": syntax error", parseError("SELECT 1; x").view())?;
+    Check.equalText("near \"END\": syntax error", parseError("CREATE TRIGGER tr AFTER INSERT ON t BEGIN END").view())?;
+    // SQLite words this one "unknown join type: NATURAL b"; the place is the same.
+    Check.equalText("near \"b\": syntax error", parseError("SELECT * FROM a NATURAL b JOIN c").view())?;
+    Check.equalText("near \"WHERE\": syntax error", parseError("SELECT * FROM a LEFT WHERE 1").view())?;
+    Check.isTrue(Parser.parseStatement("CREATE TABLE t AS SELECT 1") is Err(SqliteError.Unsupported(_)), "CREATE TABLE AS is refused by name")?;
+    return Ok();
+}
+
+@test
+fn deepExpressionsAreRefusedNotCrashed() -> Result<void, TestFailure> {
+    // A long chain builds a tree as deep as it is long; SQLite stops at 1000.
+    var chain = String.from("SELECT 1")!;
+    for (i in 0..1500) {
+        chain.append(" + 1")!;
+    }
+    Check.equalText("Expression tree is too large (maximum depth 1000)", parseError(chain.view()).view())?;
+    var shallow = String.from("SELECT 1")!;
+    for (i in 0..900) {
+        shallow.append(" + 1")!;
+    }
+    Check.isTrue(Parser.parseStatement(shallow.view()).isOk(), "a chain under the limit parses")?;
+    var nested = String.from("SELECT ")!;
+    for (i in 0..5000) {
+        nested.append("(")!;
+    }
+    nested.append("1")!;
+    for (i in 0..5000) {
+        nested.append(")")!;
+    }
+    Check.equalText("the statement is nested too deeply", parseError(nested.view()).view())?;
+    return Ok();
+}

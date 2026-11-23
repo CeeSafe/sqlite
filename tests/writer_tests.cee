@@ -1,0 +1,263 @@
+// Databases this engine writes, judged by the sqlite3 shell: `PRAGMA integrity_check`, and queries on the content.
+
+fn expectIntact(path: StringView) -> Result<void, TestFailure> {
+    let verdict = askSqlite(path, "PRAGMA integrity_check")?;
+    return Check.equalText("ok\n", verdict.view());
+}
+
+fn rowOf3(a: SqliteValue, b: SqliteValue, c: SqliteValue) -> Vector<SqliteValue> {
+    var row = Vector<SqliteValue>.create();
+    row.push(a)!;
+    row.push(b)!;
+    row.push(c)!;
+    return row;
+}
+
+fn numbered(prefix: StringView, n: i64) -> String {
+    var text = String.from(prefix)!;
+    text.appendNumber(n)!;
+    return text;
+}
+
+fn freshPath(path: StringView) {
+    let _ = File.remove(path);
+    var journal = String.from(path)!;
+    journal.append("-journal")!;
+    let _ = File.remove(journal.view());
+}
+
+@test
+fn writesTablesAndIndexesSqliteAccepts() -> Result<void, TestFailure> {
+    let path = "out/writer-basic.db";
+    freshPath(path);
+    var options = WriterOptions.defaults();
+    options.userVersion = 7;
+    options.applicationId = 0x1234;
+    var writer = DatabaseWriter.create(options)!;
+    let t = writer.addTable("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE, n INT, body TEXT)")!;
+    // Rows are added out of order, with mixed case that BINARY and NOCASE order differently.
+    var i: i64 = 5000;
+    while (i >= 1) {
+        var row = Vector<SqliteValue>.create();
+        row.push(SqliteValue.Integer(-1))!; // the rowid's alias: whatever is here, NULL is stored
+        row.push(SqliteValue.Text(numbered(if (i % 2 == 0) "Name" else "name", i)))!;
+        row.push(SqliteValue.Integer(i % 37))!;
+        if (i % 1000 == 0) {
+            var big = String.create();
+            for (k in 0..3000) {
+                big.append("overflow ")!;
+            }
+            row.push(SqliteValue.Text(big))!;
+        } else {
+            row.push(SqliteValue.Null)!;
+        }
+        writer.addRow(t, i, row)!;
+        i -= 1;
+    }
+    writer.addIndex("CREATE INDEX t_n ON t(n DESC, name)", null)!;
+    writer.addIndex("CREATE INDEX t_name_bin ON t(name COLLATE BINARY)", null)!;
+    writer.addView("v", "CREATE VIEW v AS SELECT id, name FROM t WHERE n = 0")!;
+    writer.addTrigger("tr", "t", "CREATE TRIGGER tr AFTER DELETE ON t BEGIN SELECT 1; END")!;
+    writer.writeToFile(path)!;
+
+    expectIntact(path)?;
+    Check.equalText("5000|12502500\n", askSqlite(path, "SELECT count(*), sum(id) FROM t")?.view())?;
+    Check.equalText("1234\n", askSqlite(path, "SELECT id FROM t WHERE name = 'NAME1234'")?.view())?;
+    Check.equalText("136\n", askSqlite(path, "SELECT count(*) FROM t INDEXED BY t_n WHERE n = 3")?.view())?;
+    Check.equalText("27000\n", askSqlite(path, "SELECT length(body) FROM t WHERE id = 3000")?.view())?;
+    Check.equalText("135\n", askSqlite(path, "SELECT count(*) FROM v")?.view())?;
+    Check.equalText("7|4660\n", askSqlite(path, "SELECT * FROM pragma_user_version, pragma_application_id")?.view())?;
+    Check.equalText("table|t\nindex|sqlite_autoindex_t_1\nindex|t_n\nindex|t_name_bin\nview|v\ntrigger|tr\n", askSqlite(path, "SELECT type, name FROM sqlite_schema")?.view())?;
+    // SQLite can write to it, and it is still sound.
+    Check.equalText("", askSqlite(path, "INSERT INTO t(name, n) VALUES ('fresh', 1); DELETE FROM t WHERE id < 100; UPDATE t SET n = n + 1")?.view())?;
+    expectIntact(path)?;
+
+    // And this engine reads back what it wrote.
+    freshPath(path);
+    writer.writeToFile(path)!;
+    var reader = DatabaseReader.open(path)!;
+    match (reader.seekRow("t", 4321)!) {
+        Some(row) => {
+            Check.isTrue(row.columns[0].isNull(), "the rowid's alias is stored as NULL")?;
+            match (borrow row.columns[1]) {
+                SqliteValue.Text(name) => { Check.equalText("name4321", name.view())?; }
+                _ => { return Check.fail("expected text"); }
+            }
+        }
+        null => { return Check.fail("row 4321 was written"); }
+    }
+    return Ok();
+}
+
+@test
+fn writesKeysInTheirOwnOrder() -> Result<void, TestFailure> {
+    // The C# engine sorted these automatic indexes BINARY and ascending.
+    let path = "out/writer-keys.db";
+    freshPath(path);
+    var writer = DatabaseWriter.create(WriterOptions.defaults())!;
+    let t = writer.addTable("CREATE TABLE k(a TEXT COLLATE NOCASE, b INT, c TEXT, PRIMARY KEY (a, b DESC), UNIQUE (c COLLATE RTRIM))")!;
+    for (i in 0i64..2000) {
+        let a = SqliteValue.Text(numbered(if (i % 3 == 0) "KEY" else "key", i / 10));
+        let c = SqliteValue.Text(numbered("c", i));
+        writer.addRow(t, i + 1, rowOf3(a, SqliteValue.Integer(i % 10), c))!;
+    }
+    writer.writeToFile(path)!;
+    expectIntact(path)?;
+    Check.equalText("2000\n", askSqlite(path, "SELECT count(*) FROM k")?.view())?;
+    Check.equalText("10\n", askSqlite(path, "SELECT count(*) FROM k WHERE a = 'Key7'")?.view())?;
+    Check.equalText("9\n", askSqlite(path, "SELECT b FROM k WHERE a = 'key7' ORDER BY a, b DESC LIMIT 1")?.view())?;
+    return Ok();
+}
+
+@test
+fn writesWithoutRowidTables() -> Result<void, TestFailure> {
+    let path = "out/writer-without-rowid.db";
+    freshPath(path);
+    var writer = DatabaseWriter.create(WriterOptions.defaults())!;
+    let t = writer.addTable("CREATE TABLE w(a INT, b TEXT, c INT, PRIMARY KEY (b, a DESC)) WITHOUT ROWID")!;
+    for (i in 0i64..3000) {
+        writer.addRow(t, 0, rowOf3(SqliteValue.Integer(i), SqliteValue.Text(numbered("group", i % 50)), SqliteValue.Integer(i * 2)))!;
+    }
+    // The index has `a` already, so its entries end with `b` alone; the C# engine appended `b` and `a` again.
+    writer.addIndex("CREATE INDEX w_ca ON w(c, a)", null)!;
+    writer.addIndex("CREATE UNIQUE INDEX w_a ON w(a)", null)!;
+    writer.writeToFile(path)!;
+    expectIntact(path)?;
+    Check.equalText("3000|4498500\n", askSqlite(path, "SELECT count(*), sum(a) FROM w")?.view())?;
+    Check.equalText("2950|5900\n", askSqlite(path, "SELECT a, c FROM w WHERE b = 'group0' ORDER BY b, a DESC LIMIT 1")?.view())?;
+    Check.equalText("group7\n", askSqlite(path, "SELECT b FROM w INDEXED BY w_ca WHERE c = 114")?.view())?;
+    Check.equalText("group7\n", askSqlite(path, "SELECT b FROM w INDEXED BY w_a WHERE a = 57")?.view())?;
+    return Ok();
+}
+
+@test
+fn generatedColumnsAndSuppliedEntries() -> Result<void, TestFailure> {
+    let path = "out/writer-generated.db";
+    freshPath(path);
+    var writer = DatabaseWriter.create(WriterOptions.defaults())!;
+    let t = writer.addTable("CREATE TABLE g(id INTEGER PRIMARY KEY, n INT, twice INT GENERATED ALWAYS AS (n * 2) VIRTUAL, kept INT AS (n + 1) STORED)")!;
+    var entries = Vector<Vector<SqliteValue>>.create();
+    for (i in 1i64..501) {
+        var row = Vector<SqliteValue>.create();
+        row.push(SqliteValue.Null)!;
+        row.push(SqliteValue.Integer(i))!;
+        row.push(SqliteValue.Integer(i * 2))!; // VIRTUAL: computed by the caller, not stored
+        row.push(SqliteValue.Integer(i + 1))!;
+        writer.addRow(t, i, row)!;
+        if (i % 2 == 0) {
+            var entry = Vector<SqliteValue>.create();
+            entry.push(SqliteValue.Integer(i * i))!;
+            entry.push(SqliteValue.Integer(i))!;
+            entries.push(entry)!;
+        }
+    }
+    writer.addIndex("CREATE INDEX g_square ON g(n * n) WHERE n % 2 = 0", entries)!;
+    writer.writeToFile(path)!;
+    expectIntact(path)?;
+    Check.equalText("20|11\n", askSqlite(path, "SELECT twice, kept FROM g WHERE id = 10")?.view())?;
+    Check.equalText("10\n", askSqlite(path, "SELECT id FROM g WHERE n * n = 100 AND n % 2 = 0")?.view())?;
+    Check.isTrue(writer.addIndex("CREATE INDEX g_missing ON g(n + 1)", null) is Err(SqliteError.Unsupported(_)), "an expression index without entries is refused, not written empty")?;
+    return Ok();
+}
+
+@test
+fn schemaLargerThanOnePage() -> Result<void, TestFailure> {
+    let path = "out/writer-many-tables.db";
+    freshPath(path);
+    var writer = DatabaseWriter.create(WriterOptions.defaults())!;
+    for (i in 0i64..300) {
+        var sql = String.from("CREATE TABLE ")!;
+        sql.append(numbered("table_", i).view())!;
+        sql.append("(id INTEGER PRIMARY KEY, a_column_with_a_long_name TEXT, another_long_column_name INT)")!;
+        let t = writer.addTable(sql.view())!;
+        writer.addRow(t, 1, rowOf3(SqliteValue.Null, SqliteValue.Text(numbered("row of ", i)), SqliteValue.Integer(i)))!;
+    }
+    writer.writeToFile(path)!;
+    expectIntact(path)?;
+    Check.equalText("300\n", askSqlite(path, "SELECT count(*) FROM sqlite_schema")?.view())?;
+    Check.equalText("row of 299|299\n", askSqlite(path, "SELECT a_column_with_a_long_name, another_long_column_name FROM table_299")?.view())?;
+    let reader = DatabaseReader.open(path)!;
+    Check.equalU64(300, reader.schema().length as u64)?;
+    return Ok();
+}
+
+fn pageSizeRoundTrip(path: StringView, pageSize: usize) -> Result<void, TestFailure> {
+    freshPath(path);
+    var options = WriterOptions.defaults();
+    options.pageSize = pageSize;
+    var writer = DatabaseWriter.create(options)!;
+    let t = writer.addTable("CREATE TABLE p(id INTEGER PRIMARY KEY, word TEXT, n INT)")!;
+    for (i in 1i64..4001) {
+        var word = numbered("a word that makes the cell a little longer than a few bytes, number ", i);
+        if (i % 500 == 0) {
+            for (k in 0..400) {
+                word.append(" and more")!;
+            }
+        }
+        writer.addRow(t, i, rowOf3(SqliteValue.Null, SqliteValue.Text(word), SqliteValue.Integer(i % 100)))!;
+    }
+    writer.addIndex("CREATE INDEX p_word ON p(word)", null)!;
+    writer.addIndex("CREATE INDEX p_n ON p(n)", null)!;
+    writer.writeToFile(path)!;
+    expectIntact(path)?;
+    var expected = String.create();
+    expected.appendNumber(pageSize)!;
+    expected.append("|4000|40\n")!;
+    Check.equalText(expected.view(), askSqlite(path, "SELECT (SELECT * FROM pragma_page_size), count(*), (SELECT count(*) FROM p WHERE n = 7) FROM p")?.view())?;
+    return Ok();
+}
+
+@test
+fn smallestPages() -> Result<void, TestFailure> => pageSizeRoundTrip("out/writer-512.db", 512);
+
+@test
+fn largestPages() -> Result<void, TestFailure> => pageSizeRoundTrip("out/writer-65536.db", 65536);
+
+@test
+fn emptyDatabaseAndEmptyTables() -> Result<void, TestFailure> {
+    let path = "out/writer-empty.db";
+    freshPath(path);
+    var writer = DatabaseWriter.create(WriterOptions.defaults())!;
+    writer.writeToFile(path)!;
+    expectIntact(path)?;
+    Check.equalText("0\n", askSqlite(path, "SELECT count(*) FROM sqlite_schema")?.view())?;
+    let _ = writer.addTable("CREATE TABLE e(a UNIQUE, b)")!;
+    writer.addIndex("CREATE INDEX e_b ON e(b)", null)!;
+    writer.writeToFile(path)!;
+    expectIntact(path)?;
+    Check.equalText("0\n", askSqlite(path, "SELECT count(*) FROM e")?.view())?;
+    return Ok();
+}
+
+@test
+fn refusesWhatWouldDamageTheFile() -> Result<void, TestFailure> {
+    let path = "out/writer-refused.db";
+    freshPath(path);
+    var duplicateRowids = DatabaseWriter.create(WriterOptions.defaults())!;
+    let a = duplicateRowids.addTable("CREATE TABLE a(x, y, z)")!;
+    duplicateRowids.addRow(a, 1, rowOf3(SqliteValue.Null, SqliteValue.Null, SqliteValue.Null))!;
+    duplicateRowids.addRow(a, 1, rowOf3(SqliteValue.Null, SqliteValue.Null, SqliteValue.Null))!;
+    Check.isTrue(duplicateRowids.writeToFile(path) is Err(SqliteError.Constraint(_)), "two rows with one rowid")?;
+
+    var duplicateKeys = DatabaseWriter.create(WriterOptions.defaults())!;
+    let b = duplicateKeys.addTable("CREATE TABLE b(x TEXT UNIQUE COLLATE NOCASE, y, z)")!;
+    duplicateKeys.addRow(b, 1, rowOf3(SqliteValue.text("same")!, SqliteValue.Null, SqliteValue.Null))!;
+    duplicateKeys.addRow(b, 2, rowOf3(SqliteValue.text("SAME")!, SqliteValue.Null, SqliteValue.Null))!;
+    Check.isTrue(duplicateKeys.writeToFile(path) is Err(SqliteError.Constraint(_)), "two rows equal under the key's collation")?;
+
+    // NULLs do not collide in a UNIQUE index.
+    var nulls = DatabaseWriter.create(WriterOptions.defaults())!;
+    let c = nulls.addTable("CREATE TABLE c(x UNIQUE, y, z)")!;
+    nulls.addRow(c, 1, rowOf3(SqliteValue.Null, SqliteValue.Null, SqliteValue.Null))!;
+    nulls.addRow(c, 2, rowOf3(SqliteValue.Null, SqliteValue.Null, SqliteValue.Null))!;
+    nulls.writeToFile(path)!;
+    expectIntact(path)?;
+
+    // A journal beside the file belongs to a transaction on the old one.
+    var journal = File.create("out/writer-refused.db-journal")!;
+    journal.write("not empty".bytes())!;
+    Check.isTrue(nulls.writeToFile(path) is Err(SqliteError.Unsupported(_)), "a file with a journal is not replaced")?;
+    let _ = File.remove("out/writer-refused.db-journal");
+    Check.isTrue(DatabaseWriter.create(WriterOptions { pageSize: 1000, changeCounter: 1, schemaCookie: 1, userVersion: 0, applicationId: 0 }).isErr(), "a page size that is not a power of two")?;
+    return Ok();
+}

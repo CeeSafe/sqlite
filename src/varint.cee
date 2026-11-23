@@ -1,0 +1,84 @@
+// SQLite's varint: a big-endian variable-length integer of 1 to 9 bytes. In the first 8 bytes the high bit says
+// that another byte follows and the low 7 bits are data; a 9th byte carries 8 bits of data, for 64 bits in all.
+// https://www.sqlite.org/fileformat2.html#varint
+
+/// A decoded varint and the number of bytes it took.
+struct VarintRead {
+    value: i64;
+    length: usize;
+}
+
+/// The largest value 8 bytes hold (56 bits); above it the 9-byte form is used.
+const VARINT_NINE_BYTE_THRESHOLD: u64 = 0x00FF_FFFF_FFFF_FFFF;
+
+struct Varint {
+    /// Reads the varint at `offset`. A varint that runs past the end of `buf` is `Corrupt`.
+    fn read(buf: Slice<u8>, offset: usize) -> Result<VarintRead, SqliteError> {
+        var result: u64 = 0;
+        for (i in 0..9) {
+            if (offset + i >= buf.length) {
+                return Err(corrupt("varint runs past the end of its buffer"));
+            }
+            let c = buf[offset + i];
+            if (i == 8) {
+                result = (result << 8) | (c as u64);
+                return Ok(VarintRead { value: truncate<i64>(result), length: 9 });
+            }
+            result = (result << 7) | ((c & 0x7F) as u64);
+            if ((c & 0x80) == 0) {
+                return Ok(VarintRead { value: truncate<i64>(result), length: i + 1 });
+            }
+        }
+        return Ok(VarintRead { value: truncate<i64>(result), length: 9 });
+    }
+
+    /// The number of bytes `value` takes as a varint (1 to 9).
+    fn length(value: i64) -> usize {
+        var v = truncate<u64>(value);
+        if (v > VARINT_NINE_BYTE_THRESHOLD) {
+            return 9;
+        }
+        var n: usize = 1;
+        v = v >> 7;
+        while (v != 0) {
+            n += 1;
+            v = v >> 7;
+        }
+        return n;
+    }
+
+    /// Writes `value` at `offset`, and returns the number of bytes written.
+    fn write(value: i64, buf: SliceMut<u8>, offset: usize) -> usize {
+        var v = truncate<u64>(value);
+        if (v > VARINT_NINE_BYTE_THRESHOLD) {
+            buf[offset + 8] = truncate<u8>(v & 0xFF);
+            v = v >> 8;
+            var i: usize = 8;
+            while (i > 0) {
+                i -= 1;
+                buf[offset + i] = truncate<u8>(v & 0x7F) | 0x80;
+                v = v >> 7;
+            }
+            return 9;
+        }
+        let count = Varint.length(value);
+        var at = count;
+        while (at > 0) {
+            at -= 1;
+            var b = truncate<u8>(v & 0x7F);
+            if (at < count - 1) {
+                b = b | 0x80;
+            }
+            buf[offset + at] = b;
+            v = v >> 7;
+        }
+        return count;
+    }
+
+    /// Appends `value` to `out`.
+    fn append(value: i64, out: borrow mut Vector<u8>) -> Result<void, AllocError> {
+        var scratch = [0u8; 9];
+        let n = Varint.write(value, mut scratch[..], 0);
+        return out.extend(scratch[0..n]);
+    }
+}

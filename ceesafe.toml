@@ -1,0 +1,8 @@
+[package]
+name = "sqlite"
+version = "0.1.0"
+kind = "library"
+ceesafec = ">=0.93.7"
+tests = ["tests"]
+
+[dependencies]

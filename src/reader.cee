@@ -1,0 +1,147 @@
+// A read-only view of a database file: its schema, and its tables by name.
+
+/// One row of `sqlite_schema`.
+struct SchemaEntry {
+    /// "table", "index", "view" or "trigger".
+    kind: String;
+    name: String;
+    tableName: String;
+    /// The root page of a table's or an index's b-tree; 0 for a view, a trigger and a virtual table.
+    rootPage: u32;
+    /// The statement that made the object; `null` for an automatic index.
+    sql: String?;
+}
+
+/// ASCII letters in lower case, which is how SQLite compares names.
+fn asciiLower(text: StringView) -> Result<String, AllocError> {
+    var out = Vector<u8>.withCapacity(text.length)?;
+    for (b in text.bytes()) {
+        out.push(if (b >= 'A' && b <= 'Z') b + 32 else b)?;
+    }
+    // Only ASCII bytes changed, so the text is still UTF-8.
+    return String.from(StringView.fromUtf8(out.view())!);
+}
+
+struct DatabaseReader {
+    pager: Pager;
+    // The reader is a snapshot, so the schema is read once.
+    private entries: Vector<SchemaEntry>;
+    private tablesByName: HashMap<String, usize>;
+    private indexesByName: HashMap<String, usize>;
+
+    /// Opens the database file at `path` and reads its schema.
+    fn open(path: StringView) -> Result<DatabaseReader, SqliteError> {
+        var pager = Pager.open(path)?;
+        var entries = Vector<SchemaEntry>.create();
+        var tables = HashMap<String, usize>.create();
+        var indexes = HashMap<String, usize>.create();
+        var cursor = TableCursor.scan(1);
+        while (cursor.next(mut pager)? is Some(row)) {
+            // sqlite_schema's columns: type, name, tbl_name, rootpage, sql.
+            var columns = row.columns;
+            if (columns.length < 5) {
+                return Err(corrupt("a row of sqlite_schema has too few columns"));
+            }
+            let sql: String? = match (columns.pop()!) {
+                SqliteValue.Text(s) => s,
+                _ => null,
+            };
+            let rootPage: u32 = match (columns.pop()!) {
+                SqliteValue.Integer(n) => checkedTruncate<u32>(n) ?? {
+                    return Err(corrupt("a root page number in sqlite_schema is out of range"));
+                },
+                _ => 0,
+            };
+            let tableName = textOrEmpty(columns.pop()!);
+            let name = textOrEmpty(columns.pop()!);
+            let kind = textOrEmpty(columns.pop()!);
+            let key = asciiLower(name.view())?;
+            let at = entries.length;
+            if (kind.view() == "table" && !tables.contains(borrow key)) {
+                let _ = tables.put(key, at)?;
+            } else if (kind.view() == "index" && !indexes.contains(borrow key)) {
+                let _ = indexes.put(key, at)?;
+            }
+            entries.push(SchemaEntry { kind: kind, name: name, tableName: tableName, rootPage: rootPage, sql: sql })?;
+        }
+        return Ok(DatabaseReader { pager: pager, entries: entries, tablesByName: tables, indexesByName: indexes });
+    }
+
+    fn pageSize(borrow this) -> usize => this.pager.pageSize();
+
+    fn textEncoding(borrow this) -> TextEncoding => this.pager.textEncoding();
+
+    /// Every row of `sqlite_schema`, in the file's order.
+    fn schema(borrow this) -> Slice<SchemaEntry> => this.entries.view();
+
+    /// The table named `name` (ASCII case is ignored), or `null`.
+    fn findTable(borrow this, name: StringView) -> Result<borrow SchemaEntry?, AllocError> {
+        let key = asciiLower(name)?;
+        if (this.tablesByName.get(borrow key) is Some(at)) {
+            return Ok(borrow this.entries[*at]);
+        }
+        return Ok(null);
+    }
+
+    /// The index named `name` (ASCII case is ignored), or `null`.
+    fn findIndex(borrow this, name: StringView) -> Result<borrow SchemaEntry?, AllocError> {
+        let key = asciiLower(name)?;
+        if (this.indexesByName.get(borrow key) is Some(at)) {
+            return Ok(borrow this.entries[*at]);
+        }
+        return Ok(null);
+    }
+
+    private fn tableRoot(borrow this, name: StringView) -> Result<u32, SqliteError> {
+        let table = this.findTable(name)? ?? {
+            return Err(sqlError("no such table"));
+        };
+        if (table.rootPage == 0) {
+            return Err(sqlError("the table has no b-tree"));
+        }
+        return Ok(table.rootPage);
+    }
+
+    /// A cursor over every row of table `name`, in rowid order. Read it with `nextRow`.
+    fn scanTable(borrow this, name: StringView) -> Result<TableCursor, SqliteError> =>
+        Ok(TableCursor.scan(this.tableRoot(name)?));
+
+    /// A cursor over the rows of table `name` whose rowid is from `min` to `max`.
+    fn scanRange(borrow this, name: StringView, min: i64, max: i64) -> Result<TableCursor, SqliteError> =>
+        Ok(TableCursor.range(this.tableRoot(name)?, min, max));
+
+    /// The cursor's next row, or `null` after the last.
+    fn nextRow(borrow mut this, cursor: borrow mut TableCursor) -> Result<TableRow?, SqliteError> =>
+        cursor.next(mut this.pager);
+
+    /// The row of table `name` with `rowId`, or `null` when the table has none (or does not exist).
+    fn seekRow(borrow mut this, name: StringView, rowId: i64) -> Result<TableRow?, SqliteError> {
+        let root = match (this.findTable(name)?) {
+            Some(table) => table.rootPage,
+            null => 0,
+        };
+        if (root == 0) {
+            return Ok(null);
+        }
+        return seekTableRow(mut this.pager, root, rowId);
+    }
+
+    /// Whether table `name` is stored as an index b-tree (a WITHOUT ROWID table).
+    fn tableIsIndexBTree(borrow mut this, name: StringView) -> Result<bool, SqliteError> {
+        let root = match (this.findTable(name)?) {
+            Some(table) => table.rootPage,
+            null => 0,
+        };
+        if (root == 0) {
+            return Ok(false);
+        }
+        let page = this.pager.readPage(root)?;
+        let kind = BTreePageHeader.parse(page.view(), root)?.kind;
+        return Ok(kind == PAGE_INTERIOR_INDEX || kind == PAGE_LEAF_INDEX);
+    }
+}
+
+fn textOrEmpty(value: SqliteValue) -> String => match (value) {
+    SqliteValue.Text(s) => s,
+    _ => String.create(),
+};

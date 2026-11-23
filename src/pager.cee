@@ -1,0 +1,138 @@
+// The read-only pager: fixed-size pages by 1-based page number, with a bounded cache. Every structure above it
+// (b-trees, freelist, schema) is expressed in pages.
+
+/// One page's bytes, shared between the cache and whoever reads it.
+struct Page {
+    bytes: Arc<Vector<u8>>;
+
+    fn view(borrow this) -> Slice<u8> => this.bytes.get().view();
+
+    fn clone(borrow this) -> Page => Page { bytes: this.bytes.clone() };
+}
+
+/// The default number of pages the cache keeps.
+const PAGER_DEFAULT_CACHE_PAGES: usize = 1000;
+
+struct Pager {
+    private file: File;
+    header: DatabaseHeader;
+    /// The number of pages in the database.
+    pageCount: u32;
+    // Two generations approximate least-recently-used at constant cost: a hit in `older` moves the page to
+    // `recent`; when `recent` holds half the capacity, `older` is dropped and `recent` takes its place.
+    private recent: HashMap<u32, Page>;
+    private older: HashMap<u32, Page>;
+    private generationSize: usize;
+
+    /// Opens the database file at `path` for reading.
+    fn open(path: StringView) -> Result<Pager, SqliteError> => Pager.openWithCache(path, PAGER_DEFAULT_CACHE_PAGES);
+
+    /// Opens the database file at `path`, keeping at most about `cachePages` pages in memory.
+    fn openWithCache(path: StringView, cachePages: usize) -> Result<Pager, SqliteError> {
+        var file = File.open(path)?;
+        var headerBytes = [0u8; 100];
+        if (!readFully(mut file, mut headerBytes[..], 0)?) {
+            return Err(notADatabase("file is too small to be a SQLite database"));
+        }
+        let header = DatabaseHeader.parse(headerBytes[..])?;
+        // Until the WAL reader is ported, a database with frames waiting in its write-ahead log is refused:
+        // reading the main file alone would silently return rows as they were before those commits.
+        var walPath = String.from(path)?;
+        walPath.append("-wal")?;
+        if (File.open(walPath.view()) is Ok(wal) && wal.length()? > 0) {
+            return Err(unsupported("the database has a write-ahead log, which this build cannot read yet"));
+        }
+        let fileLength = file.length()?;
+        let pages = fileLength / (header.pageSize as u64);
+        let pageCount = checkedTruncate<u32>(pages) ?? {
+            return Err(corrupt("database file has more pages than the format allows"));
+        };
+        return Ok(Pager {
+            file: file,
+            header: header,
+            pageCount: pageCount,
+            recent: HashMap<u32, Page>.create(),
+            older: HashMap<u32, Page>.create(),
+            generationSize: cachePages / 2,
+        });
+    }
+
+    fn pageSize(borrow this) -> usize => this.header.pageSize;
+
+    fn usableSize(borrow this) -> usize => this.header.usableSize();
+
+    fn textEncoding(borrow this) -> TextEncoding => this.header.textEncoding;
+
+    /// The page numbered `pageNumber` (from 1). A number outside the database is `Corrupt`: page numbers come
+    /// from the file's own pointers.
+    fn readPage(borrow mut this, pageNumber: u32) -> Result<Page, SqliteError> {
+        if (pageNumber < 1 || pageNumber > this.pageCount) {
+            return Err(corrupt("a page pointer leads outside the database file"));
+        }
+        if (this.recent.get(borrow pageNumber) is Some(hit)) {
+            return Ok(hit.clone());
+        }
+        if (this.older.remove(borrow pageNumber) is Some(promoted)) {
+            let copy = promoted.clone();
+            this.admit(pageNumber, promoted)?;
+            return Ok(copy);
+        }
+        var bytes = Vector<u8>.create();
+        bytes.resize(this.header.pageSize, 0)?;
+        let offset = ((pageNumber - 1) as u64) * (this.header.pageSize as u64);
+        if (!readFully(mut this.file, bytes.viewMut(), offset)?) {
+            return Err(corrupt("database file ends inside a page"));
+        }
+        let page = Page { bytes: Arc<Vector<u8>>.create(bytes)? };
+        let copy = page.clone();
+        this.admit(pageNumber, page)?;
+        return Ok(copy);
+    }
+
+    private fn admit(borrow mut this, pageNumber: u32, page: Page) -> Result<void, AllocError> {
+        if (this.generationSize == 0) {
+            return Ok();
+        }
+        if (this.recent.length() >= this.generationSize) {
+            this.older = replace(mut this.recent, HashMap<u32, Page>.create());
+        }
+        let _ = this.recent.put(pageNumber, page)?;
+        return Ok();
+    }
+}
+
+/// Fills `buffer` from `offset`. False when the file ends first.
+fn readFully(file: borrow mut File, buffer: SliceMut<u8>, offset: u64) -> Result<bool, IoError> {
+    var done: usize = 0;
+    while (done < buffer.length) {
+        let n = file.readAt(mut buffer[done..], offset + (done as u64))?;
+        if (n == 0) {
+            return Ok(false);
+        }
+        done += n;
+    }
+    return Ok(true);
+}
+
+/// The number of pages on the freelist, counted by walking its trunk pages.
+fn countFreePages(pager: borrow mut Pager) -> Result<u64, SqliteError> {
+    var trunk = pager.header.firstFreelistTrunkPage;
+    var total: u64 = 0;
+    var trunks: u32 = 0;
+    while (trunk != 0) {
+        // A chain longer than the file has a cycle in it.
+        trunks += 1;
+        if (trunks > pager.pageCount) {
+            return Err(corrupt("the freelist's trunk pages form a cycle"));
+        }
+        let page = pager.readPage(trunk)?;
+        let bytes = page.view();
+        let leafCount = bytes.readBE<u32>(4) as usize;
+        if (leafCount > (pager.usableSize() - 8) / 4) {
+            return Err(corrupt("a freelist trunk page claims more leaves than fit in it"));
+        }
+        total += 1 + (leafCount as u64);
+        trunk = bytes.readBE<u32>(0);
+    }
+    return Ok(total);
+}

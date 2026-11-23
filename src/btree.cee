@@ -1,0 +1,287 @@
+// Reading table b-trees: rows keyed by rowid. An interior page (type 5) holds child pointers and separator keys;
+// a leaf page (type 13) holds the rows. https://www.sqlite.org/fileformat2.html#b_tree_pages
+//
+// The C# engine walks the tree with recursive iterators and trusts every offset in the file. Here the walk is a
+// cursor with an explicit stack, and every offset, length and pointer is checked, so a damaged file is `Corrupt`
+// instead of a crash, a hang or a row of zeros.
+
+const PAGE_INTERIOR_INDEX: u8 = 2;
+const PAGE_INTERIOR_TABLE: u8 = 5;
+const PAGE_LEAF_INDEX: u8 = 10;
+const PAGE_LEAF_TABLE: u8 = 13;
+
+/// A b-tree deeper than this has a cycle: a tree of 2^32 pages with the smallest fan-out is far shallower.
+const BTREE_MAX_DEPTH: usize = 40;
+
+/// A decoded b-tree page header.
+struct BTreePageHeader {
+    kind: u8;
+    cellCount: usize;
+    /// Where the cell pointer array starts.
+    cellPointers: usize;
+    /// An interior page's right-most child; 0 on a leaf.
+    rightMost: u32;
+
+    fn isLeaf(borrow this) -> bool => this.kind == PAGE_LEAF_TABLE || this.kind == PAGE_LEAF_INDEX;
+
+    fn parse(page: Slice<u8>, pageNumber: u32) -> Result<BTreePageHeader, SqliteError> {
+        // On page 1 the b-tree header follows the database header.
+        let start: usize = if (pageNumber == 1) DATABASE_HEADER_SIZE else 0;
+        let kind = page[start];
+        let leaf = kind == PAGE_LEAF_TABLE || kind == PAGE_LEAF_INDEX;
+        if (!leaf && kind != PAGE_INTERIOR_TABLE && kind != PAGE_INTERIOR_INDEX) {
+            return Err(corrupt("a page in a b-tree is not a b-tree page"));
+        }
+        let cellCount = page.readBE<u16>(start + 3) as usize;
+        let cellPointers = start + (if (leaf) 8 else 12);
+        if (cellPointers + cellCount * 2 > page.length) {
+            return Err(corrupt("a b-tree page claims more cells than fit in it"));
+        }
+        return Ok(BTreePageHeader {
+            kind: kind,
+            cellCount: cellCount,
+            cellPointers: cellPointers,
+            rightMost: if (leaf) 0 else page.readBE<u32>(start + 8),
+        });
+    }
+
+    /// The offset of cell `index` in the page.
+    fn cellOffset(borrow this, page: Slice<u8>, index: usize) -> Result<usize, SqliteError> {
+        let offset = page.readBE<u16>(this.cellPointers + index * 2) as usize;
+        if (offset < this.cellPointers || offset + 4 > page.length) {
+            return Err(corrupt("a b-tree cell pointer leads outside its page"));
+        }
+        return Ok(offset);
+    }
+}
+
+/// One row of a table.
+struct TableRow {
+    rowId: i64;
+    columns: Vector<SqliteValue>;
+}
+
+/// The start of a table leaf cell: its payload's length, its rowid, and where the payload starts.
+struct TableLeafCell {
+    payloadLength: i64;
+    rowId: i64;
+    payloadOffset: usize;
+
+    fn parse(page: Slice<u8>, offset: usize) -> Result<TableLeafCell, SqliteError> {
+        let length = Varint.read(page, offset)?;
+        let rowId = Varint.read(page, offset + length.length)?;
+        return Ok(TableLeafCell {
+            payloadLength: length.value,
+            rowId: rowId.value,
+            payloadOffset: offset + length.length + rowId.length,
+        });
+    }
+}
+
+/// Where a cell's payload lies: `local` bytes in the page, the rest on overflow pages.
+struct PayloadShape {
+    total: usize;
+    local: usize;
+
+    /// The shape of a table leaf cell's payload of `payloadLength` bytes.
+    fn ofTableLeaf(pager: borrow Pager, payloadLength: i64) -> Result<PayloadShape, SqliteError> {
+        let usable = pager.usableSize();
+        return PayloadShape.of(pager, payloadLength, usable - 35);
+    }
+
+    /// The shape of an index cell's payload of `payloadLength` bytes.
+    fn ofIndex(pager: borrow Pager, payloadLength: i64) -> Result<PayloadShape, SqliteError> {
+        let usable = pager.usableSize();
+        return PayloadShape.of(pager, payloadLength, (usable - 12) * 64 / 255 - 23);
+    }
+
+    private fn of(pager: borrow Pager, payloadLength: i64, maxLocal: usize) -> Result<PayloadShape, SqliteError> {
+        let usable = pager.usableSize();
+        let total = checkedTruncate<usize>(payloadLength) ?? {
+            return Err(corrupt("a cell's payload length is negative"));
+        };
+        // No payload is larger than the database that holds it.
+        if ((total as u64) > (pager.pageCount as u64) * (usable as u64)) {
+            return Err(corrupt("a cell's payload is larger than the database"));
+        }
+        if (total <= maxLocal) {
+            return Ok(PayloadShape { total: total, local: total });
+        }
+        let minLocal = (usable - 12) * 32 / 255 - 23;
+        let k = minLocal + (total - minLocal) % (usable - 4);
+        return Ok(PayloadShape { total: total, local: if (k <= maxLocal) k else minLocal });
+    }
+
+    fn isLocal(borrow this) -> bool => this.local == this.total;
+}
+
+/// The whole payload of a cell that spills to overflow pages, starting at `offset` in `page`.
+fn readOverflowPayload(
+    pager: borrow mut Pager,
+    page: Slice<u8>,
+    offset: usize,
+    shape: PayloadShape,
+) -> Result<Vector<u8>, SqliteError> {
+    if (offset + shape.local + 4 > page.length) {
+        return Err(corrupt("a cell runs past the end of its page"));
+    }
+    var result = Vector<u8>.withCapacity(shape.total)?;
+    result.extend(page[offset..offset + shape.local])?;
+    let chunkSize = pager.usableSize() - 4;
+    var next = page.readBE<u32>(offset + shape.local);
+    while (result.length < shape.total) {
+        // The chain must hold every byte the cell promised; `total` bounds its length, so a cycle ends here too.
+        if (next == 0) {
+            return Err(corrupt("an overflow chain ends before its payload does"));
+        }
+        let overflow = pager.readPage(next)?;
+        let bytes = overflow.view();
+        let chunk = chunkSize.min(shape.total - result.length);
+        result.extend(bytes[4..4 + chunk])?;
+        next = bytes.readBE<u32>(0);
+    }
+    return Ok(result);
+}
+
+/// The row in the table leaf cell at `offset`.
+fn readTableLeafRow(
+    pager: borrow mut Pager,
+    page: Slice<u8>,
+    offset: usize,
+    wanted: Slice<bool>,
+) -> Result<TableRow, SqliteError> {
+    let cell = TableLeafCell.parse(page, offset)?;
+    let shape = PayloadShape.ofTableLeaf(pager, cell.payloadLength)?;
+    let encoding = pager.textEncoding();
+    if (shape.isLocal()) {
+        if (cell.payloadOffset + shape.total > page.length) {
+            return Err(corrupt("a cell runs past the end of its page"));
+        }
+        let payload = page[cell.payloadOffset..cell.payloadOffset + shape.total];
+        return Ok(TableRow { rowId: cell.rowId, columns: Record.decodeMasked(payload, encoding, wanted)? });
+    }
+    let payload = readOverflowPayload(pager, page, cell.payloadOffset, shape)?;
+    return Ok(TableRow { rowId: cell.rowId, columns: Record.decodeMasked(payload.view(), encoding, wanted)? });
+}
+
+/// A page on the cursor's path, and the next cell (or, on an interior page, child) to visit in it.
+struct CursorFrame {
+    page: Page;
+    header: BTreePageHeader;
+    /// On an interior page, `cellCount` means the right-most child.
+    index: usize;
+}
+
+/// Walks a table b-tree's rows in rowid order, between two rowids (both included).
+struct TableCursor {
+    private root: u32;
+    private min: i64;
+    private max: i64;
+    private wanted: Vector<bool>;
+    private stack: Vector<CursorFrame>;
+    private started: bool;
+
+    /// A cursor over every row of the table rooted at `rootPage`.
+    fn scan(rootPage: u32) -> TableCursor => TableCursor.range(rootPage, -9223372036854775808, 9223372036854775807);
+
+    /// A cursor over the rows whose rowid is from `min` to `max`.
+    fn range(rootPage: u32, min: i64, max: i64) -> TableCursor => TableCursor {
+        root: rootPage,
+        min: min,
+        max: max,
+        wanted: Vector<bool>.create(),
+        stack: Vector<CursorFrame>.create(),
+        started: false,
+    };
+
+    /// Decodes only the columns whose slot in `wanted` is true; the others read as NULL.
+    fn withColumns(this, wanted: Slice<bool>) -> Result<TableCursor, AllocError> {
+        var me = this;
+        me.wanted.clear();
+        me.wanted.extend(wanted)?;
+        return Ok(me);
+    }
+
+    /// The next row, or `null` after the last.
+    fn next(borrow mut this, pager: borrow mut Pager) -> Result<TableRow?, SqliteError> {
+        if (!this.started) {
+            this.started = true;
+            if (this.min > this.max) {
+                return Ok(null);
+            }
+            this.push(pager, this.root)?;
+        }
+        loop {
+            if (this.stack.length == 0) {
+                return Ok(null);
+            }
+            let top = this.stack.length - 1;
+            if (this.stack[top].index >= this.stack[top].header.cellCount + (if (this.stack[top].header.isLeaf()) 0
+                else 1)) {
+                let _ = this.stack.pop();
+                continue;
+            }
+            let index = this.stack[top].index;
+            this.stack[top].index = index + 1;
+            if (this.stack[top].header.isLeaf()) {
+                let page = this.stack[top].page.clone();
+                let bytes = page.view();
+                let offset = this.stack[top].header.cellOffset(bytes, index)?;
+                let cell = TableLeafCell.parse(bytes, offset)?;
+                if (cell.rowId > this.max) {
+                    this.stack.clear();
+                    return Ok(null);
+                }
+                return Ok(readTableLeafRow(pager, bytes, offset, this.wanted.view())?);
+            }
+            var child = this.stack[top].header.rightMost;
+            if (index < this.stack[top].header.cellCount) {
+                let bytes = this.stack[top].page.view();
+                let offset = this.stack[top].header.cellOffset(bytes, index)?;
+                child = bytes.readBE<u32>(offset);
+                // The cell's key is the largest rowid under its child: past `max`, nothing after it is wanted.
+                if (Varint.read(bytes, offset + 4)?.value >= this.max) {
+                    this.stack[top].index = this.stack[top].header.cellCount + 1;
+                }
+            }
+            this.push(pager, child)?;
+        }
+    }
+
+    /// Enters `pageNumber`, positioned at the first cell that can hold a rowid of `min` or more.
+    private fn push(borrow mut this, pager: borrow mut Pager, pageNumber: u32) -> Result<void, SqliteError> {
+        if (this.stack.length >= BTREE_MAX_DEPTH) {
+            return Err(corrupt("a table b-tree's pages form a cycle"));
+        }
+        let page = pager.readPage(pageNumber)?;
+        let header = BTreePageHeader.parse(page.view(), pageNumber)?;
+        if (header.kind != PAGE_LEAF_TABLE && header.kind != PAGE_INTERIOR_TABLE) {
+            return Err(corrupt("a page in a table b-tree is not a table page"));
+        }
+        // Keys ascend within a page, so a binary search finds the first cell whose key is not below `min`.
+        var low: usize = 0;
+        var high = header.cellCount;
+        let bytes = page.view();
+        while (low < high) {
+            let middle = low + (high - low) / 2;
+            let offset = header.cellOffset(bytes, middle)?;
+            let key = if (header.isLeaf()) TableLeafCell.parse(bytes, offset)?.rowId else Varint.read(
+                bytes,
+                offset + 4,
+            )?.value;
+            if (key < this.min) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        this.stack.push(CursorFrame { page: page, header: header, index: low })?;
+        return Ok();
+    }
+}
+
+/// The row with `rowId` in the table rooted at `rootPage`, or `null` when there is none.
+fn seekTableRow(pager: borrow mut Pager, rootPage: u32, rowId: i64) -> Result<TableRow?, SqliteError> {
+    var cursor = TableCursor.range(rootPage, rowId, rowId);
+    return cursor.next(pager);
+}

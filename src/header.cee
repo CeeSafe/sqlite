@@ -1,0 +1,71 @@
+// The 100-byte database header at the start of page 1. https://www.sqlite.org/fileformat2.html#the_database_header
+
+/// The size of the database header, which page 1's b-tree header follows.
+const DATABASE_HEADER_SIZE: usize = 100;
+
+const DATABASE_MAGIC: Slice<u8> = "SQLite format 3\u{0}".bytes();
+
+/// The header's fields the engine uses.
+struct DatabaseHeader {
+    /// Bytes per page: a power of two from 512 to 65536.
+    pageSize: usize;
+    /// Bytes at the end of every page that the b-trees leave alone.
+    reservedSpace: usize;
+    fileChangeCounter: u32;
+    /// The database's size in pages as the header records it; 0 when the header does not say.
+    headerPageCount: u32;
+    firstFreelistTrunkPage: u32;
+    freelistPageCount: u32;
+    schemaCookie: u32;
+    schemaFormat: u32;
+    textEncoding: TextEncoding;
+    userVersion: u32;
+    applicationId: u32;
+
+    /// The bytes of a page that b-trees use.
+    fn usableSize(borrow this) -> usize => this.pageSize - this.reservedSpace;
+
+    /// Reads the header from the first bytes of the file.
+    fn parse(header: Slice<u8>) -> Result<DatabaseHeader, SqliteError> {
+        if (header.length < DATABASE_HEADER_SIZE) {
+            return Err(notADatabase("file is too small to be a SQLite database"));
+        }
+        if (header[0..DATABASE_MAGIC.length] != DATABASE_MAGIC) {
+            return Err(notADatabase("file is not a SQLite database"));
+        }
+        // A stored page size of 1 means 65536.
+        let rawPageSize = header.readBE<u16>(16) as usize;
+        let pageSize: usize = if (rawPageSize == 1) 65536 else rawPageSize;
+        if (pageSize < 512 || (pageSize & (pageSize - 1)) != 0) {
+            return Err(corrupt("invalid page size in the database header"));
+        }
+        let reserved = header[20] as usize;
+        // SQLite requires at least 480 usable bytes a page.
+        if (pageSize - reserved < 480) {
+            return Err(corrupt("reserved space leaves too little of each page"));
+        }
+        let encoding = match (header.readBE<u32>(56)) {
+            0 | 1 => TextEncoding.Utf8,
+            2 => TextEncoding.Utf16LE,
+            3 => TextEncoding.Utf16BE,
+            _ => { return Err(corrupt("unknown text encoding in the database header")); }
+        };
+        // The in-header size is trustworthy only when the header was last written by a library that maintains it:
+        // the change counter (24) must equal the version-valid-for number (92).
+        let changeCounter = header.readBE<u32>(24);
+        let sizeIsValid = changeCounter == header.readBE<u32>(92);
+        return Ok(DatabaseHeader {
+            pageSize: pageSize,
+            reservedSpace: reserved,
+            fileChangeCounter: changeCounter,
+            headerPageCount: if (sizeIsValid) header.readBE<u32>(28) else 0,
+            firstFreelistTrunkPage: header.readBE<u32>(32),
+            freelistPageCount: header.readBE<u32>(36),
+            schemaCookie: header.readBE<u32>(40),
+            schemaFormat: header.readBE<u32>(44),
+            textEncoding: encoding,
+            userVersion: header.readBE<u32>(60),
+            applicationId: header.readBE<u32>(68),
+        });
+    }
+}

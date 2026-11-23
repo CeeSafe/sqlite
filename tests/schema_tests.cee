@@ -1,0 +1,183 @@
+// The schema catalog, read from databases the sqlite3 shell made.
+
+const CATALOG_SQL: StringView = """
+    CREATE TABLE parent(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE COLLATE NOCASE);
+    CREATE TABLE child(
+        id INTEGER,
+        "unique" VARCHAR ( 10 ) NOT NULL DEFAULT 'x',
+        amount DECIMAL(10, 2) DEFAULT -1 CHECK (amount >= -1),
+        flag BOOLEAN DEFAULT (1 + 1),
+        word TEXT DEFAULT abc,
+        stamp TEXT DEFAULT CURRENT_TIMESTAMP,
+        parent_id INT CONSTRAINT fk REFERENCES parent(id) ON DELETE CASCADE ON UPDATE SET NULL DEFERRABLE INITIALLY DEFERRED,
+        doubled INT GENERATED ALWAYS AS (id * 2) STORED,
+        blob_col,
+        ratio DOUBLE PRECISION,
+        CONSTRAINT pk PRIMARY KEY (id DESC),
+        UNIQUE ("unique", amount) ON CONFLICT IGNORE,
+        CHECK (id > 0),
+        FOREIGN KEY (parent_id, id) REFERENCES parent
+    );
+    CREATE TABLE keyed(a TEXT, b INT, c, PRIMARY KEY (b, a)) WITHOUT ROWID;
+    CREATE TABLE descending(id INTEGER PRIMARY KEY DESC, v);
+    CREATE INDEX child_word ON child(word, amount DESC);
+    CREATE INDEX parent_code ON parent(code);
+    CREATE INDEX parent_code_bin ON parent(code COLLATE BINARY);
+    CREATE UNIQUE INDEX child_partial ON child(flag) WHERE flag IS NOT NULL;
+    CREATE INDEX child_expr ON child(lower(word));
+    """;
+
+fn tableNamed(catalog: borrow SchemaCatalog, name: StringView) -> borrow(catalog) TableSchema {
+    match (catalog.table(name)!) {
+        Some(table) => { return table; }
+        null => { panic("the table is missing from the catalog"); }
+    }
+}
+
+fn exprTextOf(value: borrow SchemaExpr?) -> StringView => match (value) {
+    Some(e) => e.text.view(),
+    null => "<none>",
+};
+
+@test
+fn catalogReadsTables() -> Result<void, TestFailure> {
+    let path = "out/schema-tables.db";
+    makeDatabase(path, CATALOG_SQL)?;
+    let reader = DatabaseReader.open(path)!;
+    let catalog = SchemaCatalog.load(reader)!;
+    Check.equalU64(0, catalog.unsupported.length as u64)?;
+
+    let parent = tableNamed(catalog, "PARENT");
+    Check.isTrue(parent.rowidAlias == Some(0) && parent.autoincrement, "INTEGER PRIMARY KEY AUTOINCREMENT")?;
+    Check.isTrue(parent.columns[1].unique && parent.columns[1].collation == Collation.NoCase, "UNIQUE COLLATE NOCASE")?;
+    Check.isTrue(parent.columns[1].affinity == Affinity.Text, "TEXT affinity")?;
+
+    let child = tableNamed(catalog, "child");
+    Check.equalU64(10, child.columns.length as u64)?;
+    // A table-level PRIMARY KEY on an INTEGER column is the rowid, DESC or not.
+    Check.isTrue(child.rowidAlias == Some(0) && child.columns[0].isRowidAlias, "PRIMARY KEY (id DESC) is the rowid")?;
+    Check.equalText("unique", child.columns[1].name.view())?;
+    Check.equalText("VARCHAR(10)", child.columns[1].declaredType.view())?;
+    Check.isTrue(child.columns[1].notNull && !child.columns[1].unique, "a column named \"unique\" is not UNIQUE")?;
+    Check.equalText("'x'", exprTextOf(child.columns[1].defaultValue))?;
+    Check.equalText("DECIMAL(10, 2)", child.columns[2].declaredType.view())?;
+    Check.isTrue(child.columns[2].affinity == Affinity.Numeric, "DECIMAL is NUMERIC")?;
+    // The C# engine recorded this default as "-".
+    Check.equalText("- 1", exprTextOf(child.columns[2].defaultValue))?;
+    Check.equalText("(1 + 1)", exprTextOf(child.columns[3].defaultValue))?;
+    match (borrow child.columns[4].defaultValue) {
+        Some(value) => { Check.isTrue(value.expr is Expr.Literal(Literal { kind: LiteralKind.String, .. }), "DEFAULT abc is the string 'abc'")?; }
+        null => { return Check.fail("the column has a default"); }
+    }
+    match (borrow child.columns[5].defaultValue) {
+        Some(value) => { Check.isTrue(value.expr is Expr.Literal(Literal { kind: LiteralKind.CurrentTimestamp, .. }), "DEFAULT CURRENT_TIMESTAMP")?; }
+        null => { return Check.fail("the column has a default"); }
+    }
+    Check.isTrue(child.columns[6].affinity == Affinity.Integer, "INT is INTEGER")?;
+    Check.equalText("id * 2", exprTextOf(child.columns[7].generated))?;
+    Check.isTrue(child.columns[7].generatedStored, "STORED")?;
+    Check.isTrue(child.columns[8].affinity == Affinity.Blob && child.columns[8].declaredType.length == 0, "no type is BLOB")?;
+    Check.isTrue(child.columns[9].affinity == Affinity.Real, "DOUBLE PRECISION is REAL")?;
+
+    Check.equalU64(2, child.checks.length as u64)?;
+    Check.equalText("amount >= - 1", child.checks[0].text.view())?;
+    Check.equalText("id > 0", child.checks[1].text.view())?;
+    Check.equalU64(1, child.keys.length as u64)?;
+    Check.isTrue(!child.keys[0].primaryKey, "the rowid's PRIMARY KEY needs no index; UNIQUE does")?;
+    Check.equalText("unique", child.keys[0].columns[0].name.view())?;
+    Check.equalText("amount", child.keys[0].columns[1].name.view())?;
+    Check.equalU64(1, parent.keys.length as u64)?;
+    Check.isTrue(parent.keyCollation(parent.keys[0].columns[0]) == Collation.NoCase, "a key takes its column's collation")?;
+
+    Check.equalU64(2, child.foreignKeys.length as u64)?;
+    let first = borrow child.foreignKeys[0];
+    Check.equalText("parent_id", first.columns[0].view())?;
+    Check.equalText("parent", first.refTable.view())?;
+    Check.equalText("id", first.refColumns[0].view())?;
+    Check.isTrue(first.onDelete == ForeignKeyAction.Cascade && first.onUpdate == ForeignKeyAction.SetNull && first.deferred, "the key's actions")?;
+    let second = borrow child.foreignKeys[1];
+    Check.equalU64(2, second.columns.length as u64)?;
+    Check.equalU64(0, second.refColumns.length as u64)?;
+    Check.isTrue(second.onDelete == ForeignKeyAction.NoAction && !second.deferred, "defaults")?;
+
+    let keyed = tableNamed(catalog, "keyed");
+    Check.isTrue(keyed.withoutRowid && keyed.rowidAlias.isNull(), "WITHOUT ROWID")?;
+    Check.equalText("b", keyed.primaryKey[0].name.view())?;
+    Check.equalText("a", keyed.primaryKey[1].name.view())?;
+    Check.isTrue(keyed.columns[0].primaryKey && keyed.columns[1].primaryKey && !keyed.columns[2].primaryKey, "the key's columns")?;
+    Check.isTrue(keyed.keys.length == 1 && keyed.keys[0].primaryKey, "the key is listed once")?;
+
+    // A column-level INTEGER PRIMARY KEY DESC is an ordinary key, not the rowid.
+    let descending = tableNamed(catalog, "descending");
+    Check.isTrue(descending.rowidAlias.isNull() && descending.columns[0].primaryKey, "INTEGER PRIMARY KEY DESC")?;
+    Check.isTrue(descending.keys.length == 1 && descending.keys[0].columns[0].descending, "and its index descends")?;
+    return Ok();
+}
+
+fn indexNamed(catalog: borrow SchemaCatalog, name: StringView) -> borrow(catalog) IndexSchema {
+    for (i in 0..catalog.indexes.length) {
+        if (catalog.indexes[i].name.view() == name) {
+            return borrow catalog.indexes[i];
+        }
+    }
+    panic("the index is missing from the catalog");
+}
+
+@test
+fn catalogReadsIndexes() -> Result<void, TestFailure> {
+    let path = "out/schema-indexes.db";
+    makeDatabase(path, CATALOG_SQL)?;
+    let reader = DatabaseReader.open(path)!;
+    let catalog = SchemaCatalog.load(reader)!;
+    Check.equalU64(5, catalog.indexes.length as u64)?;
+
+    let word = indexNamed(catalog, "child_word");
+    Check.equalText("child", word.table.view())?;
+    Check.equalU64(2, word.columns.length as u64)?;
+    Check.equalText("word", word.columns[0].name.view())?;
+    Check.isTrue(!word.columns[0].descending && word.columns[1].descending, "amount DESC")?;
+    Check.isTrue(word.coversEveryRow() && word.rootPage > 1, "a plain index")?;
+
+    // An index column takes its table column's collation unless it names one; the C# engine used BINARY always.
+    Check.isTrue(indexNamed(catalog, "parent_code").columns[0].collation == Collation.NoCase, "the column's NOCASE is inherited")?;
+    Check.isTrue(indexNamed(catalog, "parent_code_bin").columns[0].collation == Collation.Binary, "COLLATE BINARY on the index")?;
+
+    let partial = indexNamed(catalog, "child_partial");
+    Check.isTrue(partial.unique && partial.filter.isSome() && !partial.coversEveryRow(), "a partial index does not cover every row")?;
+    let expression = indexNamed(catalog, "child_expr");
+    Check.isTrue(expression.columns[0].expression.isSome() && !expression.coversEveryRow(), "an expression index")?;
+    return Ok();
+}
+
+@test
+fn oneUnreadableTableDoesNotHideTheOthers() -> Result<void, TestFailure> {
+    let path = "out/schema-unsupported.db";
+    makeDatabase(path, """
+        CREATE TABLE plain(a, b);
+        CREATE VIRTUAL TABLE docs USING fts5(body);
+        """)?;
+    let reader = DatabaseReader.open(path)!;
+    let catalog = SchemaCatalog.load(reader)!;
+    Check.isTrue(catalog.table("plain")!.isSome(), "the ordinary table is there")?;
+    Check.isTrue(catalog.table("docs")!.isNull(), "the virtual table is not")?;
+    var listed = false;
+    for (i in 0..catalog.unsupported.length) {
+        if (catalog.unsupported[i].view() == "docs") {
+            listed = true;
+        }
+    }
+    Check.isTrue(listed, "and is listed as unsupported")?;
+    return Ok();
+}
+
+@test
+fn affinityRules() -> Result<void, TestFailure> {
+    Check.isTrue(affinityOf("") == Affinity.Blob, "no type")?;
+    Check.isTrue(affinityOf("BIGINT") == Affinity.Integer, "BIGINT")?;
+    Check.isTrue(affinityOf("charint") == Affinity.Integer, "INT wins over CHAR")?;
+    Check.isTrue(affinityOf("nvarchar(20)") == Affinity.Text, "NVARCHAR")?;
+    Check.isTrue(affinityOf("Blob") == Affinity.Blob, "BLOB")?;
+    Check.isTrue(affinityOf("float") == Affinity.Real, "FLOAT")?;
+    Check.isTrue(affinityOf("DATETIME") == Affinity.Numeric, "anything else is NUMERIC")?;
+    return Ok();
+}

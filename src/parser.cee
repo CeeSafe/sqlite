@@ -1,0 +1,1838 @@
+// The SQL parser: recursive descent for statements, precedence climbing for expressions.
+// https://www.sqlite.org/lang.html
+//
+// Differences from the C# engine, which this replaces:
+// - operator precedence is SQLite's: `->` and `->>` bind as tightly as `||` (the C# put them with `&` and `<<`),
+//   and COLLATE binds tighter than `||`, so `a || b COLLATE NOCASE` collates `b` alone;
+// - `NOT` is a prefix operator wherever an operand may stand (`a = NOT b`), and `x NOT NULL` is accepted;
+// - a subquery may start with VALUES or WITH wherever one may start with SELECT, and so may an INSERT's source;
+// - `INSERT OR`, `UPDATE OR` and RAISE take only the actions SQLite defines; the C# took any word;
+// - an alias may be a string literal, and empty statements between semicolons are skipped;
+// - an expression nested or chained deeper than SQLite's limit is an error here; in the C# it overflowed the
+//   stack;
+// - a trigger's body holds only INSERT, UPDATE, DELETE and SELECT statements, each ended by a semicolon.
+
+/// SQLite's SQLITE_MAX_EXPR_DEPTH.
+const EXPR_MAX_HEIGHT: u32 = 1000;
+
+/// How deeply expressions and subqueries may nest in parentheses: each level costs native stack.
+const PARSER_MAX_NESTING: u32 = 200;
+
+const PREC_OR: u32 = 1;
+const PREC_AND: u32 = 2;
+const PREC_NOT: u32 = 3;
+const PREC_EQUALITY: u32 = 4;
+const PREC_COMPARE: u32 = 5;
+const PREC_BITWISE: u32 = 6;
+const PREC_ADD: u32 = 7;
+const PREC_MULTIPLY: u32 = 8;
+const PREC_CONCAT: u32 = 9;
+const PREC_COLLATE: u32 = 10;
+const PREC_UNARY: u32 = 11;
+
+/// Keywords that cannot be names without quotes. The join keywords and CURRENT_* are not here: SQLite accepts
+/// them as names.
+const RESERVED_NAMES: [StringView; 57] = [
+    "ADD", "ALL", "ALTER", "AND", "AS", "AUTOINCREMENT", "BETWEEN", "CASE", "CHECK", "COLLATE", "COMMIT",
+    "CONSTRAINT", "CREATE", "DEFAULT", "DEFERRABLE", "DELETE", "DISTINCT", "DROP", "ELSE", "ESCAPE", "EXCEPT",
+    "EXISTS", "FOREIGN", "FROM", "GROUP", "HAVING", "IN", "INDEX", "INSERT", "INTERSECT", "INTO", "IS", "ISNULL",
+    "JOIN", "LIMIT", "NOT", "NOTNULL", "NULL", "ON", "OR", "ORDER", "PRIMARY", "REFERENCES", "SELECT", "SET",
+    "TABLE", "THEN", "TO", "TRANSACTION", "UNION", "UNIQUE", "UPDATE", "USING", "VALUES", "WHEN", "WHERE",
+    "RETURNING",
+];
+
+/// Words that end an expression or a table name, and so are not taken as an alias written without AS.
+const ALIAS_STOP_WORDS: [StringView; 27] = [
+    "FROM", "WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "UNION", "INTERSECT", "EXCEPT", "ON", "USING",
+    "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "AND", "OR", "AS", "WHEN", "THEN", "ELSE", "END",
+    "WINDOW",
+];
+
+fn wordIn(word: StringView, words: Slice<StringView>) -> bool {
+    for (w in words) {
+        if (word.equalsIgnoreAsciiCase(w)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// What follows an operand.
+enum Infix {
+    None,
+    Operator(BinaryOp),
+    In,
+    Between,
+    Like(LikeOp),
+    Is,
+    /// `ISNULL`.
+    IsNull,
+    /// `NOTNULL`, or `NOT NULL`: the count of tokens.
+    NotNull(usize),
+    Collate,
+    /// `NOT` before IN, BETWEEN, LIKE, GLOB, MATCH or REGEXP.
+    Negated,
+}
+
+struct InfixPeek {
+    precedence: u32;
+    infix: Infix;
+}
+
+struct Parser {
+    private tokens: Vector<Token>;
+    private at: usize;
+    private nesting: u32;
+    /// The height of the expression parsed last.
+    private height: u32;
+
+    /// The one statement in `sql`, which may end with a semicolon.
+    fn parseStatement(sql: StringView) -> Result<Stmt, SqliteError> {
+        var p = Parser { tokens: Tokenizer.tokenize(sql)?, at: 0, nesting: 0, height: 0 };
+        let stmt = p.statement()?;
+        let _ = p.acceptOp(";");
+        p.expectEnd()?;
+        return Ok(stmt);
+    }
+
+    /// Every statement in `sql`.
+    fn parseProgram(sql: StringView) -> Result<Vector<Stmt>, SqliteError> {
+        var p = Parser { tokens: Tokenizer.tokenize(sql)?, at: 0, nesting: 0, height: 0 };
+        var list = Vector<Stmt>.create();
+        loop {
+            while (p.acceptOp(";")) {}
+            if (p.kind() == TokenKind.Eof) {
+                break;
+            }
+            list.push(p.statement()?)?;
+            if (!p.isOp(";")) {
+                break;
+            }
+        }
+        p.expectEnd()?;
+        return Ok(list);
+    }
+
+    /// The expression that `tokens` (ending with an Eof token) spell.
+    fn parseExpressionTokens(tokens: Vector<Token>) -> Result<Expr, SqliteError> {
+        var p = Parser { tokens: tokens, at: 0, nesting: 0, height: 0 };
+        let expr = p.expr()?;
+        p.expectEnd()?;
+        return Ok(expr);
+    }
+
+    // ── cursor ───────────────────────────────────────────────────────────────────────────────────────────────
+
+    private fn kind(borrow this) -> TokenKind => this.tokens[this.at].kind;
+
+    private fn isWord(borrow this, keyword: StringView) -> bool => this.tokens[this.at].isWord(keyword);
+
+    private fn isOp(borrow this, op: StringView) -> bool => this.tokens[this.at].isOp(op);
+
+    private fn peekIndex(borrow this, ahead: usize) -> usize => (this.at + ahead).min(this.tokens.length - 1);
+
+    private fn peekIsWord(borrow this, ahead: usize, keyword: StringView) -> bool =>
+        this.tokens[this.peekIndex(ahead)].isWord(keyword);
+
+    private fn peekIsOp(borrow this, ahead: usize, op: StringView) -> bool =>
+        this.tokens[this.peekIndex(ahead)].isOp(op);
+
+    /// Moves past the current token; the final Eof token is never passed.
+    private fn advance(borrow mut this) {
+        if (this.at + 1 < this.tokens.length) {
+            this.at += 1;
+        }
+    }
+
+    private fn acceptWord(borrow mut this, keyword: StringView) -> bool {
+        if (this.isWord(keyword)) {
+            this.advance();
+            return true;
+        }
+        return false;
+    }
+
+    private fn acceptOp(borrow mut this, op: StringView) -> bool {
+        if (this.isOp(op)) {
+            this.advance();
+            return true;
+        }
+        return false;
+    }
+
+    /// SQLite's message for a token the grammar does not allow where it stands.
+    private fn syntaxErrorHere(borrow this) -> SqliteError {
+        var text = String.create();
+        if (this.kind() == TokenKind.Eof) {
+            let _ = text.append("incomplete input");
+        } else {
+            let _ = text.append("near \"");
+            let _ = text.append(this.tokens[this.at].text.view());
+            let _ = text.append("\": syntax error");
+        }
+        return SqliteError.Sql(text);
+    }
+
+    private fn expectWord(borrow mut this, keyword: StringView) -> Result<void, SqliteError> {
+        if (!this.acceptWord(keyword)) {
+            return Err(this.syntaxErrorHere());
+        }
+        return Ok();
+    }
+
+    private fn expectOp(borrow mut this, op: StringView) -> Result<void, SqliteError> {
+        if (!this.acceptOp(op)) {
+            return Err(this.syntaxErrorHere());
+        }
+        return Ok();
+    }
+
+    private fn expectEnd(borrow this) -> Result<void, SqliteError> {
+        if (this.kind() != TokenKind.Eof) {
+            return Err(this.syntaxErrorHere());
+        }
+        return Ok();
+    }
+
+    /// The current token's text, and moves past it.
+    private fn takeText(borrow mut this) -> Result<String, SqliteError> {
+        let text = this.tokens[this.at].text.clone()?;
+        this.advance();
+        return Ok(text);
+    }
+
+    /// An identifier: a word that is not reserved, or a quoted identifier.
+    private fn name(borrow mut this) -> Result<String, SqliteError> {
+        let kind = this.kind();
+        if (kind == TokenKind.QuotedId || (kind == TokenKind.Word && !wordIn(
+            this.tokens[this.at].text.view(),
+            RESERVED_NAMES[..],
+        ))) {
+            return this.takeText();
+        }
+        return Err(this.syntaxErrorHere());
+    }
+
+    private fn nameList(borrow mut this) -> Result<Vector<String>, SqliteError> {
+        var names = Vector<String>.create();
+        loop {
+            names.push(this.name()?)?;
+            if (!this.acceptOp(",")) {
+                return Ok(names);
+            }
+        }
+    }
+
+    /// `( name, … )`.
+    private fn parenthesizedNames(borrow mut this) -> Result<Vector<String>, SqliteError> {
+        this.expectOp("(")?;
+        let names = this.nameList()?;
+        this.expectOp(")")?;
+        return Ok(names);
+    }
+
+    private fn qualifiedName(borrow mut this) -> Result<QualifiedName, SqliteError> {
+        let first = this.name()?;
+        if (this.acceptOp(".")) {
+            return Ok(QualifiedName { schema: first, name: this.name()? });
+        }
+        return Ok(QualifiedName { schema: null, name: first });
+    }
+
+    /// An alias: after AS, a name or a string; without AS, a quoted name, a string, or a word that could not
+    /// continue the statement.
+    private fn alias(borrow mut this) -> Result<String?, SqliteError> {
+        if (this.acceptWord("AS")) {
+            if (this.kind() == TokenKind.StringLit) {
+                return Ok(this.takeText()?);
+            }
+            return Ok(this.name()?);
+        }
+        let kind = this.kind();
+        if (kind == TokenKind.QuotedId || kind == TokenKind.StringLit) {
+            return Ok(this.takeText()?);
+        }
+        if (kind == TokenKind.Word) {
+            let word = this.tokens[this.at].text.view();
+            if (!wordIn(word, ALIAS_STOP_WORDS[..]) && !wordIn(word, RESERVED_NAMES[..])) {
+                return Ok(this.takeText()?);
+            }
+        }
+        return Ok(null);
+    }
+
+    private fn startsSelect(borrow this) -> bool =>
+        this.isWord("SELECT") || this.isWord("VALUES") || this.isWord("WITH");
+
+    private fn enter(borrow mut this) -> Result<void, SqliteError> {
+        this.nesting += 1;
+        if (this.nesting > PARSER_MAX_NESTING) {
+            return Err(sqlError("the statement is nested too deeply"));
+        }
+        return Ok();
+    }
+
+    private fn checkedHeight(height: u32) -> Result<u32, SqliteError> {
+        if (height > EXPR_MAX_HEIGHT) {
+            return Err(sqlError("Expression tree is too large (maximum depth 1000)"));
+        }
+        return Ok(height);
+    }
+
+    // ── statements ───────────────────────────────────────────────────────────────────────────────────────────
+
+    private fn statement(borrow mut this) -> Result<Stmt, SqliteError> {
+        if (this.isWord("SELECT") || this.isWord("VALUES")) {
+            return Ok(Stmt.Select(Box.create(this.select(null)?)?));
+        }
+        if (this.isWord("WITH")) {
+            // WITH stands before SELECT and before INSERT, UPDATE and DELETE alike.
+            let with = this.withClause()?;
+            if (this.isWord("UPDATE")) {
+                return Ok(Stmt.Update(Box.create(this.update(with)?)?));
+            }
+            if (this.isWord("DELETE")) {
+                return Ok(Stmt.Delete(Box.create(this.delete(with)?)?));
+            }
+            if (this.isWord("INSERT") || this.isWord("REPLACE")) {
+                return Ok(Stmt.Insert(Box.create(this.insert(with)?)?));
+            }
+            return Ok(Stmt.Select(Box.create(this.select(with)?)?));
+        }
+        if (this.isWord("INSERT") || this.isWord("REPLACE")) {
+            return Ok(Stmt.Insert(Box.create(this.insert(null)?)?));
+        }
+        if (this.isWord("UPDATE")) {
+            return Ok(Stmt.Update(Box.create(this.update(null)?)?));
+        }
+        if (this.isWord("DELETE")) {
+            return Ok(Stmt.Delete(Box.create(this.delete(null)?)?));
+        }
+        if (this.isWord("CREATE")) {
+            return this.create();
+        }
+        if (this.isWord("ALTER")) {
+            return Ok(Stmt.AlterTable(Box.create(this.alter()?)?));
+        }
+        if (this.isWord("DROP")) {
+            return this.dropStatement();
+        }
+        if (this.isWord("PRAGMA")) {
+            return this.pragma();
+        }
+        if (this.acceptWord("BEGIN")) {
+            var kind = TransactionKind.Deferred;
+            if (this.acceptWord("IMMEDIATE")) {
+                kind = TransactionKind.Immediate;
+            } else if (this.acceptWord("EXCLUSIVE")) {
+                kind = TransactionKind.Exclusive;
+            } else {
+                let _ = this.acceptWord("DEFERRED");
+            }
+            let _ = this.acceptWord("TRANSACTION");
+            return Ok(Stmt.Begin(kind));
+        }
+        if (this.acceptWord("COMMIT") || this.acceptWord("END")) {
+            let _ = this.acceptWord("TRANSACTION");
+            return Ok(Stmt.Commit);
+        }
+        if (this.acceptWord("ROLLBACK")) {
+            let _ = this.acceptWord("TRANSACTION");
+            if (this.acceptWord("TO")) {
+                let _ = this.acceptWord("SAVEPOINT");
+                return Ok(Stmt.Rollback(this.name()?));
+            }
+            return Ok(Stmt.Rollback(null));
+        }
+        if (this.acceptWord("SAVEPOINT")) {
+            return Ok(Stmt.Savepoint(this.name()?));
+        }
+        if (this.acceptWord("RELEASE")) {
+            let _ = this.acceptWord("SAVEPOINT");
+            return Ok(Stmt.Release(this.name()?));
+        }
+        if (this.acceptWord("ATTACH")) {
+            let _ = this.acceptWord("DATABASE");
+            let target = this.expr()?;
+            this.expectWord("AS")?;
+            return Ok(Stmt.Attach(Box.create(AttachStmt { target: target, schema: this.name()? })?));
+        }
+        if (this.acceptWord("DETACH")) {
+            let _ = this.acceptWord("DATABASE");
+            return Ok(Stmt.Detach(this.name()?));
+        }
+        if (this.acceptWord("VACUUM")) {
+            if (!this.atStatementEnd()) {
+                let _ = this.name()?;
+            }
+            return Ok(Stmt.Vacuum);
+        }
+        if (this.acceptWord("ANALYZE")) {
+            if (this.atStatementEnd()) {
+                return Ok(Stmt.Analyze(null));
+            }
+            let target = this.qualifiedName()?;
+            return Ok(Stmt.Analyze(target.name));
+        }
+        if (this.acceptWord("REINDEX")) {
+            if (!this.atStatementEnd()) {
+                let _ = this.qualifiedName()?;
+            }
+            return Ok(Stmt.Reindex);
+        }
+        return Err(this.syntaxErrorHere());
+    }
+
+    private fn atStatementEnd(borrow this) -> bool => this.isOp(";") || this.kind() == TokenKind.Eof;
+
+    // ── SELECT ───────────────────────────────────────────────────────────────────────────────────────────────
+
+    private fn withClause(borrow mut this) -> Result<WithClause, SqliteError> {
+        this.expectWord("WITH")?;
+        var with = WithClause { recursive: this.acceptWord("RECURSIVE"), ctes: Vector<CommonTableExpr>.create() };
+        loop {
+            let name = this.name()?;
+            var columns = Vector<String>.create();
+            if (this.isOp("(")) {
+                columns = this.parenthesizedNames()?;
+            }
+            this.expectWord("AS")?;
+            // AS [NOT] MATERIALIZED is a hint to SQLite's planner; a CTE here is always materialized.
+            if (this.acceptWord("NOT")) {
+                this.expectWord("MATERIALIZED")?;
+            } else {
+                let _ = this.acceptWord("MATERIALIZED");
+            }
+            this.expectOp("(")?;
+            let select = this.select(null)?;
+            this.expectOp(")")?;
+            with.ctes.push(CommonTableExpr { name: name, columns: columns, select: select })?;
+            if (!this.acceptOp(",")) {
+                return Ok(with);
+            }
+        }
+    }
+
+    private fn select(borrow mut this, with: WithClause?) -> Result<SelectStmt, SqliteError> {
+        this.enter()?;
+        let result = this.selectBody(with);
+        this.nesting -= 1;
+        return result;
+    }
+
+    private fn selectBody(borrow mut this, with: WithClause?) -> Result<SelectStmt, SqliteError> {
+        var stmt = SelectStmt {
+            with: null,
+            cores: Vector<SelectCore>.create(),
+            compoundOps: Vector<CompoundOp>.create(),
+            orderBy: Vector<OrderTerm>.create(),
+            limit: null,
+            offset: null,
+        };
+        if (with.isSome()) {
+            stmt.with = with;
+        } else if (this.isWord("WITH")) {
+            stmt.with = this.withClause()?;
+        }
+        this.selectArm(mut stmt)?;
+        loop {
+            var op = CompoundOp.Union;
+            if (this.acceptWord("UNION")) {
+                op = if (this.acceptWord("ALL")) CompoundOp.UnionAll else CompoundOp.Union;
+            } else if (this.acceptWord("INTERSECT")) {
+                op = CompoundOp.Intersect;
+            } else if (this.acceptWord("EXCEPT")) {
+                op = CompoundOp.Except;
+            } else {
+                break;
+            }
+            stmt.compoundOps.push(op)?;
+            this.selectArm(mut stmt)?;
+        }
+        if (this.acceptWord("ORDER")) {
+            this.expectWord("BY")?;
+            stmt.orderBy = this.orderTerms()?;
+        }
+        if (this.acceptWord("LIMIT")) {
+            let first = this.expr()?;
+            if (this.acceptOp(",")) {
+                // LIMIT offset, count.
+                stmt.offset = first;
+                stmt.limit = this.expr()?;
+            } else {
+                stmt.limit = first;
+                if (this.acceptWord("OFFSET")) {
+                    stmt.offset = this.expr()?;
+                }
+            }
+        }
+        // A compound operator here means ORDER BY or LIMIT stood on one arm instead of the whole compound.
+        if (this.isWord("UNION") || this.isWord("INTERSECT") || this.isWord("EXCEPT")) {
+            let op: StringView = if (this.isWord(
+                "UNION",
+            )) "UNION" else if (this.isWord("INTERSECT")) "INTERSECT" else "EXCEPT";
+            var message = String.create();
+            if (stmt.orderBy.length != 0) {
+                message.append("ORDER BY clause should come after ")?;
+            } else if (stmt.limit.isSome()) {
+                message.append("LIMIT clause should come after ")?;
+            } else {
+                return Err(this.syntaxErrorHere());
+            }
+            message.append(op)?;
+            message.append(" not before")?;
+            return Err(SqliteError.Sql(message));
+        }
+        return Ok(stmt);
+    }
+
+    /// One arm of a compound: a SELECT core, or VALUES rows, each of which is a core joined by UNION ALL.
+    private fn selectArm(borrow mut this, stmt: borrow mut SelectStmt) -> Result<void, SqliteError> {
+        if (this.acceptWord("VALUES")) {
+            loop {
+                if (stmt.compoundOps.length < stmt.cores.length) {
+                    stmt.compoundOps.push(CompoundOp.UnionAll)?;
+                }
+                this.expectOp("(")?;
+                var core = Parser.emptyCore();
+                core.isValues = true;
+                loop {
+                    core.columns.push(ResultColumn.Expr(this.expr()?, null))?;
+                    if (!this.acceptOp(",")) {
+                        break;
+                    }
+                }
+                this.expectOp(")")?;
+                stmt.cores.push(core)?;
+                if (!this.acceptOp(",")) {
+                    return Ok();
+                }
+            }
+        }
+        stmt.cores.push(this.selectCore()?)?;
+        return Ok();
+    }
+
+    private fn emptyCore() -> SelectCore => SelectCore {
+        distinct: false,
+        columns: Vector<ResultColumn>.create(),
+        from: null,
+        filter: null,
+        groupBy: Vector<Expr>.create(),
+        having: null,
+        windows: Vector<NamedWindow>.create(),
+        isValues: false,
+    };
+
+    private fn selectCore(borrow mut this) -> Result<SelectCore, SqliteError> {
+        this.expectWord("SELECT")?;
+        var core = Parser.emptyCore();
+        if (this.acceptWord("DISTINCT")) {
+            core.distinct = true;
+        } else {
+            let _ = this.acceptWord("ALL");
+        }
+        core.columns = this.resultColumns()?;
+        if (this.acceptWord("FROM")) {
+            core.from = this.fromClause()?;
+        }
+        if (this.acceptWord("WHERE")) {
+            core.filter = this.expr()?;
+        }
+        if (this.acceptWord("GROUP")) {
+            this.expectWord("BY")?;
+            core.groupBy = this.exprList()?;
+        }
+        // HAVING without GROUP BY is allowed: the whole table is one group.
+        if (this.acceptWord("HAVING")) {
+            core.having = this.expr()?;
+        }
+        if (this.acceptWord("WINDOW")) {
+            loop {
+                let name = this.name()?;
+                this.expectWord("AS")?;
+                core.windows.push(NamedWindow { name: name, spec: this.overSpec()? })?;
+                if (!this.acceptOp(",")) {
+                    break;
+                }
+            }
+        }
+        return Ok(core);
+    }
+
+    private fn resultColumns(borrow mut this) -> Result<Vector<ResultColumn>, SqliteError> {
+        var columns = Vector<ResultColumn>.create();
+        loop {
+            columns.push(this.resultColumn()?)?;
+            if (!this.acceptOp(",")) {
+                return Ok(columns);
+            }
+        }
+    }
+
+    private fn resultColumn(borrow mut this) -> Result<ResultColumn, SqliteError> {
+        if (this.acceptOp("*")) {
+            return Ok(ResultColumn.Star);
+        }
+        if ((this.kind() == TokenKind.Word || this.kind() == TokenKind.QuotedId) && this.peekIsOp(
+            1,
+            ".",
+        ) && this.peekIsOp(2, "*")) {
+            let table = this.name()?;
+            this.advance();
+            this.advance();
+            return Ok(ResultColumn.TableStar(table));
+        }
+        let expr = this.expr()?;
+        return Ok(ResultColumn.Expr(expr, this.alias()?));
+    }
+
+    private fn exprList(borrow mut this) -> Result<Vector<Expr>, SqliteError> {
+        var list = Vector<Expr>.create();
+        var height: u32 = 0;
+        loop {
+            list.push(this.expr()?)?;
+            height = height.max(this.height);
+            if (!this.acceptOp(",")) {
+                this.height = height;
+                return Ok(list);
+            }
+        }
+    }
+
+    private fn orderTerms(borrow mut this) -> Result<Vector<OrderTerm>, SqliteError> {
+        var terms = Vector<OrderTerm>.create();
+        loop {
+            // A COLLATE on the term is part of its expression.
+            var term = OrderTerm { expr: this.expr()?, descending: false, nullsFirst: null };
+            if (this.acceptWord("DESC")) {
+                term.descending = true;
+            } else {
+                let _ = this.acceptWord("ASC");
+            }
+            if (this.acceptWord("NULLS")) {
+                if (this.acceptWord("FIRST")) {
+                    term.nullsFirst = true;
+                } else {
+                    this.expectWord("LAST")?;
+                    term.nullsFirst = false;
+                }
+            }
+            terms.push(term)?;
+            if (!this.acceptOp(",")) {
+                return Ok(terms);
+            }
+        }
+    }
+
+    private fn fromClause(borrow mut this) -> Result<FromClause, SqliteError> {
+        var clause = FromClause { source: this.fromItem()?, joins: Vector<Join>.create() };
+        loop {
+            if (this.acceptOp(",")) {
+                clause.joins.push(
+                    Join {
+                        kind: JoinKind.Comma,
+                        natural: false,
+                        item: this.fromItem()?,
+                        constraint: JoinConstraint.None,
+                    },
+                )?;
+                continue;
+            }
+            let natural = this.acceptWord("NATURAL");
+            var kind = JoinKind.Inner;
+            var worded = natural;
+            if (this.acceptWord("LEFT")) {
+                kind = JoinKind.Left;
+                worded = true;
+                let _ = this.acceptWord("OUTER");
+            } else if (this.acceptWord("RIGHT")) {
+                kind = JoinKind.Right;
+                worded = true;
+                let _ = this.acceptWord("OUTER");
+            } else if (this.acceptWord("FULL")) {
+                kind = JoinKind.Full;
+                worded = true;
+                let _ = this.acceptWord("OUTER");
+            } else if (this.acceptWord("INNER")) {
+                worded = true;
+            } else if (this.acceptWord("CROSS")) {
+                kind = JoinKind.Cross;
+                worded = true;
+            }
+            if (!this.acceptWord("JOIN")) {
+                if (worded) {
+                    return Err(this.syntaxErrorHere());
+                }
+                return Ok(clause);
+            }
+            let item = this.fromItem()?;
+            var constraint = JoinConstraint.None;
+            if (this.acceptWord("ON")) {
+                constraint = JoinConstraint.On(this.expr()?);
+            } else if (this.acceptWord("USING")) {
+                constraint = JoinConstraint.Using(this.parenthesizedNames()?);
+            }
+            clause.joins.push(Join { kind: kind, natural: natural, item: item, constraint: constraint })?;
+        }
+    }
+
+    private fn fromItem(borrow mut this) -> Result<FromItem, SqliteError> {
+        if (this.acceptOp("(")) {
+            if (!this.startsSelect()) {
+                return Err(unsupported("a parenthesized join in FROM is not supported"));
+            }
+            let select = this.select(null)?;
+            this.expectOp(")")?;
+            return Ok(FromItem.Subquery(Box.create(SubquerySource { select: select, alias: this.alias()? })?));
+        }
+        let name = this.qualifiedName()?;
+        // A table-valued function: name(arguments), such as pragma_table_info('t').
+        if (name.schema.isNull() && this.acceptOp("(")) {
+            var args = Vector<Expr>.create();
+            if (!this.isOp(")")) {
+                args = this.exprList()?;
+            }
+            this.expectOp(")")?;
+            return Ok(
+                FromItem.TableFunction(TableFunctionSource { name: name.name, args: args, alias: this.alias()? }),
+            );
+        }
+        // A pragma function may be written without parentheses.
+        if (name.schema.isNull() && name.name.length > 7 && name.name.view()[0..7].equalsIgnoreAsciiCase("pragma_")) {
+            return Ok(
+                FromItem.TableFunction(
+                    TableFunctionSource { name: name.name, args: Vector<Expr>.create(), alias: this.alias()? },
+                ),
+            );
+        }
+        var table = TableSource { name: name, alias: null, indexedBy: null, notIndexed: false };
+        // INDEXED is not reserved, so it is looked for before a bare alias would take it.
+        if (!(this.isWord("INDEXED") && this.peekIsWord(1, "BY"))) {
+            table.alias = this.alias()?;
+        }
+        if (this.acceptWord("INDEXED")) {
+            this.expectWord("BY")?;
+            table.indexedBy = this.name()?;
+        } else if (this.isWord("NOT") && this.peekIsWord(1, "INDEXED")) {
+            this.advance();
+            this.advance();
+            table.notIndexed = true;
+        }
+        return Ok(FromItem.Table(table));
+    }
+
+    // ── INSERT, UPDATE, DELETE ───────────────────────────────────────────────────────────────────────────────
+
+    private fn conflictAction(borrow mut this) -> Result<ConflictAction, SqliteError> {
+        if (this.acceptWord("ROLLBACK")) {
+            return Ok(ConflictAction.Rollback);
+        }
+        if (this.acceptWord("ABORT")) {
+            return Ok(ConflictAction.Abort);
+        }
+        if (this.acceptWord("FAIL")) {
+            return Ok(ConflictAction.Fail);
+        }
+        if (this.acceptWord("IGNORE")) {
+            return Ok(ConflictAction.Ignore);
+        }
+        if (this.acceptWord("REPLACE")) {
+            return Ok(ConflictAction.Replace);
+        }
+        return Err(this.syntaxErrorHere());
+    }
+
+    private fn assignments(borrow mut this) -> Result<Vector<Assignment>, SqliteError> {
+        var list = Vector<Assignment>.create();
+        loop {
+            let column = this.name()?;
+            this.expectOp("=")?;
+            list.push(Assignment { column: column, value: this.expr()? })?;
+            if (!this.acceptOp(",")) {
+                return Ok(list);
+            }
+        }
+    }
+
+    private fn returning(borrow mut this) -> Result<Vector<ResultColumn>, SqliteError> {
+        if (!this.acceptWord("RETURNING")) {
+            return Ok(Vector<ResultColumn>.create());
+        }
+        return this.resultColumns();
+    }
+
+    private fn insert(borrow mut this, with: WithClause?) -> Result<InsertStmt, SqliteError> {
+        var conflict: ConflictAction? = null;
+        if (this.acceptWord("REPLACE")) {
+            conflict = ConflictAction.Replace;
+        } else {
+            this.expectWord("INSERT")?;
+            if (this.acceptWord("OR")) {
+                conflict = this.conflictAction()?;
+            }
+        }
+        this.expectWord("INTO")?;
+        let table = this.qualifiedName()?;
+        var columns = Vector<String>.create();
+        if (this.isOp("(")) {
+            columns = this.parenthesizedNames()?;
+        }
+        var source = InsertSource.DefaultValues;
+        if (this.acceptWord("DEFAULT")) {
+            this.expectWord("VALUES")?;
+        } else if (this.isWord("VALUES") && !this.valuesContinuesAsSelect()) {
+            this.advance();
+            var rows = Vector<Vector<Expr>>.create();
+            loop {
+                this.expectOp("(")?;
+                rows.push(this.exprList()?)?;
+                this.expectOp(")")?;
+                if (!this.acceptOp(",")) {
+                    break;
+                }
+            }
+            source = InsertSource.Values(rows);
+        } else if (this.startsSelect()) {
+            source = InsertSource.Select(this.select(null)?);
+        } else {
+            return Err(this.syntaxErrorHere());
+        }
+        var upserts = Vector<UpsertClause>.create();
+        while (this.acceptWord("ON")) {
+            this.expectWord("CONFLICT")?;
+            var clause = UpsertClause {
+                target: Vector<String>.create(),
+                assignments: Vector<Assignment>.create(),
+                filter: null,
+            };
+            if (this.isOp("(")) {
+                clause.target = this.parenthesizedNames()?;
+                // A partial index's predicate names the index; a conflict is found without it.
+                if (this.acceptWord("WHERE")) {
+                    let _ = this.expr()?;
+                }
+            }
+            this.expectWord("DO")?;
+            if (!this.acceptWord("NOTHING")) {
+                this.expectWord("UPDATE")?;
+                this.expectWord("SET")?;
+                clause.assignments = this.assignments()?;
+                if (this.acceptWord("WHERE")) {
+                    clause.filter = this.expr()?;
+                }
+            }
+            upserts.push(clause)?;
+        }
+        return Ok(InsertStmt {
+            with: with,
+            conflict: conflict,
+            table: table,
+            columns: columns,
+            source: source,
+            upserts: upserts,
+            returning: this.returning()?,
+        });
+    }
+
+    /// Whether the VALUES at the cursor is the first arm of a compound (`VALUES (1) UNION SELECT …`), which is a
+    /// SELECT rather than an INSERT's row list.
+    private fn valuesContinuesAsSelect(borrow this) -> bool {
+        var depth: u32 = 0;
+        var i = this.at + 1;
+        while (i < this.tokens.length) {
+            let token = borrow this.tokens[i];
+            if (token.kind == TokenKind.Eof) {
+                return false;
+            }
+            if (token.isOp("(")) {
+                depth += 1;
+            } else if (token.isOp(")")) {
+                if (depth == 0) {
+                    return false;
+                }
+                depth -= 1;
+            } else if (depth == 0) {
+                if (token.isWord(
+                    "UNION",
+                ) || token.isWord(
+                    "INTERSECT",
+                ) || token.isWord("EXCEPT") || token.isWord("ORDER") || token.isWord("LIMIT")) {
+                    return true;
+                }
+                if (!token.isOp(",")) {
+                    return false;
+                }
+            }
+            i += 1;
+        }
+        return false;
+    }
+
+    private fn update(borrow mut this, with: WithClause?) -> Result<UpdateStmt, SqliteError> {
+        this.expectWord("UPDATE")?;
+        var conflict: ConflictAction? = null;
+        if (this.acceptWord("OR")) {
+            conflict = this.conflictAction()?;
+        }
+        let table = this.qualifiedName()?;
+        this.expectWord("SET")?;
+        var stmt = UpdateStmt {
+            with: with,
+            conflict: conflict,
+            table: table,
+            assignments: this.assignments()?,
+            from: null,
+            filter: null,
+            returning: Vector<ResultColumn>.create(),
+        };
+        if (this.acceptWord("FROM")) {
+            stmt.from = this.fromClause()?;
+        }
+        if (this.acceptWord("WHERE")) {
+            stmt.filter = this.expr()?;
+        }
+        stmt.returning = this.returning()?;
+        return Ok(stmt);
+    }
+
+    private fn delete(borrow mut this, with: WithClause?) -> Result<DeleteStmt, SqliteError> {
+        this.expectWord("DELETE")?;
+        this.expectWord("FROM")?;
+        var stmt = DeleteStmt {
+            with: with,
+            table: this.qualifiedName()?,
+            filter: null,
+            returning: Vector<ResultColumn>.create(),
+        };
+        if (this.acceptWord("WHERE")) {
+            stmt.filter = this.expr()?;
+        }
+        stmt.returning = this.returning()?;
+        return Ok(stmt);
+    }
+
+    // ── CREATE, ALTER, DROP ──────────────────────────────────────────────────────────────────────────────────
+
+    private fn ifNotExists(borrow mut this) -> Result<bool, SqliteError> {
+        if (this.acceptWord("IF")) {
+            this.expectWord("NOT")?;
+            this.expectWord("EXISTS")?;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
+    private fn create(borrow mut this) -> Result<Stmt, SqliteError> {
+        this.expectWord("CREATE")?;
+        let temporary = this.acceptWord("TEMP") || this.acceptWord("TEMPORARY");
+        if (this.acceptWord("TABLE")) {
+            return Ok(Stmt.CreateTable(Box.create(this.createTable(temporary)?)?));
+        }
+        if (this.acceptWord("VIEW")) {
+            var stmt = CreateViewStmt {
+                temporary: temporary,
+                ifNotExists: this.ifNotExists()?,
+                name: this.qualifiedName()?,
+                columns: Vector<String>.create(),
+                select: Parser.emptySelect(),
+            };
+            if (this.isOp("(")) {
+                stmt.columns = this.parenthesizedNames()?;
+            }
+            this.expectWord("AS")?;
+            stmt.select = this.select(null)?;
+            return Ok(Stmt.CreateView(Box.create(stmt)?));
+        }
+        if (this.acceptWord("TRIGGER")) {
+            return Ok(Stmt.CreateTrigger(Box.create(this.createTrigger(temporary)?)?));
+        }
+        if (temporary) {
+            return Err(this.syntaxErrorHere());
+        }
+        let unique = this.acceptWord("UNIQUE");
+        if (this.acceptWord("INDEX")) {
+            return Ok(Stmt.CreateIndex(Box.create(this.createIndex(unique)?)?));
+        }
+        if (!unique && this.isWord("VIRTUAL")) {
+            return Err(unsupported("virtual tables are not supported"));
+        }
+        return Err(this.syntaxErrorHere());
+    }
+
+    private fn emptySelect() -> SelectStmt => SelectStmt {
+        with: null,
+        cores: Vector<SelectCore>.create(),
+        compoundOps: Vector<CompoundOp>.create(),
+        orderBy: Vector<OrderTerm>.create(),
+        limit: null,
+        offset: null,
+    };
+
+    /// The tokens up to the comma or closing parenthesis that ends a column definition or table constraint.
+    private fn bodyTokens(borrow mut this, toStatementEnd: bool) -> Result<Vector<Token>, SqliteError> {
+        var tokens = Vector<Token>.create();
+        var depth: u32 = 0;
+        loop {
+            if (this.kind() == TokenKind.Eof) {
+                if (toStatementEnd) {
+                    return Ok(tokens);
+                }
+                return Err(this.syntaxErrorHere());
+            }
+            if (depth == 0) {
+                if (toStatementEnd && this.isOp(";")) {
+                    return Ok(tokens);
+                }
+                if (!toStatementEnd && (this.isOp(",") || this.isOp(")"))) {
+                    return Ok(tokens);
+                }
+            }
+            if (this.isOp("(")) {
+                depth += 1;
+            } else if (this.isOp(")")) {
+                if (depth == 0) {
+                    return Err(this.syntaxErrorHere());
+                }
+                depth -= 1;
+            }
+            let token = borrow this.tokens[this.at];
+            tokens.push(Token { kind: token.kind, text: token.text.clone()?, offset: token.offset })?;
+            this.advance();
+        }
+    }
+
+    private fn createTable(borrow mut this, temporary: bool) -> Result<CreateTableStmt, SqliteError> {
+        var stmt = CreateTableStmt {
+            temporary: temporary,
+            ifNotExists: this.ifNotExists()?,
+            name: this.qualifiedName()?,
+            columns: Vector<ColumnDef>.create(),
+            constraints: Vector<Vector<Token>>.create(),
+            withoutRowid: false,
+            strict: false,
+        };
+        if (this.isWord("AS")) {
+            return Err(unsupported("CREATE TABLE … AS SELECT is not supported"));
+        }
+        this.expectOp("(")?;
+        loop {
+            if (this.isWord(
+                "CONSTRAINT",
+            ) || this.isWord("PRIMARY") || this.isWord("UNIQUE") || this.isWord("CHECK") || this.isWord("FOREIGN")) {
+                stmt.constraints.push(this.bodyTokens(false)?)?;
+            } else {
+                // Column definitions come first: after a table constraint SQLite accepts only more constraints.
+                if (stmt.constraints.length != 0) {
+                    return Err(this.syntaxErrorHere());
+                }
+                let name = this.name()?;
+                stmt.columns.push(ColumnDef { name: name, body: this.bodyTokens(false)? })?;
+            }
+            if (!this.acceptOp(",")) {
+                break;
+            }
+        }
+        this.expectOp(")")?;
+        if (stmt.columns.length == 0) {
+            return Err(this.syntaxErrorHere());
+        }
+        // Table options: WITHOUT ROWID and STRICT, separated by commas.
+        loop {
+            if (this.acceptWord("WITHOUT")) {
+                this.expectWord("ROWID")?;
+                stmt.withoutRowid = true;
+            } else if (this.acceptWord("STRICT")) {
+                stmt.strict = true;
+            } else {
+                break;
+            }
+            if (!this.acceptOp(",")) {
+                break;
+            }
+        }
+        return Ok(stmt);
+    }
+
+    private fn createIndex(borrow mut this, unique: bool) -> Result<CreateIndexStmt, SqliteError> {
+        var stmt = CreateIndexStmt {
+            unique: unique,
+            ifNotExists: this.ifNotExists()?,
+            name: this.qualifiedName()?,
+            table: String.create(),
+            columns: Vector<IndexedColumn>.create(),
+            filter: null,
+        };
+        this.expectWord("ON")?;
+        stmt.table = this.name()?;
+        this.expectOp("(")?;
+        loop {
+            // An indexed column is an expression: most often a column's name, perhaps with a COLLATE.
+            var column = IndexedColumn {
+                name: String.create(),
+                expression: null,
+                descending: false,
+                collation: String.create(),
+            };
+            var expr = this.expr()?;
+            if (expr is Expr.Collate(operand, collation)) {
+                column.collation = collation;
+                expr = Parser.unbox(operand);
+            }
+            match (expr) {
+                Expr.Column(ColumnRef { schema: null, table: null, name }) => { column.name = name; }
+                other => { column.expression = other; }
+            }
+            if (this.acceptWord("DESC")) {
+                column.descending = true;
+            } else {
+                let _ = this.acceptWord("ASC");
+            }
+            stmt.columns.push(column)?;
+            if (!this.acceptOp(",")) {
+                break;
+            }
+        }
+        this.expectOp(")")?;
+        if (this.acceptWord("WHERE")) {
+            stmt.filter = this.expr()?;
+        }
+        return Ok(stmt);
+    }
+
+    private fn unbox(boxed: Box<Expr>) -> Expr {
+        let inner: Expr = boxed;
+        return inner;
+    }
+
+    private fn createTrigger(borrow mut this, temporary: bool) -> Result<CreateTriggerStmt, SqliteError> {
+        var stmt = CreateTriggerStmt {
+            temporary: temporary,
+            ifNotExists: this.ifNotExists()?,
+            name: this.qualifiedName()?,
+            timing: TriggerTiming.Before,
+            event: TriggerEvent.Insert,
+            updateOf: Vector<String>.create(),
+            table: String.create(),
+            when: null,
+            body: Vector<Stmt>.create(),
+        };
+        if (this.acceptWord("AFTER")) {
+            stmt.timing = TriggerTiming.After;
+        } else if (this.acceptWord("INSTEAD")) {
+            this.expectWord("OF")?;
+            stmt.timing = TriggerTiming.InsteadOf;
+        } else {
+            let _ = this.acceptWord("BEFORE");
+        }
+        if (this.acceptWord("DELETE")) {
+            stmt.event = TriggerEvent.Delete;
+        } else if (this.acceptWord("INSERT")) {
+            stmt.event = TriggerEvent.Insert;
+        } else if (this.acceptWord("UPDATE")) {
+            stmt.event = TriggerEvent.Update;
+            if (this.acceptWord("OF")) {
+                stmt.updateOf = this.nameList()?;
+            }
+        } else {
+            return Err(this.syntaxErrorHere());
+        }
+        this.expectWord("ON")?;
+        stmt.table = this.name()?;
+        if (this.acceptWord("FOR")) {
+            this.expectWord("EACH")?;
+            this.expectWord("ROW")?;
+        }
+        if (this.acceptWord("WHEN")) {
+            stmt.when = this.expr()?;
+        }
+        this.expectWord("BEGIN")?;
+        if (this.isWord("END")) {
+            return Err(this.syntaxErrorHere());
+        }
+        while (!this.acceptWord("END")) {
+            if (!(this.isWord(
+                "INSERT",
+            ) || this.isWord("REPLACE") || this.isWord("UPDATE") || this.isWord("DELETE") || this.startsSelect())) {
+                return Err(this.syntaxErrorHere());
+            }
+            stmt.body.push(this.statement()?)?;
+            this.expectOp(";")?;
+        }
+        return Ok(stmt);
+    }
+
+    private fn alter(borrow mut this) -> Result<AlterTableStmt, SqliteError> {
+        this.expectWord("ALTER")?;
+        this.expectWord("TABLE")?;
+        let table = this.qualifiedName()?;
+        if (this.acceptWord("RENAME")) {
+            if (this.acceptWord("TO")) {
+                return Ok(AlterTableStmt { table: table, action: AlterAction.RenameTo(this.name()?) });
+            }
+            let _ = this.acceptWord("COLUMN");
+            let from = this.name()?;
+            this.expectWord("TO")?;
+            return Ok(AlterTableStmt { table: table, action: AlterAction.RenameColumn(from, this.name()?) });
+        }
+        if (this.isWord("DROP")) {
+            return Err(unsupported("ALTER TABLE … DROP COLUMN is not supported"));
+        }
+        this.expectWord("ADD")?;
+        let _ = this.acceptWord("COLUMN");
+        let name = this.name()?;
+        return Ok(
+            AlterTableStmt {
+                table: table,
+                action: AlterAction.AddColumn(ColumnDef { name: name, body: this.bodyTokens(true)? }),
+            },
+        );
+    }
+
+    private fn dropStatement(borrow mut this) -> Result<Stmt, SqliteError> {
+        this.expectWord("DROP")?;
+        var kind = DropKind.Table;
+        if (this.acceptWord("INDEX")) {
+            kind = DropKind.Index;
+        } else if (this.acceptWord("VIEW")) {
+            kind = DropKind.View;
+        } else if (this.acceptWord("TRIGGER")) {
+            kind = DropKind.Trigger;
+        } else {
+            this.expectWord("TABLE")?;
+        }
+        var ifExists = false;
+        if (this.acceptWord("IF")) {
+            this.expectWord("EXISTS")?;
+            ifExists = true;
+        }
+        return Ok(Stmt.Drop(DropStmt { kind: kind, ifExists: ifExists, name: this.qualifiedName()? }));
+    }
+
+    private fn pragma(borrow mut this) -> Result<Stmt, SqliteError> {
+        this.expectWord("PRAGMA")?;
+        var stmt = PragmaStmt { name: this.qualifiedName()?, value: null, parenthesized: false };
+        if (this.acceptOp("=")) {
+            stmt.value = this.pragmaValue()?;
+        } else if (this.acceptOp("(")) {
+            stmt.parenthesized = true;
+            stmt.value = this.pragmaValue()?;
+            this.expectOp(")")?;
+        }
+        return Ok(Stmt.Pragma(stmt));
+    }
+
+    /// A pragma's value: a name, a keyword such as ON, a string, or a number with an optional sign.
+    private fn pragmaValue(borrow mut this) -> Result<String, SqliteError> {
+        var value = String.create();
+        if (this.acceptOp("-")) {
+            value.append("-")?;
+            if (this.kind() != TokenKind.IntLit && this.kind() != TokenKind.FloatLit) {
+                return Err(this.syntaxErrorHere());
+            }
+        } else if (this.acceptOp("+")) {
+            if (this.kind() != TokenKind.IntLit && this.kind() != TokenKind.FloatLit) {
+                return Err(this.syntaxErrorHere());
+            }
+        }
+        match (this.kind()) {
+            TokenKind.Word | TokenKind.QuotedId | TokenKind.StringLit | TokenKind.IntLit | TokenKind.FloatLit => {
+                value.append(this.tokens[this.at].text.view())?;
+                this.advance();
+                return Ok(value);
+            }
+            _ => { return Err(this.syntaxErrorHere()); }
+        }
+    }
+
+    // ── expressions ──────────────────────────────────────────────────────────────────────────────────────────
+
+    private fn expr(borrow mut this) -> Result<Expr, SqliteError> => this.exprAt(0);
+
+    private fn exprAt(borrow mut this, minPrecedence: u32) -> Result<Expr, SqliteError> {
+        this.enter()?;
+        let result = this.exprClimb(minPrecedence);
+        this.nesting -= 1;
+        return result;
+    }
+
+    private fn exprClimb(borrow mut this, minPrecedence: u32) -> Result<Expr, SqliteError> {
+        var left = this.prefix()?;
+        var height = this.height;
+        loop {
+            let next = this.peekInfix();
+            if (next.precedence == 0 || next.precedence < minPrecedence) {
+                break;
+            }
+            match (next.infix) {
+                Infix.None => { break; }
+                Infix.Operator(op) => {
+                    this.advance();
+                    // Left-associative: the right operand takes only operators that bind tighter.
+                    let right = this.exprAt(next.precedence + 1)?;
+                    height = Parser.checkedHeight(height.max(this.height) + 1)?;
+                    left = Expr.Binary(op, Box.create(left)?, Box.create(right)?);
+                }
+                Infix.In => {
+                    this.advance();
+                    left = this.inTail(left, false)?;
+                    height = Parser.checkedHeight(height.max(this.height) + 1)?;
+                }
+                Infix.Between => {
+                    this.advance();
+                    left = this.betweenTail(left, false)?;
+                    height = Parser.checkedHeight(height.max(this.height) + 1)?;
+                }
+                Infix.Like(op) => {
+                    this.advance();
+                    left = this.likeTail(left, op, false)?;
+                    height = Parser.checkedHeight(height.max(this.height) + 1)?;
+                }
+                Infix.Is => {
+                    this.advance();
+                    var negated = this.acceptWord("NOT");
+                    // a IS DISTINCT FROM b is a IS NOT b; a IS NOT DISTINCT FROM b is a IS b.
+                    if (this.acceptWord("DISTINCT")) {
+                        this.expectWord("FROM")?;
+                        negated = !negated;
+                    }
+                    let right = this.exprAt(PREC_COMPARE)?;
+                    height = Parser.checkedHeight(height.max(this.height) + 1)?;
+                    left = Expr.Is(Box.create(left)?, Box.create(right)?, negated);
+                }
+                Infix.IsNull => {
+                    this.advance();
+                    height = Parser.checkedHeight(height + 1)?;
+                    left = Expr.Is(Box.create(left)?, Box.create(Parser.nullLiteral())?, false);
+                }
+                Infix.NotNull(count) => {
+                    for (i in 0..count) {
+                        this.advance();
+                    }
+                    height = Parser.checkedHeight(height + 1)?;
+                    left = Expr.Is(Box.create(left)?, Box.create(Parser.nullLiteral())?, true);
+                }
+                Infix.Collate => {
+                    this.advance();
+                    height = Parser.checkedHeight(height + 1)?;
+                    left = Expr.Collate(Box.create(left)?, this.name()?);
+                }
+                Infix.Negated => {
+                    this.advance();
+                    if (this.acceptWord("IN")) {
+                        left = this.inTail(left, true)?;
+                    } else if (this.acceptWord("BETWEEN")) {
+                        left = this.betweenTail(left, true)?;
+                    } else if (this.acceptWord("LIKE")) {
+                        left = this.likeTail(left, LikeOp.Like, true)?;
+                    } else if (this.acceptWord("GLOB")) {
+                        left = this.likeTail(left, LikeOp.Glob, true)?;
+                    } else if (this.acceptWord("MATCH")) {
+                        left = this.likeTail(left, LikeOp.Match, true)?;
+                    } else if (this.acceptWord("REGEXP")) {
+                        left = this.likeTail(left, LikeOp.Regexp, true)?;
+                    } else {
+                        return Err(this.syntaxErrorHere());
+                    }
+                    height = Parser.checkedHeight(height.max(this.height) + 1)?;
+                }
+            }
+        }
+        this.height = height;
+        return Ok(left);
+    }
+
+    private fn nullLiteral() -> Expr => Expr.Literal(Literal { kind: LiteralKind.Null, text: String.create() });
+
+    private fn peekInfix(borrow this) -> InfixPeek {
+        let token = borrow this.tokens[this.at];
+        if (token.kind == TokenKind.Op) {
+            return match (token.text.view()) {
+                "||" => InfixPeek { precedence: PREC_CONCAT, infix: Infix.Operator(BinaryOp.Concat) },
+                "->" => InfixPeek { precedence: PREC_CONCAT, infix: Infix.Operator(BinaryOp.JsonGet) },
+                "->>" => InfixPeek { precedence: PREC_CONCAT, infix: Infix.Operator(BinaryOp.JsonGetValue) },
+                "*" => InfixPeek { precedence: PREC_MULTIPLY, infix: Infix.Operator(BinaryOp.Multiply) },
+                "/" => InfixPeek { precedence: PREC_MULTIPLY, infix: Infix.Operator(BinaryOp.Divide) },
+                "%" => InfixPeek { precedence: PREC_MULTIPLY, infix: Infix.Operator(BinaryOp.Modulo) },
+                "+" => InfixPeek { precedence: PREC_ADD, infix: Infix.Operator(BinaryOp.Add) },
+                "-" => InfixPeek { precedence: PREC_ADD, infix: Infix.Operator(BinaryOp.Subtract) },
+                "<<" => InfixPeek { precedence: PREC_BITWISE, infix: Infix.Operator(BinaryOp.ShiftLeft) },
+                ">>" => InfixPeek { precedence: PREC_BITWISE, infix: Infix.Operator(BinaryOp.ShiftRight) },
+                "&" => InfixPeek { precedence: PREC_BITWISE, infix: Infix.Operator(BinaryOp.BitAnd) },
+                "|" => InfixPeek { precedence: PREC_BITWISE, infix: Infix.Operator(BinaryOp.BitOr) },
+                "<" => InfixPeek { precedence: PREC_COMPARE, infix: Infix.Operator(BinaryOp.Less) },
+                "<=" => InfixPeek { precedence: PREC_COMPARE, infix: Infix.Operator(BinaryOp.LessOrEqual) },
+                ">" => InfixPeek { precedence: PREC_COMPARE, infix: Infix.Operator(BinaryOp.Greater) },
+                ">=" => InfixPeek { precedence: PREC_COMPARE, infix: Infix.Operator(BinaryOp.GreaterOrEqual) },
+                "=" | "==" => InfixPeek { precedence: PREC_EQUALITY, infix: Infix.Operator(BinaryOp.Equal) },
+                "!=" | "<>" => InfixPeek { precedence: PREC_EQUALITY, infix: Infix.Operator(BinaryOp.NotEqual) },
+                _ => InfixPeek { precedence: 0, infix: Infix.None },
+            };
+        }
+        if (token.kind != TokenKind.Word) {
+            return InfixPeek { precedence: 0, infix: Infix.None };
+        }
+        if (token.isWord("OR")) {
+            return InfixPeek { precedence: PREC_OR, infix: Infix.Operator(BinaryOp.Or) };
+        }
+        if (token.isWord("AND")) {
+            return InfixPeek { precedence: PREC_AND, infix: Infix.Operator(BinaryOp.And) };
+        }
+        if (token.isWord("IS")) {
+            return InfixPeek { precedence: PREC_EQUALITY, infix: Infix.Is };
+        }
+        if (token.isWord("IN")) {
+            return InfixPeek { precedence: PREC_EQUALITY, infix: Infix.In };
+        }
+        if (token.isWord("LIKE")) {
+            return InfixPeek { precedence: PREC_EQUALITY, infix: Infix.Like(LikeOp.Like) };
+        }
+        if (token.isWord("GLOB")) {
+            return InfixPeek { precedence: PREC_EQUALITY, infix: Infix.Like(LikeOp.Glob) };
+        }
+        if (token.isWord("MATCH")) {
+            return InfixPeek { precedence: PREC_EQUALITY, infix: Infix.Like(LikeOp.Match) };
+        }
+        if (token.isWord("REGEXP")) {
+            return InfixPeek { precedence: PREC_EQUALITY, infix: Infix.Like(LikeOp.Regexp) };
+        }
+        if (token.isWord("BETWEEN")) {
+            return InfixPeek { precedence: PREC_EQUALITY, infix: Infix.Between };
+        }
+        if (token.isWord("ISNULL")) {
+            return InfixPeek { precedence: PREC_EQUALITY, infix: Infix.IsNull };
+        }
+        if (token.isWord("NOTNULL")) {
+            return InfixPeek { precedence: PREC_EQUALITY, infix: Infix.NotNull(1) };
+        }
+        if (token.isWord("COLLATE")) {
+            return InfixPeek { precedence: PREC_COLLATE, infix: Infix.Collate };
+        }
+        if (token.isWord("NOT")) {
+            if (this.peekIsWord(1, "NULL")) {
+                return InfixPeek { precedence: PREC_EQUALITY, infix: Infix.NotNull(2) };
+            }
+            if (this.peekIsWord(
+                1,
+                "IN",
+            ) || this.peekIsWord(
+                1,
+                "LIKE",
+            ) || this.peekIsWord(
+                1,
+                "GLOB",
+            ) || this.peekIsWord(1, "MATCH") || this.peekIsWord(1, "REGEXP") || this.peekIsWord(1, "BETWEEN")) {
+                return InfixPeek { precedence: PREC_EQUALITY, infix: Infix.Negated };
+            }
+        }
+        return InfixPeek { precedence: 0, infix: Infix.None };
+    }
+
+    private fn inTail(borrow mut this, left: Expr, negated: bool) -> Result<Expr, SqliteError> {
+        let operandHeight = this.height;
+        var source = InSource.Items(Vector<Expr>.create());
+        this.height = 0;
+        if (this.acceptOp("(")) {
+            if (this.startsSelect()) {
+                source = InSource.Select(this.select(null)?);
+                this.height = 1;
+            } else if (!this.isOp(")")) {
+                source = InSource.Items(this.exprList()?);
+            }
+            this.expectOp(")")?;
+        } else {
+            source = InSource.Table(this.qualifiedName()?);
+        }
+        this.height = this.height.max(operandHeight);
+        return Ok(Expr.In(Box.create(InExpr { operand: left, negated: negated, source: source })?));
+    }
+
+    private fn betweenTail(borrow mut this, left: Expr, negated: bool) -> Result<Expr, SqliteError> {
+        var height = this.height;
+        // The bounds stop before AND.
+        let low = this.exprAt(PREC_COMPARE)?;
+        height = height.max(this.height);
+        this.expectWord("AND")?;
+        let high = this.exprAt(PREC_COMPARE)?;
+        this.height = height.max(this.height);
+        return Ok(Expr.Between(Box.create(BetweenExpr { operand: left, low: low, high: high, negated: negated })?));
+    }
+
+    private fn likeTail(borrow mut this, left: Expr, op: LikeOp, negated: bool) -> Result<Expr, SqliteError> {
+        var height = this.height;
+        var like = LikeExpr {
+            op: op,
+            operand: left,
+            pattern: this.exprAt(PREC_COMPARE)?,
+            escape: null,
+            negated: negated,
+        };
+        height = height.max(this.height);
+        if (this.acceptWord("ESCAPE")) {
+            like.escape = this.exprAt(PREC_COMPARE)?;
+            height = height.max(this.height);
+        }
+        this.height = height;
+        return Ok(Expr.Like(Box.create(like)?));
+    }
+
+    private fn prefix(borrow mut this) -> Result<Expr, SqliteError> {
+        if (this.isOp("-") || this.isOp("+") || this.isOp("~")) {
+            let op = if (this.isOp("-")) UnaryOp.Negate else if (this.isOp("+")) UnaryOp.Plus else UnaryOp.BitNot;
+            this.advance();
+            // SQLite reads -9223372036854775808 as one integer: its digits alone do not fit, the negated
+            // literal does.
+            if (op == UnaryOp.Negate && this.kind() == TokenKind.IntLit &&
+                this.tokens[this.at].text.view() == "9223372036854775808") {
+                this.advance();
+                this.height = 1;
+                return Ok(
+                    Expr.Literal(Literal { kind: LiteralKind.Integer, text: String.from("-9223372036854775808")? }),
+                );
+            }
+            let operand = this.exprAt(PREC_UNARY)?;
+            this.height = Parser.checkedHeight(this.height + 1)?;
+            return Ok(Expr.Unary(op, Box.create(operand)?));
+        }
+        if (this.isWord("NOT")) {
+            this.advance();
+            let operand = this.exprAt(PREC_NOT)?;
+            this.height = Parser.checkedHeight(this.height + 1)?;
+            return Ok(Expr.Unary(UnaryOp.Not, Box.create(operand)?));
+        }
+        return this.primary();
+    }
+
+    private fn literal(borrow mut this, kind: LiteralKind) -> Result<Expr, SqliteError> {
+        this.height = 1;
+        return Ok(Expr.Literal(Literal { kind: kind, text: this.takeText()? }));
+    }
+
+    private fn keywordLiteral(borrow mut this, kind: LiteralKind) -> Result<Expr, SqliteError> {
+        this.advance();
+        this.height = 1;
+        return Ok(Expr.Literal(Literal { kind: kind, text: String.create() }));
+    }
+
+    private fn primary(borrow mut this) -> Result<Expr, SqliteError> {
+        match (this.kind()) {
+            TokenKind.IntLit => { return this.integerLiteral(); }
+            TokenKind.FloatLit => { return this.literal(LiteralKind.Float); }
+            TokenKind.StringLit => { return this.literal(LiteralKind.String); }
+            TokenKind.BlobLit => { return this.literal(LiteralKind.Blob); }
+            TokenKind.Param => {
+                this.height = 1;
+                return Ok(Expr.Param(this.takeText()?));
+            }
+            _ => {}
+        }
+        if (this.acceptOp("(")) {
+            if (this.startsSelect()) {
+                let select = this.select(null)?;
+                this.expectOp(")")?;
+                this.height = 1;
+                return Ok(Expr.Subquery(Box.create(select)?));
+            }
+            var items = this.exprList()?;
+            this.expectOp(")")?;
+            if (items.length == 1) {
+                return Ok(items.pop()!);
+            }
+            // A parenthesized list is a row value.
+            this.height = Parser.checkedHeight(this.height + 1)?;
+            return Ok(Expr.RowValue(items));
+        }
+        if (this.kind() == TokenKind.Word) {
+            if (this.isWord("NULL")) {
+                return this.keywordLiteral(LiteralKind.Null);
+            }
+            if (this.isWord("CAST") && this.peekIsOp(1, "(")) {
+                return this.cast();
+            }
+            if (this.isWord("CASE")) {
+                return this.caseExpr();
+            }
+            if (this.isWord("EXISTS") && this.peekIsOp(1, "(")) {
+                this.advance();
+                this.advance();
+                let select = this.select(null)?;
+                this.expectOp(")")?;
+                this.height = 1;
+                return Ok(Expr.Exists(Box.create(select)?));
+            }
+            if (!this.peekIsOp(1, "(") && !this.peekIsOp(1, ".")) {
+                if (this.isWord("TRUE")) {
+                    return this.keywordLiteral(LiteralKind.True);
+                }
+                if (this.isWord("FALSE")) {
+                    return this.keywordLiteral(LiteralKind.False);
+                }
+                if (this.isWord("CURRENT_TIME")) {
+                    return this.keywordLiteral(LiteralKind.CurrentTime);
+                }
+                if (this.isWord("CURRENT_DATE")) {
+                    return this.keywordLiteral(LiteralKind.CurrentDate);
+                }
+                if (this.isWord("CURRENT_TIMESTAMP")) {
+                    return this.keywordLiteral(LiteralKind.CurrentTimestamp);
+                }
+            }
+        }
+        if (this.kind() == TokenKind.Word || this.kind() == TokenKind.QuotedId) {
+            if (this.peekIsOp(1, "(")) {
+                return this.functionCall();
+            }
+            var column = ColumnRef { schema: null, table: null, name: this.name()? };
+            if (this.acceptOp(".")) {
+                column.table = replace(mut column.name, this.name()?);
+                if (this.acceptOp(".")) {
+                    column.schema = replace(mut column.table, null);
+                    column.table = replace(mut column.name, this.name()?);
+                }
+            }
+            this.height = 1;
+            return Ok(Expr.Column(column));
+        }
+        return Err(this.syntaxErrorHere());
+    }
+
+    /// An integer literal. Decimal digits that do not fit 64 bits are a real, as in SQLite; a hexadecimal
+    /// literal of more than 64 bits is an error.
+    private fn integerLiteral(borrow mut this) -> Result<Expr, SqliteError> {
+        let text = this.tokens[this.at].text.view();
+        var kind = LiteralKind.Integer;
+        if (text.length > 2 && (text[1] == 'x' || text[1] == 'X')) {
+            var digits = text.length - 2;
+            var i: usize = 2;
+            while (i < text.length && text[i] == '0') {
+                digits -= 1;
+                i += 1;
+            }
+            if (digits > 16) {
+                return Err(sqlError("hex literal too big"));
+            }
+        } else if (text.parseInt<i64>().isNull()) {
+            kind = LiteralKind.Float;
+        }
+        return this.literal(kind);
+    }
+
+    private fn functionCall(borrow mut this) -> Result<Expr, SqliteError> {
+        let name = this.takeText()?;
+        this.expectOp("(")?;
+        if (name.view().equalsIgnoreAsciiCase("RAISE")) {
+            var action = RaiseAction.Ignore;
+            var message: Box<Expr>? = null;
+            if (!this.acceptWord("IGNORE")) {
+                if (this.acceptWord("ROLLBACK")) {
+                    action = RaiseAction.Rollback;
+                } else if (this.acceptWord("ABORT")) {
+                    action = RaiseAction.Abort;
+                } else if (this.acceptWord("FAIL")) {
+                    action = RaiseAction.Fail;
+                } else {
+                    return Err(this.syntaxErrorHere());
+                }
+                this.expectOp(",")?;
+                message = Box.create(this.expr()?)?;
+            }
+            this.expectOp(")")?;
+            this.height = Parser.checkedHeight(this.height + 1)?;
+            return Ok(Expr.Raise(action, message));
+        }
+        var call = FunctionCall {
+            name: name,
+            distinct: false,
+            star: false,
+            args: Vector<Expr>.create(),
+            filter: null,
+            over: null,
+        };
+        var height: u32 = 0;
+        if (this.acceptOp("*")) {
+            call.star = true;
+        } else if (!this.isOp(")")) {
+            if (this.acceptWord("DISTINCT")) {
+                call.distinct = true;
+            } else {
+                let _ = this.acceptWord("ALL");
+            }
+            call.args = this.exprList()?;
+            height = this.height;
+        }
+        this.expectOp(")")?;
+        if (this.isWord("FILTER") && this.peekIsOp(1, "(")) {
+            this.advance();
+            this.advance();
+            this.expectWord("WHERE")?;
+            call.filter = this.expr()?;
+            height = height.max(this.height);
+            this.expectOp(")")?;
+        }
+        if (this.acceptWord("OVER")) {
+            if (this.isOp("(")) {
+                call.over = this.overSpec()?;
+            } else {
+                call.over = OverClause {
+                    baseName: this.name()?,
+                    partitionBy: Vector<Expr>.create(),
+                    orderBy: Vector<OrderTerm>.create(),
+                    frame: null,
+                };
+            }
+        }
+        this.height = Parser.checkedHeight(height + 1)?;
+        return Ok(Expr.Function(Box.create(call)?));
+    }
+
+    /// A window's definition in parentheses.
+    private fn overSpec(borrow mut this) -> Result<OverClause, SqliteError> {
+        this.expectOp("(")?;
+        var over = OverClause {
+            baseName: null,
+            partitionBy: Vector<Expr>.create(),
+            orderBy: Vector<OrderTerm>.create(),
+            frame: null,
+        };
+        let startsClause = this.isWord(
+            "PARTITION",
+        ) || this.isWord("ORDER") || this.isWord("ROWS") || this.isWord("RANGE") || this.isWord("GROUPS");
+        if (!startsClause && !this.isOp(")")) {
+            over.baseName = this.name()?;
+        }
+        if (this.acceptWord("PARTITION")) {
+            this.expectWord("BY")?;
+            over.partitionBy = this.exprList()?;
+        }
+        if (this.acceptWord("ORDER")) {
+            this.expectWord("BY")?;
+            over.orderBy = this.orderTerms()?;
+        }
+        if (this.isWord("ROWS") || this.isWord("RANGE") || this.isWord("GROUPS")) {
+            let mode = if (this.isWord(
+                "ROWS",
+            )) FrameMode.Rows else if (this.isWord("RANGE")) FrameMode.Range else FrameMode.Groups;
+            this.advance();
+            var frame = FrameSpec {
+                mode: mode,
+                start: FrameBound { kind: FrameBoundKind.UnboundedPreceding, offset: null },
+                end: FrameBound { kind: FrameBoundKind.CurrentRow, offset: null },
+                exclude: FrameExclude.NoOthers,
+            };
+            if (this.acceptWord("BETWEEN")) {
+                frame.start = this.frameBound()?;
+                this.expectWord("AND")?;
+                frame.end = this.frameBound()?;
+            } else {
+                frame.start = this.frameBound()?;
+            }
+            if (this.acceptWord("EXCLUDE")) {
+                if (this.acceptWord("NO")) {
+                    this.expectWord("OTHERS")?;
+                } else if (this.acceptWord("CURRENT")) {
+                    this.expectWord("ROW")?;
+                    frame.exclude = FrameExclude.CurrentRow;
+                } else if (this.acceptWord("GROUP")) {
+                    frame.exclude = FrameExclude.Group;
+                } else {
+                    this.expectWord("TIES")?;
+                    frame.exclude = FrameExclude.Ties;
+                }
+            }
+            over.frame = frame;
+        }
+        this.expectOp(")")?;
+        return Ok(over);
+    }
+
+    private fn frameBound(borrow mut this) -> Result<FrameBound, SqliteError> {
+        if (this.acceptWord("UNBOUNDED")) {
+            if (this.acceptWord("PRECEDING")) {
+                return Ok(FrameBound { kind: FrameBoundKind.UnboundedPreceding, offset: null });
+            }
+            this.expectWord("FOLLOWING")?;
+            return Ok(FrameBound { kind: FrameBoundKind.UnboundedFollowing, offset: null });
+        }
+        if (this.isWord("CURRENT") && this.peekIsWord(1, "ROW")) {
+            this.advance();
+            this.advance();
+            return Ok(FrameBound { kind: FrameBoundKind.CurrentRow, offset: null });
+        }
+        // The distance stops before BETWEEN's AND.
+        let offset = this.exprAt(PREC_COMPARE)?;
+        if (this.acceptWord("PRECEDING")) {
+            return Ok(FrameBound { kind: FrameBoundKind.Preceding, offset: offset });
+        }
+        this.expectWord("FOLLOWING")?;
+        return Ok(FrameBound { kind: FrameBoundKind.Following, offset: offset });
+    }
+
+    private fn cast(borrow mut this) -> Result<Expr, SqliteError> {
+        this.expectWord("CAST")?;
+        this.expectOp("(")?;
+        let operand = this.expr()?;
+        let height = this.height;
+        this.expectWord("AS")?;
+        // A type name: words, then perhaps one or two signed numbers in parentheses.
+        var typeName = String.create();
+        while (this.kind() == TokenKind.Word || this.kind() == TokenKind.QuotedId) {
+            if (typeName.length != 0) {
+                typeName.append(" ")?;
+            }
+            typeName.append(this.tokens[this.at].text.view())?;
+            this.advance();
+        }
+        if (this.acceptOp("(")) {
+            typeName.append("(")?;
+            loop {
+                if (this.acceptOp("-")) {
+                    typeName.append("-")?;
+                } else {
+                    let _ = this.acceptOp("+");
+                }
+                if (this.kind() != TokenKind.IntLit && this.kind() != TokenKind.FloatLit) {
+                    return Err(this.syntaxErrorHere());
+                }
+                typeName.append(this.tokens[this.at].text.view())?;
+                this.advance();
+                if (!this.acceptOp(",")) {
+                    break;
+                }
+                typeName.append(", ")?;
+            }
+            this.expectOp(")")?;
+            typeName.append(")")?;
+        }
+        this.expectOp(")")?;
+        this.height = Parser.checkedHeight(height + 1)?;
+        return Ok(Expr.Cast(Box.create(operand)?, typeName));
+    }
+
+    private fn caseExpr(borrow mut this) -> Result<Expr, SqliteError> {
+        this.expectWord("CASE")?;
+        var expr = CaseExpr { operand: null, branches: Vector<WhenThen>.create(), otherwise: null };
+        var height: u32 = 0;
+        if (!this.isWord("WHEN")) {
+            expr.operand = this.expr()?;
+            height = this.height;
+        }
+        while (this.acceptWord("WHEN")) {
+            let when = this.expr()?;
+            height = height.max(this.height);
+            this.expectWord("THEN")?;
+            let then = this.expr()?;
+            height = height.max(this.height);
+            expr.branches.push(WhenThen { when: when, then: then })?;
+        }
+        if (expr.branches.length == 0) {
+            return Err(this.syntaxErrorHere());
+        }
+        if (this.acceptWord("ELSE")) {
+            expr.otherwise = this.expr()?;
+            height = height.max(this.height);
+        }
+        this.expectWord("END")?;
+        this.height = Parser.checkedHeight(height + 1)?;
+        return Ok(Expr.Case(Box.create(expr)?));
+    }
+}

@@ -1,0 +1,322 @@
+// The SQL tokenizer. https://www.sqlite.org/lang.html, and SQLite's tokenize.c for the edge cases.
+//
+// Differences from the C# engine, which this replaces:
+// - character classes are SQLite's, not Unicode's: digits are ASCII, white space is space, tab, newline, form
+//   feed and carriage return, and an identifier is letters, digits, `_`, `$` and any byte above 0x7F. The C#
+//   used .NET's `char.IsDigit` and `char.IsLetter`, so other scripts' digits started numbers that then failed
+//   to parse, and `$` ended an identifier;
+// - malformed tokens are errors where they are met, as in SQLite: a blob literal that is not pairs of hex
+//   digits, `0x` without digits, a number that runs into a name (`123abc`), a bare `:` or `@`. The C# passed
+//   them on, to fail later or be read as something else;
+// - an exponent is part of a number only when digits follow it, and `_` may separate digits (SQLite 3.46).
+
+enum TokenKind {
+    Eof,
+    /// An unquoted identifier or keyword; compared without regard to ASCII case.
+    Word,
+    /// "x", [x] or `x`.
+    QuotedId,
+    /// 'x'.
+    StringLit,
+    /// x'AABB': the text is the hex digits.
+    BlobLit,
+    /// 123 or 0x1F.
+    IntLit,
+    /// 1.5 or 1e10.
+    FloatLit,
+    /// ?, ?1, :name, @name or $name.
+    Param,
+    /// An operator or punctuation.
+    Op,
+}
+
+struct Token {
+    kind: TokenKind;
+    text: String;
+    /// Where the token starts in the SQL text, for error messages.
+    offset: usize;
+
+    fn isWord(borrow this, keyword: StringView) -> bool =>
+        this.kind == TokenKind.Word && this.text.view().equalsIgnoreAsciiCase(keyword);
+
+    fn isOp(borrow this, op: StringView) -> bool => this.kind == TokenKind.Op && this.text.view() == op;
+}
+
+fn isSqlSpace(c: u8) -> bool => c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 0x0C;
+
+fn isSqlDigit(c: u8) -> bool => c >= '0' && c <= '9';
+
+fn isSqlHexDigit(c: u8) -> bool => isSqlDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+
+/// Whether `c` may start an identifier.
+fn isSqlIdStart(c: u8) -> bool => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 0x80;
+
+/// Whether `c` may continue an identifier.
+fn isSqlIdChar(c: u8) -> bool => isSqlIdStart(c) || isSqlDigit(c) || c == '$';
+
+fn syntaxError(message: StringView, offset: usize) -> SqliteError {
+    var text = String.create();
+    let _ = text.append("SQL syntax error at offset ");
+    let _ = text.appendNumber(offset);
+    let _ = text.append(": ");
+    let _ = text.append(message);
+    return SqliteError.Sql(text);
+}
+
+struct Tokenizer<region r> {
+    private text: StringView<r>;
+    private at: usize;
+    private tokens: Vector<Token>;
+
+    /// The tokens of `sql`, ending with one of kind `Eof`.
+    fn tokenize(sql: StringView) -> Result<Vector<Token>, SqliteError> {
+        var t = Tokenizer { text: sql, at: 0, tokens: Vector<Token>.create() };
+        t.run()?;
+        return Ok(t.tokens);
+    }
+
+    private fn peek(borrow this, ahead: usize) -> u8 =>
+        if (this.at + ahead < this.text.length) this.text[this.at + ahead] else 0;
+
+    private fn add(
+        borrow mut this,
+        kind: TokenKind,
+        start: usize,
+        end: usize,
+        offset: usize,
+    ) -> Result<void, SqliteError> {
+        this.tokens.push(Token { kind: kind, text: String.from(this.text[start..end])?, offset: offset })?;
+        return Ok();
+    }
+
+    private fn run(borrow mut this) -> Result<void, SqliteError> {
+        let n = this.text.length;
+        while (this.at < n) {
+            let start = this.at;
+            let c = this.text[start];
+            if (isSqlSpace(c)) {
+                this.at += 1;
+                continue;
+            }
+            if (c == '-' && this.peek(1) == '-') {
+                while (this.at < n && this.text[this.at] != '\n') {
+                    this.at += 1;
+                }
+                continue;
+            }
+            if (c == '/' && this.peek(1) == '*') {
+                // As in SQLite, a comment that is never closed runs to the end of the text.
+                this.at += 2;
+                while (this.at < n && !(this.text[this.at] == '*' && this.peek(1) == '/')) {
+                    this.at += 1;
+                }
+                this.at = (this.at + 2).min(n);
+                continue;
+            }
+            if ((c == 'x' || c == 'X') && this.peek(1) == '\'') {
+                var end = start + 2;
+                while (end < n && isSqlHexDigit(this.text[end])) {
+                    end += 1;
+                }
+                if (end >= n || this.text[end] != '\'' || (end - start) % 2 != 0) {
+                    return Err(syntaxError("malformed blob literal", start));
+                }
+                this.add(TokenKind.BlobLit, start + 2, end, start)?;
+                this.at = end + 1;
+                continue;
+            }
+            if (isSqlIdStart(c)) {
+                while (this.at < n && isSqlIdChar(this.text[this.at])) {
+                    this.at += 1;
+                }
+                this.add(TokenKind.Word, start, this.at, start)?;
+                continue;
+            }
+            if (isSqlDigit(c) || (c == '.' && isSqlDigit(this.peek(1)))) {
+                this.number()?;
+                continue;
+            }
+            if (c == '\'') {
+                this.delimited('\'', TokenKind.StringLit)?;
+                continue;
+            }
+            if (c == '"' || c == '`') {
+                this.delimited(c, TokenKind.QuotedId)?;
+                continue;
+            }
+            if (c == '[') {
+                var end = start + 1;
+                while (end < n && this.text[end] != ']') {
+                    end += 1;
+                }
+                if (end >= n) {
+                    return Err(syntaxError("unterminated [identifier]", start));
+                }
+                this.add(TokenKind.QuotedId, start + 1, end, start)?;
+                this.at = end + 1;
+                continue;
+            }
+            if (c == '?') {
+                this.at += 1;
+                while (this.at < n && isSqlDigit(this.text[this.at])) {
+                    this.at += 1;
+                }
+                this.add(TokenKind.Param, start, this.at, start)?;
+                continue;
+            }
+            if (c == ':' || c == '@' || c == '$') {
+                this.at += 1;
+                while (this.at < n && isSqlIdChar(this.text[this.at])) {
+                    this.at += 1;
+                }
+                if (this.at == start + 1) {
+                    return Err(syntaxError("a parameter needs a name", start));
+                }
+                this.add(TokenKind.Param, start, this.at, start)?;
+                continue;
+            }
+            let length = this.operatorLength();
+            if (length == 0) {
+                return Err(syntaxError("unexpected character", start));
+            }
+            this.add(TokenKind.Op, start, start + length, start)?;
+            this.at += length;
+        }
+        this.tokens.push(Token { kind: TokenKind.Eof, text: String.create(), offset: n })?;
+        return Ok();
+    }
+
+    /// The length of the operator at the cursor, longest match first; 0 when there is none.
+    private fn operatorLength(borrow this) -> usize {
+        let c = this.peek(0);
+        let next = this.peek(1);
+        match (c) {
+            '-' => {
+                if (next == '>') {
+                    return if (this.peek(2) == '>') 3 else 2;
+                }
+            }
+            '<' => {
+                if (next == '<' || next == '=' || next == '>') {
+                    return 2;
+                }
+            }
+            '>' => {
+                if (next == '>' || next == '=') {
+                    return 2;
+                }
+            }
+            '=' => {
+                if (next == '=') {
+                    return 2;
+                }
+            }
+            '!' => { return if (next == '=') 2 else 0; }
+            '|' => {
+                if (next == '|') {
+                    return 2;
+                }
+            }
+            _ => {}
+        }
+        return match (c) {
+            '=' | '<' | '>' | '+' | '-' | '*' | '/' | '%' | '(' | ')' | ',' | ';' | '.' | '~' | '&' | '|' => 1,
+            _ => 0,
+        };
+    }
+
+    /// Digits, with single underscores between them.
+    private fn digits(borrow mut this, hex: bool) -> Result<void, SqliteError> {
+        let n = this.text.length;
+        let start = this.at;
+        while (this.at < n) {
+            let c = this.text[this.at];
+            if (c == '_') {
+                let before = this.at > start && this.text[this.at - 1] != '_';
+                let after = this.at + 1 < n && (if (hex) isSqlHexDigit(
+                    this.text[this.at + 1],
+                ) else isSqlDigit(this.text[this.at + 1]));
+                if (!before || !after) {
+                    return Err(syntaxError("a digit separator must stand between two digits", this.at));
+                }
+            } else if (!(if (hex) isSqlHexDigit(c) else isSqlDigit(c))) {
+                break;
+            }
+            this.at += 1;
+        }
+        return Ok();
+    }
+
+    private fn number(borrow mut this) -> Result<void, SqliteError> {
+        let n = this.text.length;
+        let start = this.at;
+        var kind = TokenKind.IntLit;
+        if (this.text[start] == '0' && (this.peek(1) == 'x' || this.peek(1) == 'X')) {
+            this.at += 2;
+            if (!isSqlHexDigit(this.peek(0))) {
+                return Err(syntaxError("a hexadecimal literal needs digits", start));
+            }
+            this.digits(true)?;
+        } else {
+            this.digits(false)?;
+            if (this.peek(0) == '.') {
+                kind = TokenKind.FloatLit;
+                this.at += 1;
+                this.digits(false)?;
+            }
+            // An exponent belongs to the number only when digits follow it.
+            let e = this.peek(0);
+            if (e == 'e' || e == 'E') {
+                let sign = this.peek(1) == '+' || this.peek(1) == '-';
+                if (isSqlDigit(this.peek(if (sign) 2 else 1))) {
+                    kind = TokenKind.FloatLit;
+                    this.at += if (sign) 2 else 1;
+                    this.digits(false)?;
+                }
+            }
+        }
+        if (this.at < n && isSqlIdChar(this.text[this.at])) {
+            return Err(syntaxError("a number runs into a name", start));
+        }
+        // The token's text is the number without its separators.
+        var text = String.withCapacity(this.at - start)?;
+        var from = start;
+        for (i in start..this.at) {
+            if (this.text[i] == '_') {
+                text.append(this.text[from..i])?;
+                from = i + 1;
+            }
+        }
+        text.append(this.text[from..this.at])?;
+        this.tokens.push(Token { kind: kind, text: text, offset: start })?;
+        return Ok();
+    }
+
+    /// A literal between two `delimiter`s, in which a doubled delimiter stands for one.
+    private fn delimited(borrow mut this, delimiter: u8, kind: TokenKind) -> Result<void, SqliteError> {
+        let n = this.text.length;
+        let start = this.at;
+        var text = String.create();
+        var from = start + 1;
+        var i = from;
+        loop {
+            if (i >= n) {
+                return Err(syntaxError("unterminated literal", start));
+            }
+            if (this.text[i] != delimiter) {
+                i += 1;
+                continue;
+            }
+            text.append(this.text[from..i])?;
+            if (i + 1 < n && this.text[i + 1] == delimiter) {
+                from = i + 1;
+                i += 2;
+                continue;
+            }
+            break;
+        }
+        this.tokens.push(Token { kind: kind, text: text, offset: start })?;
+        this.at = i + 1;
+        return Ok();
+    }
+}

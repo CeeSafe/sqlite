@@ -1,0 +1,375 @@
+// Building b-trees bottom-up from sorted content, into pages held in memory. Leaves are packed full, and each
+// level above is built over the one below until one page is left: the root.
+//
+// Differences from the C# engine, which this replaces:
+// - when the last record of an index was held back to be a divider, the C# had already written that record's
+//   overflow pages for the leaf cell it then discarded, leaving pages nothing pointed to (integrity_check:
+//   "Page N: never used"). Here a leaf's records are chosen before any cell is built;
+// - rows with the same rowid, and more pages than the format holds, are errors rather than a damaged file.
+
+/// The pages of a database being built: page `n` is `pages[n - 1]`.
+struct PageStore {
+    pageSize: usize;
+    pages: Vector<Vector<u8>>;
+
+    fn create(pageSize: usize) -> PageStore => PageStore { pageSize: pageSize, pages: Vector<Vector<u8>>.create() };
+
+    /// Adds a zeroed page and returns its number.
+    fn allocate(borrow mut this) -> Result<u32, SqliteError> {
+        // SQLite's largest page number.
+        if (this.pages.length >= 4294967294) {
+            return Err(unsupported("the database would have more pages than the file format allows"));
+        }
+        var page = Vector<u8>.create();
+        page.resize(this.pageSize, 0)?;
+        this.pages.push(page)?;
+        return Ok(truncate<u32>(this.pages.length));
+    }
+
+    fn page(borrow mut this, number: u32) -> SliceMut<u8> => this.pages[(number - 1) as usize].viewMut();
+
+    fn count(borrow this) -> u32 => truncate<u32>(this.pages.length);
+}
+
+/// A page of one level and the largest rowid under it.
+struct TableNode {
+    page: u32;
+    maxKey: i64;
+}
+
+/// A table row ready to store: its rowid and its record.
+struct EncodedRow {
+    rowId: i64;
+    record: Vector<u8>;
+}
+
+struct BTreeBuilder {
+    // The builder writes pages with no reserved space, so a page's usable size is its size.
+    fn tableLeafMaxLocal(store: borrow PageStore) -> usize => store.pageSize - 35;
+
+    fn indexMaxLocal(store: borrow PageStore) -> usize => (store.pageSize - 12) * 64 / 255 - 23;
+
+    /// The bytes of a payload of `length` kept in its cell when it spills to overflow pages.
+    fn localSize(store: borrow PageStore, length: usize, maxLocal: usize) -> usize {
+        let minLocal = (store.pageSize - 12) * 32 / 255 - 23;
+        let k = minLocal + (length - minLocal) % (store.pageSize - 4);
+        return if (k <= maxLocal) k else minLocal;
+    }
+
+    /// The bytes a payload of `length` takes in its cell: all of it, or its local part and an overflow pointer.
+    fn portionSize(store: borrow PageStore, length: usize, maxLocal: usize) -> usize =>
+        if (length <= maxLocal) length else BTreeBuilder.localSize(store, length, maxLocal) + 4;
+
+    /// Appends the payload's part of a cell to `cell`, writing overflow pages for what does not fit.
+    fn appendPayload(
+        store: borrow mut PageStore,
+        cell: borrow mut Vector<u8>,
+        record: Slice<u8>,
+        maxLocal: usize,
+    ) -> Result<void, SqliteError> {
+        if (record.length <= maxLocal) {
+            cell.extend(record)?;
+            return Ok();
+        }
+        let local = BTreeBuilder.localSize(store, record.length, maxLocal);
+        cell.extend(record[0..local])?;
+        let chunkSize = store.pageSize - 4;
+        var position = local;
+        var first: u32 = 0;
+        var previous: u32 = 0;
+        while (position < record.length) {
+            let page = store.allocate()?;
+            if (first == 0) {
+                first = page;
+            }
+            if (previous != 0) {
+                store.page(previous).writeBE(0, page);
+            }
+            let chunk = chunkSize.min(record.length - position);
+            store.page(page)[4..4 + chunk].copyFrom(record[position..position + chunk]);
+            position += chunk;
+            previous = page;
+        }
+        cell.pushBE(first)?;
+        return Ok();
+    }
+
+    /// A table leaf cell: the payload's length, the rowid, the payload.
+    fn tableLeafCell(store: borrow mut PageStore, rowId: i64, record: Slice<u8>) -> Result<Vector<u8>, SqliteError> {
+        var cell = Vector<u8>.create();
+        Varint.append(truncate<i64>(record.length), mut cell)?;
+        Varint.append(rowId, mut cell)?;
+        BTreeBuilder.appendPayload(store, mut cell, record, BTreeBuilder.tableLeafMaxLocal(store))?;
+        return Ok(cell);
+    }
+
+    /// An index cell: for an interior page the child before it, then the payload's length and the payload.
+    fn indexCell(store: borrow mut PageStore, child: u32?, record: Slice<u8>) -> Result<Vector<u8>, SqliteError> {
+        var cell = Vector<u8>.create();
+        if (child is Some(page)) {
+            cell.pushBE(page)?;
+        }
+        Varint.append(truncate<i64>(record.length), mut cell)?;
+        BTreeBuilder.appendPayload(store, mut cell, record, BTreeBuilder.indexMaxLocal(store))?;
+        return Ok(cell);
+    }
+
+    /// The room an index cell takes in its page, its 2-byte pointer included.
+    fn indexCellSize(store: borrow PageStore, length: usize, interior: bool) -> usize =>
+        (if (interior) 4 else 0) + Varint.length(truncate<i64>(length)) + BTreeBuilder.portionSize(
+            store,
+            length,
+            BTreeBuilder.indexMaxLocal(store),
+        ) + 2;
+
+    /// Lays `cells` out in a page: pointers after the header, contents packed against the page's end.
+    /// `rightMost` makes it an interior page.
+    fn fillPage(page: SliceMut<u8>, headerOffset: usize, kind: u8, cells: Slice<Vector<u8>>, rightMost: u32?) {
+        page[headerOffset] = kind;
+        page.writeBE(headerOffset + 1, 0u16);
+        page.writeBE(headerOffset + 3, truncate<u16>(cells.length));
+        page[headerOffset + 7] = 0;
+        var pointers = headerOffset + 8;
+        if (rightMost is Some(child)) {
+            page.writeBE(headerOffset + 8, child);
+            pointers = headerOffset + 12;
+        }
+        var content = page.length;
+        for (i in 0..cells.length) {
+            content -= cells[i].length;
+            page[content..content + cells[i].length].copyFrom(cells[i].view());
+            page.writeBE(pointers + i * 2, truncate<u16>(content));
+        }
+        // The start of the cell content area; 65536 is written as 0, which the truncation does.
+        page.writeBE(headerOffset + 5, truncate<u16>(content));
+    }
+
+    // ── table b-trees ────────────────────────────────────────────────────────────────────────────────────────
+
+    /// Builds a table b-tree from rows in rowid order, and returns its root page.
+    fn buildTable(store: borrow mut PageStore, rows: Slice<EncodedRow>) -> Result<u32, SqliteError> {
+        var level = BTreeBuilder.tableLeaves(store, rows)?;
+        while (level.length > 1) {
+            level = BTreeBuilder.tableInteriorLevel(store, level.view())?;
+        }
+        return Ok(level[0].page);
+    }
+
+    private fn tableLeaves(
+        store: borrow mut PageStore,
+        rows: Slice<EncodedRow>,
+    ) -> Result<Vector<TableNode>, SqliteError> {
+        var leaves = Vector<TableNode>.create();
+        var cells = Vector<Vector<u8>>.create();
+        var footprint: usize = 8;
+        var lastKey: i64 = 0;
+        for (i in 0..rows.length) {
+            if (i != 0 && rows[i].rowId <= rows[i - 1].rowId) {
+                return Err(SqliteError.Constraint(ownedMessage("two rows of a table have the same rowid")));
+            }
+            let cell = BTreeBuilder.tableLeafCell(store, rows[i].rowId, rows[i].record.view())?;
+            if (cells.length != 0 && footprint + cell.length + 2 > store.pageSize) {
+                let page = store.allocate()?;
+                BTreeBuilder.fillPage(store.page(page), 0, PAGE_LEAF_TABLE, cells.view(), null);
+                leaves.push(TableNode { page: page, maxKey: lastKey })?;
+                cells.clear();
+                footprint = 8;
+            }
+            footprint += cell.length + 2;
+            cells.push(cell)?;
+            lastKey = rows[i].rowId;
+        }
+        // The last leaf; an empty table is one empty leaf.
+        let page = store.allocate()?;
+        BTreeBuilder.fillPage(store.page(page), 0, PAGE_LEAF_TABLE, cells.view(), null);
+        leaves.push(TableNode { page: page, maxKey: lastKey })?;
+        return Ok(leaves);
+    }
+
+    /// An interior table page's cells over `children`: every child but the last, with its largest rowid.
+    private fn tableInteriorCells(children: Slice<TableNode>) -> Result<Vector<Vector<u8>>, SqliteError> {
+        var cells = Vector<Vector<u8>>.create();
+        for (i in 0..children.length - 1) {
+            var cell = Vector<u8>.create();
+            cell.pushBE(children[i].page)?;
+            Varint.append(children[i].maxKey, mut cell)?;
+            cells.push(cell)?;
+        }
+        return Ok(cells);
+    }
+
+    private fn tableInteriorLevel(
+        store: borrow mut PageStore,
+        children: Slice<TableNode>,
+    ) -> Result<Vector<TableNode>, SqliteError> {
+        // A cell is at most a 4-byte child, a 9-byte key and its 2-byte pointer.
+        let maxChildren = ((store.pageSize - 12) / 15).max(2);
+        let groups = (children.length + maxChildren - 1) / maxChildren;
+        let baseSize = children.length / groups;
+        let remainder = children.length % groups;
+        var parents = Vector<TableNode>.create();
+        var index: usize = 0;
+        for (g in 0..groups) {
+            let size = baseSize + (if (g < remainder) 1 else 0);
+            let group = children[index..index + size];
+            index += size;
+            let page = store.allocate()?;
+            let cells = BTreeBuilder.tableInteriorCells(group)?;
+            BTreeBuilder.fillPage(store.page(page), 0, PAGE_INTERIOR_TABLE, cells.view(), group[size - 1].page);
+            parents.push(TableNode { page: page, maxKey: group[size - 1].maxKey })?;
+        }
+        return Ok(parents);
+    }
+
+    /// Builds sqlite_schema, whose root is page 1, after the database header: one leaf when its cells fit, an
+    /// interior page over leaves when they do not.
+    fn buildRootOnPage1(
+        store: borrow mut PageStore,
+        cells: Slice<Vector<u8>>,
+        rowIds: Slice<i64>,
+    ) -> Result<void, SqliteError> {
+        var footprint: usize = DATABASE_HEADER_SIZE + 8;
+        for (i in 0..cells.length) {
+            footprint += cells[i].length + 2;
+        }
+        if (footprint <= store.pageSize) {
+            BTreeBuilder.fillPage(store.page(1), DATABASE_HEADER_SIZE, PAGE_LEAF_TABLE, cells, null);
+            return Ok();
+        }
+        var leaves = Vector<TableNode>.create();
+        var start: usize = 0;
+        var used: usize = 8;
+        // Cells that would fit one ordinary leaf are still put in two, so that the root has a cell: SQLite
+        // leaves a root without cells only when a single cell is all there is.
+        let fitsOneLeaf = footprint - DATABASE_HEADER_SIZE <= store.pageSize && cells.length >= 2;
+        let forcedSplit = if (fitsOneLeaf) (cells.length + 1) / 2 else cells.length + 1;
+        for (i in 0..cells.length + 1) {
+            if (i == cells.length || (i > start && (i == forcedSplit || used + cells[i].length + 2 > store.pageSize))) {
+                let page = store.allocate()?;
+                BTreeBuilder.fillPage(store.page(page), 0, PAGE_LEAF_TABLE, cells[start..i], null);
+                leaves.push(TableNode { page: page, maxKey: rowIds[i - 1] })?;
+                start = i;
+                used = 8;
+            }
+            if (i < cells.length) {
+                used += cells[i].length + 2;
+            }
+        }
+        // Page 1 has 100 bytes less room; build levels until the top one fits in it.
+        let maxRootChildren = ((store.pageSize - DATABASE_HEADER_SIZE - 12) / 15).max(2);
+        while (leaves.length > maxRootChildren) {
+            leaves = BTreeBuilder.tableInteriorLevel(store, leaves.view())?;
+        }
+        let rootCells = BTreeBuilder.tableInteriorCells(leaves.view())?;
+        BTreeBuilder.fillPage(
+            store.page(1),
+            DATABASE_HEADER_SIZE,
+            PAGE_INTERIOR_TABLE,
+            rootCells.view(),
+            leaves[leaves.length - 1].page,
+        );
+        return Ok();
+    }
+
+    // ── index b-trees ────────────────────────────────────────────────────────────────────────────────────────
+
+    /// Builds an index b-tree from entries' records in index order, and returns its root page.
+    fn buildIndex(store: borrow mut PageStore, records: Slice<Vector<u8>>) -> Result<u32, SqliteError> {
+        // Between two neighbouring pages of a level stands one record, the divider, which goes to their parent:
+        // `dividers[i]` is the index of the record between `children[i]` and `children[i + 1]`.
+        var children = Vector<u32>.create();
+        var dividers = Vector<usize>.create();
+        let n = records.length;
+        var i: usize = 0;
+        while (i < n) {
+            // The records of the next leaf, measured before any cell is built.
+            let start = i;
+            var footprint: usize = 8;
+            while (i < n) {
+                let size = BTreeBuilder.indexCellSize(store, records[i].length, false);
+                if (i > start && footprint + size > store.pageSize) {
+                    break;
+                }
+                footprint += size;
+                i += 1;
+            }
+            var end = i;
+            if (i + 1 == n) {
+                // One record would be left: as a divider it would have no leaf to its right. If this leaf has
+                // two or more, its last becomes the divider and the one left becomes the final leaf; otherwise
+                // the one left joins this leaf (two index cells always fit a page).
+                if (end - start >= 2) {
+                    end -= 1;
+                    children.push(BTreeBuilder.indexLeaf(store, records[start..end])?)?;
+                    dividers.push(end)?;
+                    children.push(BTreeBuilder.indexLeaf(store, records[n - 1..n])?)?;
+                } else {
+                    children.push(BTreeBuilder.indexLeaf(store, records[start..n])?)?;
+                }
+                i = n;
+            } else {
+                children.push(BTreeBuilder.indexLeaf(store, records[start..end])?)?;
+                if (i < n) {
+                    dividers.push(i)?;
+                    i += 1;
+                }
+            }
+        }
+        if (children.length == 0) {
+            children.push(BTreeBuilder.indexLeaf(store, records[0..0])?)?;
+        }
+        while (children.length > 1) {
+            // Split evenly, so that every interior page has at least two children and its cells fit.
+            var maxCell: usize = 2;
+            for (d in 0..dividers.length) {
+                maxCell = maxCell.max(BTreeBuilder.indexCellSize(store, records[dividers[d]].length, true));
+            }
+            let maxChildren = (1 + (store.pageSize - 12) / maxCell).max(2);
+            let groups = (children.length + maxChildren - 1) / maxChildren;
+            let baseSize = children.length / groups;
+            let remainder = children.length % groups;
+            var parents = Vector<u32>.create();
+            var parentDividers = Vector<usize>.create();
+            var child: usize = 0;
+            var divider: usize = 0;
+            for (g in 0..groups) {
+                let size = baseSize + (if (g < remainder) 1 else 0);
+                var cells = Vector<Vector<u8>>.create();
+                for (k in 0..size - 1) {
+                    cells.push(
+                        BTreeBuilder.indexCell(store, children[child + k], records[dividers[divider + k]].view())?,
+                    )?;
+                }
+                let page = store.allocate()?;
+                BTreeBuilder.fillPage(
+                    store.page(page),
+                    0,
+                    PAGE_INTERIOR_INDEX,
+                    cells.view(),
+                    children[child + size - 1],
+                );
+                parents.push(page)?;
+                child += size;
+                divider += size - 1;
+                if (g + 1 < groups) {
+                    // The divider between this group and the next goes up another level.
+                    parentDividers.push(dividers[divider])?;
+                    divider += 1;
+                }
+            }
+            children = parents;
+            dividers = parentDividers;
+        }
+        return Ok(children[0]);
+    }
+
+    private fn indexLeaf(store: borrow mut PageStore, records: Slice<Vector<u8>>) -> Result<u32, SqliteError> {
+        var cells = Vector<Vector<u8>>.withCapacity(records.length)?;
+        for (i in 0..records.length) {
+            cells.push(BTreeBuilder.indexCell(store, null, records[i].view())?)?;
+        }
+        let page = store.allocate()?;
+        BTreeBuilder.fillPage(store.page(page), 0, PAGE_LEAF_INDEX, cells.view(), null);
+        return Ok(page);
+    }
+}

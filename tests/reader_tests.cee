@@ -1,0 +1,215 @@
+// Reading databases that the stock sqlite3 command-line shell wrote. Each test makes its own file under out/.
+
+/// Makes a fresh database at `path` by running `sql` through the sqlite3 shell.
+fn makeDatabase(path: StringView, sql: StringView) -> Result<void, TestFailure> {
+    let _ = File.remove(path);
+    var arguments = Vector<StringView>.create();
+    arguments.push(path)!;
+    arguments.push(sql)!;
+    match (Process.run("sqlite3", borrow arguments)) {
+        Ok(0) => { return Ok(); }
+        Ok(_) => { return Check.fail("sqlite3 refused the fixture's SQL"); }
+        Err(_) => { return Check.fail("the sqlite3 shell is needed to make fixtures"); }
+    }
+}
+
+fn integerAt(row: borrow TableRow, column: usize) -> Result<i64, TestFailure> {
+    match (borrow row.columns[column]) {
+        SqliteValue.Integer(v) => { return Ok(v); }
+        _ => {
+            Check.fail("expected an integer column")?;
+            return Ok(0);
+        }
+    }
+}
+
+const MANY_ROWS_SQL: StringView = """
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER, label TEXT);
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 20000)
+    INSERT INTO t SELECT i, i * 3, 'row number ' || i FROM c;
+    CREATE INDEX t_n ON t(n);
+    CREATE VIEW v AS SELECT id FROM t;
+    """;
+
+@test
+fn readsSchema() -> Result<void, TestFailure> {
+    let path = "out/reader-schema.db";
+    makeDatabase(path, MANY_ROWS_SQL)?;
+    let reader = DatabaseReader.open(path)!;
+    Check.equalU64(4096, reader.pageSize() as u64)?;
+    let schema = reader.schema();
+    Check.equalU64(3, schema.length as u64)?;
+    Check.equalText("table", schema[0].kind.view())?;
+    Check.equalText("t", schema[0].name.view())?;
+    Check.isTrue(schema[0].rootPage > 1, "the table has a root page")?;
+    Check.equalText("index", schema[1].kind.view())?;
+    Check.equalText("t_n", schema[1].name.view())?;
+    Check.equalText("t", schema[1].tableName.view())?;
+    Check.equalText("view", schema[2].kind.view())?;
+    Check.equalU64(0, schema[2].rootPage as u64)?;
+    Check.isTrue(reader.findTable("T")!.isSome(), "table names ignore ASCII case")?;
+    Check.isTrue(reader.findTable("v")!.isNull(), "a view is not a table")?;
+    Check.isTrue(reader.findIndex("T_N")!.isSome(), "index names ignore ASCII case")?;
+    return Ok();
+}
+
+@test
+fn scansAMultiLevelTable() -> Result<void, TestFailure> {
+    let path = "out/reader-scan.db";
+    makeDatabase(path, MANY_ROWS_SQL)?;
+    var reader = DatabaseReader.open(path)!;
+    var cursor = reader.scanTable("t")!;
+    var count: i64 = 0;
+    var sum: i64 = 0;
+    var previous: i64 = 0;
+    while (reader.nextRow(mut cursor)! is Some(row)) {
+        count += 1;
+        Check.isTrue(row.rowId == previous + 1, "rows come in rowid order")?;
+        previous = row.rowId;
+        // An INTEGER PRIMARY KEY column is stored as NULL: the rowid is its value.
+        Check.isTrue(row.columns[0].isNull(), "the rowid alias is stored as NULL")?;
+        sum += integerAt(row, 1)?;
+    }
+    Check.equalI64(20000, count)?;
+    Check.equalI64(3 * 20000 * 20001 / 2, sum)?;
+    return Ok();
+}
+
+@test
+fn seeksAndRanges() -> Result<void, TestFailure> {
+    let path = "out/reader-seek.db";
+    makeDatabase(path, MANY_ROWS_SQL)?;
+    var reader = DatabaseReader.open(path)!;
+    let ids = [1i64, 2, 777, 9999, 20000];
+    for (id in ids) {
+        match (reader.seekRow("t", id)!) {
+            Some(row) => {
+                Check.equalI64(id, row.rowId)?;
+                Check.equalI64(id * 3, integerAt(row, 1)?)?;
+            }
+            null => { return Check.fail("a row that exists was not found"); }
+        }
+    }
+    Check.isTrue(reader.seekRow("t", 0)!.isNull(), "rowid 0 is absent")?;
+    Check.isTrue(reader.seekRow("t", 20001)!.isNull(), "a rowid past the end is absent")?;
+    Check.isTrue(reader.seekRow("missing", 1)!.isNull(), "a missing table has no rows")?;
+
+    var cursor = reader.scanRange("t", 4990, 5010)!;
+    var expected: i64 = 4990;
+    while (reader.nextRow(mut cursor)! is Some(row)) {
+        Check.equalI64(expected, row.rowId)?;
+        expected += 1;
+    }
+    Check.equalI64(5011, expected)?;
+
+    var empty = reader.scanRange("t", 30000, 40000)!;
+    Check.isTrue(reader.nextRow(mut empty)!.isNull(), "a range past the end is empty")?;
+    var inverted = reader.scanRange("t", 10, 5)!;
+    Check.isTrue(reader.nextRow(mut inverted)!.isNull(), "an inverted range is empty")?;
+    var masked = reader.scanRange("t", 5, 5)!.withColumns([false, true, false][..])!;
+    match (reader.nextRow(mut masked)!) {
+        Some(row) => {
+            Check.equalI64(15, integerAt(row, 1)?)?;
+            Check.isTrue(row.columns[2].isNull(), "a column outside the mask is not decoded")?;
+        }
+        null => { return Check.fail("row 5 exists"); }
+    }
+    return Ok();
+}
+
+@test
+fn readsOverflowPayloads() -> Result<void, TestFailure> {
+    let path = "out/reader-overflow.db";
+    makeDatabase(path, """
+        CREATE TABLE big(id INTEGER PRIMARY KEY, body TEXT, raw BLOB);
+        INSERT INTO big VALUES (1, printf('%.*c', 50000, 'x'), zeroblob(100000));
+        INSERT INTO big VALUES (2, 'small', x'0102');
+        INSERT INTO big VALUES (3, printf('%.*c', 4061, 'y'), NULL);
+        """)?;
+    var reader = DatabaseReader.open(path)!;
+    var cursor = reader.scanTable("big")!;
+    let first = reader.nextRow(mut cursor)!!;
+    match (borrow first.columns[1]) {
+        SqliteValue.Text(s) => {
+            Check.equalU64(50000, s.length as u64)?;
+            Check.isTrue(s.view()[0] == 'x' && s.view()[49999] == 'x', "the text is whole")?;
+        }
+        _ => { return Check.fail("expected text"); }
+    }
+    match (borrow first.columns[2]) {
+        SqliteValue.Blob(b) => { Check.equalU64(100000, b.length as u64)?; }
+        _ => { return Check.fail("expected a blob"); }
+    }
+    let second = reader.nextRow(mut cursor)!!;
+    match (borrow second.columns[1]) {
+        SqliteValue.Text(s) => { Check.equalText("small", s.view())?; }
+        _ => { return Check.fail("expected text"); }
+    }
+    let third = reader.nextRow(mut cursor)!!;
+    match (borrow third.columns[1]) {
+        SqliteValue.Text(s) => { Check.equalU64(4061, s.length as u64)?; }
+        _ => { return Check.fail("expected text"); }
+    }
+    Check.isTrue(reader.nextRow(mut cursor)!.isNull(), "three rows")?;
+    return Ok();
+}
+
+@test
+fn readsUtf16Databases() -> Result<void, TestFailure> {
+    let path = "out/reader-utf16.db";
+    makeDatabase(path, """
+        PRAGMA encoding = 'UTF-16le';
+        CREATE TABLE words(w TEXT);
+        INSERT INTO words VALUES ('héllo 😀');
+        """)?;
+    var reader = DatabaseReader.open(path)!;
+    Check.isTrue(reader.textEncoding() == TextEncoding.Utf16LE, "the header names the encoding")?;
+    var cursor = reader.scanTable("words")!;
+    let row = reader.nextRow(mut cursor)!!;
+    match (borrow row.columns[0]) {
+        SqliteValue.Text(s) => { Check.equalText("héllo 😀", s.view())?; }
+        _ => { return Check.fail("expected text"); }
+    }
+    return Ok();
+}
+
+@test
+fn rejectsFilesThatAreNotDatabases() -> Result<void, TestFailure> {
+    let path = "out/reader-garbage.db";
+    var file = File.create(path)!;
+    var junk = Vector<u8>.create();
+    junk.resize(4096, 0x41)!;
+    file.write(junk.view())!;
+    match (DatabaseReader.open(path)) {
+        Err(SqliteError.NotADatabase(_)) => {}
+        _ => { return Check.fail("garbage must be refused as not a database"); }
+    }
+    return Ok();
+}
+
+@test
+fn truncatedDatabaseIsCorruptNotACrash() -> Result<void, TestFailure> {
+    let path = "out/reader-truncated.db";
+    makeDatabase(path, MANY_ROWS_SQL)?;
+    {
+        var file = File.openReadWrite(path)!;
+        let length = file.length()!;
+        file.setLength(length / 2)!;
+    }
+    var reader = DatabaseReader.open(path)!;
+    var cursor = reader.scanTable("t")!;
+    var failed = false;
+    loop {
+        match (reader.nextRow(mut cursor)) {
+            Ok(Some(_)) => {}
+            Ok(null) => { break; }
+            Err(SqliteError.Corrupt(_)) => {
+                failed = true;
+                break;
+            }
+            Err(_) => { return Check.fail("a truncated file must be reported as corrupt"); }
+        }
+    }
+    Check.isTrue(failed, "half a database cannot scan to the end")?;
+    return Ok();
+}

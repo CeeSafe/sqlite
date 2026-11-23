@@ -1,0 +1,327 @@
+// Expressions back to SQL text, in one canonical form: every operator's operands in parentheses, names in double
+// quotes, keywords in upper case. The form is for comparing and showing expressions (tests, index definitions,
+// diagnostics); it parses back to the same tree.
+//
+// The C# engine also rendered whole statements and stored the result in sqlite_schema as a view's, trigger's or
+// table's definition. Its renderer left out what it did not know (WINDOW clauses, NULLS FIRST, upserts, RETURNING,
+// NATURAL joins, table functions), so a definition could come back from the file meaning something else. The port
+// keeps a statement's own text for that, as SQLite does, and has no statement renderer.
+
+struct SqlWriter {
+    /// `expr` as SQL.
+    fn expression(expr: borrow Expr) -> Result<String, AllocError> {
+        var out = String.create();
+        SqlWriter.appendExpr(mut out, expr)?;
+        return Ok(out);
+    }
+
+    /// `name` in double quotes, with any inside doubled.
+    fn appendIdentifier(out: borrow mut String, name: StringView) -> Result<void, AllocError> {
+        out.append("\"")?;
+        SqlWriter.appendDoubling(out, name, '"')?;
+        return out.append("\"");
+    }
+
+    /// `text` as a string literal.
+    fn appendStringLiteral(out: borrow mut String, text: StringView) -> Result<void, AllocError> {
+        out.append("'")?;
+        SqlWriter.appendDoubling(out, text, '\'')?;
+        return out.append("'");
+    }
+
+    private fn appendDoubling(out: borrow mut String, text: StringView, quote: u8) -> Result<void, AllocError> {
+        var from: usize = 0;
+        for (i in 0..text.length) {
+            if (text[i] == quote) {
+                out.append(text[from..i + 1])?;
+                from = i;
+            }
+        }
+        return out.append(text[from..]);
+    }
+
+    fn binaryOperator(op: BinaryOp) -> StringView => match (op) {
+        BinaryOp.Or => "OR",
+        BinaryOp.And => "AND",
+        BinaryOp.Equal => "=",
+        BinaryOp.NotEqual => "<>",
+        BinaryOp.Less => "<",
+        BinaryOp.LessOrEqual => "<=",
+        BinaryOp.Greater => ">",
+        BinaryOp.GreaterOrEqual => ">=",
+        BinaryOp.Add => "+",
+        BinaryOp.Subtract => "-",
+        BinaryOp.Multiply => "*",
+        BinaryOp.Divide => "/",
+        BinaryOp.Modulo => "%",
+        BinaryOp.Concat => "||",
+        BinaryOp.BitAnd => "&",
+        BinaryOp.BitOr => "|",
+        BinaryOp.ShiftLeft => "<<",
+        BinaryOp.ShiftRight => ">>",
+        BinaryOp.JsonGet => "->",
+        BinaryOp.JsonGetValue => "->>",
+    };
+
+    private fn appendList(out: borrow mut String, items: Slice<Expr>) -> Result<void, AllocError> {
+        for (i in 0..items.length) {
+            if (i != 0) {
+                out.append(", ")?;
+            }
+            SqlWriter.appendExpr(out, borrow items[i])?;
+        }
+        return Ok();
+    }
+
+    private fn appendOrderTerms(out: borrow mut String, terms: Slice<OrderTerm>) -> Result<void, AllocError> {
+        for (i in 0..terms.length) {
+            if (i != 0) {
+                out.append(", ")?;
+            }
+            SqlWriter.appendExpr(out, borrow terms[i].expr)?;
+            if (terms[i].descending) {
+                out.append(" DESC")?;
+            }
+            if (terms[i].nullsFirst is Some(first)) {
+                out.append(if (first) " NULLS FIRST" else " NULLS LAST")?;
+            }
+        }
+        return Ok();
+    }
+
+    private fn appendFrameBound(out: borrow mut String, bound: borrow FrameBound) -> Result<void, AllocError> {
+        if (borrow bound.offset is Some(offset)) {
+            SqlWriter.appendExpr(out, offset)?;
+            out.append(" ")?;
+        }
+        return out.append(match (bound.kind) {
+            FrameBoundKind.UnboundedPreceding => "UNBOUNDED PRECEDING",
+            FrameBoundKind.Preceding => "PRECEDING",
+            FrameBoundKind.CurrentRow => "CURRENT ROW",
+            FrameBoundKind.Following => "FOLLOWING",
+            FrameBoundKind.UnboundedFollowing => "UNBOUNDED FOLLOWING",
+        });
+    }
+
+    private fn appendOver(out: borrow mut String, over: borrow OverClause) -> Result<void, AllocError> {
+        out.append(" OVER (")?;
+        var written = false;
+        if (borrow over.baseName is Some(base)) {
+            SqlWriter.appendIdentifier(out, base.view())?;
+            written = true;
+        }
+        if (over.partitionBy.length != 0) {
+            out.append(if (written) " PARTITION BY " else "PARTITION BY ")?;
+            SqlWriter.appendList(out, over.partitionBy.view())?;
+            written = true;
+        }
+        if (over.orderBy.length != 0) {
+            out.append(if (written) " ORDER BY " else "ORDER BY ")?;
+            SqlWriter.appendOrderTerms(out, over.orderBy.view())?;
+            written = true;
+        }
+        if (borrow over.frame is Some(frame)) {
+            if (written) {
+                out.append(" ")?;
+            }
+            out.append(match (frame.mode) {
+                FrameMode.Rows => "ROWS BETWEEN ",
+                FrameMode.Range => "RANGE BETWEEN ",
+                FrameMode.Groups => "GROUPS BETWEEN ",
+            })?;
+            SqlWriter.appendFrameBound(out, borrow frame.start)?;
+            out.append(" AND ")?;
+            SqlWriter.appendFrameBound(out, borrow frame.end)?;
+            out.append(match (frame.exclude) {
+                FrameExclude.NoOthers => "",
+                FrameExclude.CurrentRow => " EXCLUDE CURRENT ROW",
+                FrameExclude.Group => " EXCLUDE GROUP",
+                FrameExclude.Ties => " EXCLUDE TIES",
+            })?;
+        }
+        return out.append(")");
+    }
+
+    fn appendExpr(out: borrow mut String, expr: borrow Expr) -> Result<void, AllocError> {
+        match (expr) {
+            Expr.Literal(literal) => {
+                match (literal.kind) {
+                    LiteralKind.Null => { out.append("NULL")?; }
+                    LiteralKind.Integer | LiteralKind.Float => { out.append(literal.text.view())?; }
+                    LiteralKind.String => { SqlWriter.appendStringLiteral(out, literal.text.view())?; }
+                    LiteralKind.Blob => {
+                        out.append("x'")?;
+                        out.append(literal.text.view())?;
+                        out.append("'")?;
+                    }
+                    LiteralKind.True => { out.append("TRUE")?; }
+                    LiteralKind.False => { out.append("FALSE")?; }
+                    LiteralKind.CurrentTime => { out.append("CURRENT_TIME")?; }
+                    LiteralKind.CurrentDate => { out.append("CURRENT_DATE")?; }
+                    LiteralKind.CurrentTimestamp => { out.append("CURRENT_TIMESTAMP")?; }
+                }
+            }
+            Expr.Column(column) => {
+                if (borrow column.schema is Some(schema)) {
+                    SqlWriter.appendIdentifier(out, schema.view())?;
+                    out.append(".")?;
+                }
+                if (borrow column.table is Some(table)) {
+                    SqlWriter.appendIdentifier(out, table.view())?;
+                    out.append(".")?;
+                }
+                SqlWriter.appendIdentifier(out, column.name.view())?;
+            }
+            Expr.RowValue(items) => {
+                out.append("(")?;
+                SqlWriter.appendList(out, items.view())?;
+                out.append(")")?;
+            }
+            Expr.Param(text) => { out.append(text.view())?; }
+            Expr.Unary(op, operand) => {
+                out.append(match (op) {
+                    UnaryOp.Negate => "(-",
+                    UnaryOp.Plus => "(+",
+                    UnaryOp.BitNot => "(~",
+                    UnaryOp.Not => "(NOT ",
+                })?;
+                SqlWriter.appendExpr(out, operand)?;
+                out.append(")")?;
+            }
+            Expr.Binary(op, left, right) => {
+                out.append("(")?;
+                SqlWriter.appendExpr(out, left)?;
+                out.append(" ")?;
+                out.append(SqlWriter.binaryOperator(op))?;
+                out.append(" ")?;
+                SqlWriter.appendExpr(out, right)?;
+                out.append(")")?;
+            }
+            Expr.Collate(operand, collation) => {
+                out.append("(")?;
+                SqlWriter.appendExpr(out, operand)?;
+                out.append(" COLLATE ")?;
+                SqlWriter.appendIdentifier(out, collation.view())?;
+                out.append(")")?;
+            }
+            Expr.Is(left, right, negated) => {
+                out.append("(")?;
+                SqlWriter.appendExpr(out, left)?;
+                out.append(if (negated) " IS NOT " else " IS ")?;
+                SqlWriter.appendExpr(out, right)?;
+                out.append(")")?;
+            }
+            Expr.Between(between) => {
+                out.append("(")?;
+                SqlWriter.appendExpr(out, borrow between.operand)?;
+                out.append(if (between.negated) " NOT BETWEEN " else " BETWEEN ")?;
+                SqlWriter.appendExpr(out, borrow between.low)?;
+                out.append(" AND ")?;
+                SqlWriter.appendExpr(out, borrow between.high)?;
+                out.append(")")?;
+            }
+            Expr.Like(like) => {
+                out.append("(")?;
+                SqlWriter.appendExpr(out, borrow like.operand)?;
+                if (like.negated) {
+                    out.append(" NOT")?;
+                }
+                out.append(match (like.op) {
+                    LikeOp.Like => " LIKE ",
+                    LikeOp.Glob => " GLOB ",
+                    LikeOp.Match => " MATCH ",
+                    LikeOp.Regexp => " REGEXP ",
+                })?;
+                SqlWriter.appendExpr(out, borrow like.pattern)?;
+                if (borrow like.escape is Some(escape)) {
+                    out.append(" ESCAPE ")?;
+                    SqlWriter.appendExpr(out, escape)?;
+                }
+                out.append(")")?;
+            }
+            Expr.In(inExpr) => {
+                out.append("(")?;
+                SqlWriter.appendExpr(out, borrow inExpr.operand)?;
+                out.append(if (inExpr.negated) " NOT IN " else " IN ")?;
+                match (borrow inExpr.source) {
+                    InSource.Items(items) => {
+                        out.append("(")?;
+                        SqlWriter.appendList(out, items.view())?;
+                        out.append(")")?;
+                    }
+                    InSource.Select(_) => { out.append("(SELECT …)")?; }
+                    InSource.Table(table) => {
+                        if (borrow table.schema is Some(schema)) {
+                            SqlWriter.appendIdentifier(out, schema.view())?;
+                            out.append(".")?;
+                        }
+                        SqlWriter.appendIdentifier(out, table.name.view())?;
+                    }
+                }
+                out.append(")")?;
+            }
+            Expr.Function(call) => {
+                out.append(call.name.view())?;
+                out.append("(")?;
+                if (call.star) {
+                    out.append("*")?;
+                } else {
+                    if (call.distinct) {
+                        out.append("DISTINCT ")?;
+                    }
+                    SqlWriter.appendList(out, call.args.view())?;
+                }
+                out.append(")")?;
+                if (borrow call.filter is Some(filter)) {
+                    out.append(" FILTER (WHERE ")?;
+                    SqlWriter.appendExpr(out, filter)?;
+                    out.append(")")?;
+                }
+                if (borrow call.over is Some(over)) {
+                    SqlWriter.appendOver(out, over)?;
+                }
+            }
+            Expr.Cast(operand, typeName) => {
+                out.append("CAST(")?;
+                SqlWriter.appendExpr(out, operand)?;
+                out.append(" AS ")?;
+                out.append(typeName.view())?;
+                out.append(")")?;
+            }
+            Expr.Case(caseExpr) => {
+                out.append("CASE")?;
+                if (borrow caseExpr.operand is Some(operand)) {
+                    out.append(" ")?;
+                    SqlWriter.appendExpr(out, operand)?;
+                }
+                for (i in 0..caseExpr.branches.length) {
+                    out.append(" WHEN ")?;
+                    SqlWriter.appendExpr(out, borrow caseExpr.branches[i].when)?;
+                    out.append(" THEN ")?;
+                    SqlWriter.appendExpr(out, borrow caseExpr.branches[i].then)?;
+                }
+                if (borrow caseExpr.otherwise is Some(otherwise)) {
+                    out.append(" ELSE ")?;
+                    SqlWriter.appendExpr(out, otherwise)?;
+                }
+                out.append(" END")?;
+            }
+            Expr.Subquery(_) => { out.append("(SELECT …)")?; }
+            Expr.Exists(_) => { out.append("EXISTS (SELECT …)")?; }
+            Expr.Raise(action, message) => {
+                out.append(match (action) {
+                    RaiseAction.Ignore => "RAISE(IGNORE",
+                    RaiseAction.Rollback => "RAISE(ROLLBACK",
+                    RaiseAction.Abort => "RAISE(ABORT",
+                    RaiseAction.Fail => "RAISE(FAIL",
+                })?;
+                if (message is Some(text)) {
+                    out.append(", ")?;
+                    SqlWriter.appendExpr(out, text)?;
+                }
+                out.append(")")?;
+            }
+        }
+        return Ok();
+    }
+}

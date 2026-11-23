@@ -1,0 +1,524 @@
+// The syntax tree the parser builds.
+//
+// The C# tree keeps operators, join kinds, frame bounds and conflict actions as strings; here they are enums, so
+// a misspelt or unsupported one cannot reach the executor. Named windows (`OVER w`) stay names in the tree and
+// are looked up in the SELECT's WINDOW clause when the query runs: the C# resolved them while parsing, and only
+// in part of the select list.
+
+// ── Expressions ──────────────────────────────────────────────────────────────────────────────────────────────
+
+enum LiteralKind {
+    Null,
+    /// The text is decimal digits (with a sign for the smallest integer) or a hexadecimal literal.
+    Integer,
+    Float,
+    String,
+    /// The text is the blob's hex digits.
+    Blob,
+    True,
+    False,
+    CurrentTime,
+    CurrentDate,
+    CurrentTimestamp,
+}
+
+struct Literal {
+    kind: LiteralKind;
+    text: String;
+}
+
+struct ColumnRef {
+    schema: String?;
+    table: String?;
+    name: String;
+}
+
+enum UnaryOp {
+    Negate,
+    Plus,
+    BitNot,
+    Not,
+}
+
+enum BinaryOp {
+    Or,
+    And,
+    Equal,
+    NotEqual,
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
+    Concat,
+    BitAnd,
+    BitOr,
+    ShiftLeft,
+    ShiftRight,
+    /// `->`: a JSON value.
+    JsonGet,
+    /// `->>`: a JSON value as SQL text or number.
+    JsonGetValue,
+}
+
+enum LikeOp {
+    Like,
+    Glob,
+    Match,
+    Regexp,
+}
+
+enum RaiseAction {
+    Ignore,
+    Rollback,
+    Abort,
+    Fail,
+}
+
+struct BetweenExpr {
+    operand: Expr;
+    low: Expr;
+    high: Expr;
+    negated: bool;
+}
+
+struct LikeExpr {
+    op: LikeOp;
+    operand: Expr;
+    pattern: Expr;
+    escape: Expr?;
+    negated: bool;
+}
+
+/// What stands to the right of IN.
+enum InSource {
+    /// `IN (a, b, c)`.
+    Items(Vector<Expr>),
+    /// `IN (SELECT …)`.
+    Select(SelectStmt),
+    /// `IN some_table`.
+    Table(QualifiedName),
+}
+
+struct InExpr {
+    operand: Expr;
+    negated: bool;
+    source: InSource;
+}
+
+enum FrameMode {
+    Rows,
+    Range,
+    Groups,
+}
+
+enum FrameBoundKind {
+    UnboundedPreceding,
+    Preceding,
+    CurrentRow,
+    Following,
+    UnboundedFollowing,
+}
+
+struct FrameBound {
+    kind: FrameBoundKind;
+    /// The distance of a `Preceding` or `Following` bound.
+    offset: Expr?;
+}
+
+enum FrameExclude {
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
+}
+
+struct FrameSpec {
+    mode: FrameMode;
+    start: FrameBound;
+    end: FrameBound;
+    exclude: FrameExclude;
+}
+
+struct OverClause {
+    /// `OVER w`, or `OVER (w …)`: the window of the WINDOW clause this one builds on.
+    baseName: String?;
+    partitionBy: Vector<Expr>;
+    orderBy: Vector<OrderTerm>;
+    frame: FrameSpec?;
+}
+
+struct FunctionCall {
+    name: String;
+    distinct: bool;
+    /// `count(*)`.
+    star: bool;
+    args: Vector<Expr>;
+    /// `FILTER (WHERE …)`.
+    filter: Expr?;
+    /// A window function when present.
+    over: OverClause?;
+}
+
+struct WhenThen {
+    when: Expr;
+    then: Expr;
+}
+
+struct CaseExpr {
+    /// `CASE operand WHEN …`.
+    operand: Expr?;
+    branches: Vector<WhenThen>;
+    otherwise: Expr?;
+}
+
+enum Expr {
+    Literal(Literal),
+    Column(ColumnRef),
+    /// `(a, b, …)`.
+    RowValue(Vector<Expr>),
+    /// `?`, `?1`, `:name`, `@name` or `$name`, as written.
+    Param(String),
+    Unary(UnaryOp, Box<Expr>),
+    Binary(BinaryOp, Box<Expr>, Box<Expr>),
+    /// `operand COLLATE name`.
+    Collate(Box<Expr>, String),
+    /// `left IS right`, or with `true`, `left IS NOT right`.
+    Is(Box<Expr>, Box<Expr>, bool),
+    Between(Box<BetweenExpr>),
+    Like(Box<LikeExpr>),
+    In(Box<InExpr>),
+    Function(Box<FunctionCall>),
+    /// `CAST(operand AS type)`.
+    Cast(Box<Expr>, String),
+    Case(Box<CaseExpr>),
+    Subquery(Box<SelectStmt>),
+    Exists(Box<SelectStmt>),
+    /// `RAISE(action, message)`, in a trigger.
+    Raise(RaiseAction, Box<Expr>?),
+}
+
+// ── Shared ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+struct QualifiedName {
+    /// `main`, `temp` or an attached database's name, as written; `null` when the name is not qualified.
+    schema: String?;
+    name: String;
+}
+
+// ── SELECT ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+enum ResultColumn {
+    /// `*`.
+    Star,
+    /// `table.*`.
+    TableStar(String),
+    /// An expression and its alias.
+    Expr(Expr, String?),
+}
+
+struct TableSource {
+    name: QualifiedName;
+    alias: String?;
+    indexedBy: String?;
+    notIndexed: bool;
+}
+
+struct SubquerySource {
+    select: SelectStmt;
+    alias: String?;
+}
+
+struct TableFunctionSource {
+    name: String;
+    args: Vector<Expr>;
+    alias: String?;
+}
+
+enum FromItem {
+    Table(TableSource),
+    Subquery(Box<SubquerySource>),
+    TableFunction(TableFunctionSource),
+}
+
+enum JoinKind {
+    /// `,`.
+    Comma,
+    /// `JOIN` or `INNER JOIN`.
+    Inner,
+    Left,
+    Right,
+    Full,
+    Cross,
+}
+
+enum JoinConstraint {
+    None,
+    On(Expr),
+    Using(Vector<String>),
+}
+
+struct Join {
+    kind: JoinKind;
+    natural: bool;
+    item: FromItem;
+    constraint: JoinConstraint;
+}
+
+struct FromClause {
+    source: FromItem;
+    joins: Vector<Join>;
+}
+
+struct OrderTerm {
+    expr: Expr;
+    descending: bool;
+    /// `NULLS FIRST` (true) or `NULLS LAST` (false); `null` when neither is written.
+    nullsFirst: bool?;
+}
+
+struct NamedWindow {
+    name: String;
+    spec: OverClause;
+}
+
+struct SelectCore {
+    distinct: bool;
+    columns: Vector<ResultColumn>;
+    from: FromClause?;
+    filter: Expr?;
+    groupBy: Vector<Expr>;
+    having: Expr?;
+    windows: Vector<NamedWindow>;
+    /// A row of VALUES: `columns` are its expressions, and there is nothing else.
+    isValues: bool;
+}
+
+enum CompoundOp {
+    Union,
+    UnionAll,
+    Intersect,
+    Except,
+}
+
+struct CommonTableExpr {
+    name: String;
+    columns: Vector<String>;
+    select: SelectStmt;
+}
+
+struct WithClause {
+    recursive: bool;
+    ctes: Vector<CommonTableExpr>;
+}
+
+struct SelectStmt {
+    with: WithClause?;
+    cores: Vector<SelectCore>;
+    /// One fewer than `cores`: the operator between each core and the next.
+    compoundOps: Vector<CompoundOp>;
+    orderBy: Vector<OrderTerm>;
+    limit: Expr?;
+    offset: Expr?;
+}
+
+// ── Statements ───────────────────────────────────────────────────────────────────────────────────────────────
+
+enum ConflictAction {
+    Rollback,
+    Abort,
+    Fail,
+    Ignore,
+    Replace,
+}
+
+struct Assignment {
+    column: String;
+    value: Expr;
+}
+
+/// One `ON CONFLICT [(columns)] DO …` of an INSERT.
+struct UpsertClause {
+    /// The conflict target's columns; empty for a bare `ON CONFLICT`.
+    target: Vector<String>;
+    /// `DO NOTHING` when empty.
+    assignments: Vector<Assignment>;
+    filter: Expr?;
+}
+
+enum InsertSource {
+    DefaultValues,
+    Values(Vector<Vector<Expr>>),
+    Select(SelectStmt),
+}
+
+struct InsertStmt {
+    with: WithClause?;
+    /// `INSERT OR action`, or `Replace` for `REPLACE INTO`.
+    conflict: ConflictAction?;
+    table: QualifiedName;
+    columns: Vector<String>;
+    source: InsertSource;
+    upserts: Vector<UpsertClause>;
+    returning: Vector<ResultColumn>;
+}
+
+struct UpdateStmt {
+    with: WithClause?;
+    conflict: ConflictAction?;
+    table: QualifiedName;
+    assignments: Vector<Assignment>;
+    from: FromClause?;
+    filter: Expr?;
+    returning: Vector<ResultColumn>;
+}
+
+struct DeleteStmt {
+    with: WithClause?;
+    table: QualifiedName;
+    filter: Expr?;
+    returning: Vector<ResultColumn>;
+}
+
+/// A column of CREATE TABLE: its name, and the tokens of its type and constraints, which the schema catalog reads.
+struct ColumnDef {
+    name: String;
+    body: Vector<Token>;
+}
+
+struct CreateTableStmt {
+    temporary: bool;
+    ifNotExists: bool;
+    name: QualifiedName;
+    columns: Vector<ColumnDef>;
+    /// The tokens of each table constraint.
+    constraints: Vector<Vector<Token>>;
+    withoutRowid: bool;
+    strict: bool;
+}
+
+struct IndexedColumn {
+    /// A plain column's name; empty for an expression.
+    name: String;
+    expression: Expr?;
+    descending: bool;
+    /// The column's COLLATE; empty to inherit the table column's.
+    collation: String;
+}
+
+struct CreateIndexStmt {
+    unique: bool;
+    ifNotExists: bool;
+    name: QualifiedName;
+    table: String;
+    columns: Vector<IndexedColumn>;
+    filter: Expr?;
+}
+
+struct CreateViewStmt {
+    temporary: bool;
+    ifNotExists: bool;
+    name: QualifiedName;
+    columns: Vector<String>;
+    select: SelectStmt;
+}
+
+enum TriggerTiming {
+    Before,
+    After,
+    InsteadOf,
+}
+
+enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
+struct CreateTriggerStmt {
+    temporary: bool;
+    ifNotExists: bool;
+    name: QualifiedName;
+    timing: TriggerTiming;
+    event: TriggerEvent;
+    /// `UPDATE OF a, b`.
+    updateOf: Vector<String>;
+    table: String;
+    when: Expr?;
+    body: Vector<Stmt>;
+}
+
+enum AlterAction {
+    AddColumn(ColumnDef),
+    RenameTo(String),
+    /// From, to.
+    RenameColumn(String, String),
+}
+
+struct AlterTableStmt {
+    table: QualifiedName;
+    action: AlterAction;
+}
+
+enum DropKind {
+    Table,
+    Index,
+    View,
+    Trigger,
+}
+
+struct DropStmt {
+    kind: DropKind;
+    ifExists: bool;
+    name: QualifiedName;
+}
+
+struct PragmaStmt {
+    name: QualifiedName;
+    /// The value as written (a quoted one without its quotes); `null` for a query.
+    value: String?;
+    /// `PRAGMA x(value)` rather than `PRAGMA x = value`.
+    parenthesized: bool;
+}
+
+enum TransactionKind {
+    Deferred,
+    Immediate,
+    Exclusive,
+}
+
+struct AttachStmt {
+    /// ':memory:' or a file name.
+    target: Expr;
+    schema: String;
+}
+
+enum Stmt {
+    Select(Box<SelectStmt>),
+    Insert(Box<InsertStmt>),
+    Update(Box<UpdateStmt>),
+    Delete(Box<DeleteStmt>),
+    CreateTable(Box<CreateTableStmt>),
+    CreateIndex(Box<CreateIndexStmt>),
+    CreateView(Box<CreateViewStmt>),
+    CreateTrigger(Box<CreateTriggerStmt>),
+    AlterTable(Box<AlterTableStmt>),
+    Drop(DropStmt),
+    Pragma(PragmaStmt),
+    Begin(TransactionKind),
+    Commit,
+    /// `ROLLBACK`, or `ROLLBACK TO name`.
+    Rollback(String?),
+    Savepoint(String),
+    Release(String),
+    Attach(Box<AttachStmt>),
+    Detach(String),
+    Vacuum,
+    /// `ANALYZE`, or `ANALYZE name`.
+    Analyze(String?),
+    Reindex,
+}
