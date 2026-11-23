@@ -595,3 +595,18 @@ fn leftJoinsOfGroupsMatchSqlite() -> Result<void, TestFailure> {
         SELECT x, y, z FROM a LEFT JOIN (b, c) ON c.bid = b.id AND b.aid = a.id ORDER BY 1, 2, 3
         """);
 }
+
+@test
+fn slidingFramesOfReals() -> Result<void, TestFailure> {
+    let path = "out/query-sliding-reals.db";
+    makeDatabase(path, """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, r REAL, i INT);
+        WITH RECURSIVE n(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM n WHERE k < 300)
+        INSERT INTO t SELECT k, (k * 7919 % 1000) / 7.0 + 1e15 * (k % 3 = 0), k * k FROM n;
+        """)?;
+    return sameAnswers(path, """
+        SELECT id, sum(r) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) FROM t ORDER BY id
+        SELECT id, avg(r) OVER (ORDER BY id ROWS 3 PRECEDING), total(r) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 4 FOLLOWING) FROM t ORDER BY id
+        SELECT id, sum(i) OVER (ORDER BY id ROWS BETWEEN 5 PRECEDING AND CURRENT ROW), count(r) OVER (ORDER BY id RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING) FROM t ORDER BY id
+        """);
+}
