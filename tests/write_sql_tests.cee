@@ -451,6 +451,9 @@ fn writesThroughIndexSeeks() -> Result<void, TestFailure> {
         DELETE FROM t WHERE s >= 'name2' AND s < 'name3'
         SELECT count(*) FROM t
         UPDATE t SET s = 'name5' WHERE s = 'name6'
+        UPDATE t SET v = -1 WHERE k IN (20, 21, 20, NULL)
+        DELETE FROM t WHERE s IN ('NAME100', 'name101', 'nope')
+        SELECT count(*), sum(v) FROM t
         SELECT count(*), sum(k) FROM t
         """);
 }

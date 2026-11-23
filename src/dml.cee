@@ -1276,13 +1276,17 @@ fn matchingRows(
         var bounds = Vector<ColumnBound>.create();
         columnBounds(f, writer.slot, true, mut bounds)?;
         if (chooseIndexSeek(db, borrow writer.table, borrow bounds)? is Some(seek)) {
-            let Some(range) = seekRange(borrow seek, frame, db)? else {
-                return Ok(rowids);
-            };
+            var ranges = seekRanges(borrow seek, frame, db)?;
             var found = Vector<i64>.create();
-            var entries = IndexCursor.create(seek.root, range, false);
-            while (entries.next(mut db.pager)? is Some(entry)) {
-                found.push(indexEntryRowId(entry.view())?)?;
+            for (r in 0..ranges.length) {
+                var entries = IndexCursor.create(
+                    seek.root,
+                    replace(mut ranges[r], IndexRange.all(IndexOrder.plain())),
+                    false,
+                );
+                while (entries.next(mut db.pager)? is Some(entry)) {
+                    found.push(indexEntryRowId(entry.view())?)?;
+                }
             }
             // In rowid order, as a scan would give them.
             found.sortBy((a, b) => compareI64(a, b));

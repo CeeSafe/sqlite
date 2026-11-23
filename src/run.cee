@@ -328,16 +328,27 @@ fn indexLevel(
 ) -> Result<void, SqliteError> {
     let source = borrow core.sources[level];
     var matched = false;
-    let Some(range) = seekRange(seek, frame, db)? else {
-        return finishLeft(core, level, matched, frame, db, sink);
-    };
-    var cursor = IndexCursor.create(seek.root, range, false);
+    var ranges = seekRanges(seek, frame, db)?;
+    var r: usize = 0;
+    var cursor: IndexCursor? = null;
     loop {
         if (sink.stopAfter is Some(n) && sink.rows.length >= n) {
             return Ok();
         }
-        let Some(entry) = cursor.next(mut db.pager)? else {
-            break;
+        if (cursor.isNull()) {
+            if (r == ranges.length) {
+                break;
+            }
+            cursor = IndexCursor.create(seek.root, replace(mut ranges[r], IndexRange.all(IndexOrder.plain())), false);
+            r += 1;
+        }
+        var next: Vector<SqliteValue>? = null;
+        if (borrow mut cursor is Some(c)) {
+            next = c.next(mut db.pager)?;
+        }
+        let Some(entry) = next else {
+            cursor = null;
+            continue;
         };
         let rowId = indexEntryRowId(entry.view())?;
         let Some(row) = seekTableRow(mut db.pager, table.root, rowId)? else {

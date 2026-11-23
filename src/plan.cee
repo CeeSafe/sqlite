@@ -19,6 +19,8 @@ struct ColumnBound {
     key: XExpr;
     affinity: ExprAffinity;
     collation: Collation;
+    /// `column IN (…)`: the values, any of which the column may equal (`op` is `Equal`).
+    inList: Vector<XExpr>;
 }
 
 /// A seek through an index: equal keys on its leading columns, then a range on the next.
@@ -30,6 +32,9 @@ struct IndexSeek {
     affinities: Vector<ExprAffinity>;
     /// Whether an equal key is from IS, which a NULL satisfies.
     nullMatches: Vector<bool>;
+    /// The equal key that is an IN list instead: its place among the keys, and its values.
+    inAt: usize?;
+    inValues: Vector<XExpr>;
     low: XExpr?;
     lowInclusive: bool;
     high: XExpr?;
@@ -90,7 +95,16 @@ fn columnBounds(
             let Some(key) = cloneSimple(other)? else {
                 return Ok();
             };
-            out.push(ColumnBound { column: at, op: op, key: key, affinity: c.affinity, collation: c.collation })?;
+            out.push(
+                ColumnBound {
+                    column: at,
+                    op: op,
+                    key: key,
+                    affinity: c.affinity,
+                    collation: c.collation,
+                    inList: Vector<XExpr>.create(),
+                },
+            )?;
         }
         XExpr.Between(b) => {
             if (b.negated) {
@@ -110,6 +124,7 @@ fn columnBounds(
                         key: low,
                         affinity: b.lowAffinity,
                         collation: b.lowCollation,
+                        inList: Vector<XExpr>.create(),
                     },
                 )?;
             }
@@ -121,9 +136,42 @@ fn columnBounds(
                         key: high,
                         affinity: b.highAffinity,
                         collation: b.highCollation,
+                        inList: Vector<XExpr>.create(),
                     },
                 )?;
             }
+        }
+        XExpr.In(x) => {
+            // `column IN (values)`, the values known before the table is read.
+            if (x.negated || x.subquery.isSome() || x.items.length == 0) {
+                return Ok();
+            }
+            let XExpr.Column(s, k) = x.operand else {
+                return Ok();
+            };
+            if (s != slot) {
+                return Ok();
+            }
+            var values = Vector<XExpr>.withCapacity(x.items.length)?;
+            for (i in 0..x.items.length) {
+                if (!knownBefore(borrow x.items[i], slot)) {
+                    return Ok();
+                }
+                let Some(v) = cloneSimple(borrow x.items[i])? else {
+                    return Ok();
+                };
+                values.push(v)?;
+            }
+            out.push(
+                ColumnBound {
+                    column: k,
+                    op: CompareOp.Equal,
+                    key: XExpr.Value(SqliteValue.Null),
+                    affinity: x.affinity,
+                    collation: x.collation,
+                    inList: values,
+                },
+            )?;
         }
         _ => {}
     }
@@ -232,10 +280,22 @@ fn usableBound(
     c: usize,
     wantEqual: bool,
     wantLow: bool,
+    allowIn: bool,
 ) -> usize? {
+    // A plain `=` first, then an IN list.
+    var inBound: usize? = null;
     for (b in 0..bounds.length) {
         let bound = borrow bounds[b];
         if (bound.column != candidate.columns[c] || bound.collation != candidate.collations[c]) {
+            continue;
+        }
+        if (bound.inList.length != 0) {
+            if (allowIn && wantEqual && inBound.isNull() && affinityKeepsColumn(
+                bound.affinity,
+                table.columns[bound.column].affinity,
+            )) {
+                inBound = b;
+            }
             continue;
         }
         if (!affinityKeepsColumn(bound.affinity, table.columns[bound.column].affinity)) {
@@ -253,7 +313,7 @@ fn usableBound(
         }
         return b;
     }
-    return null;
+    return inBound;
 }
 
 /// The best index seek for table `table` in `slot` from `bounds`; `null` when no index helps.
@@ -276,6 +336,8 @@ fn chooseIndexSeek(
             equal: Vector<XExpr>.create(),
             affinities: Vector<ExprAffinity>.create(),
             nullMatches: Vector<bool>.create(),
+            inAt: null,
+            inValues: Vector<XExpr>.create(),
             low: null,
             lowInclusive: true,
             high: null,
@@ -283,9 +345,15 @@ fn chooseIndexSeek(
         };
         var c: usize = 0;
         while (c < candidate.columns.length) {
-            let Some(b) = usableBound(bounds, table, candidate, c, true, false) else {
+            let Some(b) = usableBound(bounds, table, candidate, c, true, false, seek.inAt.isNull()) else {
                 break;
             };
+            if (bounds[b].inList.length != 0) {
+                seek.inAt = seek.equal.length;
+                for (v in 0..bounds[b].inList.length) {
+                    seek.inValues.push(cloneSimple(borrow bounds[b].inList[v])? ?? XExpr.Value(SqliteValue.Null))?;
+                }
+            }
             seek.equal.push(cloneSimple(borrow bounds[b].key)? ?? XExpr.Value(SqliteValue.Null))?;
             seek.affinities.push(bounds[b].affinity)?;
             seek.nullMatches.push(bounds[b].op == CompareOp.Is)?;
@@ -298,8 +366,8 @@ fn chooseIndexSeek(
             score += 2;
         }
         if (c < candidate.columns.length && !candidate.descending[c]) {
-            let low = usableBound(bounds, table, candidate, c, false, true);
-            let high = usableBound(bounds, table, candidate, c, false, false);
+            let low = usableBound(bounds, table, candidate, c, false, true, false);
+            let high = usableBound(bounds, table, candidate, c, false, false, false);
             if (low.isSome() || high.isSome()) {
                 var affinity = ExprAffinity.None;
                 if (low is Some(b)) {
@@ -338,8 +406,64 @@ fn seekRange(
     frame: borrow mut Frame,
     db: borrow mut Session,
 ) -> Result<IndexRange?, SqliteError> {
+    let none: SqliteValue? = null;
+    return seekRangeWith(seek, borrow none, frame, db);
+}
+
+/// The ranges of a seek: one, or with an IN list one for each distinct value, in the index's order.
+fn seekRanges(
+    seek: borrow IndexSeek,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<IndexRange>, SqliteError> {
+    var ranges = Vector<IndexRange>.create();
+    let Some(at) = seek.inAt else {
+        if (seekRange(seek, frame, db)? is Some(range)) {
+            ranges.push(range)?;
+        }
+        return Ok(ranges);
+    };
+    var values = Vector<SqliteValue>.create();
+    for (i in 0..seek.inValues.length) {
+        let v = evaluate(borrow seek.inValues[i], frame, db)?;
+        if (v.isNull()) {
+            continue;
+        }
+        values.push(comparisonForm(borrow v, seek.affinities[at])? ?? v)?;
+    }
+    let collation = seek.order.collations[at];
+    let descending = seek.order.descending[at];
+    values.sortBy((a, b) => {
+        let c = compareValues(a, b, collation);
+        return if (descending) 0 - c else c;
+    });
+    for (i in 0..values.length) {
+        if (i > 0 && compareValues(borrow values[i], borrow values[i - 1], collation) == 0) {
+            continue;
+        }
+        let one: SqliteValue? = values[i].clone()?;
+        if (seekRangeWith(seek, borrow one, frame, db)? is Some(range)) {
+            ranges.push(range)?;
+        }
+    }
+    return Ok(ranges);
+}
+
+/// The range of a seek, with `inValue` for its IN key.
+fn seekRangeWith(
+    seek: borrow IndexSeek,
+    inValue: borrow SqliteValue?,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<IndexRange?, SqliteError> {
     var prefix = Vector<SqliteValue>.withCapacity(seek.equal.length + 1)?;
     for (k in 0..seek.equal.length) {
+        if (seek.inAt == Some(k)) {
+            if (inValue is Some(v)) {
+                prefix.push(v.clone()?)?;
+            }
+            continue;
+        }
         let v = evaluate(borrow seek.equal[k], frame, db)?;
         if (v.isNull() && !seek.nullMatches[k]) {
             return Ok(null);

@@ -28,7 +28,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | printf() and format() | `Exec/Functions` (`Printf`) | `printf.cee` | done: a port of SQLite's `sqlite3_str_vappendf`, every conversion and flag of the SQL path |
 | JSON functions | `Exec/Json`, `Functions` (JSON1) | `json.cee` | done: SQLite 3.53.4's text JSON functions, `->`, `->>`, `json_group_array` and `json_group_object`, JSON5 input, JSONB blobs as input; the `jsonb_*` functions and the table-valued `json_each` and `json_tree` are not ported and are "no such function" |
 | SELECT: joins, subqueries, views, CTEs, grouping, compounds | `Exec/QueryExecutor` | `select.cee`, `run.cee` | done but table functions; RIGHT and FULL joins, rowid and index seeks done |
-| Planner: index seeks | `Exec/QueryPlanner` | `plan.cee` | `=`, IS and range terms on the leading columns of plain indexes, for SELECT, UPDATE and DELETE; IN lists, partial and expression indexes, and covering scans next |
+| Planner: index seeks | `Exec/QueryPlanner` | `plan.cee` | `=`, IS, IN (value lists) and range terms on the leading columns of plain indexes, for SELECT, UPDATE and DELETE; partial and expression indexes, IN (SELECT …), rowid IN and covering scans next |
 | Window functions | `Exec/WindowEvaluator` | `window.cee` | done: every built-in window function, aggregates over frames, ROWS/RANGE/GROUPS, EXCLUDE, named windows |
 | INSERT, UPDATE, DELETE | `Exec/QueryExecutor` (DML), `InMemoryDatabase` | `dml.cee` | done: constraints, conflict actions, RETURNING, AUTOINCREMENT, upserts, triggers, foreign keys, UPDATE … FROM; WITHOUT ROWID tables read and written |
 | CREATE and DROP of tables, indexes and views | `Exec/QueryExecutor` (DDL) | `ddl.cee` | done |
