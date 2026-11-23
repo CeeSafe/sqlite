@@ -1,0 +1,317 @@
+// The planner (plan.cee): partial and expression indexes, IN (SELECT …) and rowid seeks, covering reads, ORDER BY
+// from an index, and sqlite_stat1. Every answer, and the order of rows without ORDER BY, is sqlite3's.
+
+const PLANNER_FIXTURE: StringView = """
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b TEXT, c REAL, d, e TEXT COLLATE NOCASE, j TEXT);
+    CREATE INDEX t_a_part ON t(a) WHERE a > 10;
+    CREATE INDEX t_b_nn ON t(b) WHERE b IS NOT NULL;
+    CREATE INDEX t_lower ON t(lower(b));
+    CREATE INDEX t_ad ON t(a DESC, c);
+    CREATE INDEX t_c ON t(c);
+    CREATE INDEX t_e ON t(e);
+    CREATE INDEX t_sum ON t(a + c);
+    CREATE INDEX t_json ON t(j ->> '$.k');
+    CREATE INDEX t_d_part ON t(d) WHERE d IS NOT NULL AND d <> 'skip';
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300)
+    INSERT INTO t SELECT i, CASE WHEN i % 17 = 0 THEN NULL ELSE i % 23 END,
+        CASE WHEN i % 11 = 0 THEN NULL ELSE 'Name' || (i % 31) END,
+        CASE WHEN i % 13 = 0 THEN NULL WHEN i % 2 = 0 THEN i % 7 ELSE (i % 7) + 0.5 END,
+        CASE i % 5 WHEN 0 THEN NULL WHEN 1 THEN i WHEN 2 THEN 'skip' WHEN 3 THEN x'0102' ELSE '' || (i % 9) END,
+        CASE i % 4 WHEN 0 THEN 'abc' WHEN 1 THEN 'ABC' WHEN 2 THEN 'Abd' ELSE NULL END,
+        json_object('k', i % 6, 'z', i)
+    FROM n;
+    CREATE TABLE u(x INTEGER PRIMARY KEY, y INT, z TEXT);
+    CREATE INDEX u_y ON u(y);
+    INSERT INTO u VALUES (1, 3, 'p'), (2, 15, 'q'), (3, NULL, 'r'), (5, 15, 's'), (8, 22, NULL);
+    CREATE TABLE w(k INT, v TEXT);
+    INSERT INTO w VALUES (3, 'three'), (15, 'fifteen'), (NULL, 'null'), ('15', 'text 15'), (99, 'none');
+    """;
+
+@test
+fn partialIndexesWhenTheQueryImpliesThem() -> Result<void, TestFailure> {
+    let path = "out/planner-partial.db";
+    makeDatabase(path, PLANNER_FIXTURE)?;
+    return sameAnswers(path, """
+        SELECT id, a FROM t WHERE a > 20
+        SELECT id, a FROM t WHERE a = 15
+        SELECT id, a FROM t WHERE a = 5
+        SELECT id, a FROM t WHERE a >= 11 AND a < 13
+        SELECT id FROM t WHERE a > 10 AND c > 3
+        SELECT count(*) FROM t WHERE a > 10
+        SELECT id, a FROM t WHERE a > 10 AND a = 12
+        SELECT id, a FROM t WHERE a > 10 AND a = 12.0
+        SELECT id, a FROM t WHERE a > 50
+        SELECT max(a), min(a) FROM t WHERE a > 10
+        SELECT id FROM t WHERE (a > 10 OR b = 'x') AND a = 15
+        SELECT id FROM t WHERE a > 10 AND id IN (SELECT x * 30 FROM u)
+        SELECT id, b FROM t WHERE b = 'Name5'
+        SELECT id, b FROM t WHERE b > 'Name7'
+        SELECT id, b FROM t WHERE b IS NOT NULL AND b < 'Name12'
+        SELECT id, b FROM t WHERE b IN ('Name1', 'Name2', NULL)
+        SELECT id, b FROM t WHERE b IS NOT NULL ORDER BY b LIMIT 5
+        SELECT id, b FROM t WHERE b > 'Name' ORDER BY b DESC LIMIT 5
+        SELECT id, b FROM t WHERE b LIKE 'Name1%' AND b IS NOT NULL
+        SELECT id, b FROM t WHERE b NOT NULL AND id < 30
+        SELECT id, b FROM t WHERE b = 5
+        SELECT id FROM t WHERE d = 'skip'
+        SELECT id, quote(d) FROM t WHERE d = '4'
+        SELECT id, quote(d) FROM t WHERE d = 4
+        SELECT id, quote(d) FROM t WHERE d > 250
+        SELECT id, quote(d) FROM t WHERE d IN (6, '7', 8)
+        SELECT id, quote(d) FROM t WHERE d > 280 AND d <> 'skip'
+        SELECT id, quote(d) FROM t WHERE d = x'0102' AND d IS NOT NULL AND d <> 'skip'
+        SELECT count(*) FROM t WHERE d IS NOT NULL AND d <> 'skip'
+        SELECT DISTINCT a FROM t WHERE a > 10 ORDER BY a DESC
+        SELECT a, count(*) FROM t WHERE a > 18 GROUP BY a ORDER BY a DESC
+        SELECT u.x, t.id FROM u LEFT JOIN t ON t.a = u.y AND t.a > 10 ORDER BY u.x, t.id
+        SELECT u.x, t.id FROM u LEFT JOIN t ON t.a = u.y WHERE t.a > 10 ORDER BY u.x, t.id
+        SELECT u.x, t.id, t.a FROM u LEFT JOIN t ON t.a = u.y WHERE t.a > 10 OR t.a IS NULL ORDER BY u.x, t.id
+        SELECT u.x, (SELECT count(*) FROM t WHERE t.a = u.y AND t.a > 10) FROM u ORDER BY 1
+        SELECT u.x, (SELECT max(id) FROM t WHERE t.a = u.y AND t.a > 10) FROM u ORDER BY 1
+        """);
+}
+
+@test
+fn expressionIndexesMatchCompiledExpressions() -> Result<void, TestFailure> {
+    let path = "out/planner-expressions.db";
+    makeDatabase(path, PLANNER_FIXTURE)?;
+    return sameAnswers(path, """
+        SELECT id FROM t WHERE lower(b) = 'name5'
+        SELECT id FROM t WHERE lower(b) > 'name28'
+        SELECT id FROM t WHERE lower(b) IN ('name1', 'name2', 'nothing')
+        SELECT id FROM t WHERE lower(b) IS NULL AND id < 50
+        SELECT id FROM t WHERE lower(b) = 'name' || 5
+        SELECT id FROM t WHERE upper(b) = 'NAME5'
+        SELECT id FROM t WHERE a + c = 10.5
+        SELECT id FROM t WHERE a + c = 10
+        SELECT id FROM t WHERE a + c = '10'
+        SELECT id FROM t WHERE c + a = 10.5
+        SELECT id FROM t WHERE a + c BETWEEN 25 AND 26
+        SELECT id FROM t WHERE (a + c) IS NULL AND id < 40
+        SELECT a + c, id FROM t WHERE a + c > 25 ORDER BY a + c DESC
+        SELECT id, lower(b) FROM t ORDER BY lower(b) LIMIT 8
+        SELECT id, lower(b) FROM t WHERE lower(b) > 'name3' ORDER BY lower(b) DESC LIMIT 8
+        SELECT id FROM t WHERE j ->> '$.k' = 3
+        SELECT id FROM t WHERE j ->> '$.k' = '3'
+        SELECT id FROM t WHERE j ->> '$.k' = 5 AND id > 280
+        SELECT id FROM t WHERE j ->> '$.k' > 4 ORDER BY id DESC LIMIT 3
+        SELECT id FROM t WHERE j -> '$.k' = 3
+        SELECT id FROM t WHERE json_extract(j, '$.k') = 5 AND id > 280
+        SELECT id FROM t WHERE CAST(a AS TEXT) = '5'
+        SELECT u.x, count(t.id) FROM u LEFT JOIN t ON lower(t.b) = lower(u.z) || '1' GROUP BY u.x ORDER BY 1
+        SELECT u.x, count(t.id) FROM u LEFT JOIN t ON t.a + t.c = u.y GROUP BY u.x ORDER BY 1
+        """);
+}
+
+@test
+fn subqueryAndRowidSeeks() -> Result<void, TestFailure> {
+    let path = "out/planner-rowids.db";
+    makeDatabase(path, PLANNER_FIXTURE)?;
+    return sameAnswers(path, """
+        SELECT id FROM t WHERE a IN (SELECT y FROM u)
+        SELECT id FROM t WHERE a IN (SELECT y FROM u WHERE y > 100)
+        SELECT id FROM t WHERE a IN (SELECT k FROM w)
+        SELECT id FROM t WHERE a IN (SELECT y FROM u UNION ALL SELECT y FROM u)
+        SELECT id FROM t WHERE a IN (SELECT y FROM u ORDER BY y DESC LIMIT 1)
+        SELECT id FROM t WHERE a IN (SELECT a FROM t WHERE id = 1)
+        SELECT id FROM t WHERE e IN (SELECT 'abc')
+        SELECT id FROM t WHERE e IN (SELECT 'abc' COLLATE BINARY)
+        SELECT id FROM t WHERE e IN (SELECT z FROM u) LIMIT 3
+        SELECT id FROM t WHERE b IN (SELECT z FROM u)
+        SELECT id FROM t WHERE c IN (SELECT 3 UNION SELECT '4' UNION SELECT 5.5)
+        SELECT id FROM t WHERE c IN (SELECT y / 4.0 FROM u)
+        SELECT (SELECT count(*) FROM t WHERE a IN (SELECT y FROM u))
+        SELECT id FROM t WHERE a > 20 AND id IN (SELECT id FROM t WHERE c > 5)
+        SELECT id FROM t WHERE rowid IN (5, 3, 3, 300, 301, NULL, '7', 8.0, 9.5)
+        SELECT id FROM t WHERE id IN (SELECT x FROM u)
+        SELECT id FROM t WHERE id IN (SELECT y FROM u)
+        SELECT id FROM t WHERE rowid IN (SELECT y FROM u) ORDER BY id DESC
+        SELECT id FROM t WHERE rowid IN (SELECT z FROM u)
+        SELECT id FROM t WHERE rowid IN (SELECT NULL)
+        SELECT id FROM t WHERE rowid IN (SELECT 3 UNION SELECT 3.0 UNION SELECT '3')
+        SELECT id FROM t WHERE id IN (SELECT x FROM u WHERE x > (SELECT 2))
+        SELECT id FROM t WHERE id IN (1, 2, 3) AND a > 10
+        SELECT id FROM t WHERE rowid > 290
+        SELECT id FROM t WHERE rowid > 290.5
+        SELECT id FROM t WHERE rowid < 4
+        SELECT id FROM t WHERE rowid <= 3.5
+        SELECT id FROM t WHERE id BETWEEN 10 AND 13
+        SELECT id FROM t WHERE id > '295'
+        SELECT id FROM t WHERE id > 'abc'
+        SELECT id FROM t WHERE id < 'abc' AND id < 3
+        SELECT id FROM t WHERE id > x'00'
+        SELECT id FROM t WHERE id > 9223372036854775807
+        SELECT id FROM t WHERE id >= 9223372036854775807
+        SELECT id FROM t WHERE id < -9223372036854775808
+        SELECT id FROM t WHERE id > 1e30
+        SELECT id FROM t WHERE id < 1e30 AND id > 298
+        SELECT id FROM t WHERE id > -1e30 AND id < 3
+        SELECT id FROM t WHERE id > NULL
+        SELECT id FROM t WHERE id > 5 AND id < 3
+        SELECT id FROM t WHERE id > 295 ORDER BY id DESC
+        SELECT id FROM t WHERE id >= 295 AND id < 298 ORDER BY id DESC
+        SELECT id FROM t WHERE id < 5 ORDER BY id DESC
+        SELECT id, a FROM t WHERE id > 290 ORDER BY a
+        SELECT id, a FROM t WHERE id BETWEEN 100 AND 105 AND a = 10
+        SELECT t.id, u.x FROM t, u WHERE t.id = u.y AND t.a > 10
+        SELECT u.x, t.id FROM u LEFT JOIN t ON t.id = u.y * 10 WHERE t.id IS NULL
+        SELECT u.x, t.id FROM u LEFT JOIN t ON t.rowid IN (u.y, u.x) ORDER BY 1, 2
+        SELECT u.x, t.id FROM u JOIN t ON t.rowid > u.y * 13 AND t.rowid < u.y * 13 + 3 ORDER BY 1, 2
+        SELECT u.x, (SELECT group_concat(id) FROM t WHERE t.rowid IN (u.x, u.y)) FROM u ORDER BY 1
+        SELECT id FROM t WHERE a IN ()
+        SELECT id FROM t WHERE b = 'nope'
+        """);
+}
+
+@test
+fn coveringReadsAndIndexOrder() -> Result<void, TestFailure> {
+    let path = "out/planner-order.db";
+    makeDatabase(path, PLANNER_FIXTURE)?;
+    return sameAnswers(path, """
+        SELECT a FROM t WHERE a > 20
+        SELECT c FROM t
+        SELECT e FROM t
+        SELECT a, c FROM t
+        SELECT id, c FROM t WHERE c > 5
+        SELECT typeof(c), c FROM t WHERE c = 4
+        SELECT c, typeof(c) FROM t WHERE c > 5.5
+        SELECT id, typeof(c), c FROM t WHERE a = 20 ORDER BY c
+        SELECT a, c FROM t WHERE a = 20
+        SELECT count(*) FROM t
+        SELECT group_concat(c) FROM t WHERE id < 30
+        SELECT DISTINCT a FROM t WHERE a > 0
+        SELECT a, count(*) FROM t GROUP BY a
+        SELECT id, a FROM t ORDER BY a LIMIT 10
+        SELECT id, a FROM t ORDER BY a DESC LIMIT 10
+        SELECT id, a, c FROM t ORDER BY a DESC, c LIMIT 10
+        SELECT id, a, c FROM t ORDER BY a, c DESC LIMIT 10
+        SELECT id, a FROM t ORDER BY a DESC, id DESC LIMIT 6
+        SELECT id, a FROM t ORDER BY a, id LIMIT 6
+        SELECT id FROM t ORDER BY id DESC LIMIT 5
+        SELECT id FROM t ORDER BY rowid DESC LIMIT 5 OFFSET 3
+        SELECT id, c FROM t ORDER BY c LIMIT 12
+        SELECT id, c FROM t ORDER BY c DESC LIMIT 12
+        SELECT id, c FROM t ORDER BY c NULLS LAST LIMIT 12
+        SELECT id, e FROM t ORDER BY e LIMIT 12
+        SELECT id, e FROM t ORDER BY e COLLATE BINARY LIMIT 12
+        SELECT id, e FROM t ORDER BY e DESC LIMIT 12
+        SELECT id, e FROM t ORDER BY e DESC, id DESC LIMIT 4
+        SELECT id, e FROM t WHERE e = 'abc' ORDER BY id DESC LIMIT 4
+        SELECT id, e FROM t WHERE e = 'ABC' LIMIT 5
+        SELECT id, e FROM t WHERE e = 'ABC' COLLATE BINARY LIMIT 5
+        SELECT id, e FROM t WHERE e > 'abc' LIMIT 5
+        SELECT id, e FROM t WHERE e > 'ABC' AND e < 'ABE' LIMIT 4
+        SELECT id, a FROM t WHERE a = 7 ORDER BY id DESC
+        SELECT id, a FROM t WHERE a = 5 ORDER BY id DESC LIMIT 3
+        SELECT id, a FROM t WHERE a IN (3, 5, 7) ORDER BY a DESC LIMIT 7
+        SELECT id, a, c FROM t WHERE a = 7 ORDER BY c
+        SELECT id, a, c FROM t WHERE a = 7 ORDER BY c DESC
+        SELECT id, a, c FROM t WHERE a = 3 ORDER BY a, c
+        SELECT id, a, c FROM t WHERE a IN (3, 4) ORDER BY a, c
+        SELECT id, a, c FROM t WHERE a IN (3, 4) ORDER BY a DESC, c DESC
+        SELECT id, a FROM t WHERE a > 20 ORDER BY a DESC
+        SELECT id, a FROM t WHERE a > 20 ORDER BY a DESC LIMIT 3
+        SELECT id, a FROM t WHERE a <= 2 ORDER BY a DESC, c DESC
+        SELECT id, a, c FROM t WHERE a = 7 AND c > 2
+        SELECT id, a, c FROM t WHERE a = 7 AND c < 3
+        SELECT id, a, c FROM t WHERE a = 7 AND c BETWEEN 1 AND 5
+        SELECT id, a, c FROM t WHERE a = 7 AND c >= 3.5 AND c <= 4
+        SELECT id, a, c FROM t WHERE a > 20 AND a < 22
+        SELECT id, a FROM t WHERE a < 3
+        SELECT id, a, c FROM t WHERE a = 3 AND c IS NULL
+        SELECT id, a, c FROM t WHERE a IS NULL
+        SELECT id, a, c FROM t WHERE a IS NULL ORDER BY c
+        SELECT id FROM t WHERE c IS NULL
+        SELECT id FROM t WHERE c IS NULL ORDER BY id DESC
+        SELECT id FROM t WHERE c > 4 ORDER BY id LIMIT 5
+        SELECT id FROM t WHERE id > 100 ORDER BY a LIMIT 5
+        SELECT DISTINCT a FROM t ORDER BY a DESC LIMIT 5
+        SELECT id, a, b, c, e, j FROM t WHERE a = 9 LIMIT 3
+        SELECT id, a, b, c, e, j FROM t WHERE a = 9 ORDER BY c DESC LIMIT 3
+        SELECT max(c) FROM t WHERE a = 4
+        SELECT u.x, t.id FROM u JOIN t ON t.a = u.y ORDER BY u.x, t.id
+        SELECT t.id, u.x FROM t JOIN u ON u.y = t.a WHERE t.id < 20 ORDER BY t.id
+        SELECT t.id, u.x FROM t JOIN u ON u.y = t.a WHERE t.id < 40 ORDER BY t.id DESC
+        SELECT t.id, u.x FROM t LEFT JOIN u ON u.y = t.a WHERE t.id < 10 ORDER BY t.id DESC
+        SELECT t.id, u.x FROM t LEFT JOIN u ON u.y = t.a WHERE t.id < 10 ORDER BY t.id DESC, u.x
+        SELECT u.x, t.id FROM u LEFT JOIN t ON t.a = u.y AND t.c > 3 ORDER BY 1, 2
+        SELECT u.x, t.id FROM u LEFT JOIN t ON t.a = u.y WHERE t.a IS NULL ORDER BY 1, 2
+        SELECT u.x, t.id FROM u LEFT JOIN t ON t.a IS u.y WHERE t.id < 100 ORDER BY 1, 2
+        SELECT w.v, t.id FROM w JOIN t ON t.a = w.k ORDER BY 1, 2
+        SELECT w.v, count(t.id) FROM w LEFT JOIN t ON t.a = w.k GROUP BY w.v ORDER BY 1
+        SELECT x, y FROM u ORDER BY y
+        SELECT x, y FROM u ORDER BY y DESC
+        SELECT y FROM u WHERE y > 3 ORDER BY y DESC
+        SELECT id FROM t WHERE a > 99 ORDER BY a DESC
+        """);
+}
+
+/// UPDATE and DELETE through each kind of seek, the file checked by sqlite3 (after each step with
+/// SQLITE_STEP_CHECK=1).
+@test
+fn writesThroughThePlannersSeeks() -> Result<void, TestFailure> {
+    return sameScript("planner-writes", """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b TEXT, c REAL, e TEXT COLLATE NOCASE)
+        CREATE INDEX t_a_part ON t(a) WHERE a > 10
+        CREATE INDEX t_lower ON t(lower(b))
+        CREATE INDEX t_ac ON t(a DESC, c)
+        CREATE INDEX t_sum ON t(a + c)
+        CREATE TABLE k(v)
+        INSERT INTO k VALUES (3), (15), (NULL), ('16'), (99)
+        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) INSERT INTO t SELECT i, CASE WHEN i % 17 = 0 THEN NULL ELSE i % 23 END, 'Name' || (i % 31), (i % 7) + (i % 2) * 0.5, CASE i % 3 WHEN 0 THEN 'abc' WHEN 1 THEN 'ABC' ELSE NULL END FROM n
+        UPDATE t SET c = c + 100 WHERE a > 10 AND a = 12
+        SELECT count(*), sum(c) FROM t WHERE a = 12
+        DELETE FROM t WHERE a > 20 AND a < 22
+        SELECT count(*) FROM t
+        UPDATE t SET b = upper(b) WHERE lower(b) = 'name5'
+        SELECT count(*) FROM t WHERE b = 'NAME5'
+        DELETE FROM t WHERE lower(b) IN ('name7', 'name8')
+        UPDATE t SET a = a + 1 WHERE a IN (SELECT v FROM k)
+        SELECT a, count(*) FROM t WHERE a IN (3, 4, 15, 16, 17) GROUP BY a ORDER BY a
+        DELETE FROM t WHERE rowid IN (SELECT v * 10 FROM k)
+        UPDATE t SET e = 'x' WHERE rowid > 1990
+        DELETE FROM t WHERE rowid BETWEEN 100 AND 150
+        DELETE FROM t WHERE id < 5.5
+        UPDATE t SET a = NULL WHERE id IN (6, 7, '8', 9.0, 10.5)
+        SELECT count(*), sum(id), count(a) FROM t
+        UPDATE t SET c = -1 WHERE a + c = 10.5
+        SELECT count(*) FROM t WHERE c = -1
+        DELETE FROM t WHERE a > 10 AND a + c > 25
+        UPDATE t SET a = 50 WHERE a = 13 AND a > 10 RETURNING id
+        DELETE FROM t WHERE rowid > 1995 RETURNING id
+        UPDATE t SET b = 'gone' WHERE id IN (SELECT id FROM t WHERE a = 50)
+        DELETE FROM t WHERE id IN (SELECT id FROM t WHERE b = 'gone')
+        DELETE FROM t WHERE a IN (SELECT v FROM k WHERE v > 1000)
+        UPDATE t SET c = c * 2 WHERE rowid > 'abc'
+        UPDATE t SET c = c * 2 WHERE rowid < 'abc' AND rowid < 20
+        SELECT count(*), sum(id), sum(a), sum(c), count(e) FROM t
+        SELECT id, a, c FROM t WHERE a > 10 ORDER BY a DESC, c LIMIT 5
+        SELECT id FROM t ORDER BY id DESC LIMIT 3
+        PRAGMA integrity_check
+        """);
+}
+
+/// After ANALYZE, sqlite_stat1 decides between indexes: a column of two values loses to a range on a column of
+/// many, as in SQLite, so the rows come in the other index's order.
+@test
+fn statisticsChooseBetweenIndexes() -> Result<void, TestFailure> {
+    return sameScript("planner-stat1", """
+        CREATE TABLE s(id INTEGER PRIMARY KEY, flag INT, n INT, tag TEXT)
+        CREATE INDEX s_flag ON s(flag)
+        CREATE INDEX s_n ON s(n)
+        CREATE INDEX s_tag ON s(tag)
+        WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r WHERE i < 3000) INSERT INTO s SELECT i, i % 2, (i * 7919) % 3001, 'tag' || (i % 3) FROM r
+        SELECT id, n FROM s WHERE flag = 1 AND n > 2990
+        SELECT id, n FROM s WHERE tag = 'tag1' AND n > 2985
+        ANALYZE
+        SELECT * FROM sqlite_stat1 ORDER BY idx
+        SELECT id, n FROM s WHERE flag = 1 AND n > 2990
+        SELECT id, n FROM s WHERE tag = 'tag1' AND n > 2985
+        SELECT id, n FROM s WHERE flag = 0 AND n BETWEEN 100 AND 110
+        SELECT count(*) FROM s WHERE flag = 1 AND tag = 'tag2'
+        UPDATE s SET tag = 'changed' WHERE flag = 1 AND n > 2995
+        DELETE FROM s WHERE tag = 'tag0' AND n < 20
+        SELECT count(*), sum(n) FROM s
+        SELECT id, tag FROM s WHERE n > 2995
+        """);
+}

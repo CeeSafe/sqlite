@@ -28,7 +28,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | printf() and format() | `Exec/Functions` (`Printf`) | `printf.cee` | done: a port of SQLite's `sqlite3_str_vappendf`, every conversion and flag of the SQL path |
 | JSON functions | `Exec/Json`, `Functions` (JSON1) | `json.cee` | done: SQLite 3.53.4's text JSON functions, `->`, `->>`, `json_group_array` and `json_group_object`, JSON5 input, JSONB blobs as input; the `jsonb_*` functions and the table-valued `json_each` and `json_tree` are not ported and are "no such function" |
 | SELECT: joins, subqueries, views, CTEs, grouping, compounds | `Exec/QueryExecutor` | `select.cee`, `run.cee` | done but table functions; RIGHT and FULL joins, rowid and index seeks done |
-| Planner: index seeks | `Exec/QueryPlanner` | `plan.cee` | `=`, IS, IN (value lists) and range terms on the leading columns of plain indexes, for SELECT, UPDATE and DELETE; partial and expression indexes, IN (SELECT …), rowid IN and covering scans next |
+| Planner | `Exec/QueryPlanner` | `plan.cee` | done for single-table access: `=`, IS, IN (lists and subqueries) and ranges on plain, partial and expression indexes and on the rowid, for SELECT, UPDATE and DELETE; covering reads and covering scans; ORDER BY from an index or the rowid, forwards or backwards, with LIMIT stopping early; SQLite's costs, from sqlite_stat1 after ANALYZE. Not done: the OR optimization (MULTI-INDEX OR), skip-scans, automatic indexes, join reordering, NULLS FIRST/LAST from an index (they sort) |
 | Window functions | `Exec/WindowEvaluator` | `window.cee` | done: every built-in window function, aggregates over frames, ROWS/RANGE/GROUPS, EXCLUDE, named windows |
 | INSERT, UPDATE, DELETE | `Exec/QueryExecutor` (DML), `InMemoryDatabase` | `dml.cee` | done: constraints, conflict actions, RETURNING, AUTOINCREMENT, upserts, triggers, foreign keys, UPDATE … FROM; WITHOUT ROWID tables read and written |
 | CREATE and DROP of tables, indexes and views | `Exec/QueryExecutor` (DDL) | `ddl.cee` | done |
@@ -329,6 +329,38 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   collation must be the comparison's, and the comparison's affinity must leave the stored values unchanged; the key
   is converted as the comparison converts it (`indexSeeksGiveTheSameRows`, `writesThroughIndexSeeks`). WHERE
   still runs on every row the index gives.
+- **Partial indexes** are used when the query implies the index's WHERE by SQLite's rule (sqlite3ExprImpliesExpr):
+  each of its AND-terms is a term of WHERE (of ON alone for a LEFT JOIN table), one side of an OR that is, or
+  `x IS NOT NULL` where a term is false for a NULL x (`partialIndexesWhenTheQueryImpliesThem`). The C# skipped
+  every partial index.
+- **Expression indexes** take a term on the same expression, compared as compiled (operators, values, columns,
+  affinities, collations), the expression's affinity standing for the column's: none, but a CAST's
+  (`expressionIndexesMatchCompiledExpressions`). The C# skipped them, and also skipped an index whose COLLATE
+  differs from its column's, which this uses for comparisons in that collation.
+- **IN (SELECT …) and the rowid**: `x IN (SELECT …)` with a subquery that does not depend on the row runs it once
+  and seeks each distinct value; `rowid IN (…)`, `rowid IN (SELECT …)` and rowid ranges read the table between
+  rowids, a real between two integers, text or a blob above every number, as SQLite compares them
+  (`subqueryAndRowidSeeks`). The C# had only rowid ranges.
+- **Covering reads**: when the index entry holds every column the query reads of the table, rows are made from the
+  entries (a REAL column's integers read as reals, as from the record) without reading the table; a covering
+  index narrower than the table (SQLite's width estimate from the declared types) is scanned instead of the
+  table, as SQLite does, so `SELECT b FROM t` comes in `b`'s order as in sqlite3 (`coveringReadsAndIndexOrder`).
+- **ORDER BY from an index** only when the order is provably the same: the index's collations, the default NULLS
+  placement (NULLS FIRST/LAST otherwise are sorted), every term matched after the columns `=` fixes, all forwards
+  or all backwards, for the first table of a SELECT without aggregates, windows or RIGHT JOIN; a rowid after the
+  index columns orders the rest only when the table is the query's only one. Backwards walks use the index (or
+  the table's b-tree, by rowid) backwards, and LIMIT then stops early (`coveringReadsAndIndexOrder`).
+- **Choosing a path** follows SQLite's cost model (whereLoopAddBtree, whereRangeScanEst, whereSortingCost) in
+  LogEst: the table scan, the rowid, then the newest index first, the first of equal cost winning; a path that
+  needs a sort pays for it, so a range on one end gives way to a scan in ORDER BY's order. With sqlite_stat1 (after
+  ANALYZE) the estimates are the statistics' (`statisticsChooseBetweenIndexes`): a column with two values loses to
+  a range on a column of many. The C# read sqlite_stat1 too, to choose among its seeks.
+- **ORDER BY sorts are stable**, as SQLite's sorter is: rows with equal keys keep the order they came in. The sort
+  was an introsort (CeeSafe's `sortBy` is not stable), so ties came out in an arbitrary order.
+- **A LEFT JOIN table's rowid** is not sought from an IS in WHERE: `t.id IS NULL` there found no row, so every
+  row came out NULL-extended instead of only those without a match (`subqueryAndRowidSeeks`).
+- **Indexes a statement left stale** (a removal not done in place, rebuilt when it ends) are not read by its
+  triggers' seeks.
 - **CREATE TABLE … AS SELECT** writes its statement as SQLite's createTableStmt does: columns typed `INT`,
   `TEXT`, `NUM`, `REAL` or nothing by their affinities, repeated names made unique with `:N`, names quoted where
   SQLite quotes them, and a column a line once the statement is long (`createTableAsSelectLikeSqlite`). The C#
@@ -395,8 +427,8 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   The C# refused savepoints.
 - **ANALYZE and REINDEX** (`analyzeAndReindexLikeSqlite`): ANALYZE writes sqlite_stat1 as SQLite does, row for
   row (index columns under their collations, partial indexes over their rows, a WITHOUT ROWID key under the
-  table's name, nothing for an empty table); REINDEX rebuilds every index. The planner does not use the
-  statistics yet. The C# refused both.
+  table's name, nothing for an empty table); REINDEX rebuilds every index. The planner reads the statistics
+  (see "The planner" below). The C# refused both.
 - **VACUUM** (`vacuumPacksTheFile`) builds every b-tree again into packed pages within one transaction, records
   as they are stored, header settings kept, freelist empty; the file comes out the size sqlite3's VACUUM gives.
   Refused: VACUUM inside a transaction (as in SQLite), VACUUM INTO, UTF-16 databases and pages with reserved
@@ -613,3 +645,13 @@ Collations other than BINARY, NOCASE and RTRIM are refused.
 `ceesafec test` needs the `sqlite3` shell on the path: fixtures are made with it, and answers are compared with
 what it prints. The front ends have their own: `ceesafec test` in `cli/`, `pgwire/` and `daemon/` (`pgwire`'s
 `psqlTalksToTheServer` runs `psql` when it is installed and is skipped otherwise).
+
+The planner's timing probe (`tests/planner_probe_tests.cee`) times each kind of seek, covering read and index
+order against the same query with the index defeated (`+column`) on a 20,000-row table:
+`SQLITE_PLANNER_PROBE=1 ceesafec test --filter plannerTimingProbe --show-output`. On the development machine,
+for 50 runs (20 for the scans and orders): a partial index 4 ms against 375 ms, an expression index 4 against 880,
+`a IN (SELECT …)` 94 against 1,763, `rowid IN (SELECT …)` 5 against 1,709, a rowid range 6 against 295, a covering
+seek 3 against 316 (and a covering range seek 29 ms against 118 for the same seek with lookups, 20 runs), a
+covering scan of an index 227 against the table's 565, `ORDER BY c LIMIT 10` (and DESC, and
+`ORDER BY id DESC`) under 1 against about 320, `WHERE a = 3 ORDER BY c` 3 against 489; `flag = 1 AND c > 19990`
+takes 307 ms through `flag`'s index without statistics (as SQLite would choose) and 2 ms after ANALYZE.

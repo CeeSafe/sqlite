@@ -198,6 +198,8 @@ struct TableCursor {
     private wanted: Vector<bool>;
     private stack: Vector<CursorFrame>;
     private started: bool;
+    /// Largest rowid first. A frame's `index` is then one more than the next cell (or child) to visit.
+    private reverse: bool;
 
     /// A cursor over every row of the table rooted at `rootPage`.
     fn scan(rootPage: u32) -> TableCursor => TableCursor.range(rootPage, -9223372036854775808, 9223372036854775807);
@@ -210,7 +212,15 @@ struct TableCursor {
         wanted: Vector<bool>.create(),
         stack: Vector<CursorFrame>.create(),
         started: false,
+        reverse: false,
     };
+
+    /// The same rows, largest rowid first.
+    fn walkingBackwards(this) -> TableCursor {
+        var me = this;
+        me.reverse = true;
+        return me;
+    }
 
     /// Decodes only the columns whose slot in `wanted` is true; the others read as NULL.
     fn withColumns(this, wanted: Slice<bool>) -> Result<TableCursor, AllocError> {
@@ -267,6 +277,9 @@ struct TableCursor {
             }
             this.push(pager, this.root)?;
         }
+        if (this.reverse) {
+            return this.previousCell(pager);
+        }
         loop {
             if (this.stack.length == 0) {
                 return Ok(null);
@@ -304,7 +317,53 @@ struct TableCursor {
         }
     }
 
-    /// Enters `pageNumber`, positioned at the first cell that can hold a rowid of `min` or more.
+    /// Walking backwards: the leaf cell of the next row, or `null` after the first.
+    private fn previousCell<P: PageSource>(borrow mut this, pager: borrow mut P) -> Result<LeafCellAt?, SqliteError> {
+        loop {
+            if (this.stack.length == 0) {
+                return Ok(null);
+            }
+            let top = this.stack.length - 1;
+            if (this.stack[top].index == 0) {
+                let _ = this.stack.pop();
+                continue;
+            }
+            this.stack[top].index -= 1;
+            let index = this.stack[top].index;
+            if (this.stack[top].header.isLeaf()) {
+                let page = this.stack[top].page.clone();
+                let bytes = page.view();
+                let offset = this.stack[top].header.cellOffset(bytes, index)?;
+                let cell = TableLeafCell.parse(bytes, offset)?;
+                if (cell.rowId < this.min) {
+                    this.stack.clear();
+                    return Ok(null);
+                }
+                if (cell.rowId > this.max) {
+                    continue;
+                }
+                return Ok(LeafCellAt { page: page, offset: offset });
+            }
+            var child = this.stack[top].header.rightMost;
+            let bytes = this.stack[top].page.view();
+            if (index < this.stack[top].header.cellCount) {
+                let offset = this.stack[top].header.cellOffset(bytes, index)?;
+                child = bytes.readBE<u32>(offset);
+            }
+            // The cell before this child holds the largest rowid of the children before it: below `min`, none of
+            // them is wanted.
+            if (index > 0) {
+                let offset = this.stack[top].header.cellOffset(bytes, index - 1)?;
+                if (Varint.read(bytes, offset + 4)?.value < this.min) {
+                    this.stack[top].index = 0;
+                }
+            }
+            this.push(pager, child)?;
+        }
+    }
+
+    /// Enters `pageNumber`, positioned at the first cell that can hold a rowid of `min` or more (walking backwards,
+    /// one past the last cell or child that can hold a rowid of `max` or less).
     private fn push<P: PageSource>(borrow mut this, pager: borrow mut P, pageNumber: u32) -> Result<void, SqliteError> {
         if (this.stack.length >= BTREE_MAX_DEPTH) {
             return Err(corrupt("a table b-tree's pages form a cycle"));
@@ -314,7 +373,8 @@ struct TableCursor {
         if (header.kind != PAGE_LEAF_TABLE && header.kind != PAGE_INTERIOR_TABLE) {
             return Err(corrupt("a page in a table b-tree is not a table page"));
         }
-        // Keys ascend within a page, so a binary search finds the first cell whose key is not below `min`.
+        // Keys ascend within a page, so a binary search finds the first cell whose key is not below the bound.
+        let bound = if (this.reverse) this.max else this.min;
         var low: usize = 0;
         var high = header.cellCount;
         let bytes = page.view();
@@ -325,13 +385,25 @@ struct TableCursor {
                 bytes,
                 offset + 4,
             )?.value;
-            if (key < this.min) {
+            if (key < bound) {
                 low = middle + 1;
             } else {
                 high = middle;
             }
         }
-        this.stack.push(CursorFrame { page: page, header: header, index: low })?;
+        // Backwards, a leaf's cell `low` is the last wanted when it holds `max`; an interior page's child `low`
+        // (the right-most when `low` is the cell count) holds the rowids up to its key.
+        var index = low;
+        if (this.reverse) {
+            index = low + 1;
+            if (header.isLeaf() && (low == header.cellCount || TableLeafCell.parse(
+                bytes,
+                header.cellOffset(bytes, low)?,
+            )?.rowId != this.max)) {
+                index = low;
+            }
+        }
+        this.stack.push(CursorFrame { page: page, header: header, index: index })?;
         return Ok();
     }
 }

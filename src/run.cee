@@ -258,7 +258,7 @@ fn joinLevel(
     match (borrow source.kind) {
         SourceKind.Table(table) => {
             if (borrow source.indexSeek is Some(seek)) {
-                return indexLevel(core, level, table, seek, frame, db, sink);
+                return seekLevel(core, level, table, seek, frame, db, sink);
             }
             var cursor = RowCursor.scan(table);
             if (borrow source.rowidSeek is Some(seek)) {
@@ -312,60 +312,6 @@ fn joinLevel(
                 joinLevel(core, level + 1, frame, db, sink)?;
             }
         }
-    }
-    return finishLeft(core, level, matched, frame, db, sink);
-}
-
-/// The nested loop at `level` through an index: the rows its range of entries names.
-fn indexLevel(
-    core: borrow CorePlan,
-    level: usize,
-    table: borrow TablePlan,
-    seek: borrow IndexSeek,
-    frame: borrow mut Frame,
-    db: borrow mut Session,
-    sink: borrow mut CoreSink,
-) -> Result<void, SqliteError> {
-    let source = borrow core.sources[level];
-    var matched = false;
-    var ranges = seekRanges(seek, frame, db)?;
-    var r: usize = 0;
-    var cursor: IndexCursor? = null;
-    loop {
-        if (sink.stopAfter is Some(n) && sink.rows.length >= n) {
-            return Ok();
-        }
-        if (cursor.isNull()) {
-            if (r == ranges.length) {
-                break;
-            }
-            cursor = IndexCursor.create(seek.root, replace(mut ranges[r], IndexRange.all(IndexOrder.plain())), false);
-            r += 1;
-        }
-        var next: Vector<SqliteValue>? = null;
-        if (borrow mut cursor is Some(c)) {
-            next = c.next(mut db.pager)?;
-        }
-        let Some(entry) = next else {
-            cursor = null;
-            continue;
-        };
-        let rowId = indexEntryRowId(entry.view())?;
-        let Some(row) = seekTableRow(mut db.pager, table.root, rowId)? else {
-            return Err(corrupt("an index entry names a row its table does not have"));
-        };
-        loadTableRow(table, row.rowId, row.columns, mut frame.slots[source.slot])?;
-        if (table.generated.length != 0) {
-            computeGenerated(table, source.slot, frame, db)?;
-        }
-        if (borrow source.on is Some(on)) {
-            let ok = evaluate(on, frame, db)?;
-            if (!isTrue(borrow ok)) {
-                continue;
-            }
-        }
-        matched = true;
-        joinLevel(core, level + 1, frame, db, sink)?;
     }
     return finishLeft(core, level, matched, frame, db, sink);
 }
@@ -643,6 +589,15 @@ fn compareKeys(a: Slice<SqliteValue>, b: Slice<SqliteValue>, terms: Slice<XOrder
     return 0;
 }
 
+/// Compares two rows' sort keys, then their places (the key after the terms').
+fn compareKeysThenPlace(a: Slice<SqliteValue>, b: Slice<SqliteValue>, terms: Slice<XOrderTerm>) -> i32 {
+    let c = compareKeys(a, b, terms);
+    if (c != 0 || a.length <= terms.length || b.length <= terms.length) {
+        return c;
+    }
+    return compareValues(borrow a[terms.length], borrow b[terms.length], Collation.Binary);
+}
+
 /// One ORDER BY term's comparison: NULLs first or last as asked, then the order, reversed for DESC.
 fn compareForOrder(
     a: borrow SqliteValue,
@@ -678,7 +633,11 @@ fn runSelect(
         var rows = runCore(core, frame, db, stopAfter)?;
         if (core.sortKeys.length != 0) {
             let terms = core.sortKeys.view();
-            rows.sortBy((x, y) => compareKeys(x.keys.view(), y.keys.view(), terms));
+            // Stable, as SQLite's sorter is: rows with equal keys stay in the order they came, their place a last key.
+            for (i in 0..rows.length) {
+                rows[i].keys.push(SqliteValue.Integer(truncate<i64>(i)))?;
+            }
+            rows.sortBy((x, y) => compareKeysThenPlace(x.keys.view(), y.keys.view(), terms));
         }
         var out = Vector<Vector<SqliteValue>>.withCapacity(rows.length)?;
         for (index in 0..rows.length) {

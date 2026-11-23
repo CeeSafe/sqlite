@@ -1,0 +1,165 @@
+// The planner's timing probe: each kind of seek, covering read and index order against the same query with the
+// index defeated (`+column`), on a 20,000-row table. It runs only with SQLITE_PLANNER_PROBE set:
+// `SQLITE_PLANNER_PROBE=1 ceesafec test --filter plannerTimingProbe --show-output`.
+
+fn timeQuery(session: borrow mut Session, sql: StringView, times: i64) -> i64 {
+    let none = Vector<SqliteValue>.create();
+    let start = Clock.now().millis();
+    var i: i64 = 0;
+    while (i < times) {
+        let _ = session.query(sql, none.view());
+        i += 1;
+    }
+    return Clock.now().millis() - start;
+}
+
+fn probe(session: borrow mut Session, label: StringView, fast: StringView, slow: StringView, times: i64) {
+    let mine = ours(session, fast);
+    let theirs = ours(session, slow);
+    let a = timeQuery(session, fast, times);
+    let b = timeQuery(session, slow, times);
+    var line = String.from(label)!;
+    line.append(": planned ")!;
+    line.appendNumber(a)!;
+    line.append(" ms, forced scan ")!;
+    line.appendNumber(b)!;
+    line.append(" ms, for ")!;
+    line.appendNumber(times)!;
+    line.append(if (mine.view() == theirs.view()) " (same rows)" else " (DIFFERENT ROWS)")!;
+    Console.writeLine(line.view());
+}
+
+@test
+fn plannerTimingProbe() -> Result<void, TestFailure> {
+    if (Environment.variable("SQLITE_PLANNER_PROBE").isNull()) {
+        return Ok();
+    }
+    let path = "out/planner-probe.db";
+    makeDatabase(path, """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b TEXT, c REAL, flag INT, pad TEXT);
+        CREATE INDEX t_a_part ON t(a) WHERE a > 400;
+        CREATE INDEX t_lower ON t(lower(b));
+        CREATE INDEX t_c ON t(c);
+        CREATE INDEX t_flag ON t(flag);
+        CREATE INDEX t_ac ON t(a, c);
+        CREATE TABLE u(x INTEGER PRIMARY KEY, y INT);
+        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000)
+        INSERT INTO t SELECT i, i % 500, 'Name' || (i % 1000), (i * 7919) % 20011, i % 2, printf('%.100c', 'x') FROM n;
+        INSERT INTO u SELECT i * 97, i * 3 FROM (WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20) SELECT i FROM n);
+        """)?;
+    var session = Session.open(path)!;
+    probe(
+        mut session,
+        "partial index a = 450",
+        "SELECT count(*), sum(id) FROM t WHERE a > 400 AND a = 450 AND +c >= 0",
+        "SELECT count(*), sum(id) FROM t WHERE +a > 400 AND +a = 450 AND +c >= 0",
+        50,
+    );
+    probe(
+        mut session,
+        "expression index lower(b)",
+        "SELECT count(*), sum(c) FROM t WHERE lower(b) = 'name77'",
+        "SELECT count(*), sum(c) FROM t WHERE +lower(b) = 'name77'",
+        50,
+    );
+    probe(
+        mut session,
+        "a IN (SELECT …)",
+        "SELECT count(*), sum(c) FROM t WHERE a IN (SELECT y FROM u)",
+        "SELECT count(*), sum(c) FROM t WHERE +a IN (SELECT y FROM u)",
+        50,
+    );
+    probe(
+        mut session,
+        "rowid IN (SELECT …)",
+        "SELECT count(*), sum(c) FROM t WHERE rowid IN (SELECT x FROM u)",
+        "SELECT count(*), sum(c) FROM t WHERE +rowid IN (SELECT x FROM u)",
+        50,
+    );
+    probe(
+        mut session,
+        "rowid IN (list)",
+        "SELECT count(*), sum(c) FROM t WHERE rowid IN (5, 500, 5000, 19999)",
+        "SELECT count(*), sum(c) FROM t WHERE +rowid IN (5, 500, 5000, 19999)",
+        50,
+    );
+    probe(
+        mut session,
+        "rowid > 19900",
+        "SELECT count(*), sum(c) FROM t WHERE rowid > 19900",
+        "SELECT count(*), sum(c) FROM t WHERE +rowid > 19900",
+        50,
+    );
+    probe(
+        mut session,
+        "rowid BETWEEN",
+        "SELECT count(*), sum(c) FROM t WHERE rowid BETWEEN 10000 AND 10100",
+        "SELECT count(*), sum(c) FROM t WHERE +rowid BETWEEN 10000 AND 10100",
+        50,
+    );
+    probe(
+        mut session,
+        "covering a = 7 (sum c)",
+        "SELECT count(*), sum(c) FROM t WHERE a = 7",
+        "SELECT count(*), sum(c) FROM t WHERE +a = 7",
+        50,
+    );
+    probe(
+        mut session,
+        "covering a BETWEEN 7 AND 60 (against the same seek with lookups)",
+        "SELECT count(*), sum(c) FROM t WHERE a BETWEEN 7 AND 60",
+        "SELECT count(*), sum(c + 0 * length(pad)) FROM t WHERE a BETWEEN 7 AND 60",
+        20,
+    );
+    probe(
+        mut session,
+        "covering scan of t_c for sum(c) (against the table)",
+        "SELECT sum(c) FROM t",
+        "SELECT sum(c + 0 * length(pad)) FROM t",
+        20,
+    );
+    probe(
+        mut session,
+        "ORDER BY c LIMIT 10",
+        "SELECT id, c FROM t ORDER BY c LIMIT 10",
+        "SELECT id, c FROM t ORDER BY +c LIMIT 10",
+        20,
+    );
+    probe(
+        mut session,
+        "ORDER BY c DESC LIMIT 10",
+        "SELECT id, c FROM t ORDER BY c DESC LIMIT 10",
+        "SELECT id, c FROM t ORDER BY +c DESC LIMIT 10",
+        20,
+    );
+    probe(
+        mut session,
+        "ORDER BY id DESC LIMIT 10",
+        "SELECT id, c FROM t ORDER BY id DESC LIMIT 10",
+        "SELECT id, c FROM t ORDER BY +id DESC LIMIT 10",
+        20,
+    );
+    probe(
+        mut session,
+        "WHERE a = 3 ORDER BY c",
+        "SELECT id, c FROM t WHERE a = 3 ORDER BY c",
+        "SELECT id, c FROM t WHERE +a = 3 ORDER BY +c",
+        50,
+    );
+    probe(
+        mut session,
+        "no stats: flag = 1 AND c > 19990",
+        "SELECT id FROM t WHERE flag = 1 AND c > 19990",
+        "SELECT id FROM t WHERE +flag = 1 AND +c > 19990",
+        20,
+    );
+    let _ = session.query("ANALYZE", Vector<SqliteValue>.create().view());
+    probe(
+        mut session,
+        "stat1: flag = 1 AND c > 19990",
+        "SELECT id FROM t WHERE flag = 1 AND c > 19990",
+        "SELECT id FROM t WHERE +flag = 1 AND +c > 19990",
+        20,
+    );
+    return Ok();
+}
