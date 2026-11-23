@@ -348,6 +348,12 @@ fn evaluate(expr: borrow XExpr, frame: borrow mut Frame, db: borrow mut Session)
                 let v = evaluate(m, frame, db)?;
                 appendValueText(mut text, borrow v)?;
             }
+            // RAISE(FAIL) keeps the statement's earlier changes; RAISE(ROLLBACK) ends the transaction.
+            match (action) {
+                RaiseAction.Fail => { db.conflictFailure = ConflictAction.Fail; }
+                RaiseAction.Rollback => { db.conflictFailure = ConflictAction.Rollback; }
+                _ => {}
+            }
             return Err(raiseError(action, text));
         }
         XExpr.Now(kind) => { return nowText(kind, frame.nowMillis); }

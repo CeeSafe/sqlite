@@ -746,3 +746,37 @@ fn vacuumPacksTheFile() -> Result<void, TestFailure> {
         SELECT id FROM t WHERE b = 'after'
         """);
 }
+
+@test
+fn failAndRollbackActions() -> Result<void, TestFailure> {
+    return sameSession("fail-rollback", """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, u UNIQUE, n NOT NULL ON CONFLICT FAIL, s)
+        CREATE INDEX t_s ON t(s)
+        INSERT INTO t VALUES (1, 'a', 1, 'x')
+        INSERT OR FAIL INTO t VALUES (2, 'b', 2, 'y'), (3, 'a', 3, 'z'), (4, 'c', 4, 'w')
+        SELECT * FROM t
+        BEGIN
+        INSERT INTO t VALUES (5, 'e', 5, 'v')
+        INSERT OR ROLLBACK INTO t VALUES (6, 'f', 6, 'u'), (7, 'a', 7, 't')
+        SELECT * FROM t
+        COMMIT
+        INSERT INTO t VALUES (8, 'h', 8, 's'), (9, 'i', NULL, 'r'), (10, 'j', 10, 'q')
+        SELECT * FROM t
+        WITH RECURSIVE q(i) AS (SELECT 100 UNION ALL SELECT i + 1 FROM q WHERE i < 900) INSERT INTO t SELECT i, 'k' || i, i, printf('%.*c', i % 30, 's') FROM q
+        DELETE FROM t WHERE id % 2 = 0 AND id > 100
+        UPDATE OR FAIL t SET u = 'z', s = 'moved' WHERE id >= 2
+        SELECT count(*), sum(s = 'moved') FROM t
+        SELECT * FROM t WHERE id < 100
+        CREATE TABLE r(x)
+        CREATE TRIGGER tr BEFORE INSERT ON r WHEN new.x = 3 BEGIN SELECT RAISE(FAIL, 'three'); END
+        INSERT INTO r VALUES (1), (2), (3), (4)
+        SELECT * FROM r
+        BEGIN
+        INSERT INTO r VALUES (10)
+        CREATE TRIGGER tr2 BEFORE INSERT ON r WHEN new.x = 20 BEGIN SELECT RAISE(ROLLBACK, 'twenty'); END
+        INSERT INTO r VALUES (20)
+        SELECT * FROM r
+        COMMIT
+        PRAGMA integrity_check
+        """);
+}

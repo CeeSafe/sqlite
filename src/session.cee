@@ -25,6 +25,11 @@ public struct Session {
     synchronous: i64;
     cacheSize: i64;
     busyTimeout: i64;
+    /// The OR action of the constraint (or RAISE) that failed the running statement, when it is FAIL or ROLLBACK:
+    /// FAIL keeps the statement's earlier changes, ROLLBACK ends the transaction.
+    conflictFailure: ConflictAction?;
+    /// Indexes the running statement left to be rebuilt (by table and root), which a FAIL must rebuild.
+    staleIndexes: Vector<StaleIndex>;
     /// SAVEPOINT names open, innermost last, each with its level in the pager; and whether the outermost began
     /// the transaction (so that releasing it commits).
     savepoints: Vector<NamedSavepoint>;
@@ -58,6 +63,8 @@ public struct Session {
             busyTimeout: 0,
             legacyAlterTable: false,
             savepoints: Vector<NamedSavepoint>.create(),
+            conflictFailure: null,
+            staleIndexes: Vector<StaleIndex>.create(),
             savepointBegan: false,
             trigger: null,
             activeTriggers: Vector<String>.create(),
@@ -191,17 +198,33 @@ public struct Session {
         }
         let stmt = Parser.parseStatement(text)?;
         this.pager.beginStatement();
+        this.conflictFailure = null;
         let result = this.run(borrow stmt, text, params);
+        let failure = replace(mut this.conflictFailure, null);
+        let keep = result.isOk() || failure == Some(ConflictAction.Fail);
         if (result.isOk()) {
             this.pager.endStatement();
+        } else if (failure == Some(ConflictAction.Fail)) {
+            // OR FAIL: the rows changed before the failure stay; indexes left to rebuild are rebuilt now.
+            rebuildStaleIndexes(this)?;
+            this.pager.endStatement();
+            this.reloadSchema()?;
+        } else if (failure == Some(ConflictAction.Rollback) && this.inTransaction) {
+            // OR ROLLBACK: the whole transaction goes.
+            this.pager.rollback();
+            this.inTransaction = false;
+            this.savepoints.clear();
+            this.savepointBegan = false;
+            this.reloadSchema()?;
         } else if (this.inTransaction) {
             // A failed statement undoes itself alone.
             this.pager.rollbackStatement()?;
             this.reloadSchema()?;
         }
+        this.staleIndexes.clear();
         if (!this.inTransaction) {
             // Each statement outside BEGIN is a transaction of its own.
-            if (result.isOk()) {
+            if (keep) {
                 this.pager.commit()?;
             } else {
                 this.pager.rollback();
@@ -330,6 +353,12 @@ public struct Session {
             _ => { return Err(unsupported("this statement is not supported yet")); }
         }
     }
+}
+
+/// An index a statement must rebuild before it ends.
+struct StaleIndex {
+    table: String;
+    root: u32;
 }
 
 /// A SAVEPOINT in progress: its name and its level in the pager.

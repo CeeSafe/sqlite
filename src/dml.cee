@@ -599,6 +599,8 @@ impl TableWriter {
         }
         if (!IndexMutator.applyBatch(mut db.pager, index.root, ops.view(), borrow index.order)?) {
             index.stale.set(true);
+            // A statement that fails with OR FAIL keeps its changes: the session then rebuilds the index.
+            db.staleIndexes.push(StaleIndex { table: this.table.name.clone()?, root: index.root })?;
         }
         return Ok();
     }
@@ -760,7 +762,7 @@ impl TableWriter {
             message.append(this.table.name.view())?;
             message.append(".")?;
             message.append(column.name.view())?;
-            return Err(SqliteError.Constraint(message));
+            return Err(conflictError(db, effective, message));
         }
         for (k in 0..this.checks.length) {
             let v = evaluate(borrow this.checks[k], frame, db)?;
@@ -770,7 +772,7 @@ impl TableWriter {
                 }
                 var message = String.from("CHECK constraint failed: ")?;
                 message.append(this.checkNames[k].view())?;
-                return Err(SqliteError.Constraint(message));
+                return Err(conflictError(db, action ?? ConflictAction.Abort, message));
             }
         }
         return Ok(true);
@@ -819,7 +821,7 @@ impl TableWriter {
             if (ownAction == ConflictAction.Ignore) {
                 return Ok(false);
             }
-            return Err(SqliteError.Constraint(this.keyConflictMessage()?));
+            return Err(conflictError(db, ownAction, this.keyConflictMessage()?));
         }
         for (pass in 0..2) {
             let replacing = pass == 1;
@@ -855,7 +857,7 @@ impl TableWriter {
                 if (!replacing) {
                     var message = String.from("UNIQUE constraint failed: ")?;
                     message.append(index.keyNames.view())?;
-                    return Err(SqliteError.Constraint(message));
+                    return Err(conflictError(db, effective, message));
                 }
                 for (k in 0..conflicting.length) {
                     this.replaceRow(borrow conflicting[k], frame, db)?;
@@ -1954,4 +1956,31 @@ fn executeUpdateFrom(
             rows: output,
         },
     );
+}
+
+/// A constraint's failure, noting for the session an OR FAIL or OR ROLLBACK that decides what it undoes.
+fn conflictError(db: borrow mut Session, action: ConflictAction, message: String) -> SqliteError {
+    if (action == ConflictAction.Fail || action == ConflictAction.Rollback) {
+        db.conflictFailure = action;
+    }
+    return SqliteError.Constraint(message);
+}
+
+/// Rebuilds the indexes a statement left to rebuild when it ended early (OR FAIL keeps its changes).
+fn rebuildStaleIndexes(db: borrow mut Session) -> Result<void, SqliteError> {
+    var stale = replace(mut db.staleIndexes, Vector<StaleIndex>.create());
+    for (i in 0..stale.length) {
+        if (db.catalog.table(stale[i].table.view())?.isNull()) {
+            continue;
+        }
+        var compiler = newCompiler(db)?;
+        let writer = TableWriter.create(mut compiler, stale[i].table.view(), db)?;
+        var frame = newFrame(mut compiler, [], db)?;
+        for (x in 0..writer.indexes.length) {
+            if (writer.indexes[x].root == stale[i].root) {
+                writer.rebuildIndex(borrow writer.indexes[x], mut frame, db)?;
+            }
+        }
+    }
+    return Ok();
 }

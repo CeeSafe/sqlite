@@ -463,6 +463,10 @@ Choices where the C# concept does not fit CeeSafe:
   Refused: VACUUM inside a transaction (as in SQLite), VACUUM INTO, UTF-16 databases and pages with reserved
   bytes. The C# refused VACUUM.
 
+- **OR FAIL and OR ROLLBACK** (`failAndRollbackActions`), from a statement, a constraint's ON CONFLICT or a
+  trigger's RAISE: FAIL keeps the rows the statement changed before the failing one (indexes it left to rebuild
+  are rebuilt then), ROLLBACK ends the whole transaction. changes() does not count the rows FAIL kept.
+
 ## Known differences from SQLite in PRAGMA integrity_check
 
 The report matches the `sqlite3` shell's row for row on the tests' damaged files, with these exceptions:
@@ -491,9 +495,7 @@ The report matches the `sqlite3` shell's row for row on the tests' damaged files
 `CREATE VIRTUAL TABLE`, `EXPLAIN`, and a parenthesized join
 that an outer join takes as a whole (`a LEFT JOIN (b JOIN c ON …) ON …`); a parenthesized group of inner joins is
 read as its joins in line (`parenthesizedJoinsMatchSqlite`).
-Collations other than BINARY, NOCASE and RTRIM are refused. OR FAIL and OR ROLLBACK (and the same ON
-CONFLICT on a constraint) act as ABORT: the statement's earlier rows are undone, where FAIL keeps them and ROLLBACK
-ends the transaction.
+Collations other than BINARY, NOCASE and RTRIM are refused.
 
 ## Limits
 
