@@ -21,8 +21,11 @@ struct CoreSink {
 
 struct GroupState {
     accumulators: Vector<Accumulator>;
-    /// The current rows of the core's slots when the group's bare columns were last taken.
+    /// The rows of the core's slots the group's bare columns come from: its first row, as in SQLite, or the row
+    /// of its one min() or max().
     slots: Vector<Slot>;
+    /// The GROUP BY values: groups come out in their order, as SQLite's sorter gives them.
+    key: Vector<SqliteValue>;
 }
 
 fn copySlot(slot: borrow Slot) -> Result<Slot, AllocError> =>
@@ -489,10 +492,17 @@ fn acceptRow(
             for (a in 0..core.aggregates.length) {
                 accumulators.push(Accumulator.create(borrow core.aggregates[a]))?;
             }
-            sink.groups.push(GroupState { accumulators: accumulators, slots: Vector<Slot>.create() })?;
+            sink.groups.push(
+                GroupState {
+                    accumulators: accumulators,
+                    slots: Vector<Slot>.create(),
+                    key: cloneValues(keyValues.view())?,
+                },
+            )?;
             let _ = sink.groupIndex.put(key, index)?;
         }
-        var takeRow = core.minMax.isNull();
+        // Bare columns come from the group's first row, or from the row of its one min() or max().
+        var takeRow = false;
         for (a in 0..core.aggregates.length) {
             let newBest = sink.groups[index].accumulators[a].step(borrow core.aggregates[a], frame, db)?;
             if (core.minMax == Some(a) && newBest) {
@@ -599,10 +609,42 @@ fn runCore(
         for (s in 0..core.sources.length) {
             slots.push(Slot { values: Vector<SqliteValue>.create(), rowId: 0, isNull: true })?;
         }
-        sink.groups.push(GroupState { accumulators: accumulators, slots: slots })?;
+        sink.groups.push(GroupState { accumulators: accumulators, slots: slots, key: Vector<SqliteValue>.create() })?;
     }
     let saved = replace(mut frame.aggregates, Vector<SqliteValue>.create());
     var groups = replace(mut sink.groups, Vector<GroupState>.create());
+    // In the order of their GROUP BY values (NULLs first, each under its collation), as SQLite's sorter gives them;
+    // or, read through an index that gives the GROUP BY order, in the order the scan met them, as SQLite does.
+    if (core.groupBy.length != 0 && !groupsInScanOrder(core)) {
+        var order = Vector<usize>.withCapacity(groups.length)?;
+        for (g in 0..groups.length) {
+            order.push(g)?;
+        }
+        let collations = core.groupCollations.view();
+        order.sortBy((a, b) => {
+            for (k in 0..collations.length) {
+                let c = compareForOrder(borrow groups[a].key[k], borrow groups[b].key[k], collations[k], false, true);
+                if (c != 0) {
+                    return c;
+                }
+            }
+            return if (a < b) -1 else if (a > b) 1 else 0;
+        });
+        var sorted = Vector<GroupState>.withCapacity(groups.length)?;
+        for (i in 0..order.length) {
+            sorted.push(
+                replace(
+                    mut groups[order[i]],
+                    GroupState {
+                        accumulators: Vector<Accumulator>.create(),
+                        slots: Vector<Slot>.create(),
+                        key: Vector<SqliteValue>.create(),
+                    },
+                ),
+            )?;
+        }
+        groups = sorted;
+    }
     for (g in 0..groups.length) {
         var results = Vector<SqliteValue>.withCapacity(core.aggregates.length)?;
         for (a in 0..core.aggregates.length) {
@@ -903,4 +945,40 @@ impl RowCursor {
             }
         }
     }
+}
+
+/// Whether the core's first table is read through an index whose next columns (after those `=` fixes) are the GROUP
+/// BY columns, in any order: SQLite then groups in the index's order instead of sorting.
+fn groupsInScanOrder(core: borrow CorePlan) -> bool {
+    if (core.sources.length == 0) {
+        return false;
+    }
+    let source = borrow core.sources[0];
+    let Some(seek) = borrow source.indexSeek else {
+        return false;
+    };
+    if (seek.byRowid || seek.inAt.isSome()) {
+        return false;
+    }
+    let start = seek.equal.length;
+    let n = core.groupBy.length;
+    if (start + n > seek.columns.length) {
+        return false;
+    }
+    for (g in 0..n) {
+        let XExpr.Column(slot, column) = core.groupBy[g] else {
+            return false;
+        };
+        if (slot != source.slot) {
+            return false;
+        }
+        var found = false;
+        for (k in start..start + n) {
+            found = found || seek.columns[k] == Some(column);
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    return true;
 }

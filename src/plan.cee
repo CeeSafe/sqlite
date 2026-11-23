@@ -85,11 +85,14 @@ struct IndexSeek {
     /// Rows are made from the entries alone: for each table column, its place in an entry (`null` for a column
     /// nothing reads, and for the rowid alias).
     covering: Vector<usize?>?;
+    /// The index's key columns (table column positions; `null` for an expression), in index order.
+    columns: Vector<usize?>;
 }
 
 fn newSeek(root: u32, byRowid: bool) -> IndexSeek => IndexSeek {
     root: root,
     byRowid: byRowid,
+    columns: Vector<usize?>.create(),
     order: IndexOrder.plain(),
     equal: Vector<XExpr>.create(),
     affinities: Vector<ExprAffinity>.create(),
@@ -834,6 +837,9 @@ fn indexScanChoice(
     }
     var seek = newSeek(index.root, false);
     seek.covering = covering;
+    for (k in 0..index.columns.length) {
+        let _ = seek.columns.push(index.columns[k].column);
+    }
     return AccessChoice { seek: seek, index: i, rows: rows, cost: cost };
 }
 
@@ -901,6 +907,9 @@ fn indexChoice(
 ) -> Result<AccessChoice?, AllocError> {
     let index = borrow indexes[i];
     var seek = newSeek(index.root, false);
+    for (k in 0..index.columns.length) {
+        seek.columns.push(index.columns[k].column)?;
+    }
     var values: i64 = 0;
     var c: usize = 0;
     while (c < index.columns.length) {

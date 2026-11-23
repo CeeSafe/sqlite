@@ -622,3 +622,25 @@ fn unknownCollationsAreRefusedAsInSqlite() -> Result<void, TestFailure> {
         SELECT x FROM t ORDER BY x COLLATE "nocase" DESC
         """);
 }
+
+@test
+fn groupsComeOutAsSqliteGivesThem() -> Result<void, TestFailure> {
+    let path = "out/query-group-order.db";
+    makeDatabase(path, """
+        CREATE TABLE t(k, n, s);
+        INSERT INTO t VALUES (1, 6, 'z'), (0, 9, 'y'), (1, 4, 'a'), (0, 3, 'q'), (1, 2, 'm'), (NULL, 1, 'n'), ('x', 0, 'w');
+        CREATE TABLE c(x TEXT COLLATE NOCASE, n);
+        INSERT INTO c VALUES ('b', 1), ('a', 2), ('B', 3), ('A', 4), ('a', 5), ('C', 6);
+        """)?;
+    return sameAnswers(path, """
+        SELECT k, n, s FROM t GROUP BY k
+        SELECT n, s, count(*) FROM t
+        SELECT k, n FROM t WHERE n > 100 GROUP BY k
+        SELECT n, count(*) FROM t WHERE n > 100
+        SELECT k % 2, max(n), s FROM t GROUP BY k % 2
+        SELECT x, count(*), n FROM c GROUP BY x
+        SELECT x, n FROM c GROUP BY x HAVING max(n)
+        SELECT x, count(*) FROM c GROUP BY x ORDER BY count(*)
+        SELECT s, k FROM t GROUP BY k, s % 2
+        """);
+}

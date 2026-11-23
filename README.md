@@ -456,6 +456,11 @@ The port fixes what was wrong in the source instead of copying it. Each item has
 - **The planner across databases:** each table is planned with its own database's indexes, but the statistics
   ANALYZE wrote are read from the active database only.
 
+- **GROUP BY's groups** come out as SQLite gives them (`groupsComeOutAsSqliteGivesThem`): in the order of their
+  GROUP BY values, or in an index's order when the table is read through an index on those columns; a column
+  outside the aggregates takes the group's first row (or the row of its one min() or max()). This engine had
+  listed groups as it met them and taken the last row.
+
 ## Known differences from SQLite in the math functions
 
 The `sqlite3` shell calls the platform's libm (macOS's here), and prints reals with 17 significant digits, so a
