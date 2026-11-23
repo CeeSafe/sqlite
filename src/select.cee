@@ -257,6 +257,60 @@ fn containsWindow(e: borrow Expr) -> bool {
 }
 
 /// The name a result column shows when it has no alias.
+/// The name of result column `i` with no alias, as SQLite gives it: a VALUES row's `columnN`; a column's name as
+/// its table declares it (`rowid` for the rowid); else the expression's text as written.
+fn resultColumnName(
+    compiler: borrow Compiler,
+    core: borrow SelectCore,
+    i: usize,
+    e: borrow Expr,
+) -> Result<String, AllocError> {
+    if (core.isValues) {
+        var name = String.from("column")?;
+        name.appendNumber(i + 1)?;
+        return Ok(name);
+    }
+    if (e is Expr.Column(c)) {
+        if (compiler.scopes.length != 0) {
+            let scope = borrow compiler.scopes[compiler.scopes.length - 1];
+            for (s in 0..scope.sources.length) {
+                let source = borrow scope.sources[s];
+                if (borrow c.table is Some(t)) {
+                    if (!source.name.view().equalsIgnoreAsciiCase(t.view())) {
+                        continue;
+                    }
+                }
+                if (Compiler.findColumn(source, c.name.view()) is Some(at)) {
+                    return source.columns[at].name.clone();
+                }
+            }
+            if (isRowidName(c.name.view())) {
+                // The INTEGER PRIMARY KEY's name when the table has one.
+                for (s in 0..scope.sources.length) {
+                    let source = borrow scope.sources[s];
+                    if (borrow c.table is Some(t)) {
+                        if (!source.name.view().equalsIgnoreAsciiCase(t.view())) {
+                            continue;
+                        }
+                    }
+                    if (source.hasRowid) {
+                        if (source.rowidAlias is Some(at)) {
+                            return source.columns[at].name.clone();
+                        }
+                        break;
+                    }
+                }
+                return String.from("rowid");
+            }
+        }
+        return c.name.clone();
+    }
+    if (i < core.columnTexts.length && core.columnTexts[i].length != 0) {
+        return core.columnTexts[i].clone();
+    }
+    return defaultColumnName(e);
+}
+
 fn defaultColumnName(e: borrow Expr) -> Result<String, AllocError> {
     if (e is Expr.Column(c)) {
         return c.name.clone();
@@ -1147,7 +1201,7 @@ fn compileCoreBody(
             }
             ResultColumn.Expr(e, alias) => {
                 let compiled = compiler.typed(e, db)?;
-                let name = if (alias is Some(a)) a.clone()? else defaultColumnName(e)?;
+                let name = if (alias is Some(a)) a.clone()? else resultColumnName(compiler, core, i, e)?;
                 outputExprsIn.push(compiled.expr)?;
                 outputs.push(OutputColumn { name: name, affinity: compiled.affinity, collation: compiled.collation })?;
             }

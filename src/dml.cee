@@ -1768,6 +1768,7 @@ fn executeUpdateFrom(
             having: null,
             windows: Vector<NamedWindow>.create(),
             isValues: false,
+            columnTexts: Vector<String>.create(),
         },
     )?;
     let select = SelectStmt {

@@ -262,12 +262,18 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   unqualified names, `*` and the left table's `t.*`, as in SQLite (`rightAndFullJoinsMatchSqlite`). The C# refused
   them.
 
+- **Result column names** are SQLite's (`resultColumnNamesMatchSqlite`): an expression's text as written, comments
+  and spacing kept; a column's name as its table declares it, whatever case the query uses; the INTEGER PRIMARY
+  KEY's name for `rowid`; `columnN` for VALUES. The C# wrote the expression again from its tree (`abc + 1` for
+  `abc  +  1`) and used the name as the query spelled it.
+
 ## Known gaps (inherited from the C# engine, refused by name rather than misparsed)
 
 `CREATE TABLE … AS SELECT`, `CREATE VIRTUAL TABLE`, `ALTER TABLE … DROP COLUMN`, `EXPLAIN`, parenthesized joins
 in FROM, aliases on the target of INSERT, UPDATE and DELETE, and `ORDER BY` inside an aggregate's arguments.
 `ON CONFLICT` clauses on column and table constraints are read and not applied, and collations other than
 BINARY, NOCASE and RTRIM are refused.
+RETURNING's column names are written again from the expression's tree, not taken from the statement's text.
 
 ## Limits
 

@@ -298,6 +298,8 @@ struct SelectCore {
     windows: Vector<NamedWindow>;
     /// A row of VALUES: `columns` are its expressions, and there is nothing else.
     isValues: bool;
+    /// Each result column's text as written (empty for `*`), which names a column without an alias.
+    columnTexts: Vector<String>;
 }
 
 enum CompoundOp {
@@ -808,6 +810,7 @@ fn cloneSelect(s: borrow SelectStmt) -> Result<SelectStmt, AllocError> {
             having: cloneOptional(borrow c.having)?,
             windows: windows,
             isValues: c.isValues,
+            columnTexts: cloneStrings(borrow c.columnTexts)?,
         })?;
     }
     var ops = Vector<CompoundOp>.withCapacity(s.compoundOps.length)?;

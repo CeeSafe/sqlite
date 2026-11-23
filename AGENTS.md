@@ -101,4 +101,5 @@ run code in a sandbox. The specification is embedded in `ceesafec`, so its answe
   - the catalog does not yet give `IndexSchema`s for automatic indexes: add that with the planner;
   - window functions run in `window.cee` after grouping: `project` keeps each row (`WindowRow`) until the
     windows are computed; `OVER w` is resolved by name at compile time;
-  - result column names should come from the statement's own text, as in SQLite, not from `SqlWriter`.
+  - result column names come from the statement's own text (`SelectCore.columnTexts`, `resultColumnName`), as in
+    SQLite; RETURNING's names still come from `SqlWriter`.

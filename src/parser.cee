@@ -85,10 +85,12 @@ struct Parser {
     private nesting: u32;
     /// The height of the expression parsed last.
     private height: u32;
+    /// The statement's text, for the names of result columns.
+    private source: String;
 
     /// The one statement in `sql`, which may end with a semicolon.
     fn parseStatement(sql: StringView) -> Result<Stmt, SqliteError> {
-        var p = Parser { tokens: Tokenizer.tokenize(sql)?, at: 0, nesting: 0, height: 0 };
+        var p = Parser { tokens: Tokenizer.tokenize(sql)?, at: 0, nesting: 0, height: 0, source: String.from(sql)? };
         let stmt = p.statement()?;
         let _ = p.acceptOp(";");
         p.expectEnd()?;
@@ -97,7 +99,7 @@ struct Parser {
 
     /// Every statement in `sql`.
     fn parseProgram(sql: StringView) -> Result<Vector<Stmt>, SqliteError> {
-        var p = Parser { tokens: Tokenizer.tokenize(sql)?, at: 0, nesting: 0, height: 0 };
+        var p = Parser { tokens: Tokenizer.tokenize(sql)?, at: 0, nesting: 0, height: 0, source: String.from(sql)? };
         var list = Vector<Stmt>.create();
         loop {
             while (p.acceptOp(";")) {}
@@ -115,7 +117,7 @@ struct Parser {
 
     /// The expression that `tokens` (ending with an Eof token) spell.
     fn parseExpressionTokens(tokens: Vector<Token>) -> Result<Expr, SqliteError> {
-        var p = Parser { tokens: tokens, at: 0, nesting: 0, height: 0 };
+        var p = Parser { tokens: tokens, at: 0, nesting: 0, height: 0, source: String.create() };
         let expr = p.expr()?;
         p.expectEnd()?;
         return Ok(expr);
@@ -522,6 +524,7 @@ struct Parser {
         having: null,
         windows: Vector<NamedWindow>.create(),
         isValues: false,
+        columnTexts: Vector<String>.create(),
     };
 
     private fn selectCore(borrow mut this) -> Result<SelectCore, SqliteError> {
@@ -532,7 +535,7 @@ struct Parser {
         } else {
             let _ = this.acceptWord("ALL");
         }
-        core.columns = this.resultColumns()?;
+        core.columns = this.resultColumns(mut core.columnTexts)?;
         if (this.acceptWord("FROM")) {
             core.from = this.fromClause()?;
         }
@@ -560,18 +563,22 @@ struct Parser {
         return Ok(core);
     }
 
-    private fn resultColumns(borrow mut this) -> Result<Vector<ResultColumn>, SqliteError> {
+    private fn resultColumns(
+        borrow mut this,
+        texts: borrow mut Vector<String>,
+    ) -> Result<Vector<ResultColumn>, SqliteError> {
         var columns = Vector<ResultColumn>.create();
         loop {
-            columns.push(this.resultColumn()?)?;
+            columns.push(this.resultColumn(texts)?)?;
             if (!this.acceptOp(",")) {
                 return Ok(columns);
             }
         }
     }
 
-    private fn resultColumn(borrow mut this) -> Result<ResultColumn, SqliteError> {
+    private fn resultColumn(borrow mut this, texts: borrow mut Vector<String>) -> Result<ResultColumn, SqliteError> {
         if (this.acceptOp("*")) {
+            texts.push(String.create())?;
             return Ok(ResultColumn.Star);
         }
         if ((this.kind() == TokenKind.Word || this.kind() == TokenKind.QuotedId) && this.peekIsOp(
@@ -581,10 +588,29 @@ struct Parser {
             let table = this.name()?;
             this.advance();
             this.advance();
+            texts.push(String.create())?;
             return Ok(ResultColumn.TableStar(table));
         }
+        let start = this.at;
         let expr = this.expr()?;
+        texts.push(this.textSince(start)?)?;
         return Ok(ResultColumn.Expr(expr, this.alias()?));
+    }
+
+    /// The text of tokens `start` up to the current one, as written (comments included), without the whitespace
+    /// at its end: the name SQLite gives a result column with no alias.
+    private fn textSince(borrow this, start: usize) -> Result<String, AllocError> {
+        if (this.source.length == 0 || start >= this.tokens.length || this.at <= start) {
+            return Ok(String.create());
+        }
+        let from = this.tokens[start].offset;
+        var to = if (this.at < this.tokens.length) this.tokens[this.at].offset else this.source.length;
+        let last = this.tokens[this.at - 1].end;
+        to = to.max(last).min(this.source.length);
+        if (from >= to) {
+            return Ok(String.create());
+        }
+        return String.from(this.source.view()[from..to].trimEnd());
     }
 
     private fn exprList(borrow mut this) -> Result<Vector<Expr>, SqliteError> {
@@ -759,7 +785,8 @@ struct Parser {
         if (!this.acceptWord("RETURNING")) {
             return Ok(Vector<ResultColumn>.create());
         }
-        return this.resultColumns();
+        var texts = Vector<String>.create();
+        return this.resultColumns(mut texts);
     }
 
     private fn insert(borrow mut this, with: WithClause?) -> Result<InsertStmt, SqliteError> {

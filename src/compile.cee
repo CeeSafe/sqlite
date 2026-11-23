@@ -920,6 +920,7 @@ fn selectAllFrom(table: borrow QualifiedName) -> Result<SelectStmt, AllocError> 
         having: null,
         windows: Vector<NamedWindow>.create(),
         isValues: false,
+        columnTexts: Vector<String>.create(),
     };
     core.columns.push(ResultColumn.Star)?;
     var schema: String? = null;

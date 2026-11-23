@@ -294,3 +294,78 @@ fn rightAndFullJoinsMatchSqlite() -> Result<void, TestFailure> {
         SELECT a.*, b.k FROM a NATURAL RIGHT JOIN b ORDER BY bv
         """);
 }
+
+/// The result columns' names, joined by `|`, as `sqlite3 -header` prints them; or the error.
+fn theirNames(path: StringView, sql: StringView) -> String {
+    var arguments = Vector<StringView>.create();
+    arguments.push("-header")!;
+    arguments.push(path)!;
+    arguments.push(sql)!;
+    let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
+    let text = textFromBytesLossy(output.stdout.view())!;
+    let first = text.view().splitOnce("\n") ?? TextHalves { left: text.view(), right: "" };
+    return String.from(first.left)!;
+}
+
+fn ourNames(session: borrow mut Session, sql: StringView) -> String {
+    let none = Vector<SqliteValue>.create();
+    var text = String.create();
+    match (session.query(sql, none.view())) {
+        Ok(result) => {
+            for (i in 0..result.columns.length) {
+                if (i != 0) {
+                    text.append("|")!;
+                }
+                text.append(result.columns[i].view())!;
+            }
+        }
+        Err(e) => { text.append(e.message())!; }
+    }
+    return text;
+}
+
+@test
+fn resultColumnNamesMatchSqlite() -> Result<void, TestFailure> {
+    let path = "out/query-names.db";
+    makeDatabase(path, """
+        CREATE TABLE t(abc INTEGER PRIMARY KEY, Def TEXT, "odd name" REAL);
+        INSERT INTO t VALUES (1, 'x', 2.5);
+        CREATE VIEW v AS SELECT abc + 1, Def AS d FROM t;
+        """)?;
+    var session = Session.open(path)!;
+    let queries = [
+        "SELECT ABC, T.def, \"Abc\", t.\"DEF\", main.t.abc, [abc], rowid, _ROWID_ FROM t",
+        "SELECT * FROM t",
+        "SELECT t.* FROM t",
+        "SELECT abc  +  1, (SELECT 1), count(*), x'01', 'str', -abc, CAST(abc AS TEXT), abs( abc ) FROM t",
+        "SELECT abc AS z, \"odd name\", Def || 'y' FROM t",
+        "SELECT 1 -- note\n, 2/*x*/ ,    3   ",
+        "SELECT * FROM v",
+        "SELECT x FROM (SELECT abc AS x FROM t)",
+        "SELECT abc FROM (SELECT abc FROM t)",
+        "VALUES (1, 2), (3, 4)",
+        "SELECT * FROM (VALUES (1, 'a'))",
+        "SELECT abc, Def FROM t UNION SELECT 1, 2",
+        "SELECT (abc), ((Def)) FROM t",
+        "SELECT a.abc, b.Def FROM t AS a JOIN t AS b USING (abc)",
+        "SELECT row_number() OVER (ORDER BY abc) FROM t",
+        "WITH c(n) AS (SELECT 1) SELECT n, * FROM c",
+    ];
+    var failures = String.create();
+    for (q in 0..queries.length) {
+        let theirs = theirNames(path, queries[q]);
+        let mine = ourNames(mut session, queries[q]);
+        if (theirs.view() != mine.view()) {
+            failures.append(queries[q])!;
+            failures.append("\n  sqlite3:     ")!;
+            failures.append(theirs.view())!;
+            failures.append("\n  this engine: ")!;
+            failures.append(mine.view())!;
+            failures.append("\n")!;
+        }
+    }
+    if (failures.length != 0) {
+        return Check.fail(failures.view());
+    }
+    return Ok();
+}
