@@ -23,7 +23,8 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Numbers as text, text as numbers | `Exec/SqlValueOps` | `numeric.cee` | done: SQLite's own conversion routines, ported |
 | Value operations, comparison affinity | `Exec/SqlValueOps`, `ValueComparer` | `valueops.cee`, `compare.cee` | done |
 | Expressions: compiler and evaluator | `Exec/ExpressionEvaluator`, `Binding`, `ParameterBinder` | `expr.cee`, `compile.cee` | done |
-| Scalar functions, aggregates | `Exec/Functions`, `LikeMatcher` | `functions.cee`, `aggregate.cee` | core functions done; date/time, printf, JSON and transcendental math next |
+| Scalar functions, aggregates | `Exec/Functions`, `LikeMatcher` | `functions.cee`, `aggregate.cee` | core functions done; printf, JSON and transcendental math next |
+| Date and time functions | `Exec/Functions` (date/time part) | `datetime.cee` | done: a port of SQLite's date.c; 'localtime' and 'utc' are an error where they need the time zone, which CeeSafe lacks |
 | SELECT: joins, subqueries, views, CTEs, grouping, compounds | `Exec/QueryExecutor` | `select.cee`, `run.cee` | done but RIGHT/FULL joins, window functions, table functions, index seeks (rowid seeks done) |
 | INSERT, UPDATE, DELETE | `Exec/QueryExecutor` (DML), `InMemoryDatabase` | `dml.cee` | done for rowid tables: constraints, conflict actions, RETURNING, AUTOINCREMENT; triggers, foreign keys, upserts, UPDATE … FROM next |
 | CREATE and DROP of tables, indexes and views | `Exec/QueryExecutor` (DDL) | `ddl.cee` | done; ALTER TABLE, triggers and pragmas next |
@@ -155,6 +156,19 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   ends, from the rows as they then are; rebuilding it mid-statement would read rows not yet changed
   (`manyRowsAndIndexes`).
 
+- **Date and time values.** The C# read time values through .NET's `DateTime`: no year 0 or earlier, no
+  `+HH:MM`/`Z` zones, at most three fraction digits, no time without a date, and a bare number was always a Julian
+  day. The port of SQLite's date.c reads them all as SQLite does, numbers included (`dateTimeValues`).
+- **Modifiers.** The C# applied 'unixepoch' and 'auto' wherever they stood, made 'floor' re-run month arithmetic,
+  treated 'utc' and 'localtime' as nothing, and lacked 'julianday', '±HH:MM', '±YYYY-MM-DD', and 'subsec' outside
+  datetime(). Here they apply in order with SQLite's rules (only right after the value for 'unixepoch', 'julianday',
+  'auto'), and 'localtime'/'utc' are an error where they would need the time zone (`dateTimeModifiers`).
+- **strftime().** An unknown specifier made the C# throw; SQLite and this give NULL. %J, %f, %s with 'subsec', %G,
+  %g, %V, %u, %k, %l, %P and %e follow SQLite's printf (`strftimeSpecifiers`).
+- **'now'.** The C# read the clock at each call; here it is the statement's time, the same in every call.
+- **unixepoch() and timediff().** unixepoch() truncates toward zero and gives a real with 'subsec'; timediff() walks
+  months as SQLite does (`timediffAndErrors`).
+
 ## Known gaps (inherited from the C# engine, refused by name rather than misparsed)
 
 `CREATE TABLE … AS SELECT`, `CREATE VIRTUAL TABLE`, `ALTER TABLE … DROP COLUMN`, `EXPLAIN`, parenthesized joins
@@ -163,6 +177,10 @@ in FROM, aliases on the target of INSERT, UPDATE and DELETE, and `ORDER BY` insi
 BINARY, NOCASE and RTRIM are refused.
 
 ## Limits
+
+- **Local time.** 'localtime', and 'utc' on a value not known to be UTC, are an error ("local time unavailable"):
+  CeeSafe's library has no time zone (CEESAFE_FINDINGS.md). 'now' and date functions with it are also not refused
+  in CHECK constraints, index expressions and generated columns, as SQLite refuses them.
 
 - **One process at a time.** The engine does not take SQLite's file locks, which CeeSafe's library does not
   offer, so it must not have a database open while another process writes it. (The C# engine has the same

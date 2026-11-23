@@ -15,7 +15,9 @@
 // - sign() of text that is not entirely a number is NULL;
 // - min(), max() and nullif() compare with the collation of their arguments.
 //
-// Not yet ported: the date and time functions, printf() and format(), the JSON functions, and the math functions
+// The date and time functions are in datetime.cee.
+//
+// Not yet ported: printf() and format(), the JSON functions, and the math functions
 // beyond sqrt, abs, sign, floor, ceil, trunc, mod and pi (they need a port of a math library, which CeeSafe
 // lacks). Calling one is "no such function".
 
@@ -27,12 +29,15 @@ enum ScalarFunction {
     Coalesce,
     Concat,
     ConcatWs,
+    Date,
+    Datetime,
     Floor,
     Glob,
     Hex,
     IfNull,
     Iif,
     Instr,
+    JulianDay,
     LastInsertRowid,
     Length,
     Like,
@@ -55,13 +60,17 @@ enum ScalarFunction {
     Sign,
     Sqrt,
     SqliteVersion,
+    Strftime,
     Substr,
+    Time,
+    TimeDiff,
     TotalChanges,
     Trim,
     Trunc,
     TypeOf,
     Unhex,
     Unicode,
+    UnixEpoch,
     Unlikely,
     Upper,
     ZeroBlob,
@@ -95,12 +104,15 @@ fn scalarEntry(name: StringView, argc: usize) -> FunctionEntry? {
         "coalesce" => entry(ScalarFunction.Coalesce, argc, 2, MANY),
         "concat" => entry(ScalarFunction.Concat, argc, 1, MANY),
         "concat_ws" => entry(ScalarFunction.ConcatWs, argc, 2, MANY),
+        "date" => entry(ScalarFunction.Date, argc, 0, MANY),
+        "datetime" => entry(ScalarFunction.Datetime, argc, 0, MANY),
         "floor" => entry(ScalarFunction.Floor, argc, 1, 1),
         "glob" => entry(ScalarFunction.Glob, argc, 2, 2),
         "hex" => entry(ScalarFunction.Hex, argc, 1, 1),
         "ifnull" => entry(ScalarFunction.IfNull, argc, 2, 2),
         "iif" | "if" => entry(ScalarFunction.Iif, argc, 2, MANY),
         "instr" => entry(ScalarFunction.Instr, argc, 2, 2),
+        "julianday" => entry(ScalarFunction.JulianDay, argc, 0, MANY),
         "last_insert_rowid" => entry(ScalarFunction.LastInsertRowid, argc, 0, 0),
         "length" => entry(ScalarFunction.Length, argc, 1, 1),
         "like" => entry(ScalarFunction.Like, argc, 2, 3),
@@ -123,13 +135,17 @@ fn scalarEntry(name: StringView, argc: usize) -> FunctionEntry? {
         "sign" => entry(ScalarFunction.Sign, argc, 1, 1),
         "sqrt" => entry(ScalarFunction.Sqrt, argc, 1, 1),
         "sqlite_version" => entry(ScalarFunction.SqliteVersion, argc, 0, 0),
+        "strftime" => entry(ScalarFunction.Strftime, argc, 0, MANY),
         "substr" | "substring" => entry(ScalarFunction.Substr, argc, 2, 3),
+        "time" => entry(ScalarFunction.Time, argc, 0, MANY),
+        "timediff" => entry(ScalarFunction.TimeDiff, argc, 2, 2),
         "total_changes" => entry(ScalarFunction.TotalChanges, argc, 0, 0),
         "trim" => entry(ScalarFunction.Trim, argc, 1, 2),
         "trunc" => entry(ScalarFunction.Trunc, argc, 1, 1),
         "typeof" => entry(ScalarFunction.TypeOf, argc, 1, 1),
         "unhex" => entry(ScalarFunction.Unhex, argc, 1, 2),
         "unicode" => entry(ScalarFunction.Unicode, argc, 1, 1),
+        "unixepoch" => entry(ScalarFunction.UnixEpoch, argc, 0, MANY),
         "unlikely" => entry(ScalarFunction.Unlikely, argc, 1, 1),
         "upper" => entry(ScalarFunction.Upper, argc, 1, 1),
         "zeroblob" => entry(ScalarFunction.ZeroBlob, argc, 1, 1),
@@ -772,6 +788,9 @@ fn callFunction(
         }
         ScalarFunction.Ceil | ScalarFunction.Floor | ScalarFunction.Trunc => {
             return Ok(roundingFunction(call.function, borrow v[0]));
+        }
+        ScalarFunction.Date | ScalarFunction.Datetime | ScalarFunction.JulianDay | ScalarFunction.Strftime | ScalarFunction.Time | ScalarFunction.TimeDiff | ScalarFunction.UnixEpoch => {
+            return dateTimeFunction(call.function, v, frame.nowMillis);
         }
         ScalarFunction.Changes => { return Ok(SqliteValue.Integer(db.changes)); }
         ScalarFunction.TotalChanges => { return Ok(SqliteValue.Integer(db.totalChanges)); }
