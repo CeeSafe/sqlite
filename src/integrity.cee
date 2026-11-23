@@ -1,0 +1,1557 @@
+// PRAGMA integrity_check and PRAGMA quick_check, as SQLite runs them: the b-tree checks of
+// sqlite3BtreeIntegrityCheck (btree.c), then the row checks of the program pragma.c generates, with SQLite's
+// messages, its order and its error budget.
+//
+// - The b-tree check walks every tree from its root (sqlite_schema, each table and index), with an explicit
+//   stack: each page is referenced once ("2nd reference to page N", "invalid page number N"), its cells lie
+//   inside it and do not overlap, its fragment count is right, rowids ascend, overflow chains have the length
+//   their cells promise, and all children are as deep. Then the freelist, and every page must be used.
+// - The row check reads each table's rows: NOT NULL, the type of a STRICT or typed column, CHECK constraints,
+//   and (not for quick_check) that each row has its entry in every index, through TableWriter's own entries.
+// - Messages from the b-tree check are one row, after "*** in database main ***", as SQLite gives them.
+// - SQLite checks tables in the order of its schema hash table; `sqliteHashOrder` reproduces it, so the rows
+//   come in the same order as the sqlite3 shell's.
+//
+// The C# engine had no integrity check.
+
+const WAIT_NONE: u8 = 0;
+const START_RIGHT: u8 = 1;
+const WAIT_RIGHT: u8 = 2;
+const WAIT_LEFT: u8 = 3;
+
+/// What SQLite's integrity check puts before a message: where it was looking.
+enum CheckPrefix {
+    None,
+    Freelist,
+    TreePage,
+    TreeCell,
+}
+
+fn pageByte(data: Slice<u8>, at: usize) -> u8 => if (at < data.length) data[at] else 0;
+
+fn get2(data: Slice<u8>, at: usize) -> u32 => ((pageByte(data, at) as u32) << 8) | (pageByte(data, at + 1) as u32);
+
+fn get4(data: Slice<u8>, at: usize) -> u32 => (get2(data, at) << 16) | get2(data, at + 2);
+
+/// A varint read without trusting the page: bytes past its end read as zero.
+struct LooseVarint {
+    value: u64;
+    length: usize;
+}
+
+/// A 64-bit varint, as sqlite3GetVarint reads it.
+fn looseVarint(data: Slice<u8>, at: usize) -> LooseVarint {
+    var v: u64 = 0;
+    let first: usize = 0;
+    for (i in first..8) {
+        let b = pageByte(data, at + i);
+        v = ((v & 0x01ffffffffffffff) << 7) | ((b & 0x7f) as u64);
+        if (b < 0x80) {
+            return LooseVarint { value: v, length: i + 1 };
+        }
+    }
+    v = ((v & 0x00ffffffffffffff) << 8) | (pageByte(data, at + 8) as u64);
+    return LooseVarint { value: v, length: 9 };
+}
+
+/// A cell's payload size, as btreeParseCellPtr reads it: 32 bits, at most nine bytes.
+fn payloadSize(data: Slice<u8>, at: usize) -> LooseVarint {
+    var p = at;
+    var v = pageByte(data, p) as u32;
+    if (v >= 0x80) {
+        let end = p + 8;
+        v = v & 0x7f;
+        loop {
+            p += 1;
+            v = ((v & 0x01ffffff) << 7) | ((pageByte(data, p) & 0x7f) as u32);
+            if (pageByte(data, p) < 0x80 || p >= end) {
+                break;
+            }
+        }
+    }
+    return LooseVarint { value: v as u64, length: p + 1 - at };
+}
+
+/// A b-tree page as btreeInitPage sees it.
+struct CheckedPage {
+    header: usize;
+    leaf: bool;
+    intKey: bool;
+    cellCount: usize;
+    cellStart: usize;
+    contentStart: u32;
+    maxLocal: u32;
+    minLocal: u32;
+    rightChild: u32;
+}
+
+/// The page's header, or `null` where btreeInitPage finds it corrupt.
+fn initCheckedPage(data: Slice<u8>, number: u32, usable: u32) -> CheckedPage? {
+    let header: usize = if (number == 1) 100 else 0;
+    let flags = pageByte(data, header);
+    var leaf = false;
+    var intKey = false;
+    var maxLocal = (usable - 12) * 64 / 255 - 23;
+    if (flags >= 10) {
+        leaf = true;
+        if (flags == 13) {
+            intKey = true;
+            maxLocal = usable - 35;
+        } else if (flags != 10) {
+            return null;
+        }
+    } else if (flags == 5) {
+        intKey = true;
+        maxLocal = usable - 35;
+    } else if (flags != 2) {
+        return null;
+    }
+    let cellCount = get2(data, header + 3) as usize;
+    if (cellCount > (data.length - 8) / 6) {
+        return null;
+    }
+    var content = get2(data, header + 5);
+    if (content == 0) {
+        content = 65536;
+    }
+    return CheckedPage {
+        header: header,
+        leaf: leaf,
+        intKey: intKey,
+        cellCount: cellCount,
+        cellStart: header + (if (leaf) 8 else 12),
+        contentStart: content,
+        maxLocal: maxLocal,
+        minLocal: (usable - 12) * 32 / 255 - 23,
+        rightChild: if (leaf) 0 else get4(data, header + 8),
+    };
+}
+
+/// Whether the page's free space adds up, as btreeComputeFreeSpace checks it.
+fn freeSpaceIsSound(data: Slice<u8>, page: borrow CheckedPage, usable: u32) -> bool {
+    let top = page.contentStart;
+    let first = truncate<u32>(page.cellStart + 2 * page.cellCount);
+    let last = usable - 4;
+    var pc = get2(data, page.header + 1);
+    var free = (pageByte(data, page.header + 7) as u32) + top;
+    if (pc > 0) {
+        if (pc < top) {
+            return false;
+        }
+        var next: u32 = 0;
+        var size: u32 = 0;
+        loop {
+            if (pc > last) {
+                return false;
+            }
+            next = get2(data, pc as usize);
+            size = get2(data, pc as usize + 2);
+            if (size < 4) {
+                return false;
+            }
+            free += size;
+            if (next < pc + size + 4) {
+                break;
+            }
+            pc = next;
+        }
+        if (next > 0 || pc + size > usable) {
+            return false;
+        }
+    }
+    return free <= usable && free >= first;
+}
+
+/// A cell as btreeParseCell sees it: its key, its payload's size and the part of it on the page, and its size.
+struct CellShape {
+    key: i64;
+    payload: u32;
+    local: u32;
+    size: u32;
+}
+
+fn checkedCell(data: Slice<u8>, page: borrow CheckedPage, pc: usize, usable: u32) -> CellShape {
+    if (page.intKey && !page.leaf) {
+        let key = looseVarint(data, pc + 4);
+        return CellShape { key: truncate<i64>(key.value), payload: 0, local: 0, size: 4 + truncate<u32>(key.length) };
+    }
+    var at = pc + (if (page.leaf) 0 else 4);
+    let length = payloadSize(data, at);
+    at += length.length;
+    let payload = truncate<u32>(length.value);
+    var key = payload as i64;
+    if (page.intKey) {
+        let rowid = looseVarint(data, at);
+        key = truncate<i64>(rowid.value);
+        at += rowid.length;
+    }
+    let headerBytes = truncate<u32>(at - pc);
+    if (payload <= page.maxLocal) {
+        var size = (payload + headerBytes) & 0xffff;
+        if (size < 4) {
+            size = 4;
+        }
+        return CellShape { key: key, payload: payload, local: payload, size: size };
+    }
+    let surplus = page.minLocal + (payload - page.minLocal) % (usable - 4);
+    let local = if (surplus <= page.maxLocal) surplus else page.minLocal;
+    let size = (((headerBytes + local) & 0xffff) + 4) & 0xffff;
+    return CellShape { key: key, payload: payload, local: local, size: size };
+}
+
+/// What checking a page found: its depth (0 for a leaf), and the smallest key under it when it set one.
+struct ChildResult {
+    depth: i64;
+    minKey: i64?;
+}
+
+/// A page whose check is in progress: checkTreePage's locals.
+struct TreeFrame {
+    number: u32;
+    bytes: Page;
+    page: CheckedPage;
+    /// The cells not yet looked at; they are checked last first, as SQLite does.
+    remaining: usize;
+    depth: i64;
+    maxKey: i64;
+    keyCanBeEqual: bool;
+    coverage: bool;
+    /// Each cell's bytes: the first offset in the high 16 bits, the last in the low.
+    spans: Vector<u32>;
+    waiting: u8;
+    savedPrefix: CheckPrefix;
+    savedV1: u32;
+    savedV2: usize;
+}
+
+enum Entered {
+    Frame(TreeFrame),
+    Done(ChildResult),
+}
+
+/// The state of sqlite3BtreeIntegrityCheck.
+struct BtreeChecker {
+    pageCount: u32;
+    usable: u32;
+    referenced: Vector<bool>;
+    errorsLeft: usize;
+    errorCount: usize;
+    messages: Vector<String>;
+    prefix: CheckPrefix;
+    v0: u32;
+    v1: u32;
+    v2: usize;
+    /// Cells counted in the tree being checked: leaf cells of a table, every cell of an index.
+    rows: i64;
+    /// `rows` of each tree, in the order of the roots.
+    counts: Vector<i64>;
+}
+
+/// `before`, the number, then `after`.
+fn textWithNumber(before: StringView, n: i64, after: StringView) -> Result<String, AllocError> {
+    var text = String.from(before)?;
+    text.appendNumber(n)?;
+    text.append(after)?;
+    return Ok(text);
+}
+
+impl BtreeChecker {
+    /// checkAppendMsg: one message, while the budget lasts.
+    fn report(borrow mut this, text: StringView) -> Result<void, AllocError> {
+        if (this.errorsLeft == 0) {
+            return Ok();
+        }
+        this.errorsLeft -= 1;
+        this.errorCount += 1;
+        var message = String.create();
+        match (this.prefix) {
+            CheckPrefix.None => {}
+            CheckPrefix.Freelist => { message.append("Freelist: ")?; }
+            CheckPrefix.TreePage => {
+                message.append("Tree ")?;
+                message.appendNumber(this.v0 as i64)?;
+                message.append(" page ")?;
+                message.appendNumber(this.v1 as i64)?;
+                message.append(": ")?;
+            }
+            CheckPrefix.TreeCell => {
+                message.append("Tree ")?;
+                message.appendNumber(this.v0 as i64)?;
+                message.append(" page ")?;
+                message.appendNumber(this.v1 as i64)?;
+                message.append(" cell ")?;
+                message.appendNumber(truncate<i64>(this.v2))?;
+                message.append(": ")?;
+            }
+        }
+        message.append(text)?;
+        this.messages.push(message)?;
+        return Ok();
+    }
+
+    /// checkRef: true when the page is out of range or already used.
+    fn checkRef(borrow mut this, page: u32) -> Result<bool, AllocError> {
+        if (page > this.pageCount || page == 0) {
+            this.report(textWithNumber("invalid page number ", page as i64, "")?.view())?;
+            return Ok(true);
+        }
+        if (this.referenced[page as usize]) {
+            this.report(textWithNumber("2nd reference to page ", page as i64, "")?.view())?;
+            return Ok(true);
+        }
+        this.referenced[page as usize] = true;
+        return Ok(false);
+    }
+
+    /// checkList: the freelist, or an overflow chain, which should hold `expected` pages.
+    fn checkList(
+        borrow mut this,
+        pager: borrow mut WritablePager,
+        freelist: bool,
+        first: u32,
+        expected: u32,
+    ) -> Result<void, SqliteError> {
+        var page = first;
+        var n = expected;
+        let errorsAtStart = this.errorCount;
+        while (page != 0 && this.errorsLeft > 0) {
+            if (this.checkRef(page)?) {
+                break;
+            }
+            n = n.wrappingSub(1);
+            let bytes = pager.readPage(page)?;
+            let data = bytes.view();
+            if (freelist) {
+                let leaves = get4(data, 4);
+                if (leaves > this.usable / 4 - 2) {
+                    this.report(textWithNumber("freelist leaf count too big on page ", page as i64, "")?.view())?;
+                    n = n.wrappingSub(1);
+                } else {
+                    for (i in 0..leaves as usize) {
+                        let _ = this.checkRef(get4(data, 8 + i * 4))?;
+                    }
+                    n = n.wrappingSub(leaves);
+                }
+            }
+            page = get4(data, 0);
+        }
+        if (n != 0 && errorsAtStart == this.errorCount) {
+            var text = String.from(if (freelist) "size is " else "overflow list length is ")?;
+            text.appendNumber(expected.wrappingSub(n) as i64)?;
+            text.append(" but should be ")?;
+            text.appendNumber(expected as i64)?;
+            this.report(text.view())?;
+        }
+        return Ok();
+    }
+
+    /// The start of checkTreePage: a frame for the page, or what the caller sees when it is not looked into.
+    fn enter(
+        borrow mut this,
+        pager: borrow mut WritablePager,
+        number: u32,
+        maxKey: i64,
+    ) -> Result<Entered, SqliteError> {
+        if (this.errorsLeft == 0 || number == 0) {
+            return Ok(Entered.Done(ChildResult { depth: 0, minKey: null }));
+        }
+        if (this.checkRef(number)?) {
+            return Ok(Entered.Done(ChildResult { depth: 0, minKey: null }));
+        }
+        let savedPrefix = this.prefix;
+        let savedV1 = this.v1;
+        let savedV2 = this.v2;
+        this.prefix = CheckPrefix.TreePage;
+        this.v1 = number;
+        let bytes = pager.readPage(number)?;
+        var problem: StringView? = null;
+        var checked: CheckedPage? = null;
+        match (initCheckedPage(bytes.view(), number, this.usable)) {
+            Some(page) => {
+                if (freeSpaceIsSound(bytes.view(), borrow page, this.usable)) {
+                    checked = page;
+                } else {
+                    problem = "free space corruption";
+                }
+            }
+            null => { problem = "btreeInitPage() returns error code 11"; }
+        }
+        let Some(page) = checked else {
+            this.report(problem ?? "")?;
+            this.prefix = savedPrefix;
+            this.v1 = savedV1;
+            this.v2 = savedV2;
+            return Ok(Entered.Done(ChildResult { depth: 0, minKey: null }));
+        };
+        this.prefix = CheckPrefix.TreeCell;
+        if (page.leaf || !page.intKey) {
+            this.rows += truncate<i64>(page.cellCount);
+        }
+        let leaf = page.leaf;
+        let cells = page.cellCount;
+        return Ok(
+            Entered.Frame(
+                TreeFrame {
+                    number: number,
+                    bytes: bytes,
+                    page: page,
+                    remaining: cells,
+                    depth: -1,
+                    maxKey: maxKey,
+                    keyCanBeEqual: true,
+                    coverage: true,
+                    spans: Vector<u32>.create(),
+                    waiting: if (leaf) WAIT_NONE else START_RIGHT,
+                    savedPrefix: savedPrefix,
+                    savedV1: savedV1,
+                    savedV2: savedV2,
+                },
+            ),
+        );
+    }
+
+    /// The end of checkTreePage: cell coverage and fragmentation, then the caller's prefix again.
+    fn finishPage(borrow mut this, frame: TreeFrame) -> Result<ChildResult, AllocError> {
+        this.prefix = CheckPrefix.None;
+        if (frame.coverage && this.errorsLeft > 0) {
+            var spans = frame.spans;
+            let data = frame.bytes.view();
+            // The freeblocks; freeSpaceIsSound saw that their chain ascends and stays in the page.
+            var block = get2(data, frame.page.header + 1);
+            while (block > 0) {
+                let size = get2(data, block as usize + 2);
+                spans.push((block << 16) | (block + size - 1))?;
+                block = get2(data, block as usize);
+            }
+            spans.sortBy((a, b) => if (*a < *b) -1 else if (*a > *b) 1 else 0);
+            var fragments: i64 = 0;
+            var previous: u32 = frame.page.contentStart - 1;
+            var overlap = false;
+            for (i in 0..spans.length) {
+                let x = spans[i];
+                if ((previous & 0xffff) >= (x >> 16)) {
+                    var text = textWithNumber("Multiple uses for byte ", (x >> 16) as i64, " of page ")?;
+                    text.appendNumber(frame.number as i64)?;
+                    this.report(text.view())?;
+                    // SQLite's heap is empty after the last span, overlapping or not.
+                    overlap = i + 1 < spans.length;
+                    break;
+                }
+                fragments += ((x >> 16) as i64) - ((previous & 0xffff) as i64) - 1;
+                previous = x;
+            }
+            fragments += (this.usable as i64) - ((previous & 0xffff) as i64) - 1;
+            let reported = pageByte(data, frame.page.header + 7) as i64;
+            if (!overlap && fragments != reported) {
+                var text = textWithNumber("Fragmentation of ", fragments, " bytes reported as ")?;
+                text.appendNumber(reported)?;
+                text.append(" on page ")?;
+                text.appendNumber(frame.number as i64)?;
+                this.report(text.view())?;
+            }
+        }
+        this.prefix = frame.savedPrefix;
+        this.v1 = frame.savedV1;
+        this.v2 = frame.savedV2;
+        return Ok(ChildResult { depth: frame.depth + 1, minKey: frame.maxKey });
+    }
+
+    /// checkTreePage on a root, with an explicit stack in place of SQLite's recursion.
+    fn checkTree(borrow mut this, pager: borrow mut WritablePager, root: u32) -> Result<void, SqliteError> {
+        var stack = Vector<TreeFrame>.create();
+        match (this.enter(pager, root, 9223372036854775807)?) {
+            Entered.Frame(f) => { stack.push(f)?; }
+            Entered.Done(_) => { return Ok(); }
+        }
+        var returned: ChildResult? = null;
+        while (stack.length != 0) {
+            let top = stack.length - 1;
+            if (replace(mut returned, null) is Some(r)) {
+                if (r.minKey is Some(k)) {
+                    stack[top].maxKey = k;
+                }
+                stack[top].keyCanBeEqual = false;
+                if (stack[top].waiting == WAIT_LEFT) {
+                    if (r.depth != stack[top].depth) {
+                        this.report("Child page depth differs")?;
+                        stack[top].depth = r.depth;
+                    }
+                } else {
+                    stack[top].depth = r.depth;
+                }
+                stack[top].waiting = WAIT_NONE;
+                continue;
+            }
+            if (stack[top].waiting == START_RIGHT) {
+                stack[top].waiting = WAIT_RIGHT;
+                let child = stack[top].page.rightChild;
+                let maxKey = stack[top].maxKey;
+                match (this.enter(pager, child, maxKey)?) {
+                    Entered.Frame(f) => { stack.push(f)?; }
+                    Entered.Done(r) => { returned = r; }
+                }
+                continue;
+            }
+            if (stack[top].remaining > 0 && this.errorsLeft > 0) {
+                let i = stack[top].remaining - 1;
+                stack[top].remaining = i;
+                this.v2 = i;
+                let usable = this.usable;
+                let bytes = stack[top].bytes.clone();
+                let data = bytes.view();
+                let pc = get2(data, stack[top].page.cellStart + 2 * i);
+                let content = stack[top].page.contentStart;
+                if (pc < content || pc > usable - 4) {
+                    var text = textWithNumber("Offset ", pc as i64, " out of range ")?;
+                    text.appendNumber(content as i64)?;
+                    text.append("..")?;
+                    text.appendNumber((usable - 4) as i64)?;
+                    this.report(text.view())?;
+                    stack[top].coverage = false;
+                    continue;
+                }
+                let cell = checkedCell(data, borrow stack[top].page, pc as usize, usable);
+                if (pc + cell.size > usable) {
+                    this.report("Extends off end of page")?;
+                    stack[top].coverage = false;
+                    continue;
+                }
+                if (stack[top].page.intKey) {
+                    let maxKey = stack[top].maxKey;
+                    let bad = if (stack[top].keyCanBeEqual) cell.key > maxKey else cell.key >= maxKey;
+                    if (bad) {
+                        this.report(textWithNumber("Rowid ", cell.key, " out of order")?.view())?;
+                    }
+                    stack[top].maxKey = cell.key;
+                    stack[top].keyCanBeEqual = false;
+                }
+                if (cell.payload > cell.local) {
+                    let pages = cell.payload.wrappingSub(cell.local).wrappingAdd(usable - 5) / (usable - 4);
+                    let first = get4(data, pc as usize + cell.size as usize - 4);
+                    this.checkList(pager, false, first, pages)?;
+                }
+                stack[top].spans.push((pc << 16) | (pc + cell.size - 1))?;
+                if (!stack[top].page.leaf) {
+                    stack[top].waiting = WAIT_LEFT;
+                    let child = get4(data, pc as usize);
+                    let maxKey = stack[top].maxKey;
+                    match (this.enter(pager, child, maxKey)?) {
+                        Entered.Frame(f) => { stack.push(f)?; }
+                        Entered.Done(r) => { returned = r; }
+                    }
+                }
+                continue;
+            }
+            let frame = stack.pop()!;
+            returned = this.finishPage(frame)?;
+        }
+        return Ok();
+    }
+}
+
+/// sqlite3BtreeIntegrityCheck over the trees rooted at `roots` (0 for none). `partial` leaves out the check that
+/// every page is used.
+fn checkBtrees(
+    pager: borrow mut WritablePager,
+    roots: Slice<u32>,
+    partial: bool,
+    checkFreelist: bool,
+    pageCount: u32,
+    limit: usize,
+) -> Result<BtreeChecker, SqliteError> {
+    var referenced = Vector<bool>.create();
+    referenced.resize((pageCount as usize) + 1, false)?;
+    var checker = BtreeChecker {
+        pageCount: pageCount,
+        usable: truncate<u32>(pager.usable),
+        referenced: referenced,
+        errorsLeft: limit,
+        errorCount: 0,
+        messages: Vector<String>.create(),
+        prefix: CheckPrefix.None,
+        v0: 0,
+        v1: 0,
+        v2: 0,
+        rows: 0,
+        counts: Vector<i64>.create(),
+    };
+    if (pageCount == 0) {
+        return Ok(checker);
+    }
+    let pending = PENDING_BYTE / (pager.pageSize as u64) + 1;
+    if (pending <= (pageCount as u64)) {
+        checker.referenced[truncate<usize>(pending)] = true;
+    }
+    if (checkFreelist) {
+        checker.prefix = CheckPrefix.Freelist;
+        let trunk = pager.freelistTrunk();
+        let count = pager.freelistCount();
+        checker.checkList(pager, true, trunk, count)?;
+        checker.prefix = CheckPrefix.None;
+    }
+    for (i in 0..roots.length) {
+        if (checker.errorsLeft == 0) {
+            break;
+        }
+        checker.rows = 0;
+        if (roots[i] != 0) {
+            checker.v0 = roots[i];
+            checker.checkTree(pager, roots[i])?;
+        }
+        checker.counts.push(checker.rows)?;
+    }
+    if (!partial) {
+        var page: u32 = 1;
+        while (page <= pageCount && checker.errorsLeft > 0) {
+            if (!checker.referenced[page as usize]) {
+                checker.report(textWithNumber("Page ", page as i64, ": never used")?.view())?;
+            }
+            page += 1;
+        }
+    }
+    return Ok(checker);
+}
+
+// ── SQLite's schema hash table ───────────────────────────────────────────────────────────────────────────────
+
+/// strHash in hash.c.
+fn sqliteStrHash(name: StringView) -> u32 {
+    var h: u32 = 0;
+    for (b in name.bytes()) {
+        h = h.wrappingAdd((b & 0xdf) as u32);
+        h = h.wrappingMul(0x9e3779b1);
+    }
+    return h;
+}
+
+struct HashBucket {
+    count: usize;
+    chain: usize;
+}
+
+/// The order in which SQLite's Hash, given `names` one after another, lists them: hash.c's insertElement and
+/// rehash, with buckets of 16 bytes and SQLITE_MALLOC_SOFT_LIMIT of 1024.
+fn sqliteHashOrder(names: Slice<StringView>) -> Result<Vector<usize>, AllocError> {
+    var hashes = Vector<u32>.withCapacity(names.length)?;
+    for (n in names) {
+        hashes.push(sqliteStrHash(n))?;
+    }
+    var list = Vector<usize>.create();
+    var buckets = Vector<HashBucket>.create();
+    for (e in 0..names.length) {
+        let count = e + 1;
+        if (count >= 5 && count > 2 * buckets.length) {
+            var size = count * 3;
+            if (size * 16 > 1024) {
+                size = 64;
+            } else {
+                // rehash keeps all the buckets the allocation holds: macOS's allocator gives 256 bytes for the
+                // 240 the first rehash (of 5 entries) asks for, so 16 buckets.
+                size = (size * 16 + 255) / 256 * 16;
+            }
+            if (size != buckets.length) {
+                buckets.clear();
+                for (b in 0..size) {
+                    buckets.push(HashBucket { count: 0, chain: 0 })?;
+                }
+                let old = replace(mut list, Vector<usize>.create());
+                for (k in 0..old.length) {
+                    let at = (hashes[old[k]] as usize) % size;
+                    insertHashElement(mut list, mut buckets[at], old[k])?;
+                }
+            }
+        }
+        if (buckets.length == 0) {
+            list.insert(0, e)?;
+        } else {
+            let at = (hashes[e] as usize) % buckets.length;
+            insertHashElement(mut list, mut buckets[at], e)?;
+        }
+    }
+    return Ok(list);
+}
+
+fn insertHashElement(
+    list: borrow mut Vector<usize>,
+    bucket: borrow mut HashBucket,
+    element: usize,
+) -> Result<void, AllocError> {
+    var head: usize? = null;
+    if (bucket.count > 0) {
+        head = bucket.chain;
+    }
+    bucket.count += 1;
+    bucket.chain = element;
+    if (head is Some(h)) {
+        for (i in 0..list.length) {
+            if (list[i] == h) {
+                return list.insert(i, element);
+            }
+        }
+    }
+    return list.insert(0, element);
+}
+
+// ── what is checked ──────────────────────────────────────────────────────────────────────────────────────────
+
+/// An index of a table, in the order SQLite keeps them (Table.pIndex), or a WITHOUT ROWID table's primary key.
+struct CheckedIndex {
+    name: String;
+    root: u32;
+    primaryKey: bool;
+    partial: bool;
+    /// Where its root is in the list of roots.
+    at: usize;
+}
+
+/// A table (or view) of the schema, in SQLite's hash order.
+struct CheckedTable {
+    name: String;
+    root: u32;
+    hasRowid: bool;
+    ordinary: bool;
+    schemaTable: bool;
+    indexes: Vector<CheckedIndex>;
+    /// Where the root of the tree that holds its rows is in the list of roots.
+    rowsAt: usize?;
+}
+
+/// The number at the end of sqlite_autoindex_T_N.
+fn autoindexNumber(name: StringView) -> usize => match (name.lastIndexOf("_")) {
+    Some(at) => name[at + 1..].parseInt<usize>() ?? 0,
+    null => 0,
+};
+
+/// The indexes of `table`, newest first, as SQLite links them: CREATE INDEX ones in reverse schema order, then
+/// the automatic ones by their number, the last first.
+fn sqliteIndexOrder(db: borrow Session, table: StringView, root: u32) -> Result<Vector<CheckedIndex>, AllocError> {
+    var out = Vector<CheckedIndex>.create();
+    var e = db.entries.length;
+    while (e > 0) {
+        e -= 1;
+        let entry = borrow db.entries[e];
+        if (entry.kind.view() != "index" || entry.sql.isNull() || !entry.tableName.view().equalsIgnoreAsciiCase(
+            table,
+        )) {
+            continue;
+        }
+        var partial = false;
+        for (i in 0..db.catalog.indexes.length) {
+            if (db.catalog.indexes[i].name.view().equalsIgnoreAsciiCase(entry.name.view())) {
+                partial = db.catalog.indexes[i].filter.isSome();
+            }
+        }
+        out.push(
+            CheckedIndex {
+                name: entry.name.clone()?,
+                root: entry.rootPage,
+                primaryKey: false,
+                partial: partial,
+                at: 0,
+            },
+        )?;
+    }
+    // Automatic indexes, with a WITHOUT ROWID table's primary key, which is the table's own tree.
+    var automatic = Vector<CheckedIndex>.create();
+    var numbers = Vector<usize>.create();
+    if (db.catalog.table(table)? is Some(t)) {
+        if (t.withoutRowid) {
+            var number: usize = 0;
+            for (k in 0..t.keys.length) {
+                if (t.keys[k].primaryKey) {
+                    number = k + 1;
+                }
+            }
+            var name = String.from("sqlite_autoindex_")?;
+            name.append(t.name.view())?;
+            name.append("_")?;
+            name.appendNumber(number)?;
+            automatic.push(CheckedIndex { name: name, root: root, primaryKey: true, partial: false, at: 0 })?;
+            numbers.push(number)?;
+        }
+    }
+    for (i in 0..db.entries.length) {
+        let entry = borrow db.entries[i];
+        if (entry.kind.view() != "index" || entry.sql.isSome() || !entry.tableName.view().equalsIgnoreAsciiCase(
+            table,
+        )) {
+            continue;
+        }
+        automatic.push(
+            CheckedIndex { name: entry.name.clone()?, root: entry.rootPage, primaryKey: false, partial: false, at: 0 },
+        )?;
+        numbers.push(autoindexNumber(entry.name.view()))?;
+    }
+    // The largest number first.
+    while (automatic.length != 0) {
+        var best: usize = 0;
+        for (i in 1..automatic.length) {
+            if (numbers[i] > numbers[best]) {
+                best = i;
+            }
+        }
+        out.push(automatic.remove(best))?;
+        let _ = numbers.remove(best);
+    }
+    return Ok(out);
+}
+
+/// Every table and view of the schema, sqlite_master first in SQLite's list, in the order SQLite checks them.
+fn tablesInSqliteOrder(db: borrow Session) -> Result<Vector<CheckedTable>, AllocError> {
+    var all = Vector<CheckedTable>.create();
+    all.push(
+        CheckedTable {
+            name: String.from("sqlite_master")?,
+            root: 1,
+            hasRowid: true,
+            ordinary: true,
+            schemaTable: true,
+            indexes: Vector<CheckedIndex>.create(),
+            rowsAt: null,
+        },
+    )?;
+    for (e in 0..db.entries.length) {
+        let entry = borrow db.entries[e];
+        let kind = entry.kind.view();
+        if (kind != "table" && kind != "view") {
+            continue;
+        }
+        var ordinary = kind == "table" && entry.rootPage != 0;
+        var hasRowid = true;
+        if (db.catalog.table(entry.name.view())? is Some(t)) {
+            hasRowid = !t.withoutRowid;
+        } else if (kind == "table") {
+            // A definition this engine cannot read (a virtual table, say): its trees are checked, not its rows.
+            ordinary = false;
+        }
+        all.push(
+            CheckedTable {
+                name: entry.name.clone()?,
+                root: entry.rootPage,
+                hasRowid: hasRowid,
+                ordinary: ordinary,
+                schemaTable: false,
+                indexes: sqliteIndexOrder(db, entry.name.view(), entry.rootPage)?,
+                rowsAt: null,
+            },
+        )?;
+    }
+    var names = Vector<StringView>.withCapacity(all.length)?;
+    for (i in 0..all.length) {
+        names.push(all[i].name.view())?;
+    }
+    let order = sqliteHashOrder(names.view())?;
+    var slots = Vector<CheckedTable?>.withCapacity(all.length)?;
+    while (all.length != 0) {
+        slots.push(all.remove(0))?;
+    }
+    var out = Vector<CheckedTable>.withCapacity(order.length)?;
+    for (i in 0..order.length) {
+        if (replace(mut slots[order[i]], null) is Some(t)) {
+            out.push(t)?;
+        }
+    }
+    return Ok(out);
+}
+
+// ── the rows of the result ───────────────────────────────────────────────────────────────────────────────────
+
+/// The rows so far, and the budget of messages left (register 1 of SQLite's program).
+struct Verdict {
+    rows: Vector<Vector<SqliteValue>>;
+    left: i64;
+    halted: bool;
+}
+
+impl Verdict {
+    /// integrityCheckResultRow: the message, then a halt when the budget is spent.
+    fn emit(borrow mut this, text: StringView) -> Result<bool, AllocError> {
+        var row = Vector<SqliteValue>.create();
+        row.push(SqliteValue.text(text)?)?;
+        this.rows.push(row)?;
+        if (this.left > 0) {
+            this.left -= 1;
+        } else {
+            this.halted = true;
+        }
+        return Ok(this.halted);
+    }
+}
+
+fn strictTypeMask(declaredType: StringView) -> u8 {
+    if (declaredType.equalsIgnoreAsciiCase("INT") || declaredType.equalsIgnoreAsciiCase("INTEGER")) {
+        return 0x11;
+    }
+    if (declaredType.equalsIgnoreAsciiCase("REAL")) {
+        return 0x13;
+    }
+    if (declaredType.equalsIgnoreAsciiCase("TEXT")) {
+        return 0x14;
+    }
+    if (declaredType.equalsIgnoreAsciiCase("BLOB")) {
+        return 0x18;
+    }
+    return 0x1f;
+}
+
+fn typeBit(value: borrow SqliteValue) -> u8 => match (value) {
+    SqliteValue.Null => 0x10,
+    SqliteValue.Integer(_) => 0x01,
+    SqliteValue.Real(_) => 0x02,
+    SqliteValue.Text(_) => 0x04,
+    SqliteValue.Blob(_) => 0x08,
+};
+
+fn columnMessage(prefix: StringView, table: StringView, column: StringView) -> Result<String, AllocError> {
+    var text = String.from(prefix)?;
+    text.append(table)?;
+    text.append(".")?;
+    text.append(column)?;
+    return Ok(text);
+}
+
+/// What pragma.c's checks find wrong with a computed (VIRTUAL) column's value: NOT NULL, then its type.
+fn columnProblem(
+    table: StringView,
+    column: borrow ColumnSchema,
+    strict: bool,
+    value: borrow SqliteValue,
+) -> Result<String?, AllocError> {
+    if (column.notNull && isNullish(value)) {
+        return Ok(columnMessage("NULL value in ", table, column.name.view())?);
+    }
+    return typeProblem(table, column, strict, typeBit(value), value);
+}
+
+/// A NULL as SQLite's OP_Column reads it: a NaN real is one too.
+fn isNullish(value: borrow SqliteValue) -> bool => value.isNull() || (value is SqliteValue.Real(r) && r != r);
+
+/// The type checks of a column whose type, as OP_IsType sees it, is `bits`; `value` is what OP_Column reads.
+fn typeProblem(
+    table: StringView,
+    column: borrow ColumnSchema,
+    strict: bool,
+    bits: u8,
+    value: borrow SqliteValue,
+) -> Result<String?, AllocError> {
+    if (strict) {
+        let mask = strictTypeMask(column.declaredType.view());
+        if (mask != 0x1f && (bits & mask) == 0) {
+            var prefix = String.from("non-")?;
+            prefix.append(asciiUpper(column.declaredType.view())?.view())?;
+            prefix.append(" value in ")?;
+            return Ok(columnMessage(prefix.view(), table, column.name.view())?);
+        }
+        return Ok(null);
+    }
+    if (column.affinity == Affinity.Text) {
+        if ((bits & 0x1c) == 0) {
+            return Ok(columnMessage("NUMERIC value in ", table, column.name.view())?);
+        }
+        return Ok(null);
+    }
+    if (column.affinity != Affinity.Blob && (bits & 0x1b) == 0) {
+        let converted = applyColumnAffinity(value.clone()?, Affinity.Numeric)?;
+        if (converted is SqliteValue.Integer(_) || converted is SqliteValue.Real(_)) {
+            return Ok(columnMessage("TEXT value in ", table, column.name.view())?);
+        }
+    }
+    return Ok(null);
+}
+
+/// How much of the current row's record header SQLite's cursor has parsed. OP_IsType trusts what was parsed and
+/// takes a column past it to have its default's type, even after a result row has made the cache stale; OP_Column
+/// parses afresh from the start once the cache is stale. pragma.c's type checks inherit this: after a message, a
+/// later column can be judged by its default's type, and the shell's rows follow from that.
+struct HeaderCache {
+    fields: usize;
+    parsed: usize;
+    valid: bool;
+
+    /// OP_Column of the field at `at`.
+    fn column(borrow mut this, at: usize) {
+        if (!this.valid) {
+            this.valid = true;
+            this.parsed = 0;
+        }
+        if (this.parsed <= at) {
+            this.parsed = (at + 1).min(this.fields).max(this.parsed);
+        }
+    }
+}
+
+/// A row's record as the check reads it. When the row's overflow chain is broken, the fields in its page are
+/// read and the others hold a value of their type only: SQLite reads a column's bytes only when a check needs
+/// its value, and fails then.
+struct CheckedRecord {
+    values: Vector<SqliteValue>;
+    /// Which fields could be read; empty when all could.
+    available: Vector<bool>;
+}
+
+fn decodeRawRow(row: borrow RawTableRow, encoding: TextEncoding) -> Result<CheckedRecord, SqliteError> {
+    if (row.complete) {
+        return Ok(
+            CheckedRecord { values: Record.decode(row.payload.view(), encoding)?, available: Vector<bool>.create() },
+        );
+    }
+    let payload = row.payload.view();
+    let header = Varint.read(payload, 0)?;
+    let headerLength = checkedTruncate<usize>(header.value) ?? {
+        return Err(corrupt("record header length is negative"));
+    };
+    if (headerLength > payload.length) {
+        return Err(corrupt("a record's header is on an overflow page that cannot be read"));
+    }
+    var values = Vector<SqliteValue>.create();
+    var available = Vector<bool>.create();
+    var headerPos = header.length;
+    var bodyPos = headerLength;
+    while (headerPos < headerLength) {
+        let serial = Varint.read(payload, headerPos)?;
+        headerPos += serial.length;
+        let size = Record.serialTypeSize(serial.value);
+        if (bodyPos + size > row.total) {
+            return Err(corrupt("record body runs past the payload"));
+        }
+        if (bodyPos + size <= payload.length) {
+            values.push(Record.readValue(payload[bodyPos..bodyPos + size], serial.value, encoding)?)?;
+            available.push(true)?;
+        } else {
+            // Of its type, for OP_IsType; its bytes are not there.
+            let placeholder = if (serial.value >= 12 && serial.value % 2 == 0) SqliteValue.Blob(Vector<u8>.create())
+                else if (serial.value >= 12) SqliteValue.Text(
+                    String.create(),
+                ) else if (serial.value == 7) SqliteValue.Real(
+                    0.0,
+                ) else if (serial.value == 0) SqliteValue.Null else SqliteValue.Integer(0);
+            values.push(placeholder)?;
+            available.push(false)?;
+        }
+        bodyPos += size;
+    }
+    return Ok(CheckedRecord { values: values, available: available });
+}
+
+/// SQLite reads field `at` here: it must be there.
+fn requireField(available: Slice<bool>, at: usize) -> Result<void, SqliteError> {
+    if (at < available.length && !available[at]) {
+        return Err(corrupt("a row's overflow chain cannot be read"));
+    }
+    return Ok();
+}
+
+/// Whether every field of the record could be read.
+fn wholeRecord(available: Slice<bool>) -> bool {
+    for (a in available) {
+        if (!a) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The checks of each column of a row: `stored` is its record, `values` its columns as read (with VIRTUAL ones
+/// computed). True when the budget of messages is spent.
+fn checkColumns(
+    table: StringView,
+    schema: borrow TableSchema,
+    positions: Slice<usize?>,
+    defaults: Slice<SqliteValue>,
+    stored: Slice<SqliteValue>,
+    values: Slice<SqliteValue>,
+    available: Slice<bool>,
+    cache: borrow mut HeaderCache,
+    verdict: borrow mut Verdict,
+) -> Result<bool, SqliteError> {
+    for (c in 0..schema.columns.length) {
+        if (schema.rowidAlias == Some(c)) {
+            continue;
+        }
+        let column = borrow schema.columns[c];
+        let typed = if (schema.strict) strictTypeMask(column.declaredType.view()) != 0x1f else column.affinity !=
+            Affinity.Blob;
+        if (!column.notNull && !typed) {
+            continue;
+        }
+        var problem: String? = null;
+        if (positions[c] is Some(p)) {
+            let defaultValue = applyColumnAffinity(defaults[c].clone()?, column.affinity)?;
+            let defaultBits = typeBit(borrow defaultValue);
+            let actual = if (p < stored.length) borrow stored[p] else borrow defaultValue;
+            var nullFound = false;
+            if (column.notNull) {
+                let bits = if (p < cache.parsed) typeBit(actual) else defaultBits;
+                if ((bits & 0x0d) == 0) {
+                    cache.column(p);
+                    requireField(available, p)?;
+                    if (isNullish(actual)) {
+                        problem = columnMessage("NULL value in ", table, column.name.view())?;
+                        nullFound = true;
+                    }
+                }
+            }
+            if (!nullFound && typed) {
+                let bits = if (p < cache.parsed) typeBit(actual) else defaultBits;
+                if (!schema.strict && column.affinity != Affinity.Text && (bits & 0x1b) == 0) {
+                    cache.column(p);
+                    requireField(available, p)?;
+                }
+                problem = typeProblem(table, column, schema.strict, bits, actual)?;
+            }
+        } else if (c < values.length) {
+            let value = applyColumnAffinity(values[c].clone()?, column.affinity)?;
+            problem = columnProblem(table, column, schema.strict, borrow value)?;
+        }
+        if (problem is Some(text)) {
+            if (verdict.emit(text.view())?) {
+                return Ok(true);
+            }
+            cache.valid = false;
+        }
+    }
+    return Ok(false);
+}
+
+fn asciiUpper(text: StringView) -> Result<String, AllocError> {
+    var out = Vector<u8>.withCapacity(text.length)?;
+    for (b in text.bytes()) {
+        out.push(if (b >= 'a' && b <= 'z') b - 32 else b)?;
+    }
+    // Only ASCII bytes changed, so the text is still UTF-8.
+    return String.from(StringView.fromUtf8(out.view())!);
+}
+
+/// The rows of sqlite_master: each record must decode, and its typed columns hold their types.
+fn checkSchemaRows(db: borrow mut Session, verdict: borrow mut Verdict) -> Result<void, SqliteError> {
+    let table = schemaTableSchema()?;
+    var positions = Vector<usize?>.create();
+    var defaults = Vector<SqliteValue>.create();
+    for (c in 0..table.columns.length) {
+        positions.push(c)?;
+        defaults.push(SqliteValue.Null)?;
+    }
+    var cursor = TableCursor.scan(1);
+    while (cursor.next(mut db.pager)? is Some(row)) {
+        let fields = row.columns.length;
+        var cache = HeaderCache { fields: fields, parsed: fields.min(table.columns.length), valid: true };
+        if (checkColumns(
+            "sqlite_master",
+            borrow table,
+            positions.view(),
+            defaults.view(),
+            row.columns.view(),
+            row.columns.view(),
+            [],
+            mut cache,
+            verdict,
+        )?) {
+            return Ok();
+        }
+    }
+    return Ok();
+}
+
+/// The entry of `index` equal to `entry`, if there is one.
+fn findIndexEntry(
+    pager: borrow mut WritablePager,
+    index: borrow TableIndex,
+    entry: Slice<SqliteValue>,
+) -> Result<Vector<SqliteValue>?, SqliteError> {
+    let range = IndexRange.equalTo(copyOrder(borrow index.order)?, entry)?;
+    var cursor = IndexCursor.create(index.root, range, false);
+    return cursor.next(pager);
+}
+
+/// Whether another entry of a UNIQUE index follows `found` with the same key.
+fn hasDuplicateAfter(
+    pager: borrow mut WritablePager,
+    index: borrow TableIndex,
+    found: Slice<SqliteValue>,
+    key: Slice<SqliteValue>,
+) -> Result<bool, SqliteError> {
+    let range = IndexRange {
+        order: copyOrder(borrow index.order)?,
+        min: cloneValues(found)?,
+        minInclusive: true,
+        max: cloneValues(key)?,
+        maxInclusive: true,
+    };
+    var cursor = IndexCursor.create(index.root, range, false);
+    if (cursor.next(pager)?.isNull()) {
+        return Ok(false);
+    }
+    return Ok(cursor.next(pager)?.isSome());
+}
+
+/// The row checks of one table, as pragma.c's program makes them for each row.
+fn checkTableRows(
+    db: borrow mut Session,
+    item: borrow CheckedTable,
+    quick: bool,
+    verdict: borrow mut Verdict,
+) -> Result<void, SqliteError> {
+    var compiler = newCompiler(db)?;
+    let writer = TableWriter.create(mut compiler, item.name.view(), db)?;
+    var frame = newFrame(mut compiler, [], db)?;
+    // The indexes to check, in SQLite's order.
+    var indexes = Vector<usize>.create();
+    for (i in 0..item.indexes.length) {
+        if (item.indexes[i].primaryKey) {
+            continue;
+        }
+        for (w in 0..writer.indexes.length) {
+            if (writer.indexes[w].name.view().equalsIgnoreAsciiCase(item.indexes[i].name.view())) {
+                indexes.push(w)?;
+            }
+        }
+    }
+    let table = borrow writer.table;
+    let tableName = table.name.view();
+    // pragma.c's mxCol: the stored columns less one, and one less again when that is the rowid's alias.
+    var storedColumns: usize = 0;
+    for (c in 0..table.columns.length) {
+        if (writer.read.recordPosition[c].isSome()) {
+            storedColumns += 1;
+        }
+    }
+    var lastColumn: usize? = null;
+    if (storedColumns > 0) {
+        var last = storedColumns - 1;
+        if (!table.withoutRowid && table.rowidAlias == Some(last)) {
+            lastColumn = if (last == 0) null else Some(last - 1);
+        } else {
+            lastColumn = last;
+        }
+    }
+    let encoding = db.pager.textEncoding;
+    var rows = TableCursor.scan(writer.read.root);
+    var keys = IndexCursor.create(writer.read.root, IndexRange.all(IndexOrder.plain()), false);
+    var count: i64 = 0;
+    var previous: Vector<SqliteValue>? = null;
+    loop {
+        var stored = Vector<SqliteValue>.create();
+        var available = Vector<bool>.create();
+        var rowId: i64 = 0;
+        if (table.withoutRowid) {
+            let Some(entry) = keys.next(mut db.pager)? else {
+                break;
+            };
+            stored = entry;
+        } else {
+            let Some(raw) = rows.nextRaw(mut db.pager)? else {
+                break;
+            };
+            rowId = raw.rowId;
+            let record = decodeRawRow(borrow raw, encoding)?;
+            stored = record.values;
+            available = record.available;
+        }
+        count += 1;
+        let whole = wholeRecord(available.view());
+        loadTableRow(borrow writer.read, rowId, cloneValues(stored.view())?, mut frame.slots[writer.slot])?;
+        if (writer.read.generated.length != 0) {
+            if (!whole) {
+                return Err(corrupt("a row's overflow chain cannot be read"));
+            }
+            computeGenerated(borrow writer.read, writer.slot, mut frame, db)?;
+        }
+        // The program begins each row by reading its last stored column, which parses the whole header.
+        var cache = HeaderCache { fields: stored.length, parsed: 0, valid: true };
+        if (lastColumn is Some(last)) {
+            cache.parsed = (last + 1).min(stored.length);
+        }
+        // A WITHOUT ROWID table's keys ascend.
+        if (!quick && table.withoutRowid) {
+            var key = Vector<SqliteValue>.withCapacity(writer.primaryKey.columns.length)?;
+            for (k in 0..writer.primaryKey.columns.length) {
+                key.push(frame.slots[writer.slot].values[writer.primaryKey.columns[k]].clone()?)?;
+            }
+            if (borrow previous is Some(p)) {
+                if (writer.primaryKey.order.comparePrefix(key.view(), p.view()) <= 0) {
+                    var text = String.from("row not in PRIMARY KEY order for ")?;
+                    text.append(tableName)?;
+                    if (verdict.emit(text.view())?) {
+                        return Ok();
+                    }
+                    cache.valid = false;
+                }
+            }
+            previous = key;
+            // The key is then read column by column.
+            for (k in 0..writer.primaryKey.columns.length) {
+                cache.column(k);
+            }
+        }
+        // NOT NULL and types.
+        if (checkColumns(
+            tableName,
+            table,
+            writer.read.recordPosition.view(),
+            writer.read.defaults.view(),
+            stored.view(),
+            frame.slots[writer.slot].values.view(),
+            available.view(),
+            mut cache,
+            verdict,
+        )?) {
+            return Ok();
+        }
+        // CHECK constraints: the last first, and the first false one fails the row.
+        if (writer.checks.length != 0) {
+            if (!whole) {
+                return Err(corrupt("a row's overflow chain cannot be read"));
+            }
+            var failed = false;
+            var k = writer.checks.length;
+            while (k > 0 && !failed) {
+                k -= 1;
+                let v = evaluate(borrow writer.checks[k], mut frame, db)?;
+                failed = truthOf(borrow v) == Some(false);
+            }
+            if (failed) {
+                var text = String.from("CHECK constraint failed in ")?;
+                text.append(tableName)?;
+                if (verdict.emit(text.view())?) {
+                    return Ok();
+                }
+            }
+        }
+        if (quick) {
+            continue;
+        }
+        for (j in 0..indexes.length) {
+            let index = borrow writer.indexes[indexes[j]];
+            if (!whole) {
+                // The key's columns are read from the record.
+                if (index.filter.isSome()) {
+                    return Err(corrupt("a row's overflow chain cannot be read"));
+                }
+                for (kk in 0..index.columns.length) {
+                    match (index.columns[kk].column) {
+                        Some(at) => {
+                            if (writer.read.recordPosition[at] is Some(p)) {
+                                requireField(available.view(), p)?;
+                            }
+                        }
+                        null => { return Err(corrupt("a row's overflow chain cannot be read")); }
+                    }
+                }
+            }
+            let Some(entry) = writer.entryFor(index, mut frame, db)? else {
+                continue;
+            };
+            let name = index.name.view();
+            var problem: String? = null;
+            match (findIndexEntry(mut db.pager, index, entry.view())?) {
+                null => {
+                    var text = textWithNumber("row ", count, " missing from index ")?;
+                    text.append(name)?;
+                    problem = text;
+                }
+                Some(found) => {
+                    if (!table.withoutRowid && (found.length != entry.length || !(found[found.length - 1] is
+                        SqliteValue.Integer(r) && r == rowId))) {
+                        var text = textWithNumber("rowid not at end-of-record for row ", count, " of index ")?;
+                        text.append(name)?;
+                        problem = text;
+                    } else {
+                        var differs = false;
+                        for (kk in 0..index.columns.length) {
+                            if (index.order.collations[kk] != Collation.Binary && kk < found.length && compareValues(
+                                borrow found[kk],
+                                borrow entry[kk],
+                                Collation.Binary,
+                            ) != 0) {
+                                differs = true;
+                            }
+                        }
+                        if (differs) {
+                            var text = textWithNumber("row ", count, " values differ from index ")?;
+                            text.append(name)?;
+                            problem = text;
+                        } else if (index.unique) {
+                            var anyNull = false;
+                            for (kk in 0..index.columns.length) {
+                                var notNull = false;
+                                if (index.columns[kk].column is Some(at)) {
+                                    notNull = table.columns[at].notNull;
+                                }
+                                if (!notNull && entry[kk].isNull()) {
+                                    anyNull = true;
+                                }
+                            }
+                            if (!anyNull && hasDuplicateAfter(
+                                mut db.pager,
+                                index,
+                                found.view(),
+                                entry.view()[0..index.columns.length],
+                            )?) {
+                                var text = String.from("non-unique entry in index ")?;
+                                text.append(name)?;
+                                problem = text;
+                            }
+                        }
+                    }
+                }
+            }
+            if (problem is Some(text)) {
+                if (verdict.emit(text.view())?) {
+                    return Ok();
+                }
+            }
+        }
+    }
+    return Ok();
+}
+
+/// The number of pages SQLite checks: the header's count when it is valid, else the file's.
+fn pagesToCheck(db: borrow mut Session) -> Result<u32, SqliteError> {
+    let pages = db.pager.pageCount;
+    if (db.pager.hasChanges() || pages == 0) {
+        return Ok(pages);
+    }
+    let header = db.pager.copy(1)?;
+    let inHeader = header.view().readBE<u32>(28);
+    if (inHeader == 0 || header.view().readBE<u32>(24) != header.view().readBE<u32>(92)) {
+        return Ok(pages);
+    }
+    if (inHeader > db.pager.committedPages()) {
+        return Err(corrupt("database disk image is malformed"));
+    }
+    return Ok(inHeader);
+}
+
+/// PRAGMA integrity_check and PRAGMA quick_check (`quick`), with their argument: a number of messages, or a
+/// table to check alone.
+fn integrityCheck(
+    db: borrow mut Session,
+    name: StringView,
+    quick: bool,
+    argument: StringView?,
+) -> Result<QueryResult, SqliteError> {
+    var limit: i64 = 100;
+    var only: String? = null;
+    if (argument is Some(a)) {
+        if (a.parseInt<i32>() is Some(n)) {
+            if (n > 0) {
+                limit = n as i64;
+            }
+        } else if (a.equalsIgnoreAsciiCase("sqlite_schema") || a.equalsIgnoreAsciiCase("sqlite_master")) {
+            only = String.from("sqlite_master")?;
+        } else {
+            for (e in 0..db.entries.length) {
+                let kind = db.entries[e].kind.view();
+                if ((kind == "table" || kind == "view") && db.entries[e].name.view().equalsIgnoreAsciiCase(a)) {
+                    only = db.entries[e].name.clone()?;
+                    break;
+                }
+            }
+            if (only.isNull()) {
+                return Err(namedError("no such table: ", a));
+            }
+        }
+    }
+    var tables = Vector<CheckedTable>.create();
+    var everyTable = tablesInSqliteOrder(db)?;
+    while (everyTable.length != 0) {
+        let t = everyTable.remove(0);
+        if (borrow only is Some(o)) {
+            if (!t.name.view().equalsIgnoreAsciiCase(o.view())) {
+                continue;
+            }
+        }
+        tables.push(t)?;
+    }
+    // The roots, as pragma.c lists them: each table's (if it has rowids), then its indexes'.
+    var roots = Vector<u32>.create();
+    if (only.isSome()) {
+        roots.push(0)?;
+    }
+    for (i in 0..tables.length) {
+        if (tables[i].hasRowid) {
+            tables[i].rowsAt = roots.length;
+            roots.push(tables[i].root)?;
+        }
+        for (x in 0..tables[i].indexes.length) {
+            tables[i].indexes[x].at = roots.length;
+            if (tables[i].indexes[x].primaryKey) {
+                tables[i].rowsAt = roots.length;
+            }
+            let root = tables[i].indexes[x].root;
+            roots.push(root)?;
+        }
+    }
+    let partial = only.isSome();
+    let checkFreelist = !partial || (roots.length > 1 && roots[1] == 1);
+    let pageCount = pagesToCheck(db)?;
+    var verdict = Verdict { rows: Vector<Vector<SqliteValue>>.create(), left: limit - 1, halted: false };
+    let checker = checkBtrees(mut db.pager, roots.view(), partial, checkFreelist, pageCount, truncate<usize>(limit))?;
+    if (checker.errorCount > 0) {
+        verdict.left -= truncate<i64>(checker.errorCount) - 1;
+        var text = String.from("*** in database main ***\n")?;
+        for (m in 0..checker.messages.length) {
+            if (m != 0) {
+                text.append("\n")?;
+            }
+            text.append(checker.messages[m].view())?;
+        }
+        let _ = verdict.emit(text.view())?;
+    }
+    // Each index has as many entries as its table has rows.
+    if (!verdict.halted) {
+        for (i in 0..tables.length) {
+            if (verdict.halted) {
+                break;
+            }
+            let Some(rowsAt) = tables[i].rowsAt else {
+                continue;
+            };
+            for (x in 0..tables[i].indexes.length) {
+                let index = borrow tables[i].indexes[x];
+                if (index.partial || index.at >= checker.counts.length || rowsAt >= checker.counts.length) {
+                    continue;
+                }
+                if (checker.counts[index.at] != checker.counts[rowsAt]) {
+                    var text = String.from("wrong # of entries in index ")?;
+                    text.append(index.name.view())?;
+                    if (verdict.emit(text.view())?) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // Each row.
+    for (i in 0..tables.length) {
+        if (verdict.halted) {
+            break;
+        }
+        if (!tables[i].ordinary) {
+            continue;
+        }
+        let result = if (tables[i].schemaTable) checkSchemaRows(db, mut verdict) else checkTableRows(
+            db,
+            borrow tables[i],
+            quick,
+            mut verdict,
+        );
+        match (result) {
+            Ok(_) => {}
+            Err(SqliteError.Corrupt(_)) => {
+                // SQLite stops at a record it cannot read, with this as the last row.
+                var row = Vector<SqliteValue>.create();
+                row.push(SqliteValue.text("database disk image is malformed")?)?;
+                verdict.rows.push(row)?;
+                verdict.halted = true;
+            }
+            Err(e) => { return Err(e); }
+        }
+    }
+    if (verdict.rows.length == 0) {
+        let _ = verdict.emit("ok")?;
+    }
+    var columns = Vector<String>.create();
+    columns.push(String.from(name)?)?;
+    return Ok(QueryResult { columns: columns, rows: verdict.rows });
+}

@@ -165,3 +165,10 @@ library in `lib/core` (CORE-MATH's functions are small and exact) would make all
 `0..m + 1`, which reads as a different bound and overflows when `m` is the type's maximum.
 
 Workaround: `0..m + 1` (`src/libm.cee`).
+
+### 22. A Vector cannot be iterated by value
+
+`for (t in v)` borrows each element, and there is no consuming iteration (`drain`, `intoIter`), so moving every
+element of a vector into another container in order takes `while (v.length != 0) { w.push(v.remove(0))?; }`,
+which is quadratic, or a reversed `pop` loop and a second reversal. `integrity.cee` (`tablesInSqliteOrder`) does
+the former on short lists. A `for (t in move v)` or a `Vector.drain()` iterator would say what is meant.

@@ -95,6 +95,14 @@ struct WritablePager {
     /// The number of pages the transaction has changed.
     fn changedPages(borrow this) -> usize => this.dirty.length();
 
+    /// The first trunk page of the freelist, and the number of pages on it, as the transaction sees them.
+    fn freelistTrunk(borrow this) -> u32 => this.freeTrunk;
+
+    fn freelistCount(borrow this) -> u32 => this.freeCount;
+
+    /// The number of pages the file held at the last commit.
+    fn committedPages(borrow this) -> u32 => this.committedPageCount;
+
     /// The page that holds SQLite's lock bytes, which no b-tree may use.
     private fn pendingPage(borrow this) -> u32 => truncate<u32>(PENDING_BYTE / (this.pageSize as u64)) + 1;
 

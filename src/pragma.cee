@@ -8,7 +8,8 @@
 // - user_version and application_id are stored in the database header, so they persist and other programs see
 //   them.
 //
-// Not yet supported, and refused by name: integrity_check and quick_check, and pragmas this engine does not have.
+// integrity_check and quick_check are in integrity.cee. Pragmas this engine does not have are ignored, as SQLite
+// ignores those it does not know.
 
 fn intRow(n: i64) -> Result<Vector<SqliteValue>, AllocError> {
     var row = Vector<SqliteValue>.create();
@@ -449,7 +450,13 @@ fn executePragma(stmt: borrow PragmaStmt, db: borrow mut Session) -> Result<Quer
             rows.push(intRow(0)?)?;
         }
         "data_version" => { rows.push(intRow(1)?)?; }
-        "integrity_check" | "quick_check" => { return Err(unsupported("PRAGMA integrity_check is not supported yet")); }
+        "integrity_check" | "quick_check" => {
+            var argument: StringView? = null;
+            if (borrow stmt.value is Some(v)) {
+                argument = v.view();
+            }
+            return integrityCheck(db, lower.view(), lower.view() == "quick_check", argument);
+        }
         _ => {
             // SQLite ignores a pragma it does not know.
             return Ok(emptyResult());

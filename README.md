@@ -34,7 +34,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | CREATE and DROP of tables, indexes and views | `Exec/QueryExecutor` (DDL) | `ddl.cee` | done |
 | Triggers | `Exec/QueryExecutor` (`FireTriggers`) | `triggers.cee` | BEFORE and AFTER on tables done; INSTEAD OF on views next |
 | ALTER TABLE | `Exec/QueryExecutor` (`ExecuteAlterTable`) | `alter.cee` | RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN done; renames that views or triggers refer to next |
-| PRAGMAs, pragma_* table functions | `Exec/QueryExecutor` (`ExecutePragma`) | `pragma.cee` | schema pragmas and header fields done; integrity_check next |
+| PRAGMAs, pragma_* table functions | `Exec/QueryExecutor` (`ExecutePragma`) | `pragma.cee`, `integrity.cee` | schema pragmas, header fields, integrity_check and quick_check done |
 | Connection, transactions | `SqliteConnection`, `EngineGlue` | `session.cee` | done: statements commit on their own outside BEGIN, and a failed statement undoes only itself inside it |
 | WAL | `Storage/Wal*`, `Shm*` | | until then a database with a non-empty `-wal` file is refused |
 | Connection, command, pool | `SqliteConnection`, `SqliteCommand`, `SqliteConnectionPool` | | |
@@ -50,6 +50,14 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   `varintTruncatedIsCorrupt`).
 - **Short overflow chains.** When an overflow chain ended before its payload, the C# returned the payload padded
   with zeros. Here that is `Corrupt`.
+- **PRAGMA integrity_check.** The C# answered "ok" to `integrity_check` and `quick_check` whatever the file held.
+  Here they run SQLite's checks (`integrity.cee`): the b-tree walk of sqlite3BtreeIntegrityCheck (page
+  references, cell bounds and overlaps, fragmentation, rowid order, child depths, overflow chains, the freelist,
+  unused pages, the header's page count) and then the row checks of pragma.c's program (NOT NULL, column types,
+  CHECK, and, for integrity_check, every row's entry in every index, extra entries, UNIQUE, and WITHOUT ROWID key
+  order), with SQLite's messages, order and error limit, the `N` and table-name arguments included
+  (`damagedTreePages`, `damagedChainsAndHeader`, `indexesThatDisagreeWithTheirTables`,
+  `rowsThatBreakTheirTablesDefinition`, `tablesComeInSqlitesHashOrder`).
 - **Integer against real.** The C# compares an integer with a real by converting the integer to a double, so
   `9007199254740993` equals `9007199254740992.0`. SQLite compares them exactly, and so does this
   (`valuesCompareAsSqliteOrdersThem`).
@@ -317,6 +325,29 @@ would take Apple's algorithms, which are not published. The tests use arguments 
   table/index X after drop column", and every row loses the value (`dropColumnLikeSqlite`).
 - **Index cells take at least 4 bytes**, as SQLite counts them: a WITHOUT ROWID table of small keys made 3-byte
   cells, which sqlite3 calls out of range (`tinyIndexCellsTakeFourBytes`).
+
+## Known differences from SQLite in PRAGMA integrity_check
+
+The report matches the `sqlite3` shell's row for row on the tests' damaged files, with these exceptions:
+
+- **Reading through damage.** After the b-tree check, SQLite reads every row with its ordinary cursors, which
+  follow a damaged page as far as they can: a cell pointer into the page header is read as a cell of whatever
+  bytes are there, and the rows that come out of it are then checked against the indexes. This engine's cursors
+  refuse such a page (`Corrupt`), and the report ends with "database disk image is malformed", which is also how
+  SQLite ends when its cursor gives up (the shell then prints that as an error after the rows). The b-tree report
+  that comes first is the same (`sameTreeReport` in `tests/integrity_tests.cee`). A row whose overflow chain is
+  broken is read as SQLite reads it: its fields in the page are checked, and only a check that needs a field on
+  the missing pages ends the report.
+- **The order of tables.** SQLite checks tables in the order of its schema hash table, which depends on how
+  many buckets its allocator rounds the table's array up to; `sqliteHashOrder` uses what macOS's allocator gives
+  (16 buckets for the first 5 to 32 tables). With glibc the shell may list tables with errors in another order.
+- **Index order.** Among a table's automatic indexes, one made for a constraint with `ON CONFLICT REPLACE` comes
+  last in SQLite's list; here it keeps its place, which matters only for the order of messages.
+- **Details not modelled.** "index X stores an imprecise floating-point value" (SQLite's near match of a real
+  computed by an index expression) is reported as a missing row; a VIRTUAL generated column's own reads of the
+  record are not counted when deciding which column types SQLite re-reads (see `HeaderCache`); a header page
+  count larger than the file is an error from the pragma here, and from every statement in SQLite;
+  `PRAGMA ignore_check_constraints` does not exist here, so CHECK constraints are always checked.
 
 ## Known gaps (inherited from the C# engine, refused by name rather than misparsed)
 
