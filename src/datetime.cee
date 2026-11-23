@@ -1,0 +1,1282 @@
+// The date and time functions: date(), time(), datetime(), julianday(), unixepoch(), strftime() and timediff().
+// A port of SQLite 3.53's date.c (public domain), with its arithmetic as written there: a moment is a Julian day
+// number in milliseconds, calendar fields come from Meeus's formulas in the same mix of integer and float steps,
+// and numbers are written by SQLite's own printf rules, so results match sqlite3 digit for digit.
+//
+// Differences from the C# engine, which this replaces (each checked against sqlite3 3.54):
+// - every time value SQLite reads is read: a time without a date (on 2000-01-01), `T` between date and time, a
+//   `+HH:MM`/`-HH:MM`/`Z` zone, negative years and year 0, any number of fractional digits, and numbers as Julian
+//   days. The C# went through .NET's DateTime, which has no year 0 or before, no zones and three fraction digits;
+// - modifiers apply in order, as in SQLite: 'unixepoch', 'julianday' and 'auto' only right after the time value,
+//   'floor' and 'ceiling' after month or year arithmetic, '±YYYY-MM-DD HH:MM:SS' and '±HH:MM' shifts, 'weekday N',
+//   'start of …' and 'subsec' everywhere. The C# honoured 'unixepoch' and 'auto' in any position and lacked the rest;
+// - 'now' is the statement's time, the same in every call of one statement; the C# read the clock at each call;
+// - an unknown strftime() specifier makes the result NULL, as in SQLite; the C# threw. %J has 16 significant digits
+//   and %f, %s with 'subsec', %G, %g, %V, %u, %k, %l, %P and %e are all supported;
+// - unixepoch() truncates toward zero and gives a real with 'subsec'; timediff() follows SQLite's month walk.
+//
+// 'localtime' and 'utc' need the system's time zone, which CeeSafe's library does not offer: where SQLite would
+// consult it they are an error here (CEESAFE_FINDINGS.md). Where SQLite skips it (a value already in UTC given 'utc')
+// they behave as in SQLite.
+
+/// SQLite's DateTime: a moment as a Julian day number in milliseconds, as calendar fields, or both.
+struct DateTime {
+    /// The Julian day number times 86400000.
+    jd: i64;
+    year: i64;
+    month: i64;
+    day: i64;
+    hour: i64;
+    minute: i64;
+    /// The zone's offset in minutes.
+    tz: i64;
+    second: f64;
+    validJD: bool;
+    validYMD: bool;
+    validHMS: bool;
+    /// Days to subtract for 'floor'.
+    nFloor: i64;
+    /// `second` holds the raw number given as the time value.
+    rawS: bool;
+    isError: bool;
+    useSubsec: bool;
+    isUtc: bool;
+    isLocal: bool;
+
+    fn zero() -> DateTime => DateTime {
+        jd: 0,
+        year: 0,
+        month: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        tz: 0,
+        second: 0.0,
+        validJD: false,
+        validYMD: false,
+        validHMS: false,
+        nFloor: 0,
+        rawS: false,
+        isError: false,
+        useSubsec: false,
+        isUtc: false,
+        isLocal: false,
+    };
+}
+
+/// The Julian day of 1970-01-01 00:00:00, in milliseconds.
+const UNIX_EPOCH_JD_MS: i64 = 210866760000000;
+
+/// The largest valid DateTime.jd: 9999-12-31 23:59:59.999.
+const MAX_JD_MS: i64 = 464269060799999;
+
+/// A byte of a C string: zero past its end.
+fn byteAt(z: Slice<u8>, i: usize) -> u8 => if (i < z.length) z[i] else 0;
+
+/// The text from `at` on, empty past the end.
+fn tail(z: Slice<u8>, at: usize) -> Slice<u8> => if (at <= z.length) z[at..] else z[z.length..];
+
+/// sqlite3StrICmp against a lower-case ASCII word.
+fn sameWord(z: Slice<u8>, word: StringView) -> bool {
+    let w = word.bytes();
+    if (z.length != w.length) {
+        return false;
+    }
+    for (i in 0..z.length) {
+        if (foldAscii(z[i]) != w[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// sqlite3_strnicmp(z, word, word's length) == 0.
+fn startsWithWord(z: Slice<u8>, word: StringView) -> bool {
+    let w = word.bytes();
+    if (z.length < w.length) {
+        return false;
+    }
+    return sameWord(z[0..w.length], word);
+}
+
+/// sqlite3AtoF(z) > 0: the value when the whole text is a number.
+fn wholeNumber(z: Slice<u8>) -> f64? {
+    let parsed = RealParse.of(z);
+    return if (parsed.hasPrefix && parsed.pure) parsed.value else null;
+}
+
+/// A double as C's `(sqlite3_int64)` cast makes it: toward zero.
+fn toInteger(r: f64) -> i64 => saturatingTruncate<i64>(r);
+
+fn toReal(i: i64) -> f64 => round<f64>(i);
+
+/// getDigits: reads the integers that `format` describes (four characters each: digit count, minimum, maximum as
+/// a letter, separator) into `values`, and returns how many it read.
+fn getDigits(z: Slice<u8>, format: StringView, values: SliceMut<i64>) -> usize {
+    let maxima = [12i64, 14, 24, 31, 59, 14712];
+    let f = format.bytes();
+    var at: usize = 0;
+    var spec: usize = 0;
+    var count: usize = 0;
+    loop {
+        var digits = f[spec] - '0';
+        let least = (f[spec + 1] - '0') as i64;
+        let most = maxima[(f[spec + 2] - 'a') as usize];
+        let next = byteAt(f, spec + 3);
+        var value: i64 = 0;
+        while (digits > 0) {
+            let c = byteAt(z, at);
+            if (!isSqlDigit(c)) {
+                return count;
+            }
+            value = value * 10 + (c - '0') as i64;
+            at += 1;
+            digits -= 1;
+        }
+        if (value < least || value > most || (next != 0 && next != byteAt(z, at))) {
+            return count;
+        }
+        values[count] = value;
+        at += 1;
+        count += 1;
+        spec += 4;
+        if (next == 0) {
+            return count;
+        }
+    }
+}
+
+/// parseTimezone: `(+|-)HH:MM` or `Z` at the end of a time, or nothing. True on an error.
+fn parseTimezone(z: Slice<u8>, p: borrow mut DateTime) -> bool {
+    var at: usize = 0;
+    while (isNumberSpace(byteAt(z, at))) {
+        at += 1;
+    }
+    p.tz = 0;
+    let c = byteAt(z, at);
+    var sign: i64 = 0;
+    if (c == '-') {
+        sign = -1;
+    } else if (c == '+') {
+        sign = 1;
+    } else if (c == 'Z' || c == 'z') {
+        at += 1;
+        p.isLocal = false;
+        p.isUtc = true;
+        while (isNumberSpace(byteAt(z, at))) {
+            at += 1;
+        }
+        return byteAt(z, at) != 0;
+    } else {
+        return c != 0;
+    }
+    at += 1;
+    var v = [0i64; 3];
+    if (getDigits(tail(z, at), "20b:20e", mut v[..]) != 2) {
+        return true;
+    }
+    at += 5;
+    p.tz = sign * (v[1] + v[0] * 60);
+    if (p.tz == 0) {
+        p.isLocal = false;
+        p.isUtc = true;
+    }
+    while (isNumberSpace(byteAt(z, at))) {
+        at += 1;
+    }
+    return byteAt(z, at) != 0;
+}
+
+/// parseHhMmSs: HH:MM, HH:MM:SS or HH:MM:SS.FFFF, then a zone. True on an error.
+fn parseHhMmSs(z: Slice<u8>, p: borrow mut DateTime) -> bool {
+    var v = [0i64; 3];
+    if (getDigits(z, "20c:20e", mut v[..]) != 2) {
+        return true;
+    }
+    let h = v[0];
+    let m = v[1];
+    var s: i64 = 0;
+    var ms = 0.0;
+    var at: usize = 5;
+    if (byteAt(z, at) == ':') {
+        at += 1;
+        if (getDigits(tail(z, at), "20e", mut v[..]) != 1) {
+            return true;
+        }
+        s = v[0];
+        at += 2;
+        if (byteAt(z, at) == '.' && isSqlDigit(byteAt(z, at + 1))) {
+            var scale = 1.0;
+            at += 1;
+            while (isSqlDigit(byteAt(z, at))) {
+                ms = ms * 10.0 + (byteAt(z, at) as f64) - 48.0;
+                scale = scale * 10.0;
+                at += 1;
+            }
+            ms = ms / scale;
+            // SQLite truncates rather than round past milliseconds.
+            if (ms > 0.999) {
+                ms = 0.999;
+            }
+        }
+    }
+    p.validJD = false;
+    p.rawS = false;
+    p.validHMS = true;
+    p.hour = h;
+    p.minute = m;
+    p.second = toReal(s) + ms;
+    return parseTimezone(tail(z, at), p);
+}
+
+/// datetimeError: everything cleared, and the error flag set.
+fn datetimeError(p: borrow mut DateTime) {
+    p = DateTime.zero();
+    p.isError = true;
+}
+
+/// computeJD: the Julian day from the calendar fields (2000-01-01 when there is no date; Meeus page 61).
+fn computeJD(p: borrow mut DateTime) {
+    if (p.validJD) {
+        return;
+    }
+    var y: i64 = 2000;
+    var m: i64 = 1;
+    var d: i64 = 1;
+    if (p.validYMD) {
+        y = p.year;
+        m = p.month;
+        d = p.day;
+    }
+    if (y < -4713 || y > 9999 || p.rawS) {
+        datetimeError(p);
+        return;
+    }
+    if (m <= 2) {
+        y -= 1;
+        m += 12;
+    }
+    let a = (y + 4800) / 100;
+    let b = 38 - a + a / 4;
+    let x1 = 36525 * (y + 4716) / 100;
+    let x2 = 306001 * (m + 1) / 10000;
+    p.jd = toInteger((toReal(x1 + x2 + d + b) - 1524.5) * 86400000.0);
+    p.validJD = true;
+    if (p.validHMS) {
+        p.jd = p.jd.wrappingAdd(p.hour * 3600000 + p.minute * 60000 + toInteger(p.second * 1000.0 + 0.5));
+        if (p.tz != 0) {
+            p.jd = p.jd.wrappingSub(p.tz * 60000);
+            p.validYMD = false;
+            p.validHMS = false;
+            p.tz = 0;
+            p.isUtc = true;
+            p.isLocal = false;
+        }
+    }
+}
+
+/// computeFloor: how many days past the end of its month the date is.
+fn computeFloor(p: borrow mut DateTime) {
+    if (p.day <= 28) {
+        p.nFloor = 0;
+    } else if (p.month >= 0 && p.month < 32 && ((1u32 << truncate<u32>(p.month)) & 0x15aa) != 0) {
+        p.nFloor = 0;
+    } else if (p.month != 2) {
+        p.nFloor = if (p.day == 31) 1 else 0;
+    } else if (p.year % 4 != 0 || (p.year % 100 == 0 && p.year % 400 != 0)) {
+        p.nFloor = p.day - 28;
+    } else {
+        p.nFloor = p.day - 29;
+    }
+}
+
+/// parseYyyyMmDd: YYYY-MM-DD, then optionally a time. True on an error.
+fn parseYyyyMmDd(z: Slice<u8>, p: borrow mut DateTime) -> bool {
+    var at: usize = 0;
+    let negative = byteAt(z, 0) == '-';
+    if (negative) {
+        at = 1;
+    }
+    var v = [0i64; 3];
+    if (getDigits(tail(z, at), "40f-21a-21d", mut v[..]) != 3) {
+        return true;
+    }
+    at += 10;
+    while (isNumberSpace(byteAt(z, at)) || byteAt(z, at) == 'T') {
+        at += 1;
+    }
+    if (!parseHhMmSs(tail(z, at), p)) {
+        // The time was read.
+    } else if (byteAt(z, at) == 0) {
+        p.validHMS = false;
+    } else {
+        return true;
+    }
+    p.validJD = false;
+    p.validYMD = true;
+    p.year = if (negative) 0 - v[0] else v[0];
+    p.month = v[1];
+    p.day = v[2];
+    computeFloor(p);
+    if (p.tz != 0) {
+        computeJD(p);
+    }
+    return false;
+}
+
+/// clearYMD_HMS_TZ.
+fn clearCalendar(p: borrow mut DateTime) {
+    p.validYMD = false;
+    p.validHMS = false;
+    p.tz = 0;
+}
+
+/// setDateTimeToCurrent: the statement's time. True on an error.
+fn setToNow(p: borrow mut DateTime, nowMillis: i64) -> bool {
+    p.jd = nowMillis + UNIX_EPOCH_JD_MS;
+    if (p.jd > 0) {
+        p.validJD = true;
+        p.isUtc = true;
+        p.isLocal = false;
+        clearCalendar(p);
+        return false;
+    }
+    return true;
+}
+
+/// setRawDateNumber: a number that may be a Julian day or Unix seconds; a Julian day if it can be one.
+fn setRawDateNumber(p: borrow mut DateTime, r: f64) {
+    p.second = r;
+    p.rawS = true;
+    if (r >= 0.0 && r < 5373484.5) {
+        p.jd = toInteger(r * 86400000.0 + 0.5);
+        p.validJD = true;
+    }
+}
+
+/// parseDateOrTime: a date and time, a time, 'now', a number or 'subsec'. True on an error.
+fn parseDateOrTime(z: Slice<u8>, p: borrow mut DateTime, nowMillis: i64) -> bool {
+    if (!parseYyyyMmDd(z, p)) {
+        return false;
+    }
+    if (!parseHhMmSs(z, p)) {
+        return false;
+    }
+    if (sameWord(z, "now")) {
+        return setToNow(p, nowMillis);
+    }
+    if (wholeNumber(z) is Some(r)) {
+        setRawDateNumber(p, r);
+        return false;
+    }
+    if (sameWord(z, "subsec") || sameWord(z, "subsecond")) {
+        p.useSubsec = true;
+        return setToNow(p, nowMillis);
+    }
+    return true;
+}
+
+fn validJulianDay(jd: i64) -> bool => jd >= 0 && jd <= MAX_JD_MS;
+
+/// computeYMD: the calendar date from the Julian day (2000-01-01 when there is none).
+fn computeYMD(p: borrow mut DateTime) {
+    if (p.validYMD) {
+        return;
+    }
+    if (!p.validJD) {
+        p.year = 2000;
+        p.month = 1;
+        p.day = 1;
+    } else if (!validJulianDay(p.jd)) {
+        datetimeError(p);
+        return;
+    } else {
+        let z = (p.jd + 43200000) / 86400000;
+        let alpha = toInteger((toReal(z) + 32044.75) / 36524.25) - 52;
+        let a = z + 1 + alpha - ((alpha + 100) / 4) + 25;
+        let b = a + 1524;
+        let c = toInteger((toReal(b) - 122.1) / 365.25);
+        let d = (36525 * truncate<i64>(truncate<u64>(c) & 32767)) / 100;
+        let e = toInteger(toReal(b - d) / 30.6001);
+        let x1 = toInteger(30.6001 * toReal(e));
+        p.day = b - d - x1;
+        p.month = if (e < 14) e - 1 else e - 13;
+        p.year = if (p.month > 2) c - 4716 else c - 4715;
+    }
+    p.validYMD = true;
+}
+
+/// computeHMS: the time of day from the Julian day.
+fn computeHMS(p: borrow mut DateTime) {
+    if (p.validHMS) {
+        return;
+    }
+    computeJD(p);
+    let dayMs = (p.jd + 43200000) % 86400000;
+    p.second = toReal(dayMs % 60000) / 1000.0;
+    let dayMin = dayMs / 60000;
+    p.minute = dayMin % 60;
+    p.hour = dayMin / 60;
+    p.rawS = false;
+    p.validHMS = true;
+}
+
+fn computeYMDHMS(p: borrow mut DateTime) {
+    computeYMD(p);
+    computeHMS(p);
+}
+
+/// What 'localtime' and 'utc' report when they need the system's time zone.
+fn localTimeUnavailable() -> SqliteError =>
+    unsupported(
+        "local time unavailable: 'localtime' and 'utc' need the system time zone, which CeeSafe's library does not provide",
+    );
+
+/// The units of '±NNN units': name, the limit on NNN (SQLite keeps it as a C float), and seconds in one.
+const UNIT_NAMES: [StringView; 6] = ["second", "minute", "hour", "day", "month", "year"];
+/// (The limits are whole numbers, as are the seconds, so they are kept as integers.)
+const UNIT_LIMITS: [i64; 6] = [464269992787968, 7737900007424, 128969998336, 5373485, 176546, 14713];
+const UNIT_SECONDS: [i64; 6] = [1, 60, 3600, 86400, 2592000, 31536000];
+
+/// autoAdjustDate: a raw number becomes a Julian day if it is one, else Unix seconds if it can be.
+fn autoAdjustDate(p: borrow mut DateTime) {
+    if (!p.rawS || p.validJD) {
+        p.rawS = false;
+    } else if (p.second >= -210866760000.0 && p.second <= 253402300799.0) {
+        let r = p.second * 1000.0 + 210866760000000.0;
+        clearCalendar(p);
+        p.jd = toInteger(r + 0.5);
+        p.validJD = true;
+        p.rawS = false;
+    }
+}
+
+/// The modifiers that start with a sign or a digit: '±NNN units', '±HH:MM[:SS.SSS]' and
+/// '±YYYY-MM-DD[ HH:MM[:SS.SSS]]'.
+fn numericModifier(z: Slice<u8>, p: borrow mut DateTime) -> bool {
+    let z0 = byteAt(z, 0);
+    var v = [0i64; 3];
+    var n: usize = 1;
+    while (byteAt(z, n) != 0) {
+        let c = byteAt(z, n);
+        if (c == ':' || isNumberSpace(c)) {
+            break;
+        }
+        if (c == '-') {
+            if (n == 5 && getDigits(tail(z, 1), "40f", mut v[..]) == 1) {
+                break;
+            }
+            if (n == 6 && getDigits(tail(z, 1), "50f", mut v[..]) == 1) {
+                break;
+            }
+        }
+        n += 1;
+    }
+    let Some(number) = wholeNumber(z[0..n]) else {
+        return false;
+    };
+    var r = number;
+    var z2 = z;
+    var n2 = n;
+    if (byteAt(z, n) == '-') {
+        // ±YYYY-MM-DD adds or subtracts years, months (0-11) and days (0-30).
+        if (z0 != '+' && z0 != '-') {
+            return false;
+        }
+        var zz = z;
+        if (n == 5) {
+            if (getDigits(tail(z, 1), "40f-20a-20d", mut v[..]) != 3) {
+                return false;
+            }
+        } else {
+            if (getDigits(tail(z, 1), "50f-20a-20d", mut v[..]) != 3) {
+                return false;
+            }
+            zz = tail(z, 1);
+        }
+        let years = v[0];
+        let months = v[1];
+        var days = v[2];
+        if (months >= 12 || days >= 31) {
+            return false;
+        }
+        computeYMDHMS(p);
+        p.validJD = false;
+        if (z0 == '-') {
+            p.year -= years;
+            p.month -= months;
+            days = 0 - days;
+        } else {
+            p.year += years;
+            p.month += months;
+        }
+        let x = if (p.month > 0) (p.month - 1) / 12 else (p.month - 12) / 12;
+        p.year += x;
+        p.month -= x * 12;
+        computeFloor(p);
+        computeJD(p);
+        p.validHMS = false;
+        p.validYMD = false;
+        p.jd = p.jd.wrappingAdd(days * 86400000);
+        if (byteAt(zz, 11) == 0) {
+            return true;
+        }
+        if (isNumberSpace(byteAt(zz, 11)) && getDigits(tail(zz, 12), "20c:20e", mut v[..]) == 2) {
+            z2 = tail(zz, 12);
+            n2 = 2;
+        } else {
+            return false;
+        }
+    }
+    if (byteAt(z2, n2) == ':') {
+        // ±HH:MM:SS.FFF adds or subtracts a time.
+        var t = z2;
+        if (!isSqlDigit(byteAt(t, 0))) {
+            t = tail(t, 1);
+        }
+        var tx = DateTime.zero();
+        if (parseHhMmSs(t, mut tx)) {
+            return false;
+        }
+        computeJD(mut tx);
+        tx.jd -= 43200000;
+        let day = tx.jd / 86400000;
+        tx.jd -= day * 86400000;
+        if (z0 == '-') {
+            tx.jd = 0 - tx.jd;
+        }
+        computeJD(p);
+        clearCalendar(p);
+        p.jd = p.jd.wrappingAdd(tx.jd);
+        return true;
+    }
+    // ±NNN units.
+    var at = n;
+    while (isNumberSpace(byteAt(z, at))) {
+        at += 1;
+    }
+    let unit = tail(z, at);
+    var length = unit.length;
+    if (length < 3 || length > 10) {
+        return false;
+    }
+    if (foldAscii(unit[length - 1]) == 's') {
+        length -= 1;
+    }
+    computeJD(p);
+    let rounder = if (r < 0.0) -0.5 else 0.5;
+    p.nFloor = 0;
+    var applied = false;
+    for (i in 0..UNIT_NAMES.length) {
+        let limit = toReal(UNIT_LIMITS[i]);
+        if (UNIT_NAMES[i].length == length && sameWord(
+            unit[0..length],
+            UNIT_NAMES[i],
+        ) && r > 0.0 - limit && r < limit) {
+            if (i == 4) {
+                // Months: whole months on the calendar, the fraction as 30-day months.
+                computeYMDHMS(p);
+                p.month += toInteger(r);
+                let x = if (p.month > 0) (p.month - 1) / 12 else (p.month - 12) / 12;
+                p.year += x;
+                p.month -= x * 12;
+                computeFloor(p);
+                p.validJD = false;
+                r -= toReal(toInteger(r));
+            } else if (i == 5) {
+                // Years: whole years on the calendar, the fraction as 365-day years.
+                let y = toInteger(r);
+                computeYMDHMS(p);
+                p.year += y;
+                computeFloor(p);
+                p.validJD = false;
+                r -= toReal(toInteger(r));
+            }
+            computeJD(p);
+            p.jd = p.jd.wrappingAdd(toInteger(r * 1000.0 * toReal(UNIT_SECONDS[i]) + rounder));
+            applied = true;
+            break;
+        }
+    }
+    clearCalendar(p);
+    return applied;
+}
+
+/// parseModifier: applies one modifier. False when it is not one (the result is then NULL); an error when it
+/// needs local time.
+fn parseModifier(z: Slice<u8>, p: borrow mut DateTime, idx: usize) -> Result<bool, SqliteError> {
+    let first = foldAscii(byteAt(z, 0));
+    if (first == 'a') {
+        if (sameWord(z, "auto")) {
+            if (idx > 1) {
+                return Ok(false);
+            }
+            autoAdjustDate(p);
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    if (first == 'c') {
+        // 'ceiling': overflow into the next month, which is what happens anyway.
+        if (sameWord(z, "ceiling")) {
+            computeJD(p);
+            clearCalendar(p);
+            p.nFloor = 0;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    if (first == 'f') {
+        // 'floor': overflow past the end of a month goes back to its last day.
+        if (sameWord(z, "floor")) {
+            computeJD(p);
+            p.jd = p.jd.wrappingSub(p.nFloor * 86400000);
+            clearCalendar(p);
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    if (first == 'j') {
+        if (sameWord(z, "julianday")) {
+            if (idx > 1) {
+                return Ok(false);
+            }
+            if (p.validJD && p.rawS) {
+                p.rawS = false;
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    if (first == 'l') {
+        if (sameWord(z, "localtime")) {
+            if (!p.isLocal) {
+                return Err(localTimeUnavailable());
+            }
+            p.isUtc = false;
+            p.isLocal = true;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    if (first == 'u') {
+        if (sameWord(z, "unixepoch") && p.rawS) {
+            if (idx > 1) {
+                return Ok(false);
+            }
+            let r = p.second * 1000.0 + 210866760000000.0;
+            if (r >= 0.0 && r < 464269060800000.0) {
+                clearCalendar(p);
+                p.jd = toInteger(r + 0.5);
+                p.validJD = true;
+                p.rawS = false;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        if (sameWord(z, "utc")) {
+            if (!p.isUtc) {
+                return Err(localTimeUnavailable());
+            }
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    if (first == 'w') {
+        // 'weekday N': forward to the next day that is weekday N (0 is Sunday), unless it is one already.
+        if (startsWithWord(z, "weekday ")) {
+            if (wholeNumber(tail(z, 8)) is Some(r)) {
+                if (r >= 0.0 && r < 7.0 && toReal(toInteger(r)) == r) {
+                    let n = toInteger(r);
+                    computeYMDHMS(p);
+                    p.tz = 0;
+                    p.validJD = false;
+                    computeJD(p);
+                    var weekday = ((p.jd + 129600000) / 86400000) % 7;
+                    if (weekday > n) {
+                        weekday -= 7;
+                    }
+                    p.jd = p.jd.wrappingAdd((n - weekday) * 86400000);
+                    clearCalendar(p);
+                    return Ok(true);
+                }
+            }
+        }
+        return Ok(false);
+    }
+    if (first == 's') {
+        if (!startsWithWord(z, "start of ")) {
+            if (sameWord(z, "subsec") || sameWord(z, "subsecond")) {
+                p.useSubsec = true;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        if (!p.validJD && !p.validYMD && !p.validHMS) {
+            return Ok(false);
+        }
+        let what = tail(z, 9);
+        computeYMD(p);
+        p.validHMS = true;
+        p.hour = 0;
+        p.minute = 0;
+        p.second = 0.0;
+        p.rawS = false;
+        p.tz = 0;
+        p.validJD = false;
+        if (sameWord(what, "month")) {
+            p.day = 1;
+            return Ok(true);
+        }
+        if (sameWord(what, "year")) {
+            p.month = 1;
+            p.day = 1;
+            return Ok(true);
+        }
+        return Ok(sameWord(what, "day"));
+    }
+    if (first == '+' || first == '-' || isSqlDigit(first)) {
+        return Ok(numericModifier(z, p));
+    }
+    return Ok(false);
+}
+
+/// isDate: reads the time value and applies the modifiers. False when the result is NULL.
+fn isDate(args: Slice<SqliteValue>, p: borrow mut DateTime, nowMillis: i64) -> Result<bool, SqliteError> {
+    p = DateTime.zero();
+    if (args.length == 0) {
+        return Ok(!setToNow(p, nowMillis));
+    }
+    match (borrow args[0]) {
+        SqliteValue.Null => { return Ok(false); }
+        SqliteValue.Integer(i) => { setRawDateNumber(p, toReal(i)); }
+        SqliteValue.Real(r) => { setRawDateNumber(p, r); }
+        other => {
+            let text = valueBytes(other)?;
+            if (parseDateOrTime(beforeNul(text.view()), p, nowMillis)) {
+                return Ok(false);
+            }
+        }
+    }
+    for (i in 1..args.length) {
+        if (args[i].isNull()) {
+            return Ok(false);
+        }
+        let text = valueBytes(borrow args[i])?;
+        if (!parseModifier(beforeNul(text.view()), p, i)?) {
+            return Ok(false);
+        }
+    }
+    computeJD(p);
+    if (p.isError || !validJulianDay(p.jd)) {
+        return Ok(false);
+    }
+    if (args.length == 1 && p.validYMD && p.day > 28) {
+        // A YYYY-MM-DD alone is normalized: 2023-02-31 is 2023-03-03.
+        p.validYMD = false;
+    }
+    return Ok(true);
+}
+
+// ── printf, as SQLite's does it for the few formats these functions use ─────────────────────────────────────
+
+/// `%d` with a width, padded with spaces or (with `zeroPad`) zeros after the sign.
+fn appendInteger(out: borrow mut Vector<u8>, value: i64, width: usize, zeroPad: bool) -> Result<void, AllocError> {
+    let negative = value < 0;
+    var magnitude: u64 = if (negative) truncate<u64>(0 - (value + 1)) + 1 else truncate<u64>(value);
+    var digits = [0u8; 20];
+    var count: usize = 0;
+    loop {
+        digits[count] = truncate<u8>(magnitude % 10) + '0';
+        count += 1;
+        magnitude /= 10;
+        if (magnitude == 0) {
+            break;
+        }
+    }
+    let length = count + (if (negative) 1 else 0);
+    let pad = if (width > length) width - length else 0;
+    if (!zeroPad) {
+        for (i in 0..pad) {
+            out.push(' ')?;
+        }
+    }
+    if (negative) {
+        out.push('-')?;
+    }
+    if (zeroPad) {
+        for (i in 0..pad) {
+            out.push('0')?;
+        }
+    }
+    while (count > 0) {
+        count -= 1;
+        out.push(digits[count])?;
+    }
+    return Ok();
+}
+
+/// A real as `%[0][width].{precision}f` (`generic` false) or `%.{precision}g` (`generic` true), following
+/// SQLite's printf over sqlite3FpDecode. The value must be finite.
+fn appendFloat(
+    out: borrow mut Vector<u8>,
+    value: f64,
+    precisionIn: i32,
+    generic: bool,
+    width: usize,
+    zeroPad: bool,
+) -> Result<void, AllocError> {
+    var precision = precisionIn;
+    let iRound = if (generic) (if (precision == 0) 1 else precision) else 0 - precision;
+    if (generic && precision == 0) {
+        precision = 1;
+    }
+    var digits = Vector<u8>.create();
+    var point: i32 = 1;
+    let negative = value < 0.0;
+    if (value == 0.0) {
+        digits.push('0')?;
+    } else {
+        let decoded = DecodedReal.rounded(value.abs(), iRound, 16)?;
+        digits.extend(decoded.digits.view())?;
+        point = decoded.point;
+    }
+    let z = digits.view();
+    let n = truncate<i32>(z.length);
+    var useExponent = false;
+    var trimZeros = false;
+    if (generic) {
+        precision -= 1;
+        trimZeros = true;
+        let exp = point - 1;
+        if (exp < -4 || exp > precision) {
+            useExponent = true;
+        } else {
+            precision = precision - exp;
+        }
+    }
+    var e2 = if (useExponent) 0 else point - 1;
+    var buf = Vector<u8>.create();
+    if (negative) {
+        buf.push('-')?;
+    }
+    var j: i32 = 0;
+    if (e2 < 0) {
+        buf.push('0')?;
+    } else {
+        j = (e2 + 1).min(n);
+        buf.extend(z[0..truncate<usize>(j)])?;
+        e2 -= j;
+        if (e2 >= 0) {
+            for (i in 0..truncate<usize>(e2 + 1)) {
+                buf.push('0')?;
+            }
+            e2 = -1;
+        }
+    }
+    let withPoint = precision > 0;
+    if (withPoint) {
+        buf.push('.')?;
+    }
+    if (e2 < -1 && precision > 0) {
+        let nn = (-1 - e2).min(precision);
+        for (i in 0..truncate<usize>(nn)) {
+            buf.push('0')?;
+        }
+        precision -= nn;
+    }
+    if (precision > 0) {
+        let nn = (n - j).min(precision);
+        if (nn > 0) {
+            buf.extend(z[truncate<usize>(j)..truncate<usize>(j + nn)])?;
+            precision -= nn;
+        }
+        if (precision > 0 && !trimZeros) {
+            for (i in 0..truncate<usize>(precision)) {
+                buf.push('0')?;
+            }
+        }
+    }
+    if (trimZeros && withPoint) {
+        while (buf.length > 0 && buf[buf.length - 1] == '0') {
+            let _ = buf.pop();
+        }
+        if (buf.length > 0 && buf[buf.length - 1] == '.') {
+            let _ = buf.pop();
+        }
+    }
+    if (useExponent) {
+        var exp = point - 1;
+        buf.push('e')?;
+        if (exp < 0) {
+            buf.push('-')?;
+            exp = 0 - exp;
+        } else {
+            buf.push('+')?;
+        }
+        if (exp >= 100) {
+            buf.push(truncate<u8>(exp / 100) + '0')?;
+            exp = exp % 100;
+        }
+        buf.push(truncate<u8>(exp / 10) + '0')?;
+        buf.push(truncate<u8>(exp % 10) + '0')?;
+    }
+    let pad = if (width > buf.length) width - buf.length else 0;
+    if (pad > 0 && !zeroPad) {
+        for (i in 0..pad) {
+            out.push(' ')?;
+        }
+    }
+    var start: usize = 0;
+    if (pad > 0 && zeroPad) {
+        if (negative) {
+            out.push('-')?;
+            start = 1;
+        }
+        for (i in 0..pad) {
+            out.push('0')?;
+        }
+    }
+    out.extend(buf.view()[start..])?;
+    return Ok();
+}
+
+fn twoDigits(out: borrow mut Vector<u8>, value: i64) -> Result<void, AllocError> => appendInteger(out, value, 2, true);
+
+/// The digit of `value` at the place `divisor` (as datetimeFunc writes each digit).
+fn digitAt(value: i64, divisor: i64) -> u8 => truncate<u8>((value / divisor) % 10) + '0';
+
+/// YYYY-MM-DD, with a '-' before a negative year.
+fn appendDate(out: borrow mut Vector<u8>, x: borrow DateTime) -> Result<void, AllocError> {
+    if (x.year < 0) {
+        out.push('-')?;
+    }
+    let y = x.year.abs();
+    out.push(digitAt(y, 1000))?;
+    out.push(digitAt(y, 100))?;
+    out.push(digitAt(y, 10))?;
+    out.push(digitAt(y, 1))?;
+    out.push('-')?;
+    out.push(digitAt(x.month, 10))?;
+    out.push(digitAt(x.month, 1))?;
+    out.push('-')?;
+    out.push(digitAt(x.day, 10))?;
+    out.push(digitAt(x.day, 1))?;
+    return Ok();
+}
+
+/// HH:MM:SS, or HH:MM:SS.SSS with 'subsec'.
+fn appendTime(out: borrow mut Vector<u8>, x: borrow DateTime) -> Result<void, AllocError> {
+    out.push(digitAt(x.hour, 10))?;
+    out.push(digitAt(x.hour, 1))?;
+    out.push(':')?;
+    out.push(digitAt(x.minute, 10))?;
+    out.push(digitAt(x.minute, 1))?;
+    out.push(':')?;
+    if (x.useSubsec) {
+        let s = toInteger(1000.0 * x.second + 0.5);
+        out.push(digitAt(s, 10000))?;
+        out.push(digitAt(s, 1000))?;
+        out.push('.')?;
+        out.push(digitAt(s, 100))?;
+        out.push(digitAt(s, 10))?;
+        out.push(digitAt(s, 1))?;
+    } else {
+        let s = toInteger(x.second);
+        out.push(digitAt(s, 10))?;
+        out.push(digitAt(s, 1))?;
+    }
+    return Ok();
+}
+
+fn asciiText(bytes: Vector<u8>) -> Result<SqliteValue, SqliteError> =>
+    Ok(SqliteValue.Text(textFromBytesLossy(bytes.view())?));
+
+/// The days since the most recent January 1st (0 for January 1st).
+fn daysAfterJan01(x: borrow DateTime) -> i64 {
+    var jan01: DateTime = x;
+    jan01.validJD = false;
+    jan01.month = 1;
+    jan01.day = 1;
+    computeJD(mut jan01);
+    return (x.jd - jan01.jd + 43200000) / 86400000;
+}
+
+/// 0 for Monday … 6 for Sunday.
+fn daysAfterMonday(x: borrow DateTime) -> i64 => ((x.jd + 43200000) / 86400000) % 7;
+
+/// 0 for Sunday … 6 for Saturday.
+fn daysAfterSunday(x: borrow DateTime) -> i64 => ((x.jd + 129600000) / 86400000) % 7;
+
+/// The Thursday of the week of `x`, for the ISO week and year.
+fn thursdayOf(x: borrow DateTime) -> DateTime {
+    var y: DateTime = x;
+    y.jd = y.jd.wrappingAdd((3 - daysAfterMonday(x)) * 86400000);
+    y.validYMD = false;
+    computeYMD(mut y);
+    return y;
+}
+
+/// strftime(FORMAT, TIMESTRING, MOD, …).
+fn strftimeValue(values: Slice<SqliteValue>, nowMillis: i64) -> Result<SqliteValue, SqliteError> {
+    if (values.length == 0 || values[0].isNull()) {
+        return Ok(SqliteValue.Null);
+    }
+    let formatBytes = valueBytes(borrow values[0])?;
+    var x = DateTime.zero();
+    if (!isDate(values[1..], mut x, nowMillis)?) {
+        return Ok(SqliteValue.Null);
+    }
+    let format = beforeNul(formatBytes.view());
+    computeJD(mut x);
+    computeYMDHMS(mut x);
+    var out = Vector<u8>.create();
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < format.length) {
+        if (format[i] != '%') {
+            i += 1;
+            continue;
+        }
+        if (j < i) {
+            out.extend(format[j..i])?;
+        }
+        i += 1;
+        j = i + 1;
+        let cf = byteAt(format, i);
+        if (cf == 'd' || cf == 'e') {
+            appendInteger(mut out, x.day, 2, cf == 'd')?;
+        } else if (cf == 'f') {
+            var s = x.second;
+            if (s > 59.999) {
+                s = 59.999;
+            }
+            appendFloat(mut out, s, 3, false, 6, true)?;
+        } else if (cf == 'F') {
+            appendInteger(mut out, x.year, 4, true)?;
+            out.push('-')?;
+            twoDigits(mut out, x.month)?;
+            out.push('-')?;
+            twoDigits(mut out, x.day)?;
+        } else if (cf == 'G' || cf == 'g') {
+            let y = thursdayOf(borrow x);
+            if (cf == 'g') {
+                twoDigits(mut out, y.year % 100)?;
+            } else {
+                appendInteger(mut out, y.year, 4, true)?;
+            }
+        } else if (cf == 'H' || cf == 'k') {
+            appendInteger(mut out, x.hour, 2, cf == 'H')?;
+        } else if (cf == 'I' || cf == 'l') {
+            var h = x.hour;
+            if (h > 12) {
+                h -= 12;
+            }
+            if (h == 0) {
+                h = 12;
+            }
+            appendInteger(mut out, h, 2, cf == 'I')?;
+        } else if (cf == 'j') {
+            appendInteger(mut out, daysAfterJan01(borrow x) + 1, 3, true)?;
+        } else if (cf == 'J') {
+            appendFloat(mut out, toReal(x.jd) / 86400000.0, 16, true, 0, false)?;
+        } else if (cf == 'm') {
+            twoDigits(mut out, x.month)?;
+        } else if (cf == 'M') {
+            twoDigits(mut out, x.minute)?;
+        } else if (cf == 'p' || cf == 'P') {
+            let text = if (x.hour >= 12) (if (cf == 'p') "PM" else "pm") else (if (cf == 'p') "AM" else "am");
+            out.extend(text.bytes())?;
+        } else if (cf == 'R') {
+            twoDigits(mut out, x.hour)?;
+            out.push(':')?;
+            twoDigits(mut out, x.minute)?;
+        } else if (cf == 's') {
+            if (x.useSubsec) {
+                appendFloat(mut out, toReal(x.jd - UNIX_EPOCH_JD_MS) / 1000.0, 3, false, 0, false)?;
+            } else {
+                appendInteger(mut out, x.jd / 1000 - 210866760000, 0, false)?;
+            }
+        } else if (cf == 'S') {
+            twoDigits(mut out, toInteger(x.second))?;
+        } else if (cf == 'T') {
+            twoDigits(mut out, x.hour)?;
+            out.push(':')?;
+            twoDigits(mut out, x.minute)?;
+            out.push(':')?;
+            twoDigits(mut out, toInteger(x.second))?;
+        } else if (cf == 'u' || cf == 'w') {
+            var c = truncate<u8>(daysAfterSunday(borrow x)) + '0';
+            if (c == '0' && cf == 'u') {
+                c = '7';
+            }
+            out.push(c)?;
+        } else if (cf == 'U') {
+            twoDigits(mut out, (daysAfterJan01(borrow x) - daysAfterSunday(borrow x) + 7) / 7)?;
+        } else if (cf == 'V') {
+            let y = thursdayOf(borrow x);
+            twoDigits(mut out, daysAfterJan01(borrow y) / 7 + 1)?;
+        } else if (cf == 'W') {
+            twoDigits(mut out, (daysAfterJan01(borrow x) - daysAfterMonday(borrow x) + 7) / 7)?;
+        } else if (cf == 'Y') {
+            appendInteger(mut out, x.year, 4, true)?;
+        } else if (cf == '%') {
+            out.push('%')?;
+        } else {
+            return Ok(SqliteValue.Null);
+        }
+        i += 1;
+    }
+    if (j < i) {
+        out.extend(format[j..i])?;
+    }
+    return asciiText(out);
+}
+
+/// timediff(DATE1, DATE2): what to add to DATE2 to reach DATE1, as ±YYYY-MM-DD HH:MM:SS.SSS.
+fn timediffValue(values: Slice<SqliteValue>, nowMillis: i64) -> Result<SqliteValue, SqliteError> {
+    var d1 = DateTime.zero();
+    var d2 = DateTime.zero();
+    if (!isDate(values[0..1], mut d1, nowMillis)?) {
+        return Ok(SqliteValue.Null);
+    }
+    if (!isDate(values[1..2], mut d2, nowMillis)?) {
+        return Ok(SqliteValue.Null);
+    }
+    computeYMDHMS(mut d1);
+    computeYMDHMS(mut d2);
+    var sign: u8 = '+';
+    var y: i64 = 0;
+    var m: i64 = 0;
+    if (d1.jd >= d2.jd) {
+        y = d1.year - d2.year;
+        if (y != 0) {
+            d2.year = d1.year;
+            d2.validJD = false;
+            computeJD(mut d2);
+        }
+        m = d1.month - d2.month;
+        if (m < 0) {
+            y -= 1;
+            m += 12;
+        }
+        if (m != 0) {
+            d2.month = d1.month;
+            d2.validJD = false;
+            computeJD(mut d2);
+        }
+        while (d1.jd < d2.jd) {
+            m -= 1;
+            if (m < 0) {
+                m = 11;
+                y -= 1;
+            }
+            d2.month -= 1;
+            if (d2.month < 1) {
+                d2.month = 12;
+                d2.year -= 1;
+            }
+            d2.validJD = false;
+            computeJD(mut d2);
+        }
+        d1.jd -= d2.jd;
+        d1.jd += 148699540800000;
+    } else {
+        sign = '-';
+        y = d2.year - d1.year;
+        if (y != 0) {
+            d2.year = d1.year;
+            d2.validJD = false;
+            computeJD(mut d2);
+        }
+        m = d2.month - d1.month;
+        if (m < 0) {
+            y -= 1;
+            m += 12;
+        }
+        if (m != 0) {
+            d2.month = d1.month;
+            d2.validJD = false;
+            computeJD(mut d2);
+        }
+        while (d1.jd > d2.jd) {
+            m -= 1;
+            if (m < 0) {
+                m = 11;
+                y -= 1;
+            }
+            d2.month += 1;
+            if (d2.month > 12) {
+                d2.month = 1;
+                d2.year += 1;
+            }
+            d2.validJD = false;
+            computeJD(mut d2);
+        }
+        d1.jd = d2.jd - d1.jd;
+        d1.jd += 148699540800000;
+    }
+    clearCalendar(mut d1);
+    computeYMDHMS(mut d1);
+    var out = Vector<u8>.create();
+    out.push(sign)?;
+    appendInteger(mut out, y, 4, true)?;
+    out.push('-')?;
+    twoDigits(mut out, m)?;
+    out.push('-')?;
+    twoDigits(mut out, d1.day - 1)?;
+    out.push(' ')?;
+    twoDigits(mut out, d1.hour)?;
+    out.push(':')?;
+    twoDigits(mut out, d1.minute)?;
+    out.push(':')?;
+    appendFloat(mut out, d1.second, 3, false, 6, true)?;
+    return asciiText(out);
+}
+
+/// Calls one of the date and time functions on its evaluated arguments.
+fn dateTimeFunction(
+    function: ScalarFunction,
+    values: Slice<SqliteValue>,
+    nowMillis: i64,
+) -> Result<SqliteValue, SqliteError> {
+    if (function == ScalarFunction.Strftime) {
+        return strftimeValue(values, nowMillis);
+    }
+    if (function == ScalarFunction.TimeDiff) {
+        return timediffValue(values, nowMillis);
+    }
+    var x = DateTime.zero();
+    if (!isDate(values, mut x, nowMillis)?) {
+        return Ok(SqliteValue.Null);
+    }
+    var out = Vector<u8>.create();
+    match (function) {
+        ScalarFunction.JulianDay => {
+            computeJD(mut x);
+            return Ok(SqliteValue.Real(toReal(x.jd) / 86400000.0));
+        }
+        ScalarFunction.UnixEpoch => {
+            computeJD(mut x);
+            if (x.useSubsec) {
+                return Ok(SqliteValue.Real(toReal(x.jd - UNIX_EPOCH_JD_MS) / 1000.0));
+            }
+            return Ok(SqliteValue.Integer(x.jd / 1000 - 210866760000));
+        }
+        ScalarFunction.Date => {
+            computeYMD(mut x);
+            appendDate(mut out, borrow x)?;
+        }
+        ScalarFunction.Time => {
+            computeHMS(mut x);
+            appendTime(mut out, borrow x)?;
+        }
+        _ => {
+            computeYMDHMS(mut x);
+            appendDate(mut out, borrow x)?;
+            out.push(' ')?;
+            appendTime(mut out, borrow x)?;
+        }
+    }
+    return asciiText(out);
+}

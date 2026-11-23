@@ -1,0 +1,147 @@
+// The date and time functions, answered by this engine and by the sqlite3 shell, compared as the shell prints
+// them. Every mismatch in a group is reported, not only the first. Times are fixed: 'now' appears only where
+// its value is not shown.
+
+/// Like sameAnswers (query_tests.cee), but reports every query whose answers differ.
+fn allSameAnswers(path: StringView, queries: StringView) -> Result<void, TestFailure> {
+    var session = Session.open(path)!;
+    var lines = queries.split("\n");
+    var report = String.create();
+    while (lines.next() is Some(line)) {
+        let sql = line.trim();
+        if (sql.length == 0 || sql.startsWith("--")) {
+            continue;
+        }
+        let theirs = theirAnswer(path, sql);
+        let mine = ours(mut session, sql);
+        if (theirs.view() != mine.view()) {
+            report.append(sql)!;
+            report.append("\n  sqlite3:\n")!;
+            report.append(theirs.view())!;
+            report.append("  this engine:\n")!;
+            report.append(mine.view())!;
+        }
+    }
+    if (report.length > 0) {
+        return Check.fail(report.view());
+    }
+    return Ok();
+}
+
+fn dateFixture(name: StringView) -> Result<String, TestFailure> {
+    var path = String.from("out/datetime-")!;
+    path.append(name)!;
+    path.append(".db")!;
+    makeDatabase(path.view(), """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, v);
+        INSERT INTO t VALUES (1, '2024-02-29 13:45:30.250'), (2, 2460000.5), (3, 1700000000), (4, NULL),
+            (5, 'garbage'), (6, '0000-01-01'), (7, '9999-12-31 23:59:59.999'), (8, x'323032302d30312d3031');
+        """)?;
+    return Ok(path);
+}
+
+@test
+fn dateTimeValues() -> Result<void, TestFailure> {
+    let path = dateFixture("values")?;
+    return allSameAnswers(path.view(), """
+        SELECT date('2024-02-29'), time('2024-02-29'), datetime('2024-02-29'), julianday('2024-02-29'), unixepoch('2024-02-29')
+        SELECT datetime('2024-02-29 13:45'), datetime('2024-02-29 13:45:30'), datetime('2024-02-29 13:45:30.123456789')
+        SELECT datetime('2024-02-29T13:45:30'), datetime('2024-02-29   13:45'), datetime('2024-02-29T  13:45')
+        SELECT datetime('13:45'), datetime('13:45:30.5'), time('24:00'), datetime('24:00:00'), date('12:00')
+        SELECT datetime('2024-02-29 13:45+02:30'), datetime('2024-02-29 13:45-11:15'), datetime('2024-02-29 13:45Z'), datetime('2024-02-29 13:45 z ')
+        SELECT datetime('13:45+01:00'), datetime('2024-02-29 13:45 +00:00'), datetime('2024-02-29 13:45+14:59'), datetime('2024-02-29 13:45+15:00')
+        SELECT datetime('2024-02-30'), date('2023-02-29'), date('2023-04-31'), date('2023-02-31'), date('2024-13-01'), date('2024-00-10'), date('2024-01-00'), date('2024-01-32')
+        SELECT date('2024-2-29'), date('24-02-29'), date(' 2024-02-29'), date('2024-02-29 '), date('2024-02-29x'), date('2024-02-29 13'), date('2024-02-29 13:4')
+        SELECT datetime('2024-02-29 13:45:3'), datetime('2024-02-29 13:60'), datetime('2024-02-29 25:00'), datetime('2024-02-29 13:45:60'), datetime('2024-02-29 13:45:59.')
+        SELECT date('0000-01-01'), datetime('-0001-06-15 10:00'), date('-4713-11-24'), julianday('-4713-11-24 12:00'), date('-4713-11-24 11:59:59'), date('-4714-01-01')
+        SELECT date('9999-12-31'), datetime('9999-12-31 23:59:59.999'), date('10000-01-01'), datetime('9999-12-31 23:59:59.9999'), julianday('9999-12-31 23:59:59.999')
+        SELECT julianday('2000-01-01 12:00'), julianday('1970-01-01'), julianday('2024-02-29 13:45:30.25'), julianday('0000-01-01 00:00:00.001')
+        SELECT date(2460000.5), datetime(2460000.25), datetime(0), datetime(0.5), datetime(-1), datetime(5373484.4999999), datetime(5373484.5), julianday(5373484.49999)
+        SELECT date('2460000.5'), datetime(' 2460000.5 '), datetime('2460000.5x'), datetime('1e6'), datetime('.5'), datetime('5.'), datetime('-0'), datetime('+1')
+        SELECT datetime(1700000000), datetime(1700000000, 'unixepoch'), datetime(-1700000000.5, 'unixepoch'), datetime(1e300), datetime('1e999'), datetime(9223372036854775807)
+        SELECT date(NULL), date(''), date('now ') IS NULL, date('NOW') = date('now'), datetime('now') = datetime('now'), julianday('now') > 2460000, unixepoch() > 1700000000
+        SELECT date() = date('now'), time() = time('now'), length(datetime('subsec')), length(time('subsecond')), datetime('SubSec') = datetime('now', 'subsec')
+        SELECT date(x'323032342d30322d3239'), date(x'32303234'), datetime(20240229), date(2024.5), time(12.5)
+        SELECT date(v), datetime(v), julianday(v), unixepoch(v), time(v) FROM t ORDER BY id
+        SELECT date('2024-02-29' || char(0) || 'junk'), date(1, 2, 3), datetime('2024-02-29', NULL), datetime('2024-02-29', '')
+        """);
+}
+
+@test
+fn dateTimeModifiers() -> Result<void, TestFailure> {
+    let path = dateFixture("modifiers")?;
+    return allSameAnswers(path.view(), """
+        SELECT datetime('2024-02-29 13:45:30', '+1 day'), datetime('2024-02-29 13:45:30', '-1 days'), datetime('2024-02-29 13:45:30', '+1.5 days'), datetime('2024-02-29', '+0.000001 days')
+        SELECT datetime('2024-02-29 13:45:30', '+3 hours'), datetime('2024-02-29 13:45:30', '-90 minutes'), datetime('2024-02-29 13:45:30', '+30.5 seconds'), datetime('2024-02-29 13:45:30', '+1e3 seconds')
+        SELECT datetime('2024-02-29 13:45:30', '+1 HOURS'), datetime('2024-02-29', ' +1 day'), datetime('2024-02-29', '+1  day'), datetime('2024-02-29', '+1day'), datetime('2024-02-29', '1 day'), datetime('2024-02-29', '+1 dayss'), datetime('2024-02-29', '+1 fortnight')
+        SELECT datetime('2024-02-29', '+1 month'), datetime('2024-01-31', '+1 month'), datetime('2024-01-31', '+1 month', 'floor'), datetime('2024-01-31', '+1 month', 'ceiling'), datetime('2023-01-31', '+1 month', 'floor')
+        SELECT datetime('2024-03-31', '-1 month'), datetime('2024-03-31', '-1 month', 'floor'), datetime('2024-01-15', '+1.5 months'), datetime('2024-01-15', '-13 months'), datetime('2024-01-15', '+25 months')
+        SELECT datetime('2024-02-29', '+1 year'), datetime('2024-02-29', '+1 year', 'floor'), datetime('2024-02-29', '-4 years'), datetime('2024-02-29', '+1.25 years'), datetime('2024-02-29', '+8000 years'), datetime('2024-02-29', '-6738 years')
+        SELECT datetime('2024-05-31', 'floor'), datetime('2024-05-31', 'ceiling'), datetime('2023-02-31', 'floor'), datetime('2023-02-31', '+0 days', 'floor'), datetime('2023-02-31', 'start of day', 'floor')
+        SELECT datetime('2024-02-29 13:45:30', 'start of day'), datetime('2024-02-29 13:45:30', 'start of month'), datetime('2024-02-29 13:45:30', 'start of year'), datetime('2024-02-29', 'start of week'), datetime('2024-02-29', 'START OF MONTH'), datetime('2024-02-29', 'start of month ')
+        SELECT datetime('13:45', 'start of day'), datetime(1700000000, 'start of day'), datetime(2460000.5, 'start of month'), datetime('2024-02-29', 'start of')
+        SELECT date('2024-02-29', 'weekday 0'), date('2024-02-29', 'weekday 4'), date('2024-02-29', 'weekday 6'), date('2024-02-29', 'weekday 7'), date('2024-02-29', 'weekday 1.5'), date('2024-02-29', 'weekday 2.0'), date('2024-02-29', 'weekday  3'), date('2024-02-29', 'WEEKDAY 3'), date('2024-02-29', 'weekday')
+        SELECT datetime(1700000000.5, 'unixepoch'), datetime('1700000000', 'unixepoch'), datetime(1700000000, 'unixepoch', 'unixepoch'), datetime('2024-02-29', 'unixepoch'), datetime(1700000000, '+1 day', 'unixepoch'), datetime(-210866760001, 'unixepoch'), datetime(253402300800, 'unixepoch')
+        SELECT datetime(2460000.5, 'julianday'), datetime('2460000.5', 'julianday'), datetime(1700000000, 'julianday'), datetime('2024-02-29', 'julianday'), datetime(2460000.5, '+1 day', 'julianday')
+        SELECT datetime(2460000.5, 'auto'), datetime(1700000000, 'auto'), datetime(-1, 'auto'), datetime(253402300799, 'auto'), datetime(253402300800, 'auto'), datetime(-210866760000, 'auto'), datetime('2024-02-29', 'auto'), datetime(1700000000, '+1 day', 'auto')
+        SELECT datetime('2024-02-29 13:45:30.123', 'subsec'), time('13:45:30.5', 'subsecond'), datetime(1700000000.123, 'unixepoch', 'subsec'), unixepoch('2024-02-29 13:45:30.123', 'subsec'), unixepoch('1969-12-31 23:59:59.5', 'subsec'), unixepoch('1969-12-31 23:59:59.5')
+        SELECT datetime('2024-02-29 13:45:30', '+01:30'), datetime('2024-02-29 13:45:30', '-01:30:15.5'), datetime('2024-02-29 13:45:30', '+24:00'), datetime('2024-02-29 13:45:30', '+25:00'), datetime('2024-02-29', '-5:30'), datetime('2024-02-29', '12:00')
+        SELECT datetime('2024-02-29 13:45:30', '+0001-02-03'), datetime('2024-02-29 13:45:30', '-0001-02-03'), datetime('2024-02-29', '+0000-11-30'), datetime('2024-02-29', '+0000-12-00'), datetime('2024-02-29', '+0000-00-31'), datetime('2024-02-29', '0001-00-00')
+        SELECT datetime('2024-02-29 13:45:30', '+0001-01-01 10:20'), datetime('2024-02-29 13:45:30', '-0000-00-00 01:02:03.5'), datetime('2024-02-29', '+0001-01-01x'), datetime('2024-02-29', '+0001-01-01 1:00'), datetime('2024-01-31', '+0000-01-00'), datetime('2024-01-31', '+0000-01-00', 'floor')
+        SELECT datetime('2024-02-29', '+10000-00-00'), datetime('2000-02-29', '-01999-00-00'), datetime('2024-02-29', '+12345-01-01')
+        SELECT datetime('2024-02-29', '+464269060799 seconds'), datetime('2024-02-29', '+464270000000000 seconds'), datetime('2024-02-29', '-5373485 days'), datetime('2024-02-29', '+176545 months'), datetime('2024-02-29', '+14712 years')
+        SELECT datetime('2024-02-29Z', 'utc'), datetime('now', 'utc') = datetime('now'), datetime('2024-02-29 10:00+00:00', 'utc'), datetime('2024-02-29 10:00+01:00', 'utc')
+        SELECT datetime('2024-02-29', 'nonsense'), datetime('2024-02-29', 'start of day', 'bogus'), datetime('2024-02-29', '+'), datetime('2024-02-29', '-x days'), datetime('2024-02-29', 5), datetime('2024-02-29', 1.5)
+        SELECT date('2024-02-29', '+1 month', '-1 day', 'start of month', 'weekday 1', '+7 days'), datetime(v, '+1 hour') FROM t ORDER BY id
+        """);
+}
+
+@test
+fn strftimeSpecifiers() -> Result<void, TestFailure> {
+    let path = dateFixture("strftime")?;
+    return allSameAnswers(path.view(), """
+        SELECT strftime('%d|%e|%f|%F|%G|%g|%H|%k|%I|%l|%j|%J|%m|%M|%p|%P|%R|%s|%S|%T|%u|%w|%U|%V|%W|%Y|%%', '2024-02-29 13:45:30.250')
+        SELECT strftime('%d|%e|%f|%F|%G|%g|%H|%k|%I|%l|%j|%J|%m|%M|%p|%P|%R|%s|%S|%T|%u|%w|%U|%V|%W|%Y|%%', '2021-01-03 00:05:09')
+        SELECT strftime('%d|%e|%f|%F|%G|%g|%H|%k|%I|%l|%j|%J|%m|%M|%p|%P|%R|%s|%S|%T|%u|%w|%U|%V|%W|%Y|%%', '0000-01-01')
+        SELECT strftime('%d|%e|%f|%F|%G|%g|%H|%k|%I|%l|%j|%J|%m|%M|%p|%P|%R|%s|%S|%T|%u|%w|%U|%V|%W|%Y|%%', '9999-12-31 23:59:59.999')
+        SELECT strftime('%d|%e|%f|%F|%G|%g|%H|%k|%I|%l|%j|%J|%m|%M|%p|%P|%R|%s|%S|%T|%u|%w|%U|%V|%W|%Y|%%', '-0044-03-15 12:00')
+        SELECT strftime('%d|%e|%f|%F|%G|%g|%j|%J|%s|%u|%w|%U|%V|%W|%Y', '-4713-11-24 12:00:00')
+        SELECT strftime('%G-%V-%u', '2020-12-31'), strftime('%G-%V-%u', '2021-01-01'), strftime('%G-%V-%u', '2026-12-28'), strftime('%G-%V-%u', '2027-01-03'), strftime('%G %g %V', '2015-12-31'), strftime('%g', '2009-12-31')
+        SELECT strftime('%I %l %p', '2024-02-29 00:30'), strftime('%I %l %p', '2024-02-29 12:30'), strftime('%I %l %P', '2024-02-29 23:30'), strftime('%k %H', '24:00')
+        SELECT strftime('%J', 2460000.5), strftime('%J', 0), strftime('%J', 0.00000001), strftime('%J', '2024-02-29 13:45:30.001'), strftime('%J', 5373484.4999)
+        SELECT strftime('%s', '1969-12-31 23:59:59'), strftime('%s', '1969-12-31 23:59:59.5', 'subsec'), strftime('%s', '2024-02-29 13:45:30.123', 'subsec'), strftime('%s', '-4713-11-24 12:00', 'subsec'), strftime('%f', '13:45:05.5'), strftime('%f', '13:45:00')
+        SELECT strftime('%Q', '2024-02-29'), strftime('abc%', '2024-02-29'), strftime('', '2024-02-29'), strftime('plain', '2024-02-29'), strftime('%Y%m%d%H%M%S', '2024-02-29 13:45:30'), strftime('é%Y€', '2024-02-29')
+        SELECT strftime(NULL, '2024-02-29'), strftime('%Y', NULL), strftime('%Y'), strftime('%Y', 'now') = strftime('%Y'), strftime(), strftime(2024, '2024-02-29'), strftime('%Y', '2024-02-29', '+1 year')
+        SELECT strftime('%Y-%m-%d', v), strftime('%j %U %W %V', v) FROM t ORDER BY id
+        SELECT strftime('%j', '2023-12-31'), strftime('%j', '2024-12-31'), strftime('%U %W', '2023-01-01'), strftime('%U %W', '2024-01-01'), strftime('%U %W', '2024-12-31')
+        """);
+}
+
+@test
+fn timediffAndErrors() -> Result<void, TestFailure> {
+    let path = dateFixture("timediff")?;
+    allSameAnswers(path.view(), """
+        SELECT timediff('2024-03-01', '2024-02-29'), timediff('2024-02-29', '2024-03-01'), timediff('2024-02-29 13:45:30.5', '2023-01-31 23:00:00')
+        SELECT timediff('2023-01-31 23:00:00', '2024-02-29 13:45:30.5'), timediff('2024-03-31', '2024-02-29'), timediff('2024-02-29', '2024-03-31'), timediff('2024-01-31', '2024-03-01')
+        SELECT timediff('0000-01-01', '9999-12-31 23:59:59.999'), timediff('9999-12-31 23:59:59.999', '0000-01-01'), timediff('2024-02-29', '2024-02-29')
+        SELECT timediff(2460000.5, 2459000.25), timediff('2024-02-29', NULL), timediff('x', '2024-02-29'), timediff('2024-02-30', '2024-02-29'), timediff('12:00', '13:30:15.25')
+        SELECT datetime('2024-02-29', timediff('2025-06-30 10:00', '2024-02-29')), timediff('2024-01-01 10:00+02:00', '2024-01-01')
+        SELECT timediff('2024-02-29'), date(), julianday(1, 2, 3)
+        """)?;
+    // 'localtime' and 'utc' need a time zone, which CeeSafe cannot give: they are an error where SQLite needs one.
+    var session = Session.open(path.view())!;
+    let local = ours(mut session, "SELECT datetime('2024-02-29', 'localtime')");
+    if (!local.view().startsWith("error: local time unavailable")) {
+        return Check.fail(local.view());
+    }
+    let utc = ours(mut session, "SELECT datetime('2024-02-29', 'utc')");
+    if (!utc.view().startsWith("error: local time unavailable")) {
+        return Check.fail(utc.view());
+    }
+    // A time already known to be UTC needs no zone for 'utc'.
+    let known = ours(mut session, "SELECT datetime('2024-02-29 10:00Z', 'utc')");
+    if (known.view() != "2024-02-29 10:00:00\n") {
+        return Check.fail(known.view());
+    }
+    return Ok();
+}

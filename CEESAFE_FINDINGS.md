@@ -46,6 +46,16 @@ There is no `String.push(byte)` or `appendAscii(bytes)`; building numbers digit 
 
 Workaround: a local `appendAscii` helper (`src/numeric.cee`).
 
+### 14. No local time zone
+
+`Clock` gives UTC only: there is no `localtime_r` equivalent (the offset from UTC and whether daylight saving
+applies at a given moment), nor a way to read the system's zone. SQLite's 'localtime' and 'utc' modifiers convert
+through it.
+
+Workaround: those modifiers are an error, "local time unavailable", where SQLite would consult the zone
+(`src/datetime.cee`). Reading `TZ` and the TZif files under `/usr/share/zoneinfo` by hand is possible but would
+reimplement the C library's zone rules.
+
 ## Rough edges
 
 ### 6. Two interfaces cannot each have a method of the same name on one type
