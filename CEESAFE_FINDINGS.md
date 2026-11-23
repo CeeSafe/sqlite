@@ -108,3 +108,29 @@ Workaround: `withoutCollate(e) -> borrow Expr` (`src/select.cee`).
 `replace(mut rows[i], Vector.create())`, or repeated `remove(0)`, which is quadratic.
 
 Workaround: `takeRow` (`src/run.cee`).
+
+### 15. A package has one namespace for top-level names
+
+Every top-level function of a package shares one namespace, and there is no file-private visibility. Two
+files written apart (`datetime.cee` and `printf.cee`, ported in parallel) each defined `appendInteger` and
+`appendFloat`, and the merge stopped compiling with N0201. A file-private (or module) scope would let helpers keep
+short names.
+
+Workaround: prefix helpers with their file's subject (`printfInteger`).
+
+### 16. Constant arrays cannot hold `f64`
+
+A `const` or `static` array of `f64` is refused, so tables of factors (date.c's unit limits) are kept as `i64`
+and converted where they are used.
+
+### 17. A slice of an array literal cannot be returned
+
+`return [a, b][..];` from a function returning `Slice<T>` is refused: the array literal is a temporary. Fixed
+tables need a `static`, even when the values are constants.
+
+Workaround: `static PRAGMA_COLUMNS_n` (`src/pragma.cee`).
+
+### 18. More common names are reserved
+
+Besides `drop` and `own` (finding 10), `internal` and `match` cannot be used as names (a field `internal`, a
+function `match`), and the error does not say the word is reserved.
