@@ -249,7 +249,12 @@ fn insertIntoView(
         }
     }
     db.changes = 0;
-    return Ok(QueryResult { columns: returningNames(borrow stmt.returning, borrow table)?, rows: output });
+    return Ok(
+        QueryResult {
+            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow table)?,
+            rows: output,
+        },
+    );
 }
 
 /// DELETE from a view.
@@ -296,7 +301,12 @@ fn deleteFromView(
         }
     }
     db.changes = 0;
-    return Ok(QueryResult { columns: returningNames(borrow stmt.returning, borrow table)?, rows: output });
+    return Ok(
+        QueryResult {
+            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow table)?,
+            rows: output,
+        },
+    );
 }
 
 /// UPDATE on a view (UPDATE … FROM too).
@@ -362,5 +372,10 @@ fn updateView(
         }
     }
     db.changes = 0;
-    return Ok(QueryResult { columns: returningNames(borrow stmt.returning, borrow table)?, rows: output });
+    return Ok(
+        QueryResult {
+            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow table)?,
+            rows: output,
+        },
+    );
 }

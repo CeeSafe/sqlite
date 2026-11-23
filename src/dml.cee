@@ -134,10 +134,16 @@ fn addKeySuffix(
 }
 
 fn tableScope(table: borrow TableSchema, slot: usize) -> Result<Scope, AllocError> {
+    let none: String? = null;
+    return tableScopeNamed(table, slot, borrow none);
+}
+
+/// The table's scope, its row named by `alias` when there is one (`UPDATE t AS x`), else by the table's name.
+fn tableScopeNamed(table: borrow TableSchema, slot: usize, alias: borrow String?) -> Result<Scope, AllocError> {
     var scope = Scope { sources: Vector<ScopeSource>.create() };
     scope.sources.push(
         ScopeSource {
-            name: table.name.clone()?,
+            name: if (alias is Some(a)) a.clone()? else table.name.clone()?,
             columns: tableScopeColumns(table)?,
             slot: slot,
             hasRowid: !table.withoutRowid,
@@ -1208,7 +1214,12 @@ fn executeInsert(
     writer.finish(mut frame, db)?;
     db.changes = count;
     db.totalChanges += count;
-    return Ok(QueryResult { columns: returningNames(borrow stmt.returning, borrow writer.table)?, rows: output });
+    return Ok(
+        QueryResult {
+            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
+            rows: output,
+        },
+    );
 }
 
 /// RETURNING's expressions, compiled in the table's scope; `*` is every column.
@@ -1234,14 +1245,30 @@ fn compileReturning(
     return Ok(out);
 }
 
+/// RETURNING's column names, as SQLite gives them: an alias; a column's declared name; else the text as written.
 fn returningNames(
     columns: borrow Vector<ResultColumn>,
+    texts: borrow Vector<String>,
     table: borrow TableSchema,
 ) -> Result<Vector<String>, AllocError> {
     var names = Vector<String>.create();
     for (i in 0..columns.length) {
         match (borrow columns[i]) {
-            ResultColumn.Expr(e, alias) => { names.push(if (alias is Some(a)) a.clone()? else defaultColumnName(e)?)?; }
+            ResultColumn.Expr(e, alias) => {
+                if (alias is Some(a)) {
+                    names.push(a.clone()?)?;
+                } else if (e is Expr.Column(c) && table.indexOf(c.name.view()) is Some(at)) {
+                    names.push(table.columns[at].name.clone()?)?;
+                } else if (e is Expr.Column(c) && isRowidName(c.name.view())) {
+                    names.push(
+                        if (table.rowidAlias is Some(at)) table.columns[at].name.clone()? else String.from("rowid")?,
+                    )?;
+                } else if (i < texts.length && texts[i].length != 0) {
+                    names.push(texts[i].clone()?)?;
+                } else {
+                    names.push(defaultColumnName(e)?)?;
+                }
+            }
             _ => {
                 for (c in 0..table.columns.length) {
                     names.push(table.columns[c].name.clone()?)?;
@@ -1335,7 +1362,11 @@ fn executeDelete(
     }
     var filter: XExpr? = null;
     if (borrow stmt.filter is Some(f)) {
-        filter = compileInTable(mut compiler, f, borrow writer.table, writer.slot, db)?;
+        let saved = replace(mut compiler.scopes, compiler.freshScopes()?);
+        compiler.scopes.push(tableScopeNamed(borrow writer.table, writer.slot, borrow stmt.alias)?)?;
+        let compiled = compiler.compile(f, db);
+        compiler.scopes = saved;
+        filter = compiled?;
     }
     let returning = compileReturning(mut compiler, borrow stmt.returning, borrow writer, db)?;
     var frame = newFrame(mut compiler, params, db)?;
@@ -1398,7 +1429,12 @@ fn executeDelete(
     writer.finish(mut frame, db)?;
     db.changes = count;
     db.totalChanges += db.changes;
-    return Ok(QueryResult { columns: returningNames(borrow stmt.returning, borrow writer.table)?, rows: output });
+    return Ok(
+        QueryResult {
+            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
+            rows: output,
+        },
+    );
 }
 
 /// The columns an UPDATE (or an upsert's DO UPDATE) sets, and their new values.
@@ -1589,7 +1625,7 @@ fn executeUpdate(
         let _ = compileWith(mut compiler, with, db)?;
     }
     let saved = replace(mut compiler.scopes, compiler.freshScopes()?);
-    compiler.scopes.push(tableScope(borrow writer.table, writer.slot)?)?;
+    compiler.scopes.push(tableScopeNamed(borrow writer.table, writer.slot, borrow stmt.alias)?)?;
     let set = compileAssignments(mut compiler, borrow stmt.assignments, borrow writer.table, db);
     var filter: XExpr? = null;
     if (borrow stmt.filter is Some(f)) {
@@ -1618,7 +1654,12 @@ fn executeUpdate(
     writer.finish(mut frame, db)?;
     db.changes = count;
     db.totalChanges += count;
-    return Ok(QueryResult { columns: returningNames(borrow stmt.returning, borrow writer.table)?, rows: output });
+    return Ok(
+        QueryResult {
+            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
+            rows: output,
+        },
+    );
 }
 
 /// An upsert clause compiled: the constraint it answers (a unique index, or the rowid; any for none), and what
@@ -1706,7 +1747,7 @@ fn compileUpserts(
         }
         // DO UPDATE sees the existing row by the table's name and the proposed one as "excluded".
         let saved = replace(mut compiler.scopes, compiler.freshScopes()?);
-        var scope = tableScope(table, writer.slot)?;
+        var scope = tableScopeNamed(table, writer.slot, borrow stmt.alias)?;
         // Unqualified names are the table's: "excluded" is named only when written.
         var hidden = Vector<String>.create();
         for (c in 0..table.columns.length) {
@@ -1779,7 +1820,7 @@ fn executeUpdateFrom(
         let named = Expr.Column(
             ColumnRef {
                 schema: null,
-                table: stmt.table.name.clone()?,
+                table: if (borrow stmt.alias is Some(a)) a.clone()? else stmt.table.name.clone()?,
                 name: replace(mut keyNames[k], String.create()),
                 doubleQuoted: false,
             },
@@ -1798,7 +1839,12 @@ fn executeUpdateFrom(
         joins.push(cloneJoin(borrow from.joins[j])?)?;
     }
     let target = FromItem.Table(
-        TableSource { name: cloneName(borrow stmt.table)?, alias: null, indexedBy: null, notIndexed: false },
+        TableSource {
+            name: cloneName(borrow stmt.table)?,
+            alias: cloneString(borrow stmt.alias)?,
+            indexedBy: null,
+            notIndexed: false,
+        },
     );
     var cores = Vector<SelectCore>.create();
     cores.push(
@@ -1877,5 +1923,10 @@ fn executeUpdateFrom(
     writer.finish(mut frame, db)?;
     db.changes = count;
     db.totalChanges += count;
-    return Ok(QueryResult { columns: returningNames(borrow stmt.returning, borrow writer.table)?, rows: output });
+    return Ok(
+        QueryResult {
+            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
+            rows: output,
+        },
+    );
 }

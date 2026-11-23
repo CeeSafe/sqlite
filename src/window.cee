@@ -368,6 +368,8 @@ fn computePartition(
             filter: null,
             collation: spec.collation,
             star: false,
+            orderBy: Vector<XOrderTerm>.create(),
+            replaySlot: 0,
         };
     }
     let isNth = spec.function is WindowFunction.NthValue;

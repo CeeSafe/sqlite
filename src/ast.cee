@@ -164,6 +164,8 @@ struct FunctionCall {
     filter: Expr?;
     /// A window function when present.
     over: OverClause?;
+    /// `group_concat(x ORDER BY y)`: the order an aggregate takes its rows in.
+    orderBy: Vector<OrderTerm>;
 }
 
 struct WhenThen {
@@ -369,6 +371,10 @@ struct InsertStmt {
     source: InsertSource;
     upserts: Vector<UpsertClause>;
     returning: Vector<ResultColumn>;
+    /// `INTO t AS alias`: the name DO UPDATE uses for the row.
+    alias: String?;
+    /// Each RETURNING column's text as written, which names it.
+    returningTexts: Vector<String>;
 }
 
 struct UpdateStmt {
@@ -379,6 +385,9 @@ struct UpdateStmt {
     from: FromClause?;
     filter: Expr?;
     returning: Vector<ResultColumn>;
+    /// `UPDATE t AS alias`: the name SET, FROM and WHERE use for the row.
+    alias: String?;
+    returningTexts: Vector<String>;
 }
 
 struct DeleteStmt {
@@ -386,6 +395,9 @@ struct DeleteStmt {
     table: QualifiedName;
     filter: Expr?;
     returning: Vector<ResultColumn>;
+    /// `DELETE FROM t AS alias`: the name WHERE uses for the row.
+    alias: String?;
+    returningTexts: Vector<String>;
 }
 
 /// A column of CREATE TABLE: its name, and the tokens of its type and constraints, which the schema catalog reads.
@@ -675,6 +687,7 @@ fn cloneExpr(e: borrow Expr) -> Result<Expr, AllocError> {
                             args: cloneExprList(borrow f.args)?,
                             filter: cloneOptional(borrow f.filter)?,
                             over: over,
+                            orderBy: cloneOrderList(borrow f.orderBy)?,
                         },
                     )?,
                 ),

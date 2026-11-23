@@ -683,6 +683,13 @@ impl Compiler {
     ) -> Result<Compiled, SqliteError> {
         let name = call.name.view();
         let argc = call.args.length;
+        if (call.orderBy.length != 0) {
+            let aggregate = aggregateFunctionNamed(name, argc, call.star).isSome();
+            let misplaced = if (call.over.isSome()) windowOnlyFunctionNamed(name).isNull() else !aggregate;
+            if (misplaced) {
+                return Err(functionNameError("ORDER BY may not be used with non-aggregate ", name, "()"));
+            }
+        }
         if (borrow call.over is Some(over)) {
             return this.windowCall(call, over, db);
         }
@@ -708,6 +715,18 @@ impl Compiler {
             if (borrow call.filter is Some(f)) {
                 filter = this.compile(f, db)?;
             }
+            // ORDER BY matters to the aggregates that join their rows; the others take it and ignore it.
+            var orderBy = this.orderTerms(call.orderBy.view(), db)?;
+            let ordered =
+                function == AggregateFunction.GroupConcat ||
+                    function == AggregateFunction.JsonGroupArray || function == AggregateFunction.JsonGroupObject;
+            var replaySlot: usize = 0;
+            if (orderBy.length != 0 && ordered) {
+                replaySlot = this.slotsInUse;
+                this.slotsInUse += 1;
+            } else {
+                orderBy = Vector<XOrderTerm>.create();
+            }
             this.context = CallContext.Aggregates;
             if (call.distinct && argc != 1) {
                 return Err(functionNameError("DISTINCT aggregates must have exactly one argument", "", ""));
@@ -723,6 +742,8 @@ impl Compiler {
                     filter: filter,
                     collation: collation,
                     star: call.star,
+                    orderBy: orderBy,
+                    replaySlot: replaySlot,
                 },
             )?;
             if (givesJson) {

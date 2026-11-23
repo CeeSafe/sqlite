@@ -334,6 +334,13 @@ would take Apple's algorithms, which are not published. The tests use arguments 
   changes() stays 0, and DROP VIEW drops the view's triggers. A trigger body's changes count in
   total_changes(), as in SQLite; this engine had left them out.
 
+- **Target aliases, RETURNING names, ordered aggregates** (`targetAliasesAndReturningNames`,
+  `returningColumnNamesMatchSqlite`, `orderedAggregatesMatchSqlite`): `UPDATE t AS x`, `DELETE FROM t AS x` and
+  `INSERT INTO t AS x … DO UPDATE` name the row by the alias in SET, WHERE and DO UPDATE (RETURNING keeps the
+  table's name, as in SQLite); RETURNING's columns are named from the statement's text; `group_concat(x ORDER BY
+  y)` and the JSON aggregates take their rows in order, the other aggregates accept and ignore ORDER BY, and a
+  non-aggregate is "ORDER BY may not be used with non-aggregate f()". The C# refused all three.
+
 ## Known differences from SQLite in PRAGMA integrity_check
 
 The report matches the `sqlite3` shell's row for row on the tests' damaged files, with these exceptions:
@@ -360,10 +367,9 @@ The report matches the `sqlite3` shell's row for row on the tests' damaged files
 ## Known gaps (inherited from the C# engine, refused by name rather than misparsed)
 
 `CREATE VIRTUAL TABLE`, `EXPLAIN`, parenthesized joins
-in FROM, aliases on the target of INSERT, UPDATE and DELETE, and `ORDER BY` inside an aggregate's arguments.
+in FROM.
 `ON CONFLICT` clauses on column and table constraints are read and not applied, and collations other than
 BINARY, NOCASE and RTRIM are refused.
-RETURNING's column names are written again from the expression's tree, not taken from the statement's text.
 
 ## Limits
 

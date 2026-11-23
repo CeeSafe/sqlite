@@ -596,6 +596,10 @@ struct AggregateSpec {
     collation: Collation;
     /// The separator argument of group_concat, which is not per row in the usual case.
     star: bool;
+    /// `ORDER BY` in the arguments, for the aggregates the order matters to: the rows are kept, sorted, and then
+    /// stepped through `replaySlot`.
+    orderBy: Vector<XOrderTerm>;
+    replaySlot: usize;
 }
 
 /// A window function call found while compiling a query's result columns and ORDER BY.

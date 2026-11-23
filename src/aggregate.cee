@@ -128,10 +128,18 @@ enum AggregateState {
     Json(JsonOut, bool),
 }
 
+/// A row an ordered aggregate keeps until it finishes: its arguments and its ORDER BY keys.
+struct OrderedRow {
+    args: Vector<SqliteValue>;
+    keys: Vector<SqliteValue>;
+}
+
 struct Accumulator {
     state: AggregateState;
     /// The DISTINCT values seen, as keys.
     seen: HashMap<Vector<u8>, bool>?;
+    /// An aggregate with ORDER BY: its rows, kept until `replay` steps them in order.
+    pending: Vector<OrderedRow>?;
 
     fn create(spec: borrow AggregateSpec) -> Accumulator {
         let state = match (spec.function) {
@@ -146,7 +154,11 @@ struct Accumulator {
                 false,
             ),
         };
-        return Accumulator { state: state, seen: if (spec.distinct) HashMap<Vector<u8>, bool>.create() else null };
+        return Accumulator {
+            state: state,
+            seen: if (spec.distinct) HashMap<Vector<u8>, bool>.create() else null,
+            pending: if (spec.orderBy.length != 0) Vector<OrderedRow>.create() else null,
+        };
     }
 
     /// Adds the current row: its arguments are evaluated against the frame. True when a min() or max() took
@@ -162,6 +174,18 @@ struct Accumulator {
             if (!isTrue(borrow passes)) {
                 return Ok(false);
             }
+        }
+        if (borrow mut this.pending is Some(rows)) {
+            var args = Vector<SqliteValue>.withCapacity(spec.args.length)?;
+            for (i in 0..spec.args.length) {
+                args.push(evaluate(borrow spec.args[i], frame, db)?)?;
+            }
+            var keys = Vector<SqliteValue>.withCapacity(spec.orderBy.length)?;
+            for (i in 0..spec.orderBy.length) {
+                keys.push(evaluate(borrow spec.orderBy[i].expr, frame, db)?)?;
+            }
+            rows.push(OrderedRow { args: args, keys: keys })?;
+            return Ok(false);
         }
         if (spec.function == AggregateFunction.CountStar) {
             if (this.state is AggregateState.Count(n)) {
@@ -233,6 +257,50 @@ struct Accumulator {
             }
         }
         return Ok(false);
+    }
+
+    /// An aggregate with ORDER BY: steps its kept rows in that order (stable for ties), before `finish`.
+    fn replay(
+        borrow mut this,
+        spec: borrow AggregateSpec,
+        frame: borrow mut Frame,
+        db: borrow mut Session,
+    ) -> Result<void, SqliteError> {
+        let Some(kept) = replace(mut this.pending, null) else {
+            return Ok();
+        };
+        var order = Vector<usize>.withCapacity(kept.length)?;
+        for (i in 0..kept.length) {
+            order.push(i)?;
+        }
+        let terms = spec.orderBy.view();
+        order.sortBy((a, b) => {
+            let c = compareKeys(kept[a].keys.view(), kept[b].keys.view(), terms);
+            return if (c != 0) c else if (a < b) -1 else if (a > b) 1 else 0;
+        });
+        var args = Vector<XExpr>.withCapacity(spec.args.length)?;
+        for (k in 0..spec.args.length) {
+            args.push(XExpr.Column(spec.replaySlot, k))?;
+        }
+        let plain = AggregateSpec {
+            function: spec.function,
+            args: args,
+            distinct: spec.distinct,
+            filter: null,
+            collation: spec.collation,
+            star: spec.star,
+            orderBy: Vector<XOrderTerm>.create(),
+            replaySlot: 0,
+        };
+        for (i in 0..order.length) {
+            frame.slots[spec.replaySlot] = Slot {
+                values: cloneValues(kept[order[i]].args.view())?,
+                rowId: 0,
+                isNull: false,
+            };
+            let _ = this.step(borrow plain, frame, db)?;
+        }
+        return Ok();
     }
 
     /// The aggregate's value for the group.

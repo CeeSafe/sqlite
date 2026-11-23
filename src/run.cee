@@ -605,6 +605,7 @@ fn runCore(
     for (g in 0..groups.length) {
         var results = Vector<SqliteValue>.withCapacity(core.aggregates.length)?;
         for (a in 0..core.aggregates.length) {
+            groups[g].accumulators[a].replay(borrow core.aggregates[a], frame, db)?;
             results.push(groups[g].accumulators[a].finish(borrow core.aggregates[a])?)?;
         }
         frame.aggregates = results;

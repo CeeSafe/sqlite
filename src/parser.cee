@@ -781,12 +781,14 @@ struct Parser {
         }
     }
 
-    private fn returning(borrow mut this) -> Result<Vector<ResultColumn>, SqliteError> {
+    private fn returning(
+        borrow mut this,
+        texts: borrow mut Vector<String>,
+    ) -> Result<Vector<ResultColumn>, SqliteError> {
         if (!this.acceptWord("RETURNING")) {
             return Ok(Vector<ResultColumn>.create());
         }
-        var texts = Vector<String>.create();
-        return this.resultColumns(mut texts);
+        return this.resultColumns(texts);
     }
 
     private fn insert(borrow mut this, with: WithClause?) -> Result<InsertStmt, SqliteError> {
@@ -801,6 +803,10 @@ struct Parser {
         }
         this.expectWord("INTO")?;
         let table = this.qualifiedName()?;
+        var alias: String? = null;
+        if (this.acceptWord("AS")) {
+            alias = this.name()?;
+        }
         var columns = Vector<String>.create();
         if (this.isOp("(")) {
             columns = this.parenthesizedNames()?;
@@ -851,6 +857,8 @@ struct Parser {
             }
             upserts.push(clause)?;
         }
+        var texts = Vector<String>.create();
+        let returning = this.returning(mut texts)?;
         return Ok(InsertStmt {
             with: with,
             conflict: conflict,
@@ -858,7 +866,9 @@ struct Parser {
             columns: columns,
             source: source,
             upserts: upserts,
-            returning: this.returning()?,
+            returning: returning,
+            alias: alias,
+            returningTexts: texts,
         });
     }
 
@@ -903,6 +913,10 @@ struct Parser {
             conflict = this.conflictAction()?;
         }
         let table = this.qualifiedName()?;
+        var alias: String? = null;
+        if (this.acceptWord("AS")) {
+            alias = this.name()?;
+        }
         this.expectWord("SET")?;
         var stmt = UpdateStmt {
             with: with,
@@ -912,6 +926,8 @@ struct Parser {
             from: null,
             filter: null,
             returning: Vector<ResultColumn>.create(),
+            alias: alias,
+            returningTexts: Vector<String>.create(),
         };
         if (this.acceptWord("FROM")) {
             stmt.from = this.fromClause()?;
@@ -919,7 +935,7 @@ struct Parser {
         if (this.acceptWord("WHERE")) {
             stmt.filter = this.expr()?;
         }
-        stmt.returning = this.returning()?;
+        stmt.returning = this.returning(mut stmt.returningTexts)?;
         return Ok(stmt);
     }
 
@@ -931,11 +947,16 @@ struct Parser {
             table: this.qualifiedName()?,
             filter: null,
             returning: Vector<ResultColumn>.create(),
+            alias: null,
+            returningTexts: Vector<String>.create(),
         };
+        if (this.acceptWord("AS")) {
+            stmt.alias = this.name()?;
+        }
         if (this.acceptWord("WHERE")) {
             stmt.filter = this.expr()?;
         }
-        stmt.returning = this.returning()?;
+        stmt.returning = this.returning(mut stmt.returningTexts)?;
         return Ok(stmt);
     }
 
@@ -1687,6 +1708,7 @@ struct Parser {
             args: Vector<Expr>.create(),
             filter: null,
             over: null,
+            orderBy: Vector<OrderTerm>.create(),
         };
         var height: u32 = 0;
         if (this.acceptOp("*")) {
@@ -1697,8 +1719,16 @@ struct Parser {
             } else {
                 let _ = this.acceptWord("ALL");
             }
-            call.args = this.exprList()?;
-            height = this.height;
+            // `f(ORDER BY …)`: no arguments, an order.
+            if (!(this.isWord("ORDER") && this.peekIsWord(1, "BY"))) {
+                call.args = this.exprList()?;
+                height = this.height;
+            }
+            if (this.acceptWord("ORDER")) {
+                this.expectWord("BY")?;
+                call.orderBy = this.orderTerms()?;
+                height = height.max(this.height);
+            }
         }
         this.expectOp(")")?;
         if (this.isWord("FILTER") && this.peekIsOp(1, "(")) {

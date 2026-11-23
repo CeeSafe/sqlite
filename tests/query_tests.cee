@@ -473,3 +473,55 @@ fn inListSeeksGiveTheSameRows() -> Result<void, TestFailure> {
         SELECT id FROM t WHERE n IN (SELECT 2) ORDER BY id
         """);
 }
+
+@test
+fn orderedAggregatesMatchSqlite() -> Result<void, TestFailure> {
+    let path = "out/query-ordered-aggregates.db";
+    makeDatabase(path, """
+        CREATE TABLE t(g, x, y);
+        INSERT INTO t VALUES (1, 'a', 3), (1, 'b', 1), (1, 'c', 2), (2, 'd', NULL), (2, 'e', 5), (2, 'd', 4), (3, NULL, 1);
+        """)?;
+    return sameAnswers(path, """
+        SELECT g, group_concat(x ORDER BY y), group_concat(x, '-' ORDER BY y DESC, x), string_agg(x, ';' ORDER BY x DESC) FROM t GROUP BY g ORDER BY g
+        SELECT group_concat(DISTINCT x ORDER BY x DESC), json_group_array(x ORDER BY y), json_group_object(x, y ORDER BY y DESC) FROM t
+        SELECT group_concat(x ORDER BY y NULLS LAST) FILTER (WHERE g > 1) FROM t
+        SELECT max(x ORDER BY y), count(x ORDER BY y), sum(y ORDER BY x) FROM t
+        SELECT group_concat(x ORDER BY 1) FROM t
+        SELECT abs(1 ORDER BY 1)
+        SELECT group_concat(x ORDER BY x) OVER () FROM t
+        SELECT row_number(ORDER BY 1) OVER () FROM t LIMIT 1
+        SELECT count(* ORDER BY 1) FROM t
+        """);
+}
+
+@test
+fn returningColumnNamesMatchSqlite() -> Result<void, TestFailure> {
+    let statements = [
+        "UPDATE t AS q SET a = q.a || '!' WHERE q.id = 1 RETURNING a, id  +  1, a AS z, t.b, ID, rowid",
+        "DELETE FROM t AS d WHERE d.b = 20 RETURNING *, b*2",
+        "INSERT INTO t VALUES (3, 'z', 30) RETURNING id, upper( a ), _rowid_",
+    ];
+    var failures = String.create();
+    for (i in 0..statements.length) {
+        let path = "out/query-returning-names.db";
+        let _ = File.remove(path);
+        makeDatabase(path, "CREATE TABLE t(id INTEGER PRIMARY KEY, a, b UNIQUE); INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20);")?;
+        let theirs = theirNames(path, statements[i]);
+        let _ = File.remove(path);
+        makeDatabase(path, "CREATE TABLE t(id INTEGER PRIMARY KEY, a, b UNIQUE); INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20);")?;
+        var session = Session.open(path)!;
+        let mine = ourNames(mut session, statements[i]);
+        if (theirs.view() != mine.view()) {
+            failures.append(statements[i])!;
+            failures.append("\n  sqlite3:     ")!;
+            failures.append(theirs.view())!;
+            failures.append("\n  this engine: ")!;
+            failures.append(mine.view())!;
+            failures.append("\n")!;
+        }
+    }
+    if (failures.length != 0) {
+        return Check.fail(failures.view());
+    }
+    return Ok();
+}

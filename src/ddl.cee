@@ -496,6 +496,8 @@ fn executeCreateTableAs(
         source: InsertSource.Select(cloneSelect(query)?),
         upserts: Vector<UpsertClause>.create(),
         returning: Vector<ResultColumn>.create(),
+        alias: null,
+        returningTexts: Vector<String>.create(),
     };
     let changes = db.changes;
     let total = db.totalChanges;

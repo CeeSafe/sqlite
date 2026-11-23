@@ -593,3 +593,20 @@ fn renamesReachViewsAndTriggers() -> Result<void, TestFailure> {
         SELECT name, tbl_name, sql FROM sqlite_schema ORDER BY name
         """);
 }
+
+@test
+fn targetAliasesAndReturningNames() -> Result<void, TestFailure> {
+    return sameScript("target-alias", """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, a, b UNIQUE)
+        INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20)
+        UPDATE t AS q SET a = q.a || '!' WHERE q.id = 1 RETURNING a, id  +  1, a AS z, t.b
+        UPDATE t AS q SET a = t.a
+        UPDATE t AS q SET a = 1 RETURNING q.a
+        DELETE FROM t AS d WHERE d.b = 20 RETURNING *, b*2
+        INSERT INTO t AS n VALUES (3, 'z', 10) ON CONFLICT(b) DO UPDATE SET a = n.a || excluded.a RETURNING *, rowid
+        CREATE TABLE s(k, v)
+        INSERT INTO s VALUES (1, 'q'), (2, 'r')
+        UPDATE t AS q SET a = s.v FROM s WHERE s.k = q.id RETURNING id, a
+        SELECT * FROM t
+        """);
+}
