@@ -33,7 +33,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | INSERT, UPDATE, DELETE | `Exec/QueryExecutor` (DML), `InMemoryDatabase` | `dml.cee` | done: constraints, conflict actions, RETURNING, AUTOINCREMENT, upserts, triggers, foreign keys, UPDATE … FROM; WITHOUT ROWID tables read and written |
 | CREATE and DROP of tables, indexes and views | `Exec/QueryExecutor` (DDL) | `ddl.cee` | done |
 | Triggers | `Exec/QueryExecutor` (`FireTriggers`) | `triggers.cee` | BEFORE and AFTER on tables, INSTEAD OF on views done |
-| ALTER TABLE | `Exec/QueryExecutor` (`ExecuteAlterTable`) | `alter.cee` | RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN done; renames that views or triggers refer to next |
+| ALTER TABLE | `Exec/QueryExecutor` (`ExecuteAlterTable`) | `alter.cee` | RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN done, with views and triggers following renames |
 | PRAGMAs, pragma_* table functions | `Exec/QueryExecutor` (`ExecutePragma`) | `pragma.cee`, `integrity.cee` | schema pragmas, header fields, integrity_check and quick_check done |
 | Connection, transactions | `SqliteConnection`, `EngineGlue` | `session.cee` | done: statements commit on their own outside BEGIN, and a failed statement undoes only itself inside it |
 | WAL | `Storage/Wal*`, `Shm*` | | until then a database with a non-empty `-wal` file is refused |
@@ -177,10 +177,13 @@ The port fixes what was wrong in the source instead of copying it. Each item has
 - **Pragmas.** `table_info` leaves out generated columns; `index_list` gives SQLite's order, origins and partial
   flags; `user_version` and `application_id` live in the database header (`pragmasDescribeTheSchema`).
 - **ALTER TABLE.** Stored statements are edited where the names stand, as SQLite does, so definitions stay as
-  written; RENAME TO renames automatic indexes and index ON clauses, and other tables' REFERENCES only while foreign
-  keys are on; RENAME COLUMN follows into REFERENCES t(column) clauses; ADD COLUMN goes after the last column
-  definition and refuses what SQLite refuses, with its messages (`alterTableRewritesDefinitions`). The C# stored
-  its renderer's version of the whole statement.
+  written; RENAME TO renames automatic indexes, index ON clauses and other tables' REFERENCES; RENAME COLUMN
+  follows into REFERENCES t(column) clauses; ADD COLUMN goes after the last column definition and refuses what
+  SQLite refuses, with its messages (`alterTableRewritesDefinitions`). Views and triggers follow both renames as
+  in SQLite's default, `PRAGMA legacy_alter_table = OFF`: the table's name wherever it stands as a table or
+  qualifies a column, the column's name where it means that table's column (`renamesReachViewsAndTriggers`). The
+  macOS sqlite3 shell is built with legacy_alter_table on, which this engine also supports. The C# stored its
+  renderer's version of the whole statement and left views and triggers naming the old names.
 - **Date and time values.** The C# read time values through .NET's `DateTime`: no year 0 or earlier, no
   `+HH:MM`/`Z` zones, at most three fraction digits, no time without a date, and a bare number was always a Julian
   day. The port of SQLite's date.c reads them all as SQLite does, numbers included (`dateTimeValues`).

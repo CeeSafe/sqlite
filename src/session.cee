@@ -25,6 +25,8 @@ public struct Session {
     synchronous: i64;
     cacheSize: i64;
     busyTimeout: i64;
+    /// PRAGMA legacy_alter_table: RENAME TO leaves views and trigger bodies alone (SQLite before 3.26).
+    legacyAlterTable: bool;
     /// The trigger firing now, and the names of those running.
     trigger: TriggerContext?;
     activeTriggers: Vector<String>;
@@ -50,6 +52,7 @@ public struct Session {
             synchronous: 2,
             cacheSize: -2000,
             busyTimeout: 0,
+            legacyAlterTable: false,
             trigger: null,
             activeTriggers: Vector<String>.create(),
         });

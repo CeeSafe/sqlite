@@ -409,6 +409,13 @@ fn executePragma(stmt: borrow PragmaStmt, db: borrow mut Session) -> Result<Quer
             // Rollback journals only, for now: asked to change, the answer is the mode in force.
             rows.push(textRow("delete")?)?;
         }
+        "legacy_alter_table" => {
+            if (stmt.value.isSome()) {
+                db.legacyAlterTable = (setTo ?? 0) != 0;
+                return Ok(emptyResult());
+            }
+            rows.push(intRow(if (db.legacyAlterTable) 1 else 0)?)?;
+        }
         "foreign_keys" => {
             if (stmt.value.isSome()) {
                 db.foreignKeys = (setTo ?? 0) != 0;

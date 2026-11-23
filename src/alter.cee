@@ -1,4 +1,4 @@
-// ALTER TABLE: RENAME TO, RENAME COLUMN and ADD COLUMN, done as SQLite does them: by editing the statements
+// ALTER TABLE: RENAME TO, RENAME COLUMN, ADD COLUMN and DROP COLUMN, done as SQLite does them: by editing the statements
 // stored in sqlite_schema, token by token, and leaving the rows as they are.
 //
 // Differences from the C# engine, which this replaces:
@@ -9,8 +9,11 @@
 // - ADD COLUMN refuses what SQLite refuses (PRIMARY KEY, UNIQUE, NOT NULL with a NULL default, STORED, a default
 //   that is not constant) with SQLite's messages, and puts the column after the last column definition.
 //
-// Not yet supported, and refused by name: renaming a table or column that a view or a trigger refers to (SQLite
-// rewrites those too).
+// - views and triggers follow renames as SQLite's default does (PRAGMA legacy_alter_table = OFF): the table's
+//   name wherever a table stands or qualifies a column, and the column's name where it means that table's column;
+//   with legacy_alter_table on, RENAME TO changes only a trigger's ON, and REFERENCES only while foreign keys are on.
+// - DROP COLUMN removes the column's definition and its values; it is refused while a view or trigger names the
+//   table.
 
 /// A replacement of `[start, end)` in a text.
 struct TextEdit {
@@ -225,7 +228,6 @@ fn renameTable(old: StringView, new: StringView, db: borrow mut Session) -> Resu
     if (isReservedName(new)) {
         return Err(namedError("object name reserved for internal use: ", new));
     }
-    refuseIfReferenced(db, old)?;
     var oldPrefix = String.from("sqlite_autoindex_")?;
     oldPrefix.append(old)?;
     oldPrefix.append("_")?;
@@ -261,10 +263,24 @@ fn renameTable(old: StringView, new: StringView, db: borrow mut Session) -> Resu
             }
             rows[r].values[2] = SqliteValue.text(new)?;
             changed = true;
-        } else if (kind.view() == "table" && db.foreignKeys) {
-            // Another table's REFERENCES: SQLite follows the rename only while foreign keys are on.
+        } else if (kind.view() == "table" && (!db.legacyAlterTable || db.foreignKeys)) {
+            // Another table's REFERENCES; with legacy_alter_table only while foreign keys are on.
             referenceEdits(sqlText.view(), old, new, mut edits)?;
             changed = edits.length != 0;
+        } else if (kind.view() == "trigger" || kind.view() == "view") {
+            // Views and triggers: the table wherever it is named, or with legacy_alter_table only a trigger's ON.
+            let isTrigger = kind.view() == "trigger";
+            if (!db.legacyAlterTable) {
+                tableNameEdits(sqlText.view(), old, new, isTrigger, mut edits)?;
+            } else if (isTrigger && ofTable) {
+                if (nameEdit(sqlText.view(), true, new)? is Some(edit)) {
+                    edits.push(edit)?;
+                }
+            }
+            if (isTrigger && ofTable) {
+                rows[r].values[2] = SqliteValue.text(new)?;
+            }
+            changed = edits.length != 0 || (isTrigger && ofTable);
         }
         if (edits.length != 0) {
             rows[r].values[4] = SqliteValue.Text(applyEdits(sqlText.view(), mut edits)?);
@@ -302,17 +318,28 @@ fn renameColumn(
         message.append(to)?;
         return Err(SqliteError.Sql(message));
     }
-    refuseIfReferenced(db, tableName)?;
     var rows = schemaRows(db)?;
     for (r in 0..rows.length) {
         let kind = String.from(valueTextOf(borrow rows[r].values[0]))?;
         let ofTable = valueTextOf(borrow rows[r].values[2]).equalsIgnoreAsciiCase(tableName);
-        if (rows[r].values[4].isNull() || (kind.view() != "table" && kind.view() != "index")) {
+        if (rows[r].values[4].isNull()) {
             continue;
         }
         let sqlText = String.from(valueTextOf(borrow rows[r].values[4]))?;
         var edits = Vector<TextEdit>.create();
-        if (ofTable) {
+        if (kind.view() == "view" || kind.view() == "trigger") {
+            let triggerTable = String.from(valueTextOf(borrow rows[r].values[2]))?;
+            columnRefEdits(
+                sqlText.view(),
+                tableName,
+                from,
+                to,
+                kind.view() == "trigger",
+                triggerTable.view(),
+                db,
+                mut edits,
+            )?;
+        } else if (ofTable) {
             columnRenameEdits(sqlText.view(), from, to, kind.view() == "index", mut edits)?;
         }
         if (kind.view() == "table") {
@@ -686,5 +713,199 @@ fn dropColumn(tableName: StringView, column: StringView, db: borrow mut Session)
         ops.push(TableOp { rowId: row.rowId, record: Record.encode(values.view())? })?;
     }
     TableMutator.applyBatch(mut db.pager, table.rootPage, ops.view())?;
+    return Ok();
+}
+
+/// Words after which a name is a table: `FROM t`, `JOIN t`, `INTO t`, `UPDATE t`, `REFERENCES t`, and the conflict
+/// words of `UPDATE OR REPLACE t`.
+fn beforeTableName(token: borrow Token) -> bool =>
+    token.isWord("FROM") || token.isWord("JOIN") || token.isWord("INTO") || token.isWord("UPDATE") ||
+        token.isWord("REFERENCES");
+
+/// The positions of the tokens of `tokens` that name a table: after FROM, JOIN, INTO, UPDATE, REFERENCES, a
+/// schema's `main.`, a comma of a FROM list, and a trigger's ON (before its BEGIN).
+fn tablePositions(tokens: borrow Vector<Token>, isTrigger: bool) -> Result<Vector<bool>, AllocError> {
+    var out = Vector<bool>.withCapacity(tokens.length)?;
+    // For each parenthesis depth: whether a FROM list is open there.
+    var fromOpen = Vector<bool>.create();
+    fromOpen.push(false)?;
+    var inBody = !isTrigger;
+    for (i in 0..tokens.length) {
+        let t = borrow tokens[i];
+        var isTable = false;
+        if (i > 0 && (t.kind == TokenKind.Word || t.kind == TokenKind.QuotedId)) {
+            let previous = borrow tokens[i - 1];
+            let conflictWord = previous.isWord(
+                "REPLACE",
+            ) || previous.isWord(
+                "IGNORE",
+            ) || previous.isWord("ABORT") || previous.isWord("FAIL") || previous.isWord("ROLLBACK");
+            isTable = beforeTableName(
+                previous,
+            ) || (conflictWord && i > 1 && tokens[i - 2].isWord("OR") && i > 2 && tokens[i - 3].isWord("UPDATE"));
+            isTable = isTable || (previous.isOp(",") && fromOpen[fromOpen.length - 1]);
+            isTable = isTable || (previous.isWord("ON") && !inBody);
+            isTable = isTable || (previous.isOp(
+                ".",
+            ) && i > 1 && (tokens[i - 2].isWord("main") || tokens[i - 2].isWord("temp")));
+        }
+        out.push(isTable)?;
+        if (t.isOp("(")) {
+            fromOpen.push(false)?;
+        } else if (t.isOp(")")) {
+            if (fromOpen.length > 1) {
+                let _ = fromOpen.pop();
+            }
+        } else if (t.isWord("FROM")) {
+            fromOpen[fromOpen.length - 1] = true;
+        } else if (t.isWord(
+            "WHERE",
+        ) || t.isWord(
+            "GROUP",
+        ) || t.isWord(
+            "HAVING",
+        ) || t.isWord(
+            "ORDER",
+        ) || t.isWord(
+            "LIMIT",
+        ) || t.isWord(
+            "WINDOW",
+        ) || t.isWord(
+            "UNION",
+        ) || t.isWord(
+            "EXCEPT",
+        ) || t.isWord(
+            "INTERSECT",
+        ) || t.isWord("SET") || t.isWord("VALUES") || t.isWord("SELECT") || t.isWord("RETURNING") || t.isOp(";")) {
+            fromOpen[fromOpen.length - 1] = false;
+        } else if (t.isWord("BEGIN")) {
+            inBody = true;
+        }
+    }
+    return Ok(out);
+}
+
+/// RENAME TO in a view or trigger: each name of table `old` (where a table stands, or qualifying a column) becomes
+/// `new` in double quotes.
+fn tableNameEdits(
+    sql: StringView,
+    old: StringView,
+    new: StringView,
+    isTrigger: bool,
+    edits: borrow mut Vector<TextEdit>,
+) -> Result<void, SqliteError> {
+    let tokens = Tokenizer.tokenize(sql)?;
+    let positions = tablePositions(borrow tokens, isTrigger)?;
+    for (i in 0..tokens.length) {
+        if (!isName(borrow tokens[i], old)) {
+            continue;
+        }
+        let qualifies = i + 1 < tokens.length && tokens[i + 1].isOp(".") && !(i > 0 && tokens[i - 1].isOp("."));
+        if (positions[i] || qualifies) {
+            edits.push(TextEdit { start: tokens[i].offset, end: tokens[i].end, text: quotedName(new)? })?;
+        }
+    }
+    return Ok();
+}
+
+/// RENAME COLUMN in a view or trigger: the names that mean column `from` of `table`. A name qualified by the table,
+/// an alias of it, or (in a trigger on it) NEW or OLD means it; an unqualified one does where the statement reads
+/// the table and no other table it reads has such a column; names that define aliases, functions and tables do
+/// not. In a trigger's head, only its UPDATE OF list.
+fn columnRefEdits(
+    sql: StringView,
+    table: StringView,
+    from: StringView,
+    to: StringView,
+    isTrigger: bool,
+    triggerTable: StringView,
+    db: borrow Session,
+    edits: borrow mut Vector<TextEdit>,
+) -> Result<void, SqliteError> {
+    let tokens = Tokenizer.tokenize(sql)?;
+    let positions = tablePositions(borrow tokens, isTrigger)?;
+    let onTable = isTrigger && triggerTable.equalsIgnoreAsciiCase(table);
+    // The tables read, and the aliases of this one.
+    var readsTable = false;
+    var otherHasColumn = false;
+    var aliases = Vector<String>.create();
+    for (i in 0..tokens.length) {
+        if (!positions[i]) {
+            continue;
+        }
+        let name = tokens[i].text.view();
+        // `main.t`: the schema is not a table.
+        if (i + 1 < tokens.length && tokens[i + 1].isOp(".")) {
+            continue;
+        }
+        if (name.equalsIgnoreAsciiCase(table)) {
+            // The trigger's own table is read only through NEW and OLD.
+            let isHead = isTrigger && i > 0 && tokens[i - 1].isWord("ON");
+            if (!isHead) {
+                readsTable = true;
+            }
+            if (i + 2 < tokens.length && tokens[i + 1].isWord("AS")) {
+                aliases.push(tokens[i + 2].text.clone()?)?;
+            } else if (i + 1 < tokens.length && tokens[i + 1].kind == TokenKind.Word && !wordIn(
+                tokens[i + 1].text.view(),
+                SQL_KEYWORDS[..],
+            )) {
+                aliases.push(tokens[i + 1].text.clone()?)?;
+            }
+        } else if (!(isTrigger && i > 0 && tokens[i - 1].isWord("ON"))) {
+            if (db.catalog.table(name)? is Some(other)) {
+                otherHasColumn = otherHasColumn || other.indexOf(from).isSome();
+            }
+        }
+    }
+    var inHead = isTrigger;
+    var inUpdateOf = false;
+    var viewHead = !isTrigger;
+    for (i in 0..tokens.length) {
+        let t = borrow tokens[i];
+        if (t.isWord("BEGIN") && inHead) {
+            inHead = false;
+        }
+        if (inHead) {
+            if (t.isWord("OF")) {
+                inUpdateOf = true;
+            } else if (t.isWord("ON")) {
+                inUpdateOf = false;
+            }
+        }
+        if (viewHead && t.isWord("AS") && i > 0) {
+            viewHead = false;
+            continue;
+        }
+        if (!isName(t, from)) {
+            continue;
+        }
+        let next = if (i + 1 < tokens.length) borrow tokens[i + 1] else borrow tokens[i];
+        if (i + 1 < tokens.length && (next.isOp("(") || next.isOp("."))) {
+            continue;
+        }
+        var rename = false;
+        if (i > 1 && tokens[i - 1].isOp(".")) {
+            let qualifier = tokens[i - 2].text.view();
+            var isAlias = false;
+            for (a in 0..aliases.length) {
+                isAlias = isAlias || aliases[a].view().equalsIgnoreAsciiCase(qualifier);
+            }
+            rename = qualifier.equalsIgnoreAsciiCase(
+                table,
+            ) || isAlias || (onTable && (qualifier.equalsIgnoreAsciiCase(
+                "new",
+            ) || qualifier.equalsIgnoreAsciiCase("old")));
+        } else if (viewHead || positions[i] || (i > 0 && tokens[i - 1].isWord("AS"))) {
+            rename = false;
+        } else if (inHead) {
+            rename = inUpdateOf && onTable;
+        } else {
+            rename = readsTable && !otherHasColumn;
+        }
+        if (rename) {
+            edits.push(TextEdit { start: t.offset, end: t.end, text: sqlName(to)? })?;
+        }
+    }
     return Ok();
 }

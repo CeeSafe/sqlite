@@ -249,7 +249,9 @@ fn pragmasDescribeTheSchema() -> Result<void, TestFailure> {
 
 @test
 fn alterTableRewritesDefinitions() -> Result<void, TestFailure> {
+    // The macOS sqlite3 shell runs with legacy_alter_table on.
     return sameScript("alter", """
+        PRAGMA legacy_alter_table = ON
         CREATE TABLE t(a INT, b TEXT CHECK (b <> a), UNIQUE (a, b))
         CREATE INDEX t_b ON t(b) WHERE a > 0
         CREATE TABLE child(id INTEGER PRIMARY KEY, ref INT REFERENCES t(a))
@@ -553,5 +555,38 @@ fn insteadOfTriggersOnViews() -> Result<void, TestFailure> {
         SELECT * FROM log
         DROP VIEW v
         SELECT name FROM sqlite_schema ORDER BY name
+        """);
+}
+
+@test
+fn renamesReachViewsAndTriggers() -> Result<void, TestFailure> {
+    return sameSession("rename-views", """
+        PRAGMA legacy_alter_table = OFF
+        CREATE TABLE t(a, b)
+        CREATE TABLE o(oa, c, ref REFERENCES t(a))
+        CREATE VIEW v1 AS SELECT a, t.b, x.oa AS xa FROM t, o AS x WHERE t.a = x.oa
+        CREATE VIEW v2 AS SELECT * FROM t WHERE a > (SELECT count(*) FROM t AS inner_t WHERE inner_t.a = t.a)
+        CREATE VIEW v3 AS SELECT a AS a, "t".b FROM main.t JOIN o ON o.oa = t.a
+        CREATE VIEW v4(first, second) AS SELECT a, upper(b) FROM t
+        CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO o(oa, c) VALUES (new.a, new.b); UPDATE t SET b = a WHERE a = new.a; DELETE FROM t WHERE t.a IS NULL; END
+        CREATE TRIGGER tr2 AFTER UPDATE OF a, b ON t WHEN old.a <> new.a BEGIN SELECT a FROM t; END
+        CREATE TRIGGER tr3 AFTER INSERT ON o BEGIN UPDATE t SET a = new.oa WHERE a = new.c; END
+        INSERT INTO t VALUES (1, 'x'), (2, 'y')
+        ALTER TABLE t RENAME COLUMN a TO aa
+        SELECT name, sql FROM sqlite_schema WHERE type <> 'index' ORDER BY name
+        ALTER TABLE t RENAME TO u
+        SELECT name, tbl_name, sql FROM sqlite_schema WHERE type <> 'index' ORDER BY name
+        SELECT * FROM v1 ORDER BY 1
+        SELECT * FROM v3 ORDER BY 1
+        SELECT * FROM v4 ORDER BY 1
+        INSERT INTO u VALUES (3, 'z')
+        SELECT * FROM u ORDER BY 1
+        SELECT * FROM o ORDER BY 1
+        ALTER TABLE o RENAME COLUMN oa TO z
+        SELECT name, sql FROM sqlite_schema WHERE type IN ('view', 'trigger') ORDER BY name
+        PRAGMA legacy_alter_table = ON
+        PRAGMA legacy_alter_table
+        ALTER TABLE u RENAME TO w
+        SELECT name, tbl_name, sql FROM sqlite_schema ORDER BY name
         """);
 }
