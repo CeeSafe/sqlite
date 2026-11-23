@@ -547,3 +547,25 @@ fn parenthesizedJoinsMatchSqlite() -> Result<void, TestFailure> {
         SELECT x FROM (a) ORDER BY 1
         """);
 }
+
+@test
+fn badTokensAreReportedAsSqliteReportsThem() -> Result<void, TestFailure> {
+    let path = "out/query-bad-tokens.db";
+    makeDatabase(path, "CREATE TABLE t(x)")?;
+    return sameAnswers(path, """
+        SELECT 'abc
+        SELECT "abc
+        SELECT x'12
+        SELECT [abc
+        SELECT x'1G'
+        SELECT 12abc
+        SELECT 0x
+        SELECT 1_000
+        SELECT 1__0
+        SELECT #
+        SELECT €
+        SELECT 3 +
+        SELECT 3 +;
+        SELECT 1;;
+        """);
+}

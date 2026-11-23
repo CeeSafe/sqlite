@@ -101,7 +101,7 @@ struct Parser {
             params: ParamNumbering.create(),
         };
         let stmt = p.statement()?;
-        let _ = p.acceptOp(";");
+        while (p.acceptOp(";")) {}
         p.expectEnd()?;
         return Ok(stmt);
     }

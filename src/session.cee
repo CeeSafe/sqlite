@@ -192,11 +192,14 @@ public struct Session {
     /// Runs one SQL statement with positional parameters (?, ?N, :name in order of first use).
     public fn query(borrow mut this, sql: StringView, params: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> {
         // The statement's text, as sqlite_schema keeps a definition; token offsets are into it.
-        var text = sql.trim();
+        let written = sql.trim();
+        var text = written;
         while (text.endsWith(";")) {
             text = text[0..text.length - 1].trimEnd();
         }
-        let stmt = Parser.parseStatement(text)?;
+        // Parsed as written, so that `SELECT 3 +;` is an error near ";" as in SQLite; the text without its
+        // semicolons is what a definition keeps.
+        let stmt = Parser.parseStatement(written)?;
         this.pager.beginStatement();
         this.conflictFailure = null;
         let result = this.run(borrow stmt, text, params);

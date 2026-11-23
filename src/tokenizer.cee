@@ -58,19 +58,28 @@ fn isSqlIdStart(c: u8) -> bool => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z
 /// Whether `c` may continue an identifier.
 fn isSqlIdChar(c: u8) -> bool => isSqlIdStart(c) || isSqlDigit(c) || c == '$';
 
-fn syntaxError(message: StringView, offset: usize) -> SqliteError {
-    var text = String.create();
-    let _ = text.append("SQL syntax error at offset ");
-    let _ = text.appendNumber(offset);
-    let _ = text.append(": ");
-    let _ = text.append(message);
-    return SqliteError.Sql(text);
-}
-
 struct Tokenizer<region r> {
     private text: StringView<r>;
     private at: usize;
     private tokens: Vector<Token>;
+
+    /// SQLite's error for a token it cannot read: `unrecognized token: "…"`, with the token's text.
+    private fn unrecognized(borrow this, start: usize, end: usize) -> SqliteError {
+        let stop = end.min(this.text.length).max(start);
+        var text = String.from("unrecognized token: \"").ok() ?? String.create();
+        let _ = text.append(this.text[start..stop]);
+        let _ = text.append("\"");
+        return SqliteError.Sql(text);
+    }
+
+    /// Where a token that runs into letters ends: the letters, digits and `$` after `start`.
+    private fn wordEnd(borrow this, start: usize) -> usize {
+        var end = start;
+        while (end < this.text.length && (isSqlIdChar(this.text[end]) || this.text[end] == '.')) {
+            end += 1;
+        }
+        return end;
+    }
 
     /// The tokens of `sql`, ending with one of kind `Eof`.
     fn tokenize(sql: StringView) -> Result<Vector<Token>, SqliteError> {
@@ -131,7 +140,12 @@ struct Tokenizer<region r> {
                     end += 1;
                 }
                 if (end >= n || this.text[end] != '\'' || (end - start) % 2 != 0) {
-                    return Err(syntaxError("malformed blob literal", start));
+                    // SQLite's token runs to the closing quote, or to the end.
+                    var close = start + 2;
+                    while (close < n && this.text[close] != '\'') {
+                        close += 1;
+                    }
+                    return Err(this.unrecognized(start, close + 1));
                 }
                 this.add(TokenKind.BlobLit, start + 2, end, start)?;
                 this.at = end + 1;
@@ -162,7 +176,7 @@ struct Tokenizer<region r> {
                     end += 1;
                 }
                 if (end >= n) {
-                    return Err(syntaxError("unterminated [identifier]", start));
+                    return Err(this.unrecognized(start, n));
                 }
                 this.add(TokenKind.QuotedId, start + 1, end, start)?;
                 this.at = end + 1;
@@ -182,14 +196,19 @@ struct Tokenizer<region r> {
                     this.at += 1;
                 }
                 if (this.at == start + 1) {
-                    return Err(syntaxError("a parameter needs a name", start));
+                    return Err(this.unrecognized(start, start + 1));
                 }
                 this.add(TokenKind.Param, start, this.at, start)?;
                 continue;
             }
             let length = this.operatorLength();
             if (length == 0) {
-                return Err(syntaxError("unexpected character", start));
+                // One character, all its UTF-8 bytes.
+                var end = start + 1;
+                while (end < n && (this.text[end] & 0xC0) == 0x80) {
+                    end += 1;
+                }
+                return Err(this.unrecognized(start, end));
             }
             this.add(TokenKind.Op, start, start + length, start)?;
             this.at += length;
@@ -238,7 +257,7 @@ struct Tokenizer<region r> {
     }
 
     /// Digits, with single underscores between them.
-    private fn digits(borrow mut this, hex: bool) -> Result<void, SqliteError> {
+    private fn digits(borrow mut this, hex: bool, numberStart: usize) -> Result<void, SqliteError> {
         let n = this.text.length;
         let start = this.at;
         while (this.at < n) {
@@ -249,7 +268,7 @@ struct Tokenizer<region r> {
                     this.text[this.at + 1],
                 ) else isSqlDigit(this.text[this.at + 1]));
                 if (!before || !after) {
-                    return Err(syntaxError("a digit separator must stand between two digits", this.at));
+                    return Err(this.unrecognized(numberStart, this.wordEnd(this.at)));
                 }
             } else if (!(if (hex) isSqlHexDigit(c) else isSqlDigit(c))) {
                 break;
@@ -266,15 +285,15 @@ struct Tokenizer<region r> {
         if (this.text[start] == '0' && (this.peek(1) == 'x' || this.peek(1) == 'X')) {
             this.at += 2;
             if (!isSqlHexDigit(this.peek(0))) {
-                return Err(syntaxError("a hexadecimal literal needs digits", start));
+                return Err(this.unrecognized(start, this.wordEnd(start)));
             }
-            this.digits(true)?;
+            this.digits(true, start)?;
         } else {
-            this.digits(false)?;
+            this.digits(false, start)?;
             if (this.peek(0) == '.') {
                 kind = TokenKind.FloatLit;
                 this.at += 1;
-                this.digits(false)?;
+                this.digits(false, start)?;
             }
             // An exponent belongs to the number only when digits follow it.
             let e = this.peek(0);
@@ -283,12 +302,12 @@ struct Tokenizer<region r> {
                 if (isSqlDigit(this.peek(if (sign) 2 else 1))) {
                     kind = TokenKind.FloatLit;
                     this.at += if (sign) 2 else 1;
-                    this.digits(false)?;
+                    this.digits(false, start)?;
                 }
             }
         }
         if (this.at < n && isSqlIdChar(this.text[this.at])) {
-            return Err(syntaxError("a number runs into a name", start));
+            return Err(this.unrecognized(start, this.wordEnd(start)));
         }
         // The token's text is the number without its separators.
         var text = String.withCapacity(this.at - start)?;
@@ -313,7 +332,7 @@ struct Tokenizer<region r> {
         var i = from;
         loop {
             if (i >= n) {
-                return Err(syntaxError("unterminated literal", start));
+                return Err(this.unrecognized(start, n));
             }
             if (this.text[i] != delimiter) {
                 i += 1;
