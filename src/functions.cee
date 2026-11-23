@@ -15,11 +15,12 @@
 // - sign() of text that is not entirely a number is NULL;
 // - min(), max() and nullif() compare with the collation of their arguments.
 //
-// The date and time functions are in datetime.cee; printf() and format() are in printf.cee.
+// The date and time functions are in datetime.cee, printf() and format() in printf.cee, and the JSON functions
+// are named here and computed in json.cee.
 //
-// Not yet ported: the JSON functions, and the math functions
-// beyond sqrt, abs, sign, floor, ceil, trunc, mod and pi (they need a port of a math library, which CeeSafe
-// lacks). Calling one is "no such function".
+// Not yet ported: the jsonb_* functions, json_each and json_tree, and the math functions beyond sqrt, abs, sign,
+// floor, ceil, trunc, mod and pi (they need a port of a math library, which CeeSafe lacks). Calling one is "no
+// such function".
 
 enum ScalarFunction {
     Abs,
@@ -37,6 +38,26 @@ enum ScalarFunction {
     IfNull,
     Iif,
     Instr,
+    Json,
+    JsonArray,
+    JsonArrayInsert,
+    JsonArrayLength,
+    JsonErrorPosition,
+    JsonExtract,
+    /// json_group_array or json_group_object with the wrong number of arguments: a name that never fits.
+    JsonGroup,
+    JsonInsert,
+    JsonObject,
+    JsonPatch,
+    JsonPretty,
+    JsonQuote,
+    JsonRemove,
+    JsonReplace,
+    JsonSet,
+    /// Internal, not callable by name: its argument, marked with the JSON subtype (json.cee).
+    JsonSubtype,
+    JsonType,
+    JsonValid,
     JulianDay,
     LastInsertRowid,
     Length,
@@ -113,6 +134,23 @@ fn scalarEntry(name: StringView, argc: usize) -> FunctionEntry? {
         "ifnull" => entry(ScalarFunction.IfNull, argc, 2, 2),
         "iif" | "if" => entry(ScalarFunction.Iif, argc, 2, MANY),
         "instr" => entry(ScalarFunction.Instr, argc, 2, 2),
+        "json" => entry(ScalarFunction.Json, argc, 1, 1),
+        "json_array" => entry(ScalarFunction.JsonArray, argc, 0, MANY),
+        "json_array_insert" => entry(ScalarFunction.JsonArrayInsert, argc, 0, MANY),
+        "json_array_length" => entry(ScalarFunction.JsonArrayLength, argc, 1, 2),
+        "json_error_position" => entry(ScalarFunction.JsonErrorPosition, argc, 1, 1),
+        "json_extract" => entry(ScalarFunction.JsonExtract, argc, 0, MANY),
+        "json_group_array" | "json_group_object" => entry(ScalarFunction.JsonGroup, argc, 1, 0),
+        "json_insert" => entry(ScalarFunction.JsonInsert, argc, 0, MANY),
+        "json_object" => entry(ScalarFunction.JsonObject, argc, 0, MANY),
+        "json_patch" => entry(ScalarFunction.JsonPatch, argc, 2, 2),
+        "json_pretty" => entry(ScalarFunction.JsonPretty, argc, 1, 2),
+        "json_quote" => entry(ScalarFunction.JsonQuote, argc, 1, 1),
+        "json_remove" => entry(ScalarFunction.JsonRemove, argc, 0, MANY),
+        "json_replace" => entry(ScalarFunction.JsonReplace, argc, 0, MANY),
+        "json_set" => entry(ScalarFunction.JsonSet, argc, 0, MANY),
+        "json_type" => entry(ScalarFunction.JsonType, argc, 1, 2),
+        "json_valid" => entry(ScalarFunction.JsonValid, argc, 1, 2),
         "julianday" => entry(ScalarFunction.JulianDay, argc, 0, MANY),
         "last_insert_rowid" => entry(ScalarFunction.LastInsertRowid, argc, 0, 0),
         "length" => entry(ScalarFunction.Length, argc, 1, 1),
@@ -175,6 +213,8 @@ enum AggregateFunction {
     Min,
     Max,
     GroupConcat,
+    JsonGroupArray,
+    JsonGroupObject,
 }
 
 /// The aggregate `name` taking `argc` arguments, if it is one.
@@ -207,6 +247,12 @@ fn aggregateFunctionNamed(name: StringView, argc: usize, star: bool) -> Aggregat
     }
     if (name.equalsIgnoreAsciiCase("string_agg") && argc == 2) {
         return AggregateFunction.GroupConcat;
+    }
+    if (name.equalsIgnoreAsciiCase("json_group_array") && argc == 1) {
+        return AggregateFunction.JsonGroupArray;
+    }
+    if (name.equalsIgnoreAsciiCase("json_group_object") && argc == 2) {
+        return AggregateFunction.JsonGroupObject;
     }
     return null;
 }
@@ -743,6 +789,10 @@ fn callFunction(
     db: borrow mut Session,
 ) -> Result<SqliteValue, SqliteError> {
     let args = call.args.view();
+    if (isJsonFunction(call.function)) {
+        let result = callJsonFunction(call, frame, db)?;
+        return Ok(result.value);
+    }
     // The functions that evaluate only some of their arguments.
     match (call.function) {
         ScalarFunction.Coalesce | ScalarFunction.IfNull => {
@@ -1138,15 +1188,15 @@ fn callFunction(
             return Ok(SqliteValue.Blob(bytes));
         }
         ScalarFunction.Coalesce | ScalarFunction.IfNull | ScalarFunction.Iif => { return Ok(SqliteValue.Null); }
+        // Computed in json.cee, above.
+        ScalarFunction.Json | ScalarFunction.JsonArray | ScalarFunction.JsonArrayInsert | ScalarFunction.JsonArrayLength | ScalarFunction.JsonErrorPosition | ScalarFunction.JsonExtract | ScalarFunction.JsonGroup | ScalarFunction.JsonInsert | ScalarFunction.JsonObject | ScalarFunction.JsonPatch | ScalarFunction.JsonPretty | ScalarFunction.JsonQuote | ScalarFunction.JsonRemove | ScalarFunction.JsonReplace | ScalarFunction.JsonSet | ScalarFunction.JsonSubtype | ScalarFunction.JsonType | ScalarFunction.JsonValid => {
+            return Ok(SqliteValue.Null);
+        }
     }
 }
 
 /// The SQLite release whose behaviour this engine follows.
 const SQLITE_VERSION: StringView = "3.53.4";
-
-/// `->` and `->>`: not yet ported.
-fn jsonArrow(left: borrow SqliteValue, right: borrow SqliteValue, asSql: bool) -> Result<SqliteValue, SqliteError> =>
-    Err(unsupported("the JSON functions and operators are not ported yet"));
 
 /// The civil date of a day number from 1970-01-01 (Howard Hinnant's algorithm).
 struct CivilDate {

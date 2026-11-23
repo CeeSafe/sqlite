@@ -124,6 +124,8 @@ enum AggregateState {
     Best(SqliteValue),
     /// group_concat(): the text so far, and whether a value has been added.
     Concat(String, bool),
+    /// json_group_array() and json_group_object() (json.cee): the JSON text so far, and whether a row was added.
+    Json(JsonOut, bool),
 }
 
 struct Accumulator {
@@ -139,6 +141,10 @@ struct Accumulator {
             ),
             AggregateFunction.Min | AggregateFunction.Max => AggregateState.Best(SqliteValue.Null),
             AggregateFunction.GroupConcat => AggregateState.Concat(String.create(), false),
+            AggregateFunction.JsonGroupArray | AggregateFunction.JsonGroupObject => AggregateState.Json(
+                JsonOut.create(),
+                false,
+            ),
         };
         return Accumulator { state: state, seen: if (spec.distinct) HashMap<Vector<u8>, bool>.create() else null };
     }
@@ -163,9 +169,15 @@ struct Accumulator {
             }
             return Ok(false);
         }
-        let value = evaluate(borrow spec.args[0], frame, db)?;
+        // The JSON aggregates see their arguments' JSON subtype, and keep a NULL, also under DISTINCT.
+        let isJson = this.state is AggregateState.Json(_, _);
+        let first = if (isJson) evaluateWithSubtype(borrow spec.args[0], frame, db)? else jsonPlain(
+            evaluate(borrow spec.args[0], frame, db)?,
+        );
+        let firstIsJson = first.json;
+        let value = first.value;
         if (borrow this.seen is Some(_)) {
-            if (value.isNull()) {
+            if (value.isNull() && !isJson) {
                 return Ok(false);
             }
             let normalized = normalizeForKey(borrow value, spec.collation)?;
@@ -213,6 +225,12 @@ struct Accumulator {
                 started = true;
                 appendValueText(text, borrow value)?;
             }
+            AggregateState.Json(out, started) => {
+                let isObject = spec.function == AggregateFunction.JsonGroupObject;
+                let second: JsonValue? = if (isObject) evaluateWithSubtype(borrow spec.args[1], frame, db)? else null;
+                let firstValue = JsonValue { value: value, json: firstIsJson };
+                jsonGroupStep(isObject, out, started, borrow firstValue, borrow second)?;
+            }
         }
         return Ok(false);
     }
@@ -234,6 +252,9 @@ struct Accumulator {
                     return Ok(SqliteValue.Null);
                 }
                 return Ok(SqliteValue.Text(text.clone()?));
+            }
+            AggregateState.Json(out, started) => {
+                return jsonGroupFinish(spec.function == AggregateFunction.JsonGroupObject, out, started);
             }
         }
     }

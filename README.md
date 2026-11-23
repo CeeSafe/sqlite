@@ -23,9 +23,10 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Numbers as text, text as numbers | `Exec/SqlValueOps` | `numeric.cee` | done: SQLite's own conversion routines, ported |
 | Value operations, comparison affinity | `Exec/SqlValueOps`, `ValueComparer` | `valueops.cee`, `compare.cee` | done |
 | Expressions: compiler and evaluator | `Exec/ExpressionEvaluator`, `Binding`, `ParameterBinder` | `expr.cee`, `compile.cee` | done |
-| Scalar functions, aggregates | `Exec/Functions`, `LikeMatcher` | `functions.cee`, `aggregate.cee` | core functions done; JSON and transcendental math next |
+| Scalar functions, aggregates | `Exec/Functions`, `LikeMatcher` | `functions.cee`, `aggregate.cee` | core functions done; transcendental math next |
 | Date and time functions | `Exec/Functions` (date/time part) | `datetime.cee` | done: a port of SQLite's date.c; 'localtime' and 'utc' are an error where they need the time zone, which CeeSafe lacks |
 | printf() and format() | `Exec/Functions` (`Printf`) | `printf.cee` | done: a port of SQLite's `sqlite3_str_vappendf`, every conversion and flag of the SQL path |
+| JSON functions | `Exec/Json`, `Functions` (JSON1) | `json.cee` | done: SQLite 3.53.4's text JSON functions, `->`, `->>`, `json_group_array` and `json_group_object`, JSON5 input, JSONB blobs as input; the `jsonb_*` functions and the table-valued `json_each` and `json_tree` are not ported and are "no such function" |
 | SELECT: joins, subqueries, views, CTEs, grouping, compounds | `Exec/QueryExecutor` | `select.cee`, `run.cee` | done but RIGHT/FULL joins, window functions, table functions, index seeks (rowid seeks done) |
 | INSERT, UPDATE, DELETE | `Exec/QueryExecutor` (DML), `InMemoryDatabase` | `dml.cee` | done: constraints, conflict actions, RETURNING, AUTOINCREMENT, upserts, triggers, foreign keys, UPDATE … FROM; WITHOUT ROWID tables read and written |
 | CREATE and DROP of tables, indexes and views | `Exec/QueryExecutor` (DDL) | `ddl.cee` | done |
@@ -212,6 +213,40 @@ The port fixes what was wrong in the source instead of copying it. Each item has
 - **WITHOUT ROWID tables** are read and written in place: rows are named by their primary key, a table index holds
   the key columns it lacks after its own, as SQLite does, and the key's columns are NOT NULL. The C# loaded them
   into memory.
+- **JSON is SQLite's.** The C# JSON functions were a small JSON library of their own; `json.cee` is a port of
+  SQLite's `json.c`, which goes through JSONB as SQLite does (`tests/json_tests.cee`):
+  - malformed JSON is the "malformed JSON" error, where the C# returned NULL (and `json_valid(NULL)` is NULL, not
+    0) (`jsonRejectsMalformedInput`);
+  - a number keeps its spelling (`json('1.0')` is `1.0`; the C# wrote `1`), and an integer past 64 bits is not
+    turned into a rounded real in the text (`jsonParsesAndMinifies`);
+  - JSON5 input (comments, unquoted labels, single quotes, hexadecimal, `Infinity`, `NaN`, trailing commas,
+    `\x` and `\v` escapes) is accepted and written as RFC 8259 JSON; the C# rejected it (`jsonAcceptsJson5`);
+  - paths: `."quoted"` labels with escapes, `[#]` and `[#-N]`, and a "bad JSON path" error for a malformed path,
+    which the C# ignored; `->` and `->>` take a negative integer as `[#-N]`, where the C# made `$[-1]`
+    (`jsonFollowsPaths`);
+  - json_set() and json_insert() create the objects and arrays along a missing path, and append to an array only
+    at `[#]` or its length; the C# did nothing for a missing parent and appended for any index past the end
+    (`jsonEditsValues`);
+  - argument errors are SQLite's: an odd count for json_set(), json_insert() and json_replace(), an even count for
+    json_object(), a label that is not text, and a blob that is not JSONB ("JSON cannot hold BLOB values"); the C#
+    dropped the extra argument and stored a blob as a string (`jsonChecksArgumentCounts`);
+  - the subtype rule: text a JSON function returns nests as JSON in another JSON function, so
+    `json_array(json('[1]'))` is `[[1]]`; the C# made it `["[1]"]` (`jsonNestsJsonResultsBySubtype`);
+  - json_error_position() reports the character where SQLite's parser stops, and json_valid() takes SQLite's
+    FLAGS argument; json_pretty() and json_array_insert() exist.
+
+## Known differences from SQLite in the JSON functions
+
+- **A scalar subquery drops the JSON subtype.** `json_array((SELECT json('[1]')))` is `[[1]]` in SQLite and
+  `["[1]"]` here. This engine's values carry no subtype; JSON-function arguments are evaluated by
+  `evaluateWithSubtype` (`json.cee`), which sees through CASE, coalesce, ifnull, iif, nullif, likely, unlikely,
+  the scalar min and max, unary `+`, CAST, COLLATE, `->` and the JSON aggregates, but not into a subquery.
+- **Unpaired surrogates.** SQLite decodes `"\ud800"` to the bytes ED A0 80, which are not UTF-8. Text values here
+  are valid UTF-8, so each such byte becomes U+FFFD.
+- **Window functions.** json_group_array() and json_group_object() as window functions wait for window functions
+  in general.
+- **Nesting depth.** The limit is 3.53.4's 1000 levels; the `sqlite3` shell the tests run (3.54.0 on macOS) was
+  built with 800, so the tests stay on depths where the two agree.
 
 ## Known gaps (inherited from the C# engine, refused by name rather than misparsed)
 

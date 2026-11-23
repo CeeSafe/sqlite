@@ -134,3 +134,14 @@ Workaround: `static PRAGMA_COLUMNS_n` (`src/pragma.cee`).
 
 Besides `drop` and `own` (finding 10), `internal` and `match` cannot be used as names (a field `internal`, a
 function `match`), and the error does not say the word is reserved.
+
+### 19. Text that is not UTF-8 has no text type
+
+`String` and `StringView` hold valid UTF-8 only, and there is no text type for bytes that are mostly UTF-8 (C's
+`char *`, Rust's `OsString`/`bstr`). SQLite's TEXT may hold any bytes: its JSON functions decode `"\ud800"` to
+ED A0 80, an unpaired surrogate, and `CAST(x'ff' AS TEXT)` keeps the byte. A value type built on `String` cannot
+carry those bytes through.
+
+Workaround: `textFromBytesLossy` (`src/value.cee`) turns each byte of an invalid sequence into U+FFFD, and the
+difference is listed in README.md. A byte-string type with UTF-8 views on demand would let the engine keep
+SQLite's bytes.
