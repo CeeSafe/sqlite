@@ -7,7 +7,7 @@
 // names one of the columns; RAISE(IGNORE) skips the row and the rest of the trigger; a trigger does not fire
 // again while it is running (recursive_triggers is off); a body's changes do not count in changes().
 //
-// Not yet supported, and refused by name: INSTEAD OF triggers on views, and TEMP triggers.
+// INSTEAD OF triggers on views run from views.cee. Not yet supported, and refused by name: TEMP triggers.
 
 /// The rows a firing trigger sees, and the table's columns that name them.
 struct TriggerContext {
@@ -214,12 +214,11 @@ fn runTrigger(trigger: borrow TriggerPlan, db: borrow mut Session) -> Result<voi
         }
     }
     for (s in 0..trigger.body.length) {
+        // A body's changes count in total_changes(), not in changes(), and leave last_insert_rowid() alone.
         let changes = db.changes;
-        let total = db.totalChanges;
         let last = db.lastInsertRowid;
         let result = db.run(borrow trigger.body[s], "", []);
         db.changes = changes;
-        db.totalChanges = total;
         db.lastInsertRowid = last;
         let _ = result?;
     }
@@ -264,9 +263,6 @@ fn executeCreateTrigger(
     }
     if (!isView && stmt.timing == TriggerTiming.InsteadOf) {
         return Err(namedError("cannot create INSTEAD OF trigger on table: ", table));
-    }
-    if (isView) {
-        return Err(unsupported("INSTEAD OF triggers on views are not supported yet"));
     }
     addSchemaRow(db, "trigger", name, table, 0, sql)?;
     db.pager.bumpSchemaCookie()?;

@@ -521,3 +521,37 @@ fn tinyIndexCellsTakeFourBytes() -> Result<void, TestFailure> {
         SELECT count(*), sum(x) FROM flags
         """);
 }
+
+@test
+fn insteadOfTriggersOnViews() -> Result<void, TestFailure> {
+    return sameSession("instead-of", """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, a, b)
+        INSERT INTO t VALUES (1, 'x', 1), (2, 'y', 2)
+        CREATE VIEW v AS SELECT id, a, b * 10 AS b10 FROM t
+        CREATE TABLE log(m)
+        INSERT INTO v VALUES (3, 'z', 30)
+        CREATE TRIGGER before_v BEFORE INSERT ON v BEGIN SELECT 1; END
+        CREATE TRIGGER on_t INSTEAD OF INSERT ON t BEGIN SELECT 1; END
+        CREATE TRIGGER vi INSTEAD OF INSERT ON v BEGIN INSERT INTO t VALUES (new.id, new.a, new.b10 / 10); INSERT INTO log VALUES ('ins ' || new.id); END
+        CREATE TRIGGER vd INSTEAD OF DELETE ON v BEGIN DELETE FROM t WHERE id = old.id; END
+        CREATE TRIGGER vu INSTEAD OF UPDATE OF a ON v WHEN new.a <> 'skip' BEGIN UPDATE t SET a = new.a WHERE id = old.id; INSERT INTO log VALUES ('upd ' || old.a || '>' || new.a); END
+        INSERT INTO v VALUES (3, 'z', 30), (4, 'w', 40)
+        SELECT changes(), total_changes(), last_insert_rowid()
+        INSERT INTO v(id) VALUES (5)
+        INSERT INTO v(id, nope) VALUES (6, 1)
+        INSERT INTO v VALUES (6)
+        UPDATE v SET a = upper(a) WHERE id < 3
+        SELECT changes(), total_changes()
+        UPDATE v SET b10 = 0
+        UPDATE v SET a = 'skip' WHERE id = 1
+        DELETE FROM v WHERE id = 4
+        SELECT changes(), total_changes()
+        INSERT INTO v VALUES (9, 'q', 1) RETURNING *, b10 + 1
+        UPDATE v SET a = t.id * 100 FROM t WHERE t.id = v.id AND t.id > 2 RETURNING id, a
+        DELETE FROM v WHERE id = 9 RETURNING a
+        SELECT * FROM t ORDER BY id
+        SELECT * FROM log
+        DROP VIEW v
+        SELECT name FROM sqlite_schema ORDER BY name
+        """);
+}

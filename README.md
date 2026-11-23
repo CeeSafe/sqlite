@@ -32,7 +32,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Window functions | `Exec/WindowEvaluator` | `window.cee` | done: every built-in window function, aggregates over frames, ROWS/RANGE/GROUPS, EXCLUDE, named windows |
 | INSERT, UPDATE, DELETE | `Exec/QueryExecutor` (DML), `InMemoryDatabase` | `dml.cee` | done: constraints, conflict actions, RETURNING, AUTOINCREMENT, upserts, triggers, foreign keys, UPDATE … FROM; WITHOUT ROWID tables read and written |
 | CREATE and DROP of tables, indexes and views | `Exec/QueryExecutor` (DDL) | `ddl.cee` | done |
-| Triggers | `Exec/QueryExecutor` (`FireTriggers`) | `triggers.cee` | BEFORE and AFTER on tables done; INSTEAD OF on views next |
+| Triggers | `Exec/QueryExecutor` (`FireTriggers`) | `triggers.cee` | BEFORE and AFTER on tables, INSTEAD OF on views done |
 | ALTER TABLE | `Exec/QueryExecutor` (`ExecuteAlterTable`) | `alter.cee` | RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN done; renames that views or triggers refer to next |
 | PRAGMAs, pragma_* table functions | `Exec/QueryExecutor` (`ExecutePragma`) | `pragma.cee`, `integrity.cee` | schema pragmas, header fields, integrity_check and quick_check done |
 | Connection, transactions | `SqliteConnection`, `EngineGlue` | `session.cee` | done: statements commit on their own outside BEGIN, and a failed statement undoes only itself inside it |
@@ -325,6 +325,11 @@ would take Apple's algorithms, which are not published. The tests use arguments 
   table/index X after drop column", and every row loses the value (`dropColumnLikeSqlite`).
 - **Index cells take at least 4 bytes**, as SQLite counts them: a WITHOUT ROWID table of small keys made 3-byte
   cells, which sqlite3 calls out of range (`tinyIndexCellsTakeFourBytes`).
+
+- **INSTEAD OF triggers** make views writable as in SQLite (`insteadOfTriggersOnViews`): the rows are the view's
+  rows WHERE selects (joined with FROM for UPDATE … FROM), UPDATE OF counts, RETURNING gives NEW (OLD for DELETE),
+  changes() stays 0, and DROP VIEW drops the view's triggers. A trigger body's changes count in
+  total_changes(), as in SQLite; this engine had left them out.
 
 ## Known differences from SQLite in PRAGMA integrity_check
 

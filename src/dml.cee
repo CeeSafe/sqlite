@@ -999,6 +999,9 @@ fn executeInsert(
     params: Slice<SqliteValue>,
     db: borrow mut Session,
 ) -> Result<QueryResult, SqliteError> {
+    if (db.viewSql(stmt.table.name.view())?.isSome()) {
+        return insertIntoView(stmt, params, db);
+    }
     var compiler = newCompiler(db)?;
     let writer = TableWriter.create(mut compiler, stmt.table.name.view(), db)?;
     let table = borrow writer.table;
@@ -1318,6 +1321,9 @@ fn executeDelete(
     params: Slice<SqliteValue>,
     db: borrow mut Session,
 ) -> Result<QueryResult, SqliteError> {
+    if (db.viewSql(stmt.table.name.view())?.isSome()) {
+        return deleteFromView(stmt, params, db);
+    }
     var compiler = newCompiler(db)?;
     let writer = TableWriter.create(mut compiler, stmt.table.name.view(), db)?;
     if (borrow stmt.with is Some(with)) {
@@ -1567,6 +1573,9 @@ fn executeUpdate(
     params: Slice<SqliteValue>,
     db: borrow mut Session,
 ) -> Result<QueryResult, SqliteError> {
+    if (db.viewSql(stmt.table.name.view())?.isSome()) {
+        return updateView(stmt, params, db);
+    }
     if (stmt.from.isSome()) {
         return executeUpdateFrom(stmt, params, db);
     }

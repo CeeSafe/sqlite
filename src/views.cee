@@ -1,0 +1,366 @@
+// INSERT, UPDATE and DELETE on a view: its INSTEAD OF triggers run for each row the statement would change, with
+// OLD and NEW as rows of the view, and nothing is written to the view itself.
+//
+// As in SQLite: a view without an INSTEAD OF trigger for the statement (UPDATE OF counting) is "cannot modify v
+// because it is a view"; the rows are the view's rows that WHERE selects (joined with FROM for UPDATE … FROM);
+// changes() does not count them; RETURNING gives the NEW row (the OLD row for DELETE).
+
+/// A view as a table its triggers see: its result columns, without types.
+fn viewTable(name: StringView, db: borrow mut Session) -> Result<TableSchema, SqliteError> {
+    let select = selectFromView(name, null, Vector<ResultColumn>.create(), null, null)?;
+    var compiler = newCompiler(db)?;
+    let plan = compileSelect(mut compiler, borrow select, db)?;
+    var sql = String.from("CREATE TABLE ")?;
+    appendIdentPut(mut sql, name)?;
+    sql.append("(")?;
+    for (i in 0..plan.columnNames.length) {
+        if (i != 0) {
+            sql.append(", ")?;
+        }
+        appendIdentPut(mut sql, plan.columnNames[i].view())?;
+    }
+    sql.append(")")?;
+    let Stmt.CreateTable(stmt) = Parser.parseStatement(sql.view())? else {
+        return Err(corrupt("a view's columns did not make a table"));
+    };
+    return buildTableSchema(stmt, name, 0, sql.view());
+}
+
+/// `[WITH …] SELECT view.*, extra… FROM view [, from…] [WHERE filter]`.
+fn selectFromView(
+    name: StringView,
+    with: WithClause?,
+    extra: Vector<ResultColumn>,
+    from: FromClause?,
+    filter: Expr?,
+) -> Result<SelectStmt, AllocError> {
+    var columns = Vector<ResultColumn>.create();
+    columns.push(ResultColumn.TableStar(String.from(name)?))?;
+    var more = extra;
+    for (i in 0..more.length) {
+        columns.push(replace(mut more[i], ResultColumn.Star))?;
+    }
+    var joins = Vector<Join>.create();
+    if (from is Some(f)) {
+        joins.push(Join { kind: JoinKind.Comma, natural: false, item: f.source, constraint: JoinConstraint.None })?;
+        for (j in 0..f.joins.length) {
+            joins.push(cloneJoin(borrow f.joins[j])?)?;
+        }
+    }
+    let source = FromItem.Table(
+        TableSource {
+            name: QualifiedName { schema: null, name: String.from(name)? },
+            alias: null,
+            indexedBy: null,
+            notIndexed: false,
+        },
+    );
+    var cores = Vector<SelectCore>.create();
+    cores.push(
+        SelectCore {
+            distinct: false,
+            columns: columns,
+            from: FromClause { source: source, joins: joins },
+            filter: filter,
+            groupBy: Vector<Expr>.create(),
+            having: null,
+            windows: Vector<NamedWindow>.create(),
+            isValues: false,
+            columnTexts: Vector<String>.create(),
+        },
+    )?;
+    return Ok(
+        SelectStmt {
+            with: with,
+            cores: cores,
+            compoundOps: Vector<CompoundOp>.create(),
+            orderBy: Vector<OrderTerm>.create(),
+            limit: null,
+            offset: null,
+        },
+    );
+}
+
+/// The view's INSTEAD OF triggers for `event`; "cannot modify" when none would fire.
+fn insteadOfTriggers(
+    name: StringView,
+    event: TriggerEvent,
+    table: borrow TableSchema,
+    setColumns: Slice<usize>,
+    db: borrow Session,
+) -> Result<Vector<TriggerPlan>, SqliteError> {
+    var all = tableTriggers(db, name)?;
+    var out = Vector<TriggerPlan>.create();
+    var fires = false;
+    for (t in 0..all.length) {
+        let trigger = replace(
+            mut all[t],
+            TriggerPlan {
+                name: String.create(),
+                timing: TriggerTiming.Before,
+                event: TriggerEvent.Insert,
+                updateOf: Vector<String>.create(),
+                when: null,
+                body: Vector<Stmt>.create(),
+            },
+        );
+        if (trigger.timing != TriggerTiming.InsteadOf || trigger.event != event) {
+            continue;
+        }
+        var named = trigger.updateOf.length == 0;
+        for (k in 0..trigger.updateOf.length) {
+            for (c in 0..setColumns.length) {
+                named = named || table.columns[setColumns[c]].name.view().equalsIgnoreAsciiCase(
+                    trigger.updateOf[k].view(),
+                );
+            }
+        }
+        fires = fires || named;
+        out.push(trigger)?;
+    }
+    if (!fires) {
+        var message = String.from("cannot modify ")?;
+        message.append(name)?;
+        message.append(" because it is a view")?;
+        return Err(SqliteError.Sql(message));
+    }
+    return Ok(out);
+}
+
+/// RETURNING's expressions over a row of the view in `slot`.
+fn viewReturning(
+    compiler: borrow mut Compiler,
+    columns: borrow Vector<ResultColumn>,
+    table: borrow TableSchema,
+    slot: usize,
+    db: borrow mut Session,
+) -> Result<Vector<XExpr>, SqliteError> {
+    var out = Vector<XExpr>.create();
+    for (i in 0..columns.length) {
+        match (borrow columns[i]) {
+            ResultColumn.Expr(e, _) => { out.push(compileInTable(compiler, e, table, slot, db)?)?; }
+            _ => {
+                for (c in 0..table.columns.length) {
+                    out.push(XExpr.Column(slot, c))?;
+                }
+            }
+        }
+    }
+    return Ok(out);
+}
+
+/// Runs RETURNING for one row, put in `slot`.
+fn viewReturningRow(
+    returning: borrow Vector<XExpr>,
+    slot: usize,
+    row: borrow Slot,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<SqliteValue>, SqliteError> {
+    frame.slots[slot] = copySlot(row)?;
+    return returningRow(returning, frame, db);
+}
+
+fn viewRow(values: Vector<SqliteValue>) -> Slot => Slot { values: values, rowId: 0, isNull: false };
+
+/// INSERT into a view.
+fn insertIntoView(
+    stmt: borrow InsertStmt,
+    params: Slice<SqliteValue>,
+    db: borrow mut Session,
+) -> Result<QueryResult, SqliteError> {
+    let name = stmt.table.name.view();
+    let table = viewTable(name, db)?;
+    let triggers = insteadOfTriggers(name, TriggerEvent.Insert, borrow table, [], db)?;
+    if (stmt.upserts.length != 0) {
+        return Err(sqlError("cannot UPSERT a view"));
+    }
+    var targets = Vector<usize>.create();
+    if (stmt.columns.length == 0) {
+        for (c in 0..table.columns.length) {
+            targets.push(c)?;
+        }
+    } else {
+        for (k in 0..stmt.columns.length) {
+            let at = table.indexOf(stmt.columns[k].view()) ?? {
+                var message = String.from("table ")?;
+                message.append(name)?;
+                message.append(" has no column named ")?;
+                message.append(stmt.columns[k].view())?;
+                return Err(SqliteError.Sql(message));
+            };
+            targets.push(at)?;
+        }
+    }
+    var compiler = newCompiler(db)?;
+    let slot = compiler.slotsInUse;
+    compiler.slotsInUse += 1;
+    let returning = viewReturning(mut compiler, borrow stmt.returning, borrow table, slot, db)?;
+    if (borrow stmt.with is Some(with)) {
+        let _ = compileWith(mut compiler, with, db)?;
+    }
+    let source = compileInsertSource(stmt, mut compiler, db)?;
+    var frame = newFrame(mut compiler, params, db)?;
+    var rows = insertRows(borrow source, mut frame, db)?;
+    var output = Vector<Vector<SqliteValue>>.create();
+    for (r in 0..rows.length) {
+        let given = takeRow(mut rows, r);
+        if (given.length != targets.length) {
+            var message = String.create();
+            if (stmt.columns.length == 0) {
+                message.append("table ")?;
+                message.append(name)?;
+                message.append(" has ")?;
+                message.appendNumber(targets.length)?;
+                message.append(" columns but ")?;
+                message.appendNumber(given.length)?;
+                message.append(" values were supplied")?;
+            } else {
+                message.appendNumber(given.length)?;
+                message.append(" values for ")?;
+                message.appendNumber(targets.length)?;
+                message.append(" columns")?;
+            }
+            return Err(SqliteError.Sql(message));
+        }
+        var values = Vector<SqliteValue>.withCapacity(table.columns.length)?;
+        for (c in 0..table.columns.length) {
+            values.push(SqliteValue.Null)?;
+        }
+        for (k in 0..given.length) {
+            values[targets[k]] = given[k].clone()?;
+        }
+        let noRow: Slot? = null;
+        let newRow: Slot? = viewRow(values);
+        if (!fireTriggers(
+            borrow triggers,
+            borrow table,
+            TriggerEvent.Insert,
+            TriggerTiming.InsteadOf,
+            borrow noRow,
+            borrow newRow,
+            [],
+            db,
+        )?) {
+            continue;
+        }
+        if (returning.length != 0 && borrow newRow is Some(row)) {
+            output.push(viewReturningRow(borrow returning, slot, row, mut frame, db)?)?;
+        }
+    }
+    db.changes = 0;
+    return Ok(QueryResult { columns: returningNames(borrow stmt.returning, borrow table)?, rows: output });
+}
+
+/// DELETE from a view.
+fn deleteFromView(
+    stmt: borrow DeleteStmt,
+    params: Slice<SqliteValue>,
+    db: borrow mut Session,
+) -> Result<QueryResult, SqliteError> {
+    let name = stmt.table.name.view();
+    let table = viewTable(name, db)?;
+    let triggers = insteadOfTriggers(name, TriggerEvent.Delete, borrow table, [], db)?;
+    let select = selectFromView(
+        name,
+        cloneWith(borrow stmt.with)?,
+        Vector<ResultColumn>.create(),
+        null,
+        cloneOptional(borrow stmt.filter)?,
+    )?;
+    var compiler = newCompiler(db)?;
+    let plan = compileSelect(mut compiler, borrow select, db)?;
+    let slot = compiler.slotsInUse;
+    compiler.slotsInUse += 1;
+    let returning = viewReturning(mut compiler, borrow stmt.returning, borrow table, slot, db)?;
+    var frame = newFrame(mut compiler, params, db)?;
+    var rows = runSelect(borrow plan, mut frame, db)?;
+    var output = Vector<Vector<SqliteValue>>.create();
+    for (r in 0..rows.length) {
+        let oldRow: Slot? = viewRow(takeRow(mut rows, r));
+        let noRow: Slot? = null;
+        if (!fireTriggers(
+            borrow triggers,
+            borrow table,
+            TriggerEvent.Delete,
+            TriggerTiming.InsteadOf,
+            borrow oldRow,
+            borrow noRow,
+            [],
+            db,
+        )?) {
+            continue;
+        }
+        if (returning.length != 0 && borrow oldRow is Some(row)) {
+            output.push(viewReturningRow(borrow returning, slot, row, mut frame, db)?)?;
+        }
+    }
+    db.changes = 0;
+    return Ok(QueryResult { columns: returningNames(borrow stmt.returning, borrow table)?, rows: output });
+}
+
+/// UPDATE on a view (UPDATE … FROM too).
+fn updateView(
+    stmt: borrow UpdateStmt,
+    params: Slice<SqliteValue>,
+    db: borrow mut Session,
+) -> Result<QueryResult, SqliteError> {
+    let name = stmt.table.name.view();
+    let table = viewTable(name, db)?;
+    var targets = Vector<usize>.create();
+    var values = Vector<ResultColumn>.create();
+    for (a in 0..stmt.assignments.length) {
+        let at = table.indexOf(stmt.assignments[a].column.view()) ?? {
+            return Err(namedError("no such column: ", stmt.assignments[a].column.view()));
+        };
+        targets.push(at)?;
+        values.push(ResultColumn.Expr(cloneExpr(borrow stmt.assignments[a].value)?, null))?;
+    }
+    let triggers = insteadOfTriggers(name, TriggerEvent.Update, borrow table, targets.view(), db)?;
+    let select = selectFromView(
+        name,
+        cloneWith(borrow stmt.with)?,
+        values,
+        cloneFromClause(borrow stmt.from)?,
+        cloneOptional(borrow stmt.filter)?,
+    )?;
+    var compiler = newCompiler(db)?;
+    let plan = compileSelect(mut compiler, borrow select, db)?;
+    let slot = compiler.slotsInUse;
+    compiler.slotsInUse += 1;
+    let returning = viewReturning(mut compiler, borrow stmt.returning, borrow table, slot, db)?;
+    var frame = newFrame(mut compiler, params, db)?;
+    var rows = runSelect(borrow plan, mut frame, db)?;
+    var output = Vector<Vector<SqliteValue>>.create();
+    let n = table.columns.length;
+    for (r in 0..rows.length) {
+        var row = takeRow(mut rows, r);
+        var old = Vector<SqliteValue>.withCapacity(n)?;
+        for (c in 0..n) {
+            old.push(row[c].clone()?)?;
+        }
+        var new = cloneValues(old.view())?;
+        for (a in 0..targets.length) {
+            new[targets[a]] = replace(mut row[n + a], SqliteValue.Null);
+        }
+        let oldRow: Slot? = viewRow(old);
+        let newRow: Slot? = viewRow(new);
+        if (!fireTriggers(
+            borrow triggers,
+            borrow table,
+            TriggerEvent.Update,
+            TriggerTiming.InsteadOf,
+            borrow oldRow,
+            borrow newRow,
+            targets.view(),
+            db,
+        )?) {
+            continue;
+        }
+        if (returning.length != 0 && borrow newRow is Some(updated)) {
+            output.push(viewReturningRow(borrow returning, slot, updated, mut frame, db)?)?;
+        }
+    }
+    db.changes = 0;
+    return Ok(QueryResult { columns: returningNames(borrow stmt.returning, borrow table)?, rows: output });
+}

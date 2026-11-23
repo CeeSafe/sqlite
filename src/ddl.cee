@@ -354,8 +354,8 @@ fn executeDrop(stmt: borrow DropStmt, db: borrow mut Session) -> Result<void, Sq
             }
         }
     }
-    // A table takes its indexes and triggers with it, and its row in sqlite_sequence.
-    removeSchemaRows(db, name, stmt.kind == DropKind.Table)?;
+    // A table takes its indexes and triggers with it, and its row in sqlite_sequence; a view its triggers.
+    removeSchemaRows(db, name, stmt.kind == DropKind.Table || stmt.kind == DropKind.View)?;
     if (stmt.kind == DropKind.Table && db.catalog.table("sqlite_sequence")?.isSome()) {
         db.reloadSchema()?;
         db.removeSequence(name)?;
