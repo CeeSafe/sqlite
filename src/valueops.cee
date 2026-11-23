@@ -1,0 +1,375 @@
+// Operations on values, as SQLite's virtual machine does them: arithmetic (OP_Add and the rest), bitwise operators,
+// concatenation, truth, casts, and the affinities applied when a value is stored or compared.
+//
+// Differences from the C# engine, which this replaces (each checked against sqlite3 3.54):
+// - `%` on reals takes both operands as integers and gives a real, as SQLite does: 5.5 % 2 is 1.0, not 1.5;
+//   `x % -1` is 0 rather than an overflow on the smallest integer;
+// - the smallest integer divided by -1 becomes a real, as in SQLite; the C# overflowed;
+// - shifts by 64 or more give 0 (or -1 for a negative value shifted right), and a negative amount shifts the other
+//   way, as in SQLite; the C# took the amount modulo 64;
+// - a NaN produced by arithmetic is NULL, as in SQLite;
+// - unary + leaves its operand as it is ('abc' stays 'abc');
+// - a comparison applies the affinity SQLite's rules give the pair of operands (`compareAffinity`), and a column
+//   with BLOB affinity compared with one of TEXT affinity is compared without conversion.
+
+/// The affinity of an expression in a comparison: a column's, a CAST's, or none.
+enum ExprAffinity {
+    None,
+    Blob,
+    Text,
+    Numeric,
+    Integer,
+    Real,
+}
+
+fn exprAffinityOf(affinity: Affinity) -> ExprAffinity => match (affinity) {
+    Affinity.Blob => ExprAffinity.Blob,
+    Affinity.Text => ExprAffinity.Text,
+    Affinity.Numeric => ExprAffinity.Numeric,
+    Affinity.Integer => ExprAffinity.Integer,
+    Affinity.Real => ExprAffinity.Real,
+};
+
+fn isNumericAffinity(a: ExprAffinity) -> bool =>
+    a == ExprAffinity.Numeric || a == ExprAffinity.Integer || a == ExprAffinity.Real;
+
+/// The affinity a comparison applies to its operands, from theirs (sqlite3CompareAffinity).
+fn compareAffinity(left: ExprAffinity, right: ExprAffinity) -> ExprAffinity {
+    if (left != ExprAffinity.None && right != ExprAffinity.None) {
+        // Both have affinity: numeric if either is, else none.
+        return if (isNumericAffinity(left) || isNumericAffinity(right)) ExprAffinity.Numeric else ExprAffinity.Blob;
+    }
+    return if (left == ExprAffinity.None) right else left;
+}
+
+// ── a value as each kind ─────────────────────────────────────────────────────────────────────────────────────
+
+/// The bytes of a text or a blob.
+fn bytesOf(value: borrow SqliteValue) -> Slice<u8> => match (value) {
+    SqliteValue.Text(s) => s.view().bytes(),
+    SqliteValue.Blob(b) => b.view(),
+    _ => [],
+};
+
+/// A value as a real (sqlite3VdbeRealValue).
+fn realValue(value: borrow SqliteValue) -> f64 => match (value) {
+    SqliteValue.Null => 0.0,
+    SqliteValue.Integer(i) => round<f64>(i),
+    SqliteValue.Real(r) => r,
+    _ => RealParse.of(bytesOf(value)).value,
+};
+
+/// A value as an integer (sqlite3VdbeIntValue): a real toward zero, saturated; text by its integer prefix.
+fn integerValue(value: borrow SqliteValue) -> i64 => match (value) {
+    SqliteValue.Null => 0,
+    SqliteValue.Integer(i) => i,
+    SqliteValue.Real(r) => realToInteger(r),
+    _ => IntegerPrefix.scan(bytesOf(value)).value,
+};
+
+/// A value as a number for arithmetic (numericType): NULL stays NULL.
+fn numericValue(value: borrow SqliteValue) -> SqliteValue => match (value) {
+    SqliteValue.Null => SqliteValue.Null,
+    SqliteValue.Integer(i) => SqliteValue.Integer(i),
+    SqliteValue.Real(r) => SqliteValue.Real(r),
+    _ => textAsNumber(bytesOf(value)),
+};
+
+/// Appends a value as text: an integer in decimal, a real as SQLite writes it, a blob's bytes read as UTF-8.
+fn appendValueText(out: borrow mut String, value: borrow SqliteValue) -> Result<void, AllocError> {
+    match (value) {
+        SqliteValue.Null => { return Ok(); }
+        SqliteValue.Integer(i) => { return out.appendNumber(i); }
+        SqliteValue.Real(r) => { return appendReal(out, r); }
+        SqliteValue.Text(s) => { return out.append(s.view()); }
+        SqliteValue.Blob(b) => {
+            let text = textFromBytesLossy(b.view())?;
+            return out.append(text.view());
+        }
+    }
+}
+
+/// A value as text.
+fn valueText(value: borrow SqliteValue) -> Result<String, AllocError> {
+    if (value is SqliteValue.Text(s)) {
+        return s.clone();
+    }
+    var out = String.create();
+    appendValueText(mut out, value)?;
+    return Ok(out);
+}
+
+/// Whether a value is true in a condition (sqlite3VdbeBooleanValue); `null` for NULL.
+fn truthOf(value: borrow SqliteValue) -> bool? => match (value) {
+    SqliteValue.Null => null,
+    SqliteValue.Integer(i) => i != 0,
+    _ => realValue(value) != 0.0,
+};
+
+fn boolValue(b: bool?) -> SqliteValue => match (b) {
+    Some(true) => SqliteValue.Integer(1),
+    Some(false) => SqliteValue.Integer(0),
+    null => SqliteValue.Null,
+};
+
+fn typeName(value: borrow SqliteValue) -> StringView => match (value) {
+    SqliteValue.Null => "null",
+    SqliteValue.Integer(_) => "integer",
+    SqliteValue.Real(_) => "real",
+    SqliteValue.Text(_) => "text",
+    SqliteValue.Blob(_) => "blob",
+};
+
+// ── arithmetic ───────────────────────────────────────────────────────────────────────────────────────────────
+
+enum ArithmeticOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
+}
+
+/// A real result: NaN becomes NULL.
+fn realResult(r: f64) -> SqliteValue => if (r != r) SqliteValue.Null else SqliteValue.Real(r);
+
+/// `left op right` (OP_Add, OP_Subtract, OP_Multiply, OP_Divide, OP_Remainder).
+fn arithmetic(op: ArithmeticOp, left: borrow SqliteValue, right: borrow SqliteValue) -> SqliteValue {
+    if (left.isNull() || right.isNull()) {
+        return SqliteValue.Null;
+    }
+    let a = numericValue(left);
+    let b = numericValue(right);
+    if (a is SqliteValue.Integer(x) && b is SqliteValue.Integer(y)) {
+        match (op) {
+            ArithmeticOp.Add => {
+                if (x.checkedAdd(y) is Some(sum)) {
+                    return SqliteValue.Integer(sum);
+                }
+            }
+            ArithmeticOp.Subtract => {
+                if (x.checkedSub(y) is Some(difference)) {
+                    return SqliteValue.Integer(difference);
+                }
+            }
+            ArithmeticOp.Multiply => {
+                if (x.checkedMul(y) is Some(product)) {
+                    return SqliteValue.Integer(product);
+                }
+            }
+            ArithmeticOp.Divide => {
+                if (y == 0) {
+                    return SqliteValue.Null;
+                }
+                if (!(y == -1 && x == -9223372036854775808)) {
+                    return SqliteValue.Integer(x / y);
+                }
+            }
+            ArithmeticOp.Remainder => {
+                if (y == 0) {
+                    return SqliteValue.Null;
+                }
+                return SqliteValue.Integer(x % (if (y == -1) 1 else y));
+            }
+        }
+    }
+    let ra = realValue(borrow a);
+    let rb = realValue(borrow b);
+    match (op) {
+        ArithmeticOp.Add => { return realResult(ra + rb); }
+        ArithmeticOp.Subtract => { return realResult(ra - rb); }
+        ArithmeticOp.Multiply => { return realResult(ra * rb); }
+        ArithmeticOp.Divide => {
+            if (rb == 0.0) {
+                return SqliteValue.Null;
+            }
+            return realResult(ra / rb);
+        }
+        ArithmeticOp.Remainder => {
+            // Both operands as integers, from the original values (text by its integer prefix).
+            let ia = integerValue(left);
+            var ib = integerValue(right);
+            if (ib == 0) {
+                return SqliteValue.Null;
+            }
+            if (ib == -1) {
+                ib = 1;
+            }
+            return SqliteValue.Real(round<f64>(ia % ib));
+        }
+    }
+}
+
+/// -x, computed as 0 - x as SQLite does.
+fn negate(value: borrow SqliteValue) -> SqliteValue {
+    let zero = SqliteValue.Integer(0);
+    return arithmetic(ArithmeticOp.Subtract, borrow zero, value);
+}
+
+enum BitOp {
+    And,
+    Or,
+    ShiftLeft,
+    ShiftRight,
+}
+
+/// `left op right` on 64-bit integers (OP_BitAnd, OP_BitOr, OP_ShiftLeft, OP_ShiftRight).
+fn bitwise(op: BitOp, left: borrow SqliteValue, right: borrow SqliteValue) -> SqliteValue {
+    if (left.isNull() || right.isNull()) {
+        return SqliteValue.Null;
+    }
+    let a = integerValue(left);
+    let b = integerValue(right);
+    match (op) {
+        BitOp.And => { return SqliteValue.Integer(truncate<i64>(truncate<u64>(a) & truncate<u64>(b))); }
+        BitOp.Or => { return SqliteValue.Integer(truncate<i64>(truncate<u64>(a) | truncate<u64>(b))); }
+        _ => {}
+    }
+    var toLeft = op == BitOp.ShiftLeft;
+    var amount = b;
+    if (amount < 0) {
+        toLeft = !toLeft;
+        amount = if (amount > -64) 0 - amount else 64;
+    }
+    if (amount >= 64) {
+        return SqliteValue.Integer(if (a >= 0 || toLeft) 0 else -1);
+    }
+    let bits = truncate<u64>(a);
+    let shift = truncate<u32>(amount);
+    if (toLeft) {
+        return SqliteValue.Integer(truncate<i64>(bits << shift));
+    }
+    var shifted = bits >> shift;
+    if (a < 0 && shift > 0) {
+        shifted = shifted | (0xFFFF_FFFF_FFFF_FFFF << (64 - shift));
+    }
+    return SqliteValue.Integer(truncate<i64>(shifted));
+}
+
+fn bitNot(value: borrow SqliteValue) -> SqliteValue {
+    if (value.isNull()) {
+        return SqliteValue.Null;
+    }
+    return SqliteValue.Integer(truncate<i64>(truncate<u64>(integerValue(value)) ^ 0xFFFF_FFFF_FFFF_FFFF));
+}
+
+/// `left || right`.
+fn concatenate(left: borrow SqliteValue, right: borrow SqliteValue) -> Result<SqliteValue, AllocError> {
+    if (left.isNull() || right.isNull()) {
+        return Ok(SqliteValue.Null);
+    }
+    var out = String.create();
+    appendValueText(mut out, left)?;
+    appendValueText(mut out, right)?;
+    return Ok(SqliteValue.Text(out));
+}
+
+// ── affinity and casts ───────────────────────────────────────────────────────────────────────────────────────
+
+/// A value stored in a column of `affinity` (applyAffinity), as this engine holds it: a REAL column's integral
+/// real stays a real here, and becomes an integer only in the record.
+fn applyColumnAffinity(value: SqliteValue, affinity: Affinity) -> Result<SqliteValue, AllocError> {
+    match (affinity) {
+        Affinity.Blob => { return Ok(value); }
+        Affinity.Text => {
+            if (value is SqliteValue.Integer(_) || value is SqliteValue.Real(_)) {
+                return Ok(SqliteValue.Text(valueText(borrow value)?));
+            }
+            return Ok(value);
+        }
+        _ => {}
+    }
+    let toReal = affinity == Affinity.Real;
+    match (value) {
+        SqliteValue.Text(s) => {
+            match (textWithNumericAffinity(s.view().bytes(), true)) {
+                Some(SqliteValue.Integer(i)) => {
+                    return Ok(if (toReal) SqliteValue.Real(round<f64>(i)) else SqliteValue.Integer(i));
+                }
+                Some(number) => { return Ok(number); }
+                null => { return Ok(SqliteValue.Text(s)); }
+            }
+        }
+        SqliteValue.Real(r) => {
+            if (!toReal && realAsExactInteger(r) is Some(i)) {
+                return Ok(SqliteValue.Integer(i));
+            }
+            return Ok(SqliteValue.Real(r));
+        }
+        SqliteValue.Integer(i) => {
+            return Ok(if (toReal) SqliteValue.Real(round<f64>(i)) else SqliteValue.Integer(i));
+        }
+        other => { return Ok(other); }
+    }
+}
+
+/// The value as a comparison with `affinity` sees it (OP_Eq and the others): text becomes a number when it is one
+/// entirely, for a numeric affinity; a number becomes text, for TEXT.
+fn comparisonForm(value: borrow SqliteValue, affinity: ExprAffinity) -> Result<SqliteValue?, AllocError> {
+    if (isNumericAffinity(affinity)) {
+        if (value is SqliteValue.Text(s)) {
+            return Ok(textWithNumericAffinity(s.view().bytes(), false));
+        }
+        return Ok(null);
+    }
+    if (affinity == ExprAffinity.Text) {
+        match (value) {
+            SqliteValue.Integer(_) | SqliteValue.Real(_) => { return Ok(SqliteValue.Text(valueText(value)?)); }
+            _ => { return Ok(null); }
+        }
+    }
+    return Ok(null);
+}
+
+/// Compares two values that are not NULL as a comparison operator does: `affinity` from both operands, then
+/// SQLite's ordering under `collation`.
+fn compareWithAffinity(
+    left: borrow SqliteValue,
+    right: borrow SqliteValue,
+    affinity: ExprAffinity,
+    collation: Collation,
+) -> Result<i32, AllocError> {
+    // The common case needs no conversion.
+    if (left is SqliteValue.Integer(a) && right is SqliteValue.Integer(b)) {
+        return Ok(compareI64(a, b));
+    }
+    let a = comparisonForm(left, affinity)?;
+    let b = comparisonForm(right, affinity)?;
+    let leftForm = match (borrow a) {
+        Some(converted) => converted,
+        null => left,
+    };
+    let rightForm = match (borrow b) {
+        Some(converted) => converted,
+        null => right,
+    };
+    return Ok(compareValues(leftForm, rightForm, collation));
+}
+
+/// CAST(value AS type), where `affinity` is the type's (sqlite3VdbeMemCast).
+fn castValue(value: SqliteValue, affinity: Affinity) -> Result<SqliteValue, AllocError> {
+    if (value.isNull()) {
+        return Ok(SqliteValue.Null);
+    }
+    match (affinity) {
+        Affinity.Blob => {
+            match (value) {
+                SqliteValue.Blob(b) => { return Ok(SqliteValue.Blob(b)); }
+                other => {
+                    let text = valueText(borrow other)?;
+                    return SqliteValue.blob(text.view().bytes());
+                }
+            }
+        }
+        Affinity.Text => { return Ok(SqliteValue.Text(valueText(borrow value)?)); }
+        Affinity.Real => { return Ok(SqliteValue.Real(realValue(borrow value))); }
+        Affinity.Integer => { return Ok(SqliteValue.Integer(integerValue(borrow value))); }
+        Affinity.Numeric => {
+            match (value) {
+                SqliteValue.Integer(i) => { return Ok(SqliteValue.Integer(i)); }
+                SqliteValue.Real(r) => { return Ok(SqliteValue.Real(r)); }
+                other => { return Ok(textCastToNumeric(bytesOf(borrow other))); }
+            }
+        }
+    }
+}

@@ -83,8 +83,8 @@ struct IndexRange {
 }
 
 /// The entry in the index cell whose payload length varint is at `offset`.
-fn decodeIndexEntry(
-    pager: borrow mut Pager,
+fn decodeIndexEntry<P: PageSource>(
+    pager: borrow mut P,
     page: Slice<u8>,
     offset: usize,
 ) -> Result<Vector<SqliteValue>, SqliteError> {
@@ -103,8 +103,8 @@ fn decodeIndexEntry(
 }
 
 /// The entry of cell `index` of an index page.
-fn indexEntryAt(
-    pager: borrow mut Pager,
+fn indexEntryAt<P: PageSource>(
+    pager: borrow mut P,
     page: Slice<u8>,
     header: borrow BTreePageHeader,
     index: usize,
@@ -129,7 +129,7 @@ fn indexEntryRowId(entry: Slice<SqliteValue>) -> Result<i64, SqliteError> {
     return Err(corrupt("an index entry does not end with a rowid"));
 }
 
-fn readIndexPage(pager: borrow mut Pager, pageNumber: u32) -> Result<CursorFrame, SqliteError> {
+fn readIndexPage<P: PageSource>(pager: borrow mut P, pageNumber: u32) -> Result<CursorFrame, SqliteError> {
     let page = pager.readPage(pageNumber)?;
     let header = BTreePageHeader.parse(page.view(), pageNumber)?;
     if (header.kind != PAGE_LEAF_INDEX && header.kind != PAGE_INTERIOR_INDEX) {
@@ -139,8 +139,8 @@ fn readIndexPage(pager: borrow mut Pager, pageNumber: u32) -> Result<CursorFrame
 }
 
 /// The number of cells at the start of the page that do not satisfy the range's low bound.
-fn cellsBelowLow(
-    pager: borrow mut Pager,
+fn cellsBelowLow<P: PageSource>(
+    pager: borrow mut P,
     frame: borrow CursorFrame,
     range: borrow IndexRange,
 ) -> Result<usize, SqliteError> {
@@ -159,8 +159,8 @@ fn cellsBelowLow(
 }
 
 /// The number of cells at the start of the page that satisfy the range's high bound.
-fn cellsWithinHigh(
-    pager: borrow mut Pager,
+fn cellsWithinHigh<P: PageSource>(
+    pager: borrow mut P,
     frame: borrow CursorFrame,
     range: borrow IndexRange,
 ) -> Result<usize, SqliteError> {
@@ -208,7 +208,7 @@ struct IndexCursor {
     };
 
     /// The next entry (the indexed columns, then the rowid), or `null` after the last.
-    fn next(borrow mut this, pager: borrow mut Pager) -> Result<Vector<SqliteValue>?, SqliteError> {
+    fn next<P: PageSource>(borrow mut this, pager: borrow mut P) -> Result<Vector<SqliteValue>?, SqliteError> {
         if (!this.started) {
             this.started = true;
             this.push(pager, this.root, true)?;
@@ -261,9 +261,9 @@ struct IndexCursor {
 
     /// Enters `pageNumber`. With `place`, the cursor starts at the first step the bound on its starting side
     /// allows; without it, at the page's first (or, backwards, last) step.
-    private fn push(
+    private fn push<P: PageSource>(
         borrow mut this,
-        pager: borrow mut Pager,
+        pager: borrow mut P,
         pageNumber: u32,
         place: bool,
     ) -> Result<void, SqliteError> {
@@ -292,7 +292,7 @@ struct IndexCursor {
 }
 
 /// The number of entries in the subtree rooted at `pageNumber`.
-fn countIndexSubtree(pager: borrow mut Pager, pageNumber: u32, depth: usize) -> Result<u64, SqliteError> {
+fn countIndexSubtree<P: PageSource>(pager: borrow mut P, pageNumber: u32, depth: usize) -> Result<u64, SqliteError> {
     if (depth >= BTREE_MAX_DEPTH) {
         return Err(corrupt("an index b-tree's pages form a cycle"));
     }
@@ -310,8 +310,8 @@ fn countIndexSubtree(pager: borrow mut Pager, pageNumber: u32, depth: usize) -> 
 
 /// The number of entries under `pageNumber` in `range`. `checkLow` and `checkHigh` say which bounds this subtree
 /// may straddle: a subtree known to lie inside both is counted without decoding an entry.
-fn countIndexPage(
-    pager: borrow mut Pager,
+fn countIndexPage<P: PageSource>(
+    pager: borrow mut P,
     pageNumber: u32,
     range: borrow IndexRange,
     checkLow: bool,
@@ -346,12 +346,16 @@ fn countIndexPage(
 }
 
 /// The number of entries of the index rooted at `rootPage` that lie in `range`.
-fn countIndexRange(pager: borrow mut Pager, rootPage: u32, range: borrow IndexRange) -> Result<u64, SqliteError> =>
+fn countIndexRange<P: PageSource>(
+    pager: borrow mut P,
+    rootPage: u32,
+    range: borrow IndexRange,
+) -> Result<u64, SqliteError> =>
     countIndexPage(pager, rootPage, range, range.min.isSome(), range.max.isSome(), 0);
 
 /// Each distinct value of the index's first column, in the index's order, found with one seek a value.
-fn distinctLeadingValues(
-    pager: borrow mut Pager,
+fn distinctLeadingValues<P: PageSource>(
+    pager: borrow mut P,
     rootPage: u32,
     collation: Collation,
     descending: bool,

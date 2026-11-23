@@ -280,8 +280,21 @@ struct WritablePager {
     }
 }
 
-impl PageSink for WritablePager {
+impl PageSource for WritablePager {
+    fn readPage(borrow mut this, number: u32) -> Result<Page, SqliteError> {
+        let bytes = this.copy(number)?;
+        return Ok(Page { bytes: Arc<Vector<u8>>.create(bytes)? });
+    }
+
     fn usableSize(borrow this) -> usize => this.usable;
+
+    fn textEncoding(borrow this) -> TextEncoding => this.textEncoding;
+
+    fn totalPages(borrow this) -> u32 => this.pageCount;
+}
+
+impl PageSink for WritablePager {
+    fn usableBytes(borrow this) -> usize => this.usable;
 
     fn allocate(borrow mut this) -> Result<u32, SqliteError> => this.allocatePage();
 

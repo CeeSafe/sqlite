@@ -1,6 +1,20 @@
 // The read-only pager: fixed-size pages by 1-based page number, with a bounded cache. Every structure above it
 // (b-trees, freelist, schema) is expressed in pages.
 
+/// Where b-tree readers get pages: the read-only pager, or a transaction's writable one.
+interface PageSource {
+    /// Page `number` (from 1); a number outside the database is `Corrupt`.
+    fn readPage(borrow mut this, number: u32) -> Result<Page, SqliteError>;
+
+    /// The bytes of each page that b-trees use.
+    fn usableSize(borrow this) -> usize;
+
+    fn textEncoding(borrow this) -> TextEncoding;
+
+    /// The number of pages in the database.
+    fn totalPages(borrow this) -> u32;
+}
+
 /// One page's bytes, shared between the cache and whoever reads it.
 struct Page {
     bytes: Arc<Vector<u8>>;
@@ -64,13 +78,9 @@ struct Pager {
 
     fn pageSize(borrow this) -> usize => this.header.pageSize;
 
-    fn usableSize(borrow this) -> usize => this.header.usableSize();
-
-    fn textEncoding(borrow this) -> TextEncoding => this.header.textEncoding;
-
     /// The page numbered `pageNumber` (from 1). A number outside the database is `Corrupt`: page numbers come
     /// from the file's own pointers.
-    fn readPage(borrow mut this, pageNumber: u32) -> Result<Page, SqliteError> {
+    fn readPageCached(borrow mut this, pageNumber: u32) -> Result<Page, SqliteError> {
         if (pageNumber < 1 || pageNumber > this.pageCount) {
             return Err(corrupt("a page pointer leads outside the database file"));
         }
@@ -104,6 +114,16 @@ struct Pager {
         let _ = this.recent.put(pageNumber, page)?;
         return Ok();
     }
+}
+
+impl PageSource for Pager {
+    fn readPage(borrow mut this, number: u32) -> Result<Page, SqliteError> => this.readPageCached(number);
+
+    fn usableSize(borrow this) -> usize => this.header.usableSize();
+
+    fn textEncoding(borrow this) -> TextEncoding => this.header.textEncoding;
+
+    fn totalPages(borrow this) -> u32 => this.pageCount;
 }
 
 /// Fills `buffer` from `offset`. False when the file ends first.

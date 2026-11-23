@@ -84,24 +84,28 @@ struct PayloadShape {
     local: usize;
 
     /// The shape of a table leaf cell's payload of `payloadLength` bytes.
-    fn ofTableLeaf(pager: borrow Pager, payloadLength: i64) -> Result<PayloadShape, SqliteError> {
+    fn ofTableLeaf<P: PageSource>(pager: borrow P, payloadLength: i64) -> Result<PayloadShape, SqliteError> {
         let usable = pager.usableSize();
         return PayloadShape.of(pager, payloadLength, usable - 35);
     }
 
     /// The shape of an index cell's payload of `payloadLength` bytes.
-    fn ofIndex(pager: borrow Pager, payloadLength: i64) -> Result<PayloadShape, SqliteError> {
+    fn ofIndex<P: PageSource>(pager: borrow P, payloadLength: i64) -> Result<PayloadShape, SqliteError> {
         let usable = pager.usableSize();
         return PayloadShape.of(pager, payloadLength, (usable - 12) * 64 / 255 - 23);
     }
 
-    private fn of(pager: borrow Pager, payloadLength: i64, maxLocal: usize) -> Result<PayloadShape, SqliteError> {
+    private fn of<P: PageSource>(
+        pager: borrow P,
+        payloadLength: i64,
+        maxLocal: usize,
+    ) -> Result<PayloadShape, SqliteError> {
         let usable = pager.usableSize();
         let total = checkedTruncate<usize>(payloadLength) ?? {
             return Err(corrupt("a cell's payload length is negative"));
         };
         // No payload is larger than the database that holds it.
-        if ((total as u64) > (pager.pageCount as u64) * (usable as u64)) {
+        if ((total as u64) > (pager.totalPages() as u64) * (usable as u64)) {
             return Err(corrupt("a cell's payload is larger than the database"));
         }
         if (total <= maxLocal) {
@@ -116,8 +120,8 @@ struct PayloadShape {
 }
 
 /// The whole payload of a cell that spills to overflow pages, starting at `offset` in `page`.
-fn readOverflowPayload(
-    pager: borrow mut Pager,
+fn readOverflowPayload<P: PageSource>(
+    pager: borrow mut P,
     page: Slice<u8>,
     offset: usize,
     shape: PayloadShape,
@@ -144,8 +148,8 @@ fn readOverflowPayload(
 }
 
 /// The row in the table leaf cell at `offset`.
-fn readTableLeafRow(
-    pager: borrow mut Pager,
+fn readTableLeafRow<P: PageSource>(
+    pager: borrow mut P,
     page: Slice<u8>,
     offset: usize,
     wanted: Slice<bool>,
@@ -203,7 +207,7 @@ struct TableCursor {
     }
 
     /// The next row, or `null` after the last.
-    fn next(borrow mut this, pager: borrow mut Pager) -> Result<TableRow?, SqliteError> {
+    fn next<P: PageSource>(borrow mut this, pager: borrow mut P) -> Result<TableRow?, SqliteError> {
         if (!this.started) {
             this.started = true;
             if (this.min > this.max) {
@@ -249,7 +253,7 @@ struct TableCursor {
     }
 
     /// Enters `pageNumber`, positioned at the first cell that can hold a rowid of `min` or more.
-    private fn push(borrow mut this, pager: borrow mut Pager, pageNumber: u32) -> Result<void, SqliteError> {
+    private fn push<P: PageSource>(borrow mut this, pager: borrow mut P, pageNumber: u32) -> Result<void, SqliteError> {
         if (this.stack.length >= BTREE_MAX_DEPTH) {
             return Err(corrupt("a table b-tree's pages form a cycle"));
         }
@@ -281,7 +285,7 @@ struct TableCursor {
 }
 
 /// The row with `rowId` in the table rooted at `rootPage`, or `null` when there is none.
-fn seekTableRow(pager: borrow mut Pager, rootPage: u32, rowId: i64) -> Result<TableRow?, SqliteError> {
+fn seekTableRow<P: PageSource>(pager: borrow mut P, rootPage: u32, rowId: i64) -> Result<TableRow?, SqliteError> {
     var cursor = TableCursor.range(rootPage, rowId, rowId);
     return cursor.next(pager);
 }
