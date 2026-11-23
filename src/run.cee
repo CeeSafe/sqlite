@@ -282,7 +282,7 @@ fn joinLevel(
                 if (sink.stopAfter is Some(n) && sink.rows.length >= n) {
                     return Ok();
                 }
-                let Some(row) = cursor.next(mut db.pager)? else {
+                let Some(row) = cursor.next(db.pagerOf(table.database))? else {
                     break;
                 };
                 ordinal += 1;
@@ -381,14 +381,14 @@ fn indexLevel(
         }
         var next: Vector<SqliteValue>? = null;
         if (borrow mut cursor is Some(c)) {
-            next = c.next(mut db.pager)?;
+            next = c.next(db.pagerOf(table.database))?;
         }
         let Some(entry) = next else {
             cursor = null;
             continue;
         };
         let rowId = indexEntryRowId(entry.view())?;
-        let Some(row) = seekTableRow(mut db.pager, table.root, rowId)? else {
+        let Some(row) = seekTableRow(db.pagerOf(table.database), table.root, rowId)? else {
             return Err(corrupt("an index entry names a row its table does not have"));
         };
         loadTableRow(table, row.rowId, row.columns, mut frame.slots[source.slot])?;
@@ -456,7 +456,7 @@ fn unmatchedRightRows(
             SourceKind.Table(table) => {
                 var cursor = RowCursor.scan(table);
                 var ordinal: usize = 0;
-                while (cursor.next(mut db.pager)? is Some(row)) {
+                while (cursor.next(db.pagerOf(table.database))? is Some(row)) {
                     ordinal += 1;
                     if (wasMatched(ordinal - 1)) {
                         continue;

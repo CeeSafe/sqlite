@@ -37,7 +37,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | PRAGMAs, pragma_* table functions | `Exec/QueryExecutor` (`ExecutePragma`) | `pragma.cee`, `integrity.cee` | schema pragmas, header fields, integrity_check and quick_check done |
 | Connection, transactions | `SqliteConnection`, `EngineGlue` | `session.cee` | done: statements commit on their own outside BEGIN, and a failed statement undoes only itself inside it; SAVEPOINT, RELEASE, ROLLBACK TO; OR FAIL and OR ROLLBACK |
 | VACUUM, ANALYZE, REINDEX | (refused by the C#) | `vacuum.cee`, `analyze.cee` | done, with VACUUM INTO |
-| TEMP tables, ATTACH | (refused by the C#) | | not started: every part of the engine reads one database file |
+| TEMP tables, ATTACH | (refused by the C#) | `session.cee` (databases), `select.cee` (names) | done: TEMP tables, views, indexes and triggers (on any database's tables), ATTACH and DETACH, schema-qualified names, SQLite's search order, `database_list` |
 | WAL | `Storage/Wal*`, `Shm*` | `wal.cee`, `pagerw.cee`, `pragma.cee` | done: logs read (either checksum byte order) and written with SQLite's salts and checksums, damaged tails ignored as SQLite ignores them, `journal_mode` WAL and DELETE, `wal_checkpoint` (all four modes), `wal_autocheckpoint`, a checkpoint and removal of the log on `Session.close`; no `-shm` (see Limits) |
 | Connection, command, transaction | `SqliteConnection`, `SqliteCommand`, `SqliteTransaction`, `EngineGlue` | `api.cee`, `params.cee` | done: `Connection` with `execute`, `query`, `scalar`, `executeScript`, `begin`/`commit`/`rollback` and `transaction(work)`; `Params` bound by SQLite's rules; results materialised (see below) |
 | Connection pool | `SqliteConnectionPool`, `SharedStore` | `pool.cee` | done: shareable across threads (`Arc<ConnectionPool>`), transactions serialised, connections rolled back on return; no `:memory:` |
@@ -407,6 +407,11 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   trigger's RAISE: FAIL keeps the rows the statement changed before the failing one (indexes it left to rebuild
   are rebuilt then), ROLLBACK ends the whole transaction. changes() does not count the rows FAIL kept.
 
+- **TEMP and ATTACH** (`tempTablesAndAttachedDatabases`): names resolve as in SQLite (TEMP, then main, then the
+  attached databases in order, or the schema written), `sqlite_temp_schema` and `aux.sqlite_schema` read each
+  database's schema, a TEMP trigger may be on another database's table, a view or trigger outside TEMP sees only
+  its own database's tables, and a transaction spans every database. The C# refused both.
+
 ## Known differences from SQLite in the math functions
 
 The `sqlite3` shell calls the platform's libm (macOS's here), and prints reals with 17 significant digits, so a
@@ -590,6 +595,11 @@ group's tables NULL when no row of the whole group meets cond (`leftJoinsOfGroup
 Collations other than BINARY, NOCASE and RTRIM are refused.
 
 ## Limits
+
+- **TEMP and attached databases.** TEMP is a file of its own in `$TMPDIR`, removed when the session closes (one
+  never closed leaves it behind); so is a private database (`ATTACH ''`). A transaction that changes several
+  databases commits them one after the other, each atomically with its own journal but not all together: SQLite's
+  super-journal is not written. VACUUM, ANALYZE and REINDEX work on main only.
 
 - **Local time.** 'localtime', and 'utc' on a value not known to be UTC, are an error ("local time unavailable"):
   CeeSafe's library has no time zone (CEESAFE_FINDINGS.md). 'now' and date functions with it are also not refused

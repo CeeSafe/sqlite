@@ -6,7 +6,8 @@
 // - DROP gives the object's pages back to the freelist, and CREATE takes pages from it first;
 // - every change to the schema adds one to the schema cookie, so other connections read the schema again.
 //
-// Not yet supported, and refused by name: ALTER TABLE, CREATE TRIGGER, and TEMP objects.
+// TEMP objects and those of attached databases are made by the same code, with their database made the session's
+// active one (Session.run).
 
 /// Writes an empty b-tree page: a table leaf or an index leaf.
 fn initRoot(pager: borrow mut WritablePager, page: u32, kind: u8) -> Result<void, SqliteError> {
@@ -153,9 +154,6 @@ fn executeCreateTable(
     sql: StringView,
     db: borrow mut Session,
 ) -> Result<void, SqliteError> {
-    if (stmt.temporary) {
-        return Err(unsupported("TEMP tables are not supported yet"));
-    }
     let name = stmt.name.name.view();
     if (objectExists(db, name)) {
         if (stmt.ifNotExists) {
@@ -278,9 +276,6 @@ fn executeCreateView(
     sql: StringView,
     db: borrow mut Session,
 ) -> Result<void, SqliteError> {
-    if (stmt.temporary) {
-        return Err(unsupported("TEMP views are not supported yet"));
-    }
     let name = stmt.name.name.view();
     if (objectExists(db, name)) {
         if (stmt.ifNotExists) {

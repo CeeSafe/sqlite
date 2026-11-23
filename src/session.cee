@@ -11,9 +11,22 @@ public struct QueryResult {
 }
 
 public struct Session {
+    /// The database statements work on now: `active` in the list of databases (main is 0). The others wait in
+    /// `stash`, which has `null` at the active one's place.
     pager: WritablePager;
     catalog: SchemaCatalog;
     entries: Vector<SchemaEntry>;
+    active: usize;
+    stash: Vector<DatabaseState?>;
+    /// Each database's name (`main`, `temp`, or the name ATTACH gave), its file, and the file as PRAGMA
+    /// database_list shows it (empty for TEMP and private databases).
+    databaseNames: Vector<String>;
+    databasePaths: Vector<String>;
+    databaseShownPaths: Vector<String>;
+    /// The TEMP database's place in the list, once a TEMP object made it.
+    tempIndex: usize?;
+    /// While a view or trigger stored outside TEMP compiles: its database, the only one its names may find.
+    pinnedDatabase: usize?;
     /// Rows changed by the last INSERT, UPDATE or DELETE, and by all since the session opened.
     changes: i64;
     totalChanges: i64;
@@ -49,10 +62,25 @@ public struct Session {
         var pager = WritablePager.open(path)?;
         let entries = readSchemaEntries(mut pager)?;
         let catalog = SchemaCatalog.fromEntries(entries.view())?;
+        var stash = Vector<DatabaseState?>.create();
+        stash.push(null)?;
+        var names = Vector<String>.create();
+        names.push(String.from("main")?)?;
+        var paths = Vector<String>.create();
+        paths.push(String.from(path)?)?;
+        var shownPaths = Vector<String>.create();
+        shownPaths.push(String.from(path)?)?;
         return Ok(Session {
             pager: pager,
             catalog: catalog,
             entries: entries,
+            active: 0,
+            stash: stash,
+            databaseNames: names,
+            databasePaths: paths,
+            databaseShownPaths: shownPaths,
+            tempIndex: null,
+            pinnedDatabase: null,
             changes: 0,
             totalChanges: 0,
             lastInsertRowid: 0,
@@ -83,13 +111,15 @@ public struct Session {
     /// Closes the database, forgetting a transaction in progress. In WAL mode the log is checkpointed into the
     /// file and removed, as SQLite does when its last connection closes.
     public fn close(this) -> Result<void, SqliteError> {
-        let me = this;
+        var me = this;
+        me.closeOthers()?;
         return me.pager.close();
     }
 
     /// What `close` does, for an owner that keeps the session (a connection with a drop block).
     fn closeLog(borrow mut this) -> Result<void, SqliteError> {
         this.inTransaction = false;
+        this.closeOthers()?;
         return this.pager.closeLog();
     }
 
@@ -200,38 +230,38 @@ public struct Session {
         // Parsed as written, so that `SELECT 3 +;` is an error near ";" as in SQLite; the text without its
         // semicolons is what a definition keeps.
         let stmt = Parser.parseStatement(written)?;
-        this.pager.beginStatement();
+        this.beginStatementAll();
         this.conflictFailure = null;
         let result = this.run(borrow stmt, text, params);
         let failure = replace(mut this.conflictFailure, null);
         let keep = result.isOk() || failure == Some(ConflictAction.Fail);
         if (result.isOk()) {
-            this.pager.endStatement();
+            this.endStatementAll();
         } else if (failure == Some(ConflictAction.Fail)) {
             // OR FAIL: the rows changed before the failure stay; indexes left to rebuild are rebuilt now.
             rebuildStaleIndexes(this)?;
-            this.pager.endStatement();
-            this.reloadSchema()?;
+            this.endStatementAll();
+            this.reloadAllSchemas()?;
         } else if (failure == Some(ConflictAction.Rollback) && this.inTransaction) {
             // OR ROLLBACK: the whole transaction goes.
-            this.pager.rollback();
+            this.rollbackAll();
             this.inTransaction = false;
             this.savepoints.clear();
             this.savepointBegan = false;
-            this.reloadSchema()?;
+            this.reloadAllSchemas()?;
         } else if (this.inTransaction) {
             // A failed statement undoes itself alone.
-            this.pager.rollbackStatement()?;
-            this.reloadSchema()?;
+            this.rollbackStatementAll()?;
+            this.reloadAllSchemas()?;
         }
         this.staleIndexes.clear();
         if (!this.inTransaction) {
             // Each statement outside BEGIN is a transaction of its own.
             if (keep) {
-                this.pager.commit()?;
+                this.commitAll()?;
             } else {
-                this.pager.rollback();
-                this.reloadSchema()?;
+                this.rollbackAll();
+                this.reloadAllSchemas()?;
             }
         }
         return result;
@@ -239,6 +269,105 @@ public struct Session {
 
     /// Runs a statement.
     fn run(
+        borrow mut this,
+        stmt: borrow Stmt,
+        sql: StringView,
+        params: Slice<SqliteValue>,
+    ) -> Result<QueryResult, SqliteError> {
+        // The statement's database is made the active one while it runs.
+        let target = this.statementDatabase(stmt)?;
+        let previous = this.swapTo(target);
+        let result = this.runHere(stmt, sql, params);
+        let _ = this.swapTo(previous);
+        return result;
+    }
+
+    /// The database a statement writes to or defines in: TEMP for a TEMP object, the database a schema name
+    /// names, else the one where its table is (TEMP, main, attached, in that order), else main.
+    fn statementDatabase(borrow mut this, stmt: borrow Stmt) -> Result<usize, SqliteError> {
+        let fallback = this.pinnedDatabase ?? this.active;
+        match (stmt) {
+            Stmt.Insert(s) => { return this.objectDatabase(borrow s.table, fallback); }
+            Stmt.Update(s) => { return this.objectDatabase(borrow s.table, fallback); }
+            Stmt.Delete(s) => { return this.objectDatabase(borrow s.table, fallback); }
+            Stmt.CreateTable(s) => {
+                if (s.temporary) {
+                    return this.ensureTemp();
+                }
+                if (borrow s.name.schema is Some(name)) {
+                    return this.databaseNamed(name.view());
+                }
+                return Ok(0);
+            }
+            Stmt.CreateView(s) => {
+                if (s.temporary) {
+                    return this.ensureTemp();
+                }
+                if (borrow s.name.schema is Some(name)) {
+                    return this.databaseNamed(name.view());
+                }
+                return Ok(0);
+            }
+            Stmt.CreateIndex(s) => {
+                if (borrow s.name.schema is Some(name)) {
+                    return this.databaseNamed(name.view());
+                }
+                let anywhere: String? = null;
+                return Ok(this.findTable(borrow anywhere, s.table.view())? ?? 0);
+            }
+            Stmt.CreateTrigger(s) => {
+                if (s.temporary) {
+                    return this.ensureTemp();
+                }
+                if (borrow s.name.schema is Some(name)) {
+                    return this.databaseNamed(name.view());
+                }
+                let anywhere: String? = null;
+                let table = this.findTable(borrow anywhere, s.table.view())?;
+                return Ok(table ?? this.findObject(borrow anywhere, "view", s.table.view())? ?? 0);
+            }
+            Stmt.Drop(s) => {
+                let kind: StringView = match (s.kind) {
+                    DropKind.Table => "table",
+                    DropKind.Index => "index",
+                    DropKind.View => "view",
+                    DropKind.Trigger => "trigger",
+                };
+                return Ok(
+                    this.findObject(
+                        borrow s.name.schema,
+                        kind,
+                        s.name.name.view(),
+                    )? ?? (if (borrow s.name.schema is Some(name)) this.databaseNamed(name.view())? else 0),
+                );
+            }
+            Stmt.AlterTable(s) => { return this.objectDatabase(borrow s.table, 0); }
+            Stmt.Pragma(s) => {
+                if (borrow s.name.schema is Some(name)) {
+                    return this.databaseNamed(name.view());
+                }
+                return Ok(this.active);
+            }
+            _ => { return Ok(this.active); }
+        }
+    }
+
+    /// Where the table or view `name` is, or `fallback` when it is nowhere (the error then names it there).
+    fn objectDatabase(borrow mut this, name: borrow QualifiedName, fallback: usize) -> Result<usize, SqliteError> {
+        if (this.findTable(borrow name.schema, name.name.view())? is Some(i)) {
+            return Ok(i);
+        }
+        if (this.findObject(borrow name.schema, "view", name.name.view())? is Some(i)) {
+            return Ok(i);
+        }
+        if (borrow name.schema is Some(schema)) {
+            return this.databaseNamed(schema.view());
+        }
+        return Ok(fallback);
+    }
+
+    /// Runs a statement in the active database.
+    fn runHere(
         borrow mut this,
         stmt: borrow Stmt,
         sql: StringView,
@@ -291,7 +420,7 @@ public struct Session {
                 if (!this.inTransaction) {
                     return Err(sqlError("cannot commit - no transaction is active"));
                 }
-                this.pager.commit()?;
+                this.commitAll()?;
                 this.inTransaction = false;
                 this.savepoints.clear();
                 this.savepointBegan = false;
@@ -301,11 +430,11 @@ public struct Session {
                 if (!this.inTransaction) {
                     return Err(sqlError("cannot rollback - no transaction is active"));
                 }
-                this.pager.rollback();
+                this.rollbackAll();
                 this.inTransaction = false;
                 this.savepoints.clear();
                 this.savepointBegan = false;
-                this.reloadSchema()?;
+                this.reloadAllSchemas()?;
                 return Ok(emptyResult());
             }
             Stmt.Savepoint(name) => {
@@ -316,17 +445,17 @@ public struct Session {
                 }
                 let level = this.pager.savepointDepth() - 1;
                 this.savepoints.push(NamedSavepoint { name: name.clone()?, level: level })?;
-                this.pager.beginStatement();
+                this.beginStatementAll();
                 return Ok(emptyResult());
             }
             Stmt.Release(name) => {
                 let at = this.savepointNamed(name.view())?;
                 let level = this.savepoints[at].level;
                 this.savepoints.truncate(at);
-                this.pager.releaseLevels(level);
+                this.releaseLevelsAll(level);
                 if (this.savepoints.length == 0 && this.savepointBegan) {
                     // Releasing the savepoint that began the transaction commits it.
-                    this.pager.commit()?;
+                    this.commitAll()?;
                     this.inTransaction = false;
                     this.savepointBegan = false;
                 }
@@ -337,8 +466,16 @@ public struct Session {
                 let level = this.savepoints[at].level;
                 // The savepoint stays; those inside it go.
                 this.savepoints.truncate(at + 1);
-                this.pager.rollbackToLevel(level)?;
-                this.reloadSchema()?;
+                this.rollbackToLevelAll(level)?;
+                this.reloadAllSchemas()?;
+                return Ok(emptyResult());
+            }
+            Stmt.Attach(attach) => {
+                this.attachDatabase(borrow attach.target, attach.schema.view(), params)?;
+                return Ok(emptyResult());
+            }
+            Stmt.Detach(name) => {
+                this.detachDatabase(name.view())?;
                 return Ok(emptyResult());
             }
             Stmt.Analyze(target) => {
@@ -353,7 +490,6 @@ public struct Session {
                 executeReindex(this)?;
                 return Ok(emptyResult());
             }
-            _ => { return Err(unsupported("this statement is not supported yet")); }
         }
     }
 }
@@ -406,4 +542,372 @@ fn newFrame(
     frame.nowMillis = Clock.now().millis();
     fillTriggerSlots(mut frame, db)?;
     return Ok(frame);
+}
+
+/// A database of the session while another is active: its pager and schema.
+struct DatabaseState {
+    pager: WritablePager;
+    catalog: SchemaCatalog;
+    entries: Vector<SchemaEntry>;
+}
+
+/// The databases of a session: main, TEMP once used, and those ATTACH added. One at a time is active (in the
+/// session's own fields), which is where DDL and writes go; reads go to each table's own database.
+impl Session {
+    fn databaseCount(borrow this) -> usize => this.databaseNames.length;
+
+    /// The database called `name` (`main`, `temp`, or an attached one), if there is one.
+    fn databaseIndex(borrow this, name: StringView) -> usize? {
+        for (i in 0..this.databaseNames.length) {
+            if (this.databaseNames[i].view().equalsIgnoreAsciiCase(name)) {
+                return i;
+            }
+        }
+        return null;
+    }
+
+    /// The database a schema name in a statement names: an error for an unknown one. `temp` is made on demand.
+    fn databaseNamed(borrow mut this, name: StringView) -> Result<usize, SqliteError> {
+        if (name.equalsIgnoreAsciiCase("temp") || name.equalsIgnoreAsciiCase("temporary")) {
+            return this.ensureTemp();
+        }
+        return Ok(this.databaseIndex(name) ?? {
+            return Err(namedError("unknown database ", name));
+        });
+    }
+
+    fn pagerOf(borrow mut this, i: usize) -> borrow mut WritablePager {
+        if (i != this.active && i < this.stash.length) {
+            if (borrow mut this.stash[i] is Some(state)) {
+                return borrow mut state.pager;
+            }
+        }
+        return borrow mut this.pager;
+    }
+
+    fn catalogOf(borrow this, i: usize) -> borrow SchemaCatalog {
+        if (i != this.active && i < this.stash.length) {
+            if (borrow this.stash[i] is Some(state)) {
+                return borrow state.catalog;
+            }
+        }
+        return borrow this.catalog;
+    }
+
+    fn entriesOf(borrow this, i: usize) -> borrow Vector<SchemaEntry> {
+        if (i != this.active && i < this.stash.length) {
+            if (borrow this.stash[i] is Some(state)) {
+                return borrow state.entries;
+            }
+        }
+        return borrow this.entries;
+    }
+
+    /// Makes database `k` the active one; returns the one that was, for `swapTo` to restore.
+    fn swapTo(borrow mut this, k: usize) -> usize {
+        let previous = this.active;
+        if (k == previous || k >= this.stash.length) {
+            return previous;
+        }
+        let Some(incoming) = replace(mut this.stash[k], null) else {
+            return previous;
+        };
+        let pager = replace(mut this.pager, incoming.pager);
+        let catalog = replace(mut this.catalog, incoming.catalog);
+        let entries = replace(mut this.entries, incoming.entries);
+        this.stash[previous] = DatabaseState { pager: pager, catalog: catalog, entries: entries };
+        this.active = k;
+        return previous;
+    }
+
+    /// The TEMP database, made (as an empty file of its own, removed when the session closes) when first needed.
+    fn ensureTemp(borrow mut this) -> Result<usize, SqliteError> {
+        if (this.tempIndex is Some(i)) {
+            return Ok(i);
+        }
+        var path = String.from(Environment.variable("TMPDIR") ?? "/tmp")?;
+        if (!path.view().endsWith("/")) {
+            path.append("/")?;
+        }
+        path.append("sqlite-temp-")?;
+        let bytes = randomBytes(8)?;
+        for (b in bytes.view()) {
+            path.appendNumber(b as u64)?;
+        }
+        path.append(".db")?;
+        let state = openDatabaseState(path.view())?;
+        this.attachState("temp", path.view(), state)?;
+        this.databaseShownPaths.push(String.create())?;
+        let index = this.databaseNames.length - 1;
+        this.tempIndex = index;
+        return Ok(index);
+    }
+
+    /// Adds a database to the list, with as many savepoint levels as the others have open.
+    fn attachState(
+        borrow mut this,
+        name: StringView,
+        path: StringView,
+        state: DatabaseState,
+    ) -> Result<void, SqliteError> {
+        var added = state;
+        for (level in 0..this.pager.savepointDepth()) {
+            added.pager.beginStatement();
+        }
+        this.stash.push(added)?;
+        this.databaseNames.push(String.from(name)?)?;
+        this.databasePaths.push(String.from(path)?)?;
+        return Ok();
+    }
+
+    /// The database where table `name` is: in `schema` when one is written, else TEMP first, then main, then the
+    /// attached ones in order.
+    fn findTable(borrow mut this, schema: borrow String?, name: StringView) -> Result<usize?, SqliteError> {
+        if (schema is Some(s)) {
+            let i = this.databaseNamed(s.view())?;
+            return Ok(if (this.catalogOf(i).table(name)?.isSome()) i else null);
+        }
+        if (this.pinnedDatabase is Some(i)) {
+            return Ok(if (this.catalogOf(i).table(name)?.isSome()) i else null);
+        }
+        let order = this.searchOrder()?;
+        for (k in 0..order.length) {
+            let i = order[k];
+            if (this.catalogOf(i).table(name)?.isSome()) {
+                return Ok(i);
+            }
+        }
+        return Ok(null);
+    }
+
+    /// The database where object `name` of `kind` ("view", "trigger", "index", or "" for any) is, searched as
+    /// `findTable` does.
+    fn findObject(
+        borrow mut this,
+        schema: borrow String?,
+        kind: StringView,
+        name: StringView,
+    ) -> Result<usize?, SqliteError> {
+        var order = Vector<usize>.create();
+        if (schema is Some(s)) {
+            order.push(this.databaseNamed(s.view())?)?;
+        } else if (this.pinnedDatabase is Some(i)) {
+            order.push(i)?;
+        } else {
+            order = this.searchOrder()?;
+        }
+        for (k in 0..order.length) {
+            let entries = this.entriesOf(order[k]);
+            for (e in 0..entries.length) {
+                let entry = borrow entries[e];
+                if ((kind.length == 0 || entry.kind.view() == kind) && entry.name.view().equalsIgnoreAsciiCase(name)) {
+                    return Ok(order[k]);
+                }
+            }
+        }
+        return Ok(null);
+    }
+
+    /// TEMP, main, then the attached databases.
+    fn searchOrder(borrow this) -> Result<Vector<usize>, AllocError> {
+        var order = Vector<usize>.create();
+        if (this.tempIndex is Some(t)) {
+            order.push(t)?;
+        }
+        for (i in 0..this.databaseNames.length) {
+            if (Some(i) != this.tempIndex) {
+                order.push(i)?;
+            }
+        }
+        return Ok(order);
+    }
+
+    // Each of these does to every database what the pager method of the same name does to one.
+    fn beginStatementAll(borrow mut this) {
+        for (i in 0..this.databaseCount()) {
+            this.pagerOf(i).beginStatement();
+        }
+    }
+
+    fn endStatementAll(borrow mut this) {
+        for (i in 0..this.databaseCount()) {
+            this.pagerOf(i).endStatement();
+        }
+    }
+
+    fn rollbackStatementAll(borrow mut this) -> Result<void, SqliteError> {
+        for (i in 0..this.databaseCount()) {
+            this.pagerOf(i).rollbackStatement()?;
+        }
+        return Ok();
+    }
+
+    fn releaseLevelsAll(borrow mut this, level: usize) {
+        for (i in 0..this.databaseCount()) {
+            this.pagerOf(i).releaseLevels(level);
+        }
+    }
+
+    fn rollbackToLevelAll(borrow mut this, level: usize) -> Result<void, SqliteError> {
+        for (i in 0..this.databaseCount()) {
+            this.pagerOf(i).rollbackToLevel(level)?;
+        }
+        return Ok();
+    }
+
+    /// Commits every database the transaction changed, main first. Each file commits atomically with its own
+    /// journal; together they do not (SQLite's super-journal is not written).
+    fn commitAll(borrow mut this) -> Result<void, SqliteError> {
+        for (i in 0..this.databaseCount()) {
+            this.pagerOf(i).commit()?;
+        }
+        return Ok();
+    }
+
+    fn rollbackAll(borrow mut this) {
+        for (i in 0..this.databaseCount()) {
+            this.pagerOf(i).rollback();
+        }
+    }
+
+    /// Reads every database's schema again.
+    fn reloadAllSchemas(borrow mut this) -> Result<void, SqliteError> {
+        let previous = this.active;
+        for (i in 0..this.databaseCount()) {
+            let _ = this.swapTo(i);
+            this.reloadSchema()?;
+        }
+        let _ = this.swapTo(previous);
+        return Ok();
+    }
+}
+
+/// A database file opened for a session, made empty when it does not exist.
+fn openDatabaseState(path: StringView) -> Result<DatabaseState, SqliteError> {
+    if ((fileLength(path)? ?? 0) == 0) {
+        var writer = DatabaseWriter.create(WriterOptions.defaults())?;
+        writer.writeToFile(path)?;
+    }
+    var pager = WritablePager.open(path)?;
+    let entries = readSchemaEntries(mut pager)?;
+    let catalog = SchemaCatalog.fromEntries(entries.view())?;
+    return Ok(DatabaseState { pager: pager, catalog: catalog, entries: entries });
+}
+
+/// ATTACH and DETACH, and closing every database.
+impl Session {
+    fn attachDatabase(
+        borrow mut this,
+        target: borrow Expr,
+        name: StringView,
+        params: Slice<SqliteValue>,
+    ) -> Result<void, SqliteError> {
+        if (this.databaseIndex(
+            name,
+        ).isSome() || name.equalsIgnoreAsciiCase("main") || name.equalsIgnoreAsciiCase("temp")) {
+            var message = String.from("database ")?;
+            message.append(name)?;
+            message.append(" is already in use")?;
+            return Err(SqliteError.Sql(message));
+        }
+        var attached: usize = 0;
+        for (i in 1..this.databaseCount()) {
+            if (Some(i) != this.tempIndex) {
+                attached += 1;
+            }
+        }
+        if (attached >= 10) {
+            return Err(sqlError("too many attached databases - max 10"));
+        }
+        var compiler = newCompiler(this)?;
+        let compiled = compiler.compile(target, this)?;
+        var frame = newFrame(mut compiler, params, this)?;
+        let value = evaluate(borrow compiled, mut frame, this)?;
+        let file = if (value.isNull()) String.create() else valueText(borrow value)?;
+        // An empty name (and :memory:) is a private database: a temporary file here, shown without a name.
+        var path = file.clone()?;
+        var shown = file.clone()?;
+        if (file.length == 0 || file.view() == ":memory:") {
+            path = String.from(Environment.variable("TMPDIR") ?? "/tmp")?;
+            if (!path.view().endsWith("/")) {
+                path.append("/")?;
+            }
+            path.append("sqlite-attached-")?;
+            let bytes = randomBytes(8)?;
+            for (b in bytes.view()) {
+                path.appendNumber(b as u64)?;
+            }
+            path.append(".db")?;
+            shown = String.create();
+        }
+        let state = openDatabaseState(path.view())?;
+        this.attachState(name, path.view(), state)?;
+        let at = this.databasePaths.length - 1;
+        this.databaseShownPaths.push(shown)?;
+        let _ = at;
+        return Ok();
+    }
+
+    fn detachDatabase(borrow mut this, name: StringView) -> Result<void, SqliteError> {
+        if (name.equalsIgnoreAsciiCase("main") || name.equalsIgnoreAsciiCase("temp")) {
+            var message = String.from("cannot detach database ")?;
+            message.append(name)?;
+            return Err(SqliteError.Sql(message));
+        }
+        let i = this.databaseIndex(name) ?? {
+            return Err(namedError("no such database: ", name));
+        };
+        if (i == this.active || i == 0 || Some(i) == this.tempIndex) {
+            return Err(namedError("cannot detach database ", name));
+        }
+        if (this.pagerOf(i).hasChanges()) {
+            var message = String.from("database ")?;
+            message.append(name)?;
+            message.append(" is locked")?;
+            return Err(SqliteError.Sql(message));
+        }
+        let Some(state) = this.stash.remove(i) else {
+            return Ok();
+        };
+        let _ = this.databaseNames.remove(i);
+        let removedPath = this.databasePaths.remove(i);
+        let shown = this.databaseShownPaths.remove(i);
+        if (this.tempIndex is Some(t)) {
+            if (t > i) {
+                this.tempIndex = t - 1;
+            }
+        }
+        if (this.active > i) {
+            this.active -= 1;
+        }
+        let pager = state.pager;
+        pager.close()?;
+        // A private database goes with its file.
+        if (shown.length == 0) {
+            let _ = File.remove(removedPath.view());
+        }
+        return Ok();
+    }
+
+    /// Closes the databases other than main (checkpointing their logs) and removes TEMP's file.
+    fn closeOthers(borrow mut this) -> Result<void, SqliteError> {
+        let _ = this.swapTo(0);
+        while (this.stash.length > 1) {
+            let i = this.stash.length - 1;
+            let state = this.stash.remove(i);
+            let path = this.databasePaths.remove(i);
+            let shown = this.databaseShownPaths.remove(i);
+            let _ = this.databaseNames.remove(i);
+            if (state is Some(s)) {
+                let pager = s.pager;
+                pager.close()?;
+            }
+            if (shown.length == 0) {
+                let _ = File.remove(path.view());
+                let _ = File.remove(withSuffix(path.view(), "-journal")?.view());
+            }
+        }
+        this.tempIndex = null;
+        return Ok();
+    }
 }

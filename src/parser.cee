@@ -1396,7 +1396,9 @@ struct Parser {
             return Err(this.syntaxErrorHere());
         }
         this.expectWord("ON")?;
-        stmt.table = this.name()?;
+        // `ON schema.table`: a TEMP trigger may be on another database's table.
+        let on = this.qualifiedName()?;
+        stmt.table = on.name;
         if (this.acceptWord("FOR")) {
             this.expectWord("EACH")?;
             this.expectWord("ROW")?;

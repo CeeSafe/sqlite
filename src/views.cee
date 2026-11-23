@@ -106,6 +106,7 @@ fn insteadOfTriggers(
             mut all[t],
             TriggerPlan {
                 name: String.create(),
+                database: 0,
                 timing: TriggerTiming.Before,
                 event: TriggerEvent.Insert,
                 updateOf: Vector<String>.create(),

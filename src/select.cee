@@ -20,6 +20,8 @@
 struct TablePlan {
     /// The table's name, as its schema has it.
     name: String;
+    /// The database it is in (main is 0; see Session.databaseNames).
+    database: usize;
     root: u32;
     withoutRowid: bool;
     /// For each declared column, its place in the record; `null` for a VIRTUAL generated column.
@@ -443,6 +445,7 @@ fn tablePlan(
     }
     return Ok(TablePlan {
         name: table.name.clone()?,
+        database: db.active,
         root: table.rootPage,
         withoutRowid: table.withoutRowid,
         recordPosition: recordPosition,
@@ -764,15 +767,24 @@ fn compileFromItem(
                     return Ok();
                 }
             }
-            if (borrow t.name.schema is Some(schema)) {
-                if (!schema.view().equalsIgnoreAsciiCase("main")) {
-                    return Err(namedError("unknown database ", schema.view()));
-                }
-            }
             let tableName = t.name.name.view();
-            if (tableName.equalsIgnoreAsciiCase("sqlite_schema") || tableName.equalsIgnoreAsciiCase("sqlite_master")) {
+            // The schema table of a database: sqlite_schema (sqlite_master), or sqlite_temp_schema for TEMP.
+            let isSchemaTable = tableName.equalsIgnoreAsciiCase(
+                "sqlite_schema",
+            ) || tableName.equalsIgnoreAsciiCase("sqlite_master");
+            let isTempSchemaTable = tableName.equalsIgnoreAsciiCase(
+                "sqlite_temp_schema",
+            ) || tableName.equalsIgnoreAsciiCase("sqlite_temp_master");
+            if (isSchemaTable || isTempSchemaTable) {
+                var database = db.pinnedDatabase ?? 0;
+                if (borrow t.name.schema is Some(name)) {
+                    database = db.databaseNamed(name.view())?;
+                } else if (isTempSchemaTable) {
+                    database = db.ensureTemp()?;
+                }
                 let schema = schemaTableSchema()?;
-                let plan = tablePlan(borrow schema, compiler, slot, db)?;
+                var plan = tablePlan(borrow schema, compiler, slot, db)?;
+                plan.database = database;
                 let columns = tableScopeColumns(borrow schema)?;
                 scope.sources.push(
                     ScopeSource {
@@ -800,9 +812,15 @@ fn compileFromItem(
                 )?;
                 return Ok();
             }
-            if (db.catalog.table(t.name.name.view())?.isSome()) {
-                let tableCopy = db.catalog.tableCopy(t.name.name.view())?;
-                let plan = tablePlan(borrow tableCopy, compiler, slot, db)?;
+            // A schema name no database has: the table is not found (CREATE says "unknown database").
+            var knownSchema = true;
+            if (borrow t.name.schema is Some(name)) {
+                knownSchema = db.databaseIndex(name.view()).isSome() || name.view().equalsIgnoreAsciiCase("temp");
+            }
+            if (knownSchema && db.findTable(borrow t.name.schema, tableName)? is Some(database)) {
+                let tableCopy = db.catalogOf(database).tableCopy(tableName)?;
+                var plan = tablePlan(borrow tableCopy, compiler, slot, db)?;
+                plan.database = database;
                 let columns = tableScopeColumns(borrow tableCopy)?;
                 let count = columns.length;
                 scope.sources.push(
@@ -831,14 +849,23 @@ fn compileFromItem(
                 )?;
                 return Ok();
             }
-            if (db.viewSql(t.name.name.view())? is Some(sql)) {
+            if (knownSchema && db.findObject(borrow t.name.schema, "view", tableName)? is Some(database)) {
+                let sql = viewSqlIn(db, database, tableName)? ?? {
+                    return Err(corrupt("a view has no definition"));
+                };
                 let Stmt.CreateView(view) = Parser.parseStatement(sql.view())? else {
                     return Err(corrupt("a view's definition is not a CREATE VIEW statement"));
                 };
-                // A view sees only the database, not the query that uses it.
+                // A view sees only the database, not the query that uses it; one outside TEMP sees its own
+                // database's tables only, as in SQLite.
                 let saved = replace(mut compiler.scopes, Vector<Scope>.create());
                 let savedCtes = replace(mut compiler.cteNames, Vector<CteName>.create());
+                let savedPin = replace(
+                    mut db.pinnedDatabase,
+                    if (Some(database) == db.tempIndex) db.pinnedDatabase else database,
+                );
                 let compiled = compileSelect(compiler, borrow view.select, db);
+                db.pinnedDatabase = savedPin;
                 compiler.scopes = saved;
                 compiler.cteNames = savedCtes;
                 let plan = compiled?;
@@ -870,7 +897,14 @@ fn compileFromItem(
                 )?;
                 return Ok();
             }
-            return Err(namedError("no such table: ", t.name.name.view()));
+            // SQLite names the table with the schema that was written: `no such table: aux.t`.
+            var missing = String.create();
+            if (borrow t.name.schema is Some(schema)) {
+                missing.append(schema.view())?;
+                missing.append(".")?;
+            }
+            missing.append(t.name.name.view())?;
+            return Err(namedError("no such table: ", missing.view()));
         }
         FromItem.Subquery(sub) => {
             let plan = compileSelect(compiler, borrow sub.select, db)?;
@@ -1365,10 +1399,12 @@ fn compileCoreBody(
             continue;
         }
         // sqlite_schema and the like have no indexes.
-        if (db.catalog.table(plan.name.view())?.isNull()) {
+        if (db.catalogOf(plan.database).table(plan.name.view())?.isNull()) {
             continue;
         }
-        let table = db.catalog.tableCopy(plan.name.view())?;
+        let table = db.catalogOf(plan.database).tableCopy(plan.name.view())?;
+        // The planner reads the table's own database's indexes.
+        let planned = plan.database;
         var bounds = Vector<ColumnBound>.create();
         if (borrow filter is Some(f)) {
             columnBounds(f, sources[s].slot, !sources[s].left && !inLeftGroup(sources.view(), s), mut bounds)?;
@@ -1376,7 +1412,10 @@ fn compileCoreBody(
         if (borrow sources[s].on is Some(on)) {
             columnBounds(on, sources[s].slot, true, mut bounds)?;
         }
-        sources[s].indexSeek = chooseIndexSeek(db, borrow table, borrow bounds)?;
+        let previous = db.swapTo(planned);
+        let chosen = chooseIndexSeek(db, borrow table, borrow bounds);
+        let _ = db.swapTo(previous);
+        sources[s].indexSeek = chosen?;
     }
     return Ok(CorePlan {
         sources: sources,
@@ -1577,4 +1616,18 @@ fn inLeftGroup(sources: Slice<SourcePlan>, s: usize) -> bool {
         }
     }
     return false;
+}
+
+/// The CREATE VIEW statement of view `name` in database `database`.
+fn viewSqlIn(db: borrow Session, database: usize, name: StringView) -> Result<String?, SqliteError> {
+    let entries = db.entriesOf(database);
+    for (i in 0..entries.length) {
+        let entry = borrow entries[i];
+        if (entry.kind.view() == "view" && entry.name.view().equalsIgnoreAsciiCase(name)) {
+            if (borrow entry.sql is Some(sql)) {
+                return Ok(sql.clone()?);
+            }
+        }
+    }
+    return Ok(null);
 }

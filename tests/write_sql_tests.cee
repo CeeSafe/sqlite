@@ -137,6 +137,13 @@ fn schemaChanges() -> Result<void, TestFailure> {
 /// Runs a script (one statement a line) through one sqlite3 process on standard input, and through one session;
 /// compares what both print, errors included, line by line.
 fn sameSession(name: StringView, script: StringView) -> Result<void, TestFailure> {
+    return sameSessionWith(name, script, "", "");
+}
+
+/// `sameSession`, with each `AUXFILE` in the script a file of each engine's own (`theirAux`, `ourAux`), so that
+/// the two runs do not share an attached database.
+fn sameSessionWith(name: StringView, scriptText: StringView, theirAux: StringView, ourAux: StringView) -> Result<void, TestFailure> {
+    let script = scriptText;
     var ourPath = String.from("out/session-ours-")!;
     ourPath.append(name)!;
     ourPath.append(".db")!;
@@ -155,7 +162,7 @@ fn sameSession(name: StringView, script: StringView) -> Result<void, TestFailure
             continue;
         }
         statements.push(sql)!;
-        input.append(sql)!;
+        input.append(replaceAll(sql, "AUXFILE", theirAux).view())!;
         input.append(";\n")!;
     }
     var arguments = Vector<StringView>.create();
@@ -177,7 +184,8 @@ fn sameSession(name: StringView, script: StringView) -> Result<void, TestFailure
     var mine = String.create();
     var myErrors = String.create();
     for (i in 0..statements.length) {
-        let answer = ours(mut session, statements[i]);
+        let statement = replaceAll(statements[i], "AUXFILE", ourAux);
+        let answer = ours(mut session, statement.view());
         if (answer.view().startsWith("error: ")) {
             myErrors.append(answer.view())!;
         } else {
@@ -809,5 +817,85 @@ fn vacuumIntoWritesACopy() -> Result<void, TestFailure> {
         Err(e) => { Check.equalText("output file already exists", e.message())?; }
         Ok(_) => { return Check.fail("expected the existing file to be refused"); }
     }
+    return Ok();
+}
+
+/// `text` with every `from` replaced by `to`.
+fn replaceAll(text: StringView, from: StringView, to: StringView) -> String {
+    var out = String.create();
+    var first = true;
+    for (part in text.split(from)) {
+        if (!first) {
+            out.append(to)!;
+        }
+        first = false;
+        out.append(part)!;
+    }
+    return out;
+}
+
+@test
+fn tempTablesAndAttachedDatabases() -> Result<void, TestFailure> {
+    freshPath("out/attach-theirs.db");
+    freshPath("out/attach-ours.db");
+    sameSessionWith("attach", """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, v)
+        INSERT INTO t VALUES (1, 'main1'), (2, 'main2')
+        CREATE TEMP TABLE t(id INTEGER PRIMARY KEY, v)
+        INSERT INTO t VALUES (10, 'temp10')
+        SELECT * FROM t
+        SELECT * FROM main.t ORDER BY id
+        SELECT * FROM temp.t
+        CREATE TEMPORARY TABLE scratch(x UNIQUE)
+        INSERT INTO scratch SELECT v FROM main.t
+        INSERT INTO scratch VALUES ('main1')
+        SELECT * FROM scratch ORDER BY x
+        CREATE TEMP VIEW tv AS SELECT x FROM scratch WHERE x LIKE '%2'
+        SELECT * FROM tv
+        SELECT type, name, tbl_name FROM sqlite_temp_schema ORDER BY name
+        SELECT type, name FROM temp.sqlite_master ORDER BY name
+        SELECT name FROM sqlite_schema ORDER BY name
+        ATTACH 'AUXFILE' AS aux
+        ATTACH 'AUXFILE' AS aux
+        ATTACH 'x' AS main
+        CREATE TABLE aux.u(k TEXT PRIMARY KEY, n INT)
+        CREATE INDEX aux.u_n ON u(n)
+        INSERT INTO aux.u VALUES ('a', 1), ('b', 2)
+        INSERT INTO u SELECT v, id FROM main.t
+        SELECT * FROM u ORDER BY k
+        SELECT u.k, t.v FROM aux.u JOIN main.t ON t.id = u.n ORDER BY 1
+        UPDATE aux.u SET n = n * 10 WHERE k > 'a'
+        DELETE FROM u WHERE n = 1
+        SELECT * FROM aux.u ORDER BY k
+        SELECT name, tbl_name FROM aux.sqlite_schema ORDER BY name
+        SELECT seq, name FROM pragma_database_list
+        CREATE TEMP TRIGGER tr AFTER INSERT ON main.t BEGIN INSERT INTO scratch VALUES (new.v); END
+        INSERT INTO main.t VALUES (3, 'main3')
+        SELECT * FROM scratch ORDER BY x
+        BEGIN
+        INSERT INTO aux.u VALUES ('z', 26)
+        INSERT INTO main.t VALUES (4, 'main4')
+        ROLLBACK
+        SELECT count(*) FROM aux.u
+        SELECT count(*) FROM main.t
+        BEGIN
+        INSERT INTO aux.u VALUES ('y', 25)
+        DETACH aux
+        COMMIT
+        SELECT count(*) FROM aux.u
+        DROP TABLE temp.t
+        SELECT * FROM t ORDER BY id
+        DROP TABLE aux.u
+        SELECT name FROM aux.sqlite_schema
+        DETACH aux
+        DETACH aux
+        DETACH main
+        DETACH temp
+        SELECT * FROM nosuch.t
+        CREATE TABLE nosuch.t(x)
+        """, "out/attach-theirs.db", "out/attach-ours.db")?;
+    // The attached file this engine wrote is a sound database with the rows sqlite3's has.
+    Check.equalText("ok\n", askSqlite("out/attach-ours.db", "PRAGMA integrity_check")?.view())?;
+    Check.equalText(askSqlite("out/attach-theirs.db", "SELECT type, name FROM sqlite_schema ORDER BY name")?.view(), askSqlite("out/attach-ours.db", "SELECT type, name FROM sqlite_schema ORDER BY name")?.view())?;
     return Ok();
 }

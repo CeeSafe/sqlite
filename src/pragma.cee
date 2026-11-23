@@ -287,11 +287,28 @@ fn pragmaRows(
         return Ok(rows);
     }
     if (name.equalsIgnoreAsciiCase("database_list")) {
-        var row = Vector<SqliteValue>.create();
-        row.push(SqliteValue.Integer(0))?;
-        row.push(SqliteValue.text("main")?)?;
-        row.push(SqliteValue.text(db.pager.filePath())?)?;
-        rows.push(row)?;
+        // As SQLite numbers them: main 0, TEMP 1 (once it exists), the attached ones from 2 in order.
+        var order = Vector<usize>.create();
+        order.push(0)?;
+        if (db.tempIndex is Some(t)) {
+            order.push(t)?;
+        }
+        for (i in 1..db.databaseCount()) {
+            if (Some(i) != db.tempIndex) {
+                order.push(i)?;
+            }
+        }
+        for (k in 0..order.length) {
+            let i = order[k];
+            let seq = if (i == 0) 0 else if (Some(
+                i,
+            ) == db.tempIndex) 1 else truncate<i64>(k) + if (db.tempIndex.isSome()) 0 else 1;
+            var row = Vector<SqliteValue>.create();
+            row.push(SqliteValue.Integer(seq))?;
+            row.push(SqliteValue.text(db.databaseNames[i].view())?)?;
+            row.push(SqliteValue.text(db.databaseShownPaths[i].view())?)?;
+            rows.push(row)?;
+        }
         return Ok(rows);
     }
     if (name.equalsIgnoreAsciiCase("table_list")) {

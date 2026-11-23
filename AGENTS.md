@@ -104,3 +104,7 @@ run code in a sandbox. The specification is embedded in `ceesafec`, so its answe
     windows are computed; `OVER w` is resolved by name at compile time;
   - result column names come from the statement's own text (`SelectCore.columnTexts`, `resultColumnName`), as in
     SQLite; RETURNING's names still come from `SqlWriter`.
+  - a session has several databases (main, TEMP, attached): the active one sits in `Session.pager`/`catalog`/
+    `entries` and the others in `stash`; `Session.run` makes a statement's database active (`swapTo`) so DDL
+    and writers use those fields, while reads go to each table's own (`TablePlan.database`, `pagerOf`); use
+    `findTable`/`findObject` to resolve names, not `db.catalog` directly, in code that reads.

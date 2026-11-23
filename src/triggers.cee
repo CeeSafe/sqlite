@@ -7,7 +7,8 @@
 // names one of the columns; RAISE(IGNORE) skips the row and the rest of the trigger; a trigger does not fire
 // again while it is running (recursive_triggers is off); a body's changes do not count in changes().
 //
-// INSTEAD OF triggers on views run from views.cee. Not yet supported, and refused by name: TEMP triggers.
+// INSTEAD OF triggers on views run from views.cee. A TEMP trigger may be on a table of another database: it is
+// kept in TEMP's schema, and fires with that table's own.
 
 /// The rows a firing trigger sees, and the table's columns that name them.
 struct TriggerContext {
@@ -20,6 +21,8 @@ struct TriggerContext {
 /// A trigger of a table, parsed from its statement.
 struct TriggerPlan {
     name: String;
+    /// The database whose schema keeps it; its body's names are looked up there, unless it is TEMP's.
+    database: usize;
     timing: TriggerTiming;
     event: TriggerEvent;
     updateOf: Vector<String>;
@@ -27,11 +30,31 @@ struct TriggerPlan {
     body: Vector<Stmt>;
 }
 
-/// The triggers on table `name`.
+/// The triggers on table `name` of the active database: its own, and TEMP's on a table of that name.
 fn tableTriggers(db: borrow Session, name: StringView) -> Result<Vector<TriggerPlan>, SqliteError> {
     var out = Vector<TriggerPlan>.create();
-    for (i in 0..db.entries.length) {
-        let entry = borrow db.entries[i];
+    var databases = Vector<usize>.create();
+    databases.push(db.active)?;
+    if (db.tempIndex is Some(t)) {
+        if (t != db.active) {
+            databases.push(t)?;
+        }
+    }
+    for (d in 0..databases.length) {
+        triggersIn(db, databases[d], name, mut out)?;
+    }
+    return Ok(out);
+}
+
+fn triggersIn(
+    db: borrow Session,
+    database: usize,
+    name: StringView,
+    out: borrow mut Vector<TriggerPlan>,
+) -> Result<void, SqliteError> {
+    let entries = db.entriesOf(database);
+    for (i in 0..entries.length) {
+        let entry = borrow entries[i];
         if (entry.kind.view() != "trigger" || !entry.tableName.view().equalsIgnoreAsciiCase(name)) {
             continue;
         }
@@ -45,6 +68,7 @@ fn tableTriggers(db: borrow Session, name: StringView) -> Result<Vector<TriggerP
         out.push(
             TriggerPlan {
                 name: owned.name.name,
+                database: database,
                 timing: owned.timing,
                 event: owned.event,
                 updateOf: owned.updateOf,
@@ -53,7 +77,7 @@ fn tableTriggers(db: borrow Session, name: StringView) -> Result<Vector<TriggerP
             },
         )?;
     }
-    return Ok(out);
+    return Ok();
 }
 
 fn copyScope(scope: borrow Scope) -> Result<Scope, AllocError> {
@@ -213,6 +237,17 @@ fn runTrigger(trigger: borrow TriggerPlan, db: borrow mut Session) -> Result<voi
             return Ok();
         }
     }
+    // A trigger outside TEMP names only its own database's tables.
+    let savedPin = replace(
+        mut db.pinnedDatabase,
+        if (Some(trigger.database) == db.tempIndex) db.pinnedDatabase else trigger.database,
+    );
+    let result = runTriggerBody(trigger, db);
+    db.pinnedDatabase = savedPin;
+    return result;
+}
+
+fn runTriggerBody(trigger: borrow TriggerPlan, db: borrow mut Session) -> Result<void, SqliteError> {
     for (s in 0..trigger.body.length) {
         // A body's changes count in total_changes(), not in changes(), and leave last_insert_rowid() alone.
         let changes = db.changes;
@@ -231,9 +266,6 @@ fn executeCreateTrigger(
     sql: StringView,
     db: borrow mut Session,
 ) -> Result<void, SqliteError> {
-    if (stmt.temporary) {
-        return Err(unsupported("TEMP triggers are not supported yet"));
-    }
     let name = stmt.name.name.view();
     for (i in 0..db.entries.length) {
         if (db.entries[i].kind.view() == "trigger" && db.entries[i].name.view().equalsIgnoreAsciiCase(name)) {
@@ -247,8 +279,18 @@ fn executeCreateTrigger(
         }
     }
     let table = stmt.table.view();
-    let isView = db.viewSql(table)?.isSome();
-    if (!isView && db.catalog.table(table)?.isNull()) {
+    // A TEMP trigger may be on a table or view of any database; another only on its own database's.
+    let anywhere: String? = null;
+    let isView = if (stmt.temporary) db.findObject(
+        borrow anywhere,
+        "view",
+        table,
+    )?.isSome() else db.viewSql(table)?.isSome();
+    let tableExists = if (stmt.temporary) db.findTable(
+        borrow anywhere,
+        table,
+    )?.isSome() else db.catalog.table(table)?.isSome();
+    if (!isView && !tableExists) {
         return Err(namedError("no such table: main.", table));
     }
     if (isReservedName(table)) {
