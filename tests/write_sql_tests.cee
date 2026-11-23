@@ -430,3 +430,25 @@ fn windowFunctionsFeedWrites() -> Result<void, TestFailure> {
         SELECT * FROM r ORDER BY id
         """);
 }
+
+@test
+fn writesThroughIndexSeeks() -> Result<void, TestFailure> {
+    return sameScript("index-seek-writes", """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, k INT, s TEXT COLLATE NOCASE, v)
+        CREATE INDEX t_k ON t(k)
+        CREATE UNIQUE INDEX t_s ON t(s)
+        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000) INSERT INTO t SELECT i, i % 50, 'name' || i, i FROM n
+        UPDATE t SET k = k + 1 WHERE k BETWEEN 10 AND 12
+        SELECT k, count(*) FROM t WHERE k BETWEEN 9 AND 14 GROUP BY k ORDER BY k
+        UPDATE t SET k = 1000 + id WHERE k = 13
+        SELECT count(*), min(k), max(k) FROM t WHERE k > 999
+        DELETE FROM t WHERE k < 5
+        SELECT count(*) FROM t
+        UPDATE t SET v = 'found' WHERE s = 'NAME77'
+        SELECT id, v FROM t WHERE s = 'name77'
+        DELETE FROM t WHERE s >= 'name2' AND s < 'name3'
+        SELECT count(*) FROM t
+        UPDATE t SET s = 'name5' WHERE s = 'name6'
+        SELECT count(*), sum(k) FROM t
+        """);
+}

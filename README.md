@@ -27,7 +27,8 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Date and time functions | `Exec/Functions` (date/time part) | `datetime.cee` | done: a port of SQLite's date.c; 'localtime' and 'utc' are an error where they need the time zone, which CeeSafe lacks |
 | printf() and format() | `Exec/Functions` (`Printf`) | `printf.cee` | done: a port of SQLite's `sqlite3_str_vappendf`, every conversion and flag of the SQL path |
 | JSON functions | `Exec/Json`, `Functions` (JSON1) | `json.cee` | done: SQLite 3.53.4's text JSON functions, `->`, `->>`, `json_group_array` and `json_group_object`, JSON5 input, JSONB blobs as input; the `jsonb_*` functions and the table-valued `json_each` and `json_tree` are not ported and are "no such function" |
-| SELECT: joins, subqueries, views, CTEs, grouping, compounds | `Exec/QueryExecutor` | `select.cee`, `run.cee` | done but table functions and index seeks (rowid seeks done); RIGHT and FULL joins done |
+| SELECT: joins, subqueries, views, CTEs, grouping, compounds | `Exec/QueryExecutor` | `select.cee`, `run.cee` | done but table functions; RIGHT and FULL joins, rowid and index seeks done |
+| Planner: index seeks | `Exec/QueryPlanner` | `plan.cee` | `=`, IS and range terms on the leading columns of plain indexes, for SELECT, UPDATE and DELETE; IN lists, partial and expression indexes, and covering scans next |
 | Window functions | `Exec/WindowEvaluator` | `window.cee` | done: every built-in window function, aggregates over frames, ROWS/RANGE/GROUPS, EXCLUDE, named windows |
 | INSERT, UPDATE, DELETE | `Exec/QueryExecutor` (DML), `InMemoryDatabase` | `dml.cee` | done: constraints, conflict actions, RETURNING, AUTOINCREMENT, upserts, triggers, foreign keys, UPDATE … FROM; WITHOUT ROWID tables read and written |
 | CREATE and DROP of tables, indexes and views | `Exec/QueryExecutor` (DDL) | `ddl.cee` | done |
@@ -266,6 +267,11 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   and spacing kept; a column's name as its table declares it, whatever case the query uses; the INTEGER PRIMARY
   KEY's name for `rowid`; `columnN` for VALUES. The C# wrote the expression again from its tree (`abc + 1` for
   `abc  +  1`) and used the name as the query spelled it.
+
+- **Index seeks** use an index only where it finds every row the comparison can be true for: the index column's
+  collation must be the comparison's, and the comparison's affinity must leave the stored values unchanged; the key
+  is converted as the comparison converts it (`indexSeeksGiveTheSameRows`, `writesThroughIndexSeeks`). WHERE
+  still runs on every row the index gives.
 
 ## Known gaps (inherited from the C# engine, refused by name rather than misparsed)
 

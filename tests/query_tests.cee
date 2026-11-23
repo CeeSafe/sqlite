@@ -369,3 +369,65 @@ fn resultColumnNamesMatchSqlite() -> Result<void, TestFailure> {
     }
     return Ok();
 }
+
+@test
+fn indexSeeksGiveTheSameRows() -> Result<void, TestFailure> {
+    let path = "out/query-index-seeks.db";
+    makeDatabase(path, """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, n INT, s TEXT, c TEXT COLLATE NOCASE, b, r REAL, UNIQUE (n, s));
+        CREATE INDEX t_s ON t(s);
+        CREATE INDEX t_c ON t(c);
+        CREATE INDEX t_b ON t(b);
+        CREATE INDEX t_r_desc ON t(r DESC);
+        CREATE INDEX t_s_binary ON t(c COLLATE BINARY);
+        INSERT INTO t(n, s, c, b, r) VALUES
+            (1, '1', 'Abc', 1, 1.0), (2, '2', 'abc', '1', 2.5), (3, '10', 'ABD', x'31', NULL), (NULL, NULL, NULL, NULL, 3),
+            (5, 'x', 'b', 2.0, -1), (6, '05', 'B', 'abc', 6), (7, '7', 'c', NULL, 7.5), (8, ' 8', 'd', 8, 8);
+        CREATE TABLE big(id INTEGER PRIMARY KEY, k INT, tag TEXT);
+        CREATE INDEX big_k ON big(k);
+        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000)
+        INSERT INTO big SELECT i, i % 500, 'tag' || (i % 37) FROM n;
+        CREATE TABLE small(k INT, label TEXT);
+        INSERT INTO small VALUES (3, 'three'), (499, 'last'), (777, 'none'), (NULL, 'null');
+        """)?;
+    return sameAnswers(path, """
+        SELECT id FROM t WHERE n = 2
+        SELECT id FROM t WHERE n = '2'
+        SELECT id FROM t WHERE s = 1
+        SELECT id FROM t WHERE s = '1'
+        SELECT id FROM t WHERE s = 5
+        SELECT id FROM t WHERE s = 8
+        SELECT id FROM t WHERE c = 'abc' ORDER BY id
+        SELECT id FROM t WHERE c = 'ABC' COLLATE BINARY ORDER BY id
+        SELECT id FROM t WHERE b = 1 ORDER BY id
+        SELECT id FROM t WHERE b = '1' ORDER BY id
+        SELECT id FROM t WHERE b = x'31'
+        SELECT id FROM t WHERE r = 3 ORDER BY id
+        SELECT id FROM t WHERE r > 2 AND r <= 7.5 ORDER BY id
+        SELECT id FROM t WHERE n > 2 ORDER BY id
+        SELECT id FROM t WHERE n < 6 ORDER BY id
+        SELECT id FROM t WHERE n BETWEEN 2 AND 6 ORDER BY id
+        SELECT id FROM t WHERE n >= '3' AND n < '7' ORDER BY id
+        SELECT id FROM t WHERE s > '1' ORDER BY id
+        SELECT id FROM t WHERE s < 5 ORDER BY id
+        SELECT id FROM t WHERE c >= 'b' ORDER BY id
+        SELECT id FROM t WHERE n = 1 AND s = '1'
+        SELECT id FROM t WHERE n = 2 AND s = 2
+        SELECT id FROM t WHERE n IS NULL
+        SELECT id FROM t WHERE n = NULL
+        SELECT id FROM t WHERE s IS NULL AND n IS NULL
+        SELECT id FROM t WHERE 6 = n
+        SELECT id FROM t WHERE 6 < n ORDER BY id
+        SELECT id FROM t WHERE n = 2.0
+        SELECT id FROM t WHERE n = 2.5
+        SELECT id FROM t WHERE s = n ORDER BY id
+        SELECT count(*), sum(id) FROM big WHERE k = 7
+        SELECT count(*), sum(id) FROM big WHERE k BETWEEN 10 AND 20 AND tag = 'tag5'
+        SELECT small.label, count(big.id), sum(big.id) FROM small LEFT JOIN big ON big.k = small.k GROUP BY small.label ORDER BY 1
+        SELECT small.label, big.id FROM small JOIN big ON big.k = small.k WHERE big.id < 1000 ORDER BY 2
+        SELECT s.label, b.id FROM small AS s LEFT JOIN big AS b ON b.k = s.k AND b.id > 19000 ORDER BY 1, 2
+        SELECT count(*) FROM small AS s, big AS b WHERE b.k = s.k + 1
+        SELECT label FROM small WHERE EXISTS (SELECT 1 FROM big WHERE big.k = small.k AND big.id > 19990) ORDER BY 1
+        SELECT id FROM t WHERE n = :missing
+        """);
+}

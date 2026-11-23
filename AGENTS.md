@@ -98,7 +98,8 @@ run code in a sandbox. The specification is embedded in `ceesafec`, so its answe
     and a WITHOUT ROWID table's primary key keeps its number though it has no index;
   - rows are named by `RowKey` (rowid, or a WITHOUT ROWID primary key); indexes of WITHOUT ROWID tables end with
     the key columns they lack;
-  - the catalog does not yet give `IndexSchema`s for automatic indexes: add that with the planner;
+  - the planner (`plan.cee`) finds automatic indexes through `TableSchema.keys` and `sqlite_autoindex_T_n`;
+    `SourcePlan.indexSeek` narrows a scan, and WHERE still runs on each row it gives;
   - window functions run in `window.cee` after grouping: `project` keeps each row (`WindowRow`) until the
     windows are computed; `OVER w` is resolved by name at compile time;
   - result column names come from the statement's own text (`SelectCore.columnTexts`, `resultColumnName`), as in

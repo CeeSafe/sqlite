@@ -1257,8 +1257,10 @@ fn matchingRows(
     db: borrow mut Session,
 ) -> Result<Vector<RowKey>, SqliteError> {
     var cursor = RowCursor.scan(borrow writer.read);
+    var rowidSeek = false;
     if (filter is Some(f) && !writer.table.withoutRowid) {
         if (rowidEqualityFor(f, writer.slot)? is Some(seek)) {
+            rowidSeek = true;
             let Some(rowId) = seekRowid(borrow seek, frame, db)? else {
                 return Ok(Vector<RowKey>.create());
             };
@@ -1266,6 +1268,34 @@ fn matchingRows(
         }
     }
     var rowids = Vector<RowKey>.create();
+    // An index that narrows the rows, as in a SELECT.
+    if (filter is Some(f) && !writer.table.withoutRowid && !rowidSeek) {
+        var bounds = Vector<ColumnBound>.create();
+        columnBounds(f, writer.slot, true, mut bounds)?;
+        if (chooseIndexSeek(db, borrow writer.table, borrow bounds)? is Some(seek)) {
+            let Some(range) = seekRange(borrow seek, frame, db)? else {
+                return Ok(rowids);
+            };
+            var found = Vector<i64>.create();
+            var entries = IndexCursor.create(seek.root, range, false);
+            while (entries.next(mut db.pager)? is Some(entry)) {
+                found.push(indexEntryRowId(entry.view())?)?;
+            }
+            // In rowid order, as a scan would give them.
+            found.sortBy((a, b) => compareI64(a, b));
+            for (i in 0..found.length) {
+                let key = RowKey.Rowid(found[i]);
+                if (!writer.loadRow(borrow key, frame, db)?) {
+                    return Err(corrupt("an index entry names a row its table does not have"));
+                }
+                let ok = evaluate(f, frame, db)?;
+                if (isTrue(borrow ok)) {
+                    rowids.push(key)?;
+                }
+            }
+            return Ok(rowids);
+        }
+    }
     while (cursor.next(mut db.pager)? is Some(row)) {
         loadTableRow(borrow writer.read, row.rowId, row.columns, mut frame.slots[writer.slot])?;
         if (writer.read.generated.length != 0) {

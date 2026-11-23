@@ -18,6 +18,8 @@
 
 /// How a table's rows are read into a slot.
 struct TablePlan {
+    /// The table's name, as its schema has it.
+    name: String;
     root: u32;
     withoutRowid: bool;
     /// For each declared column, its place in the record; `null` for a VIRTUAL generated column.
@@ -60,6 +62,8 @@ struct SourcePlan {
     on: XExpr?;
     /// The rowid this source's row must have, from earlier sources: a seek instead of a scan.
     rowidSeek: XExpr?;
+    /// Else an index that narrows the scan.
+    indexSeek: IndexSeek?;
 }
 
 struct CorePlan {
@@ -434,6 +438,7 @@ fn tablePlan(
         }
     }
     return Ok(TablePlan {
+        name: table.name.clone()?,
         root: table.rootPage,
         withoutRowid: table.withoutRowid,
         recordPosition: recordPosition,
@@ -743,6 +748,7 @@ fn compileFromItem(
                             right: false,
                             on: null,
                             rowidSeek: null,
+                            indexSeek: null,
                         },
                     )?;
                     return Ok();
@@ -777,6 +783,7 @@ fn compileFromItem(
                         right: false,
                         on: null,
                         rowidSeek: null,
+                        indexSeek: null,
                     },
                 )?;
                 return Ok();
@@ -805,6 +812,7 @@ fn compileFromItem(
                         right: false,
                         on: null,
                         rowidSeek: null,
+                        indexSeek: null,
                     },
                 )?;
                 return Ok();
@@ -841,6 +849,7 @@ fn compileFromItem(
                         right: false,
                         on: null,
                         rowidSeek: null,
+                        indexSeek: null,
                     },
                 )?;
                 return Ok();
@@ -875,6 +884,7 @@ fn compileFromItem(
                     right: false,
                     on: null,
                     rowidSeek: null,
+                    indexSeek: null,
                 },
             )?;
             return Ok();
@@ -932,6 +942,7 @@ fn compileFromItem(
                     right: false,
                     on: null,
                     rowidSeek: null,
+                    indexSeek: null,
                 },
             )?;
             return Ok();
@@ -1312,6 +1323,31 @@ fn compileCoreBody(
                 sources[s].rowidSeek = rowidEqualityFor(on, sources[s].slot)?;
             }
         }
+    }
+    // Index seeks: for each table without a rowid seek, the index its WHERE and ON terms use best.
+    for (s in 0..sources.length) {
+        if (sources[s].rowidSeek.isSome() || sources[s].right) {
+            continue;
+        }
+        let SourceKind.Table(plan) = borrow sources[s].kind else {
+            continue;
+        };
+        if (plan.withoutRowid) {
+            continue;
+        }
+        // sqlite_schema and the like have no indexes.
+        if (db.catalog.table(plan.name.view())?.isNull()) {
+            continue;
+        }
+        let table = db.catalog.tableCopy(plan.name.view())?;
+        var bounds = Vector<ColumnBound>.create();
+        if (borrow filter is Some(f)) {
+            columnBounds(f, sources[s].slot, !sources[s].left, mut bounds)?;
+        }
+        if (borrow sources[s].on is Some(on)) {
+            columnBounds(on, sources[s].slot, true, mut bounds)?;
+        }
+        sources[s].indexSeek = chooseIndexSeek(db, borrow table, borrow bounds)?;
     }
     return Ok(CorePlan {
         sources: sources,
