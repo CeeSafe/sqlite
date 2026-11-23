@@ -256,3 +256,27 @@ What works is a region parameter, `fn span<region r>(…, bytes: Slice<r, u8>, �
 which the message does not mention.
 
 Workaround: `Cursor.skip` in `pgwire/src/wire.cee` returns the index where the bytes start, and the caller slices.
+
+### 32. No stable sort
+
+`sortBy` is an introsort and documented as not stable; the library has no stable sort. SQLite's sorter keeps rows
+with equal ORDER BY keys in the order they came, and answers must match it.
+
+Workaround: `runSelect` (`src/run.cee`) appends each row's place as a last key and compares it after the ORDER BY
+terms (`compareKeysThenPlace`).
+
+### 33. A field cannot be moved out of an unwrapped temporary
+
+`var seek = replace(mut best, null)!.seek;`, taking the one field wanted out of an optional that is owned and
+dropped at once, is N0251 ("cannot move a 'IndexSeek' out of an element or enum payload of 'a temporary'; only
+Copy values can be read from there"). The temporary is not borrowed from anywhere, so moving a field out of it
+(and dropping the rest) would be safe.
+
+Workaround: bind it first, `if (best is Some(b)) { var seek = b.seek; … }` (`planSource` in `src/plan.cee`).
+
+### 34. An array literal's integers are `i32` whatever the context
+
+`let a = [0, 2, 3, 5]; return a[i] + y;` with `y: i64` is N0205 (expected 'i64', found 'i32'): the literal's type
+is not taken from its use, and an array literal has no suffix or annotation in the expression to give it.
+
+Workaround: `(a[i] as i64) + y` (`logEst` in `src/plan.cee`).

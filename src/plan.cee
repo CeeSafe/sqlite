@@ -1,31 +1,67 @@
-// Index seeks: the planner's choice of an index for a table in FROM, from `column = value` and range terms of
-// WHERE and of the table's ON.
+// The planner: how each table in FROM is read, and which rows UPDATE and DELETE visit.
 //
-// A term `t.c op expression` qualifies when the expression reads only earlier tables (so it has a value when t is
-// scanned), and when the index finds every row the comparison can be true for: the index column's collation is
-// the comparison's, and the comparison's affinity leaves the stored values as they are (a numeric affinity on a
-// column of numeric affinity, TEXT on a TEXT column, or none at all). The key is then converted by that affinity,
-// as the comparison converts it. WHERE still runs on every row the index gives: the seek only skips rows.
+// A table's rows come from a scan of its b-tree, or through an `IndexSeek`: the entries of one of its indexes in
+// a range (or several ranges, for IN), or its own b-tree between two rowids. WHERE still runs on every row a seek
+// gives: the seek only skips rows that cannot satisfy it.
 //
-// The index chosen has the most leading columns fixed by `=` or IS terms, then a range on the next column; a
-// partial index, an index on expressions, and DESC columns for ranges are not used yet. A LEFT JOIN table takes
-// no IS terms from WHERE, where a row of NULLs could make one true.
+// Terms. `target op key`, `target BETWEEN low AND high` and `target IN (…)` among the AND-terms of WHERE and of
+// the table's ON, where the key reads only earlier tables (so it has a value when the table is read) and the
+// target is a column of the table, its rowid, or an expression an index is on (compared as compiled). An index
+// column takes a term when it finds every row the comparison can be true for: the comparison's collation is the
+// index column's, and its affinity leaves the stored values as they are (a numeric affinity on a column of
+// numeric affinity, TEXT on a TEXT column, or none at all); the key is converted by that affinity, as the
+// comparison converts it. A LEFT JOIN table takes no IS terms from WHERE, where a row of NULLs could make one
+// true. `IN (SELECT …)` takes a subquery that does not depend on the row: it runs once, and the seek visits each
+// distinct value.
+//
+// Partial indexes are used when the query implies the index's WHERE, by SQLite's rule (sqlite3ExprImpliesExpr,
+// whereUsablePartialIndex): each AND-term of the index's WHERE is an AND-term of the query's WHERE (only of the
+// table's ON for a LEFT JOIN table, and never for a table left of a RIGHT JOIN), or is implied by one: one side
+// of an OR it is, or `x IS NOT NULL` where the term is false for a NULL x (`x > 5`, `x + 1 = y`, `x IN (…)`).
+//
+// Choice. The ways to read the table are costed as SQLite's whereLoopAddBtree costs them, in LogEst (10 × log2):
+// a scan of the table, a seek by rowid, and for each usable index a seek and, when it covers the query and is
+// narrower than the table, is partial, or gives ORDER BY's order, a scan of the whole index. The rows each gives
+// come from sqlite_stat1 when ANALYZE has written it, else from SQLite's defaults (a table of 1,048,576 rows,
+// half that in a partial index; 10 rows for one column fixed by `=` or IS, 9 for two, 8, 7, 6, then 5; 1 for a
+// whole unique key; each IN value multiplies, a subquery counting 25; a range on one end keeps a quarter, on
+// both ends a 64th). A seek costs a search, a step for each entry (more for a wider index) and, unless the
+// index covers the query, a lookup in the table for each row. When an ORDER BY is wanted, a way that does not
+// give its order pays for a sort (whereSortingCost). The cheapest wins; on a tie the first, in SQLite's order:
+// the table, the rowid, then the newest index first.
+//
+// Covering. When every column the query reads of the table is in the index entry (its columns and the rowid),
+// rows are made from the entries without reading the table. SQLite's estimate of an index's and a table's widths
+// from the declared types decides whether a whole index is scanned instead of the table, so the rows come in the
+// index's order as they do in SQLite.
+//
+// Order. For the first table of a SELECT that is not an aggregate and has no window functions or RIGHT JOIN, an
+// ORDER BY that the chosen way already gives is not sorted again: its terms are the index's columns after those
+// fixed by `=` (an IN column in its place), then possibly the rowid, with the index's collations, all forwards or
+// all backwards, NULLs where the direction puts them (first for ASC, last for DESC). A LIMIT then stops the scan
+// early.
 
-/// A term that bounds a column of the table being planned.
+/// A term that bounds the table being planned: `target op key`, or `target IN (…)`.
 struct ColumnBound {
-    column: usize;
-    /// `Equal`, `Is`, `Less`, `LessOrEqual`, `Greater` or `GreaterOrEqual`, with the column on the left.
+    /// A column of the table (`XExpr.Column`), its rowid (`XExpr.Rowid`), or an expression on its row.
+    target: XExpr;
+    /// `Equal`, `Is`, `Less`, `LessOrEqual`, `Greater` or `GreaterOrEqual`, with the target on the left.
     op: CompareOp;
     key: XExpr;
     affinity: ExprAffinity;
     collation: Collation;
-    /// `column IN (…)`: the values, any of which the column may equal (`op` is `Equal`).
+    /// `target IN (…)`: the values, any of which the target may equal (`op` is `Equal`).
     inList: Vector<XExpr>;
+    /// `target IN (SELECT …)`: the term's place among the AND-terms of WHERE, or of ON with `inOn`.
+    inTerm: usize?;
+    inOn: bool;
 }
 
-/// A seek through an index: equal keys on its leading columns, then a range on the next.
+/// A seek: equal keys on an index's leading columns, then a range on the next; or rowids.
 struct IndexSeek {
     root: u32;
+    /// The table's own b-tree by rowid: `equal` is empty, and the IN values or the range are rowids.
+    byRowid: bool;
     order: IndexOrder;
     equal: Vector<XExpr>;
     /// The affinity each key is converted by: the equal keys', then the range's.
@@ -35,11 +71,41 @@ struct IndexSeek {
     /// The equal key that is an IN list instead: its place among the keys, and its values.
     inAt: usize?;
     inValues: Vector<XExpr>;
+    /// The IN values are those of the subquery of this AND-term of WHERE (of ON with `inOn`).
+    inTerm: usize?;
+    inOn: bool;
     low: XExpr?;
     lowInclusive: bool;
     high: XExpr?;
     highInclusive: bool;
+    /// The range's column descends in the index.
+    rangeDescending: bool;
+    /// Entries (or rows) last first, for an ORDER BY … DESC.
+    backwards: bool;
+    /// Rows are made from the entries alone: for each table column, its place in an entry (`null` for a column
+    /// nothing reads, and for the rowid alias).
+    covering: Vector<usize?>?;
 }
+
+fn newSeek(root: u32, byRowid: bool) -> IndexSeek => IndexSeek {
+    root: root,
+    byRowid: byRowid,
+    order: IndexOrder.plain(),
+    equal: Vector<XExpr>.create(),
+    affinities: Vector<ExprAffinity>.create(),
+    nullMatches: Vector<bool>.create(),
+    inAt: null,
+    inValues: Vector<XExpr>.create(),
+    inTerm: null,
+    inOn: false,
+    low: null,
+    lowInclusive: true,
+    high: null,
+    highInclusive: true,
+    rangeDescending: false,
+    backwards: false,
+    covering: null,
+};
 
 fn flipped(op: CompareOp) -> CompareOp => match (op) {
     CompareOp.Less => CompareOp.Greater,
@@ -56,18 +122,37 @@ fn knownBefore(e: borrow XExpr, slot: usize) -> bool {
     return !use.opaque && (use.highest.isNull() || use.highest! < slot);
 }
 
-/// The bounds on `slot`'s columns among the AND-terms of `condition`.
-fn columnBounds(
+/// A copy of a term's target: what cloneSimple copies, and `->` and `->>`.
+fn cloneTarget(e: borrow XExpr) -> Result<XExpr?, AllocError> {
+    if (e is XExpr.JsonGet(a, b, text)) {
+        let l = cloneTarget(a)? ?? {
+            return Ok(null);
+        };
+        let r = cloneTarget(b)? ?? {
+            return Ok(null);
+        };
+        return Ok(XExpr.JsonGet(Box.create(l)?, Box.create(r)?, text));
+    }
+    return cloneSimple(e);
+}
+
+/// The bounds on `slot` among the AND-terms of `condition`, numbering the terms from `count` on.
+fn termBounds(
     condition: borrow XExpr,
     slot: usize,
     allowIs: bool,
+    inOn: bool,
+    count: borrow mut usize,
     out: borrow mut Vector<ColumnBound>,
 ) -> Result<void, AllocError> {
+    if (condition is XExpr.And(a, b)) {
+        termBounds(a, slot, allowIs, inOn, count, out)?;
+        termBounds(b, slot, allowIs, inOn, count, out)?;
+        return Ok();
+    }
+    let at = *count;
+    *count = at + 1;
     match (condition) {
-        XExpr.And(a, b) => {
-            columnBounds(a, slot, allowIs, out)?;
-            columnBounds(b, slot, allowIs, out)?;
-        }
         XExpr.Compare(c) => {
             let usable = match (c.op) {
                 CompareOp.Equal | CompareOp.Less | CompareOp.LessOrEqual | CompareOp.Greater | CompareOp.GreaterOrEqual =>
@@ -78,18 +163,14 @@ fn columnBounds(
             if (!usable) {
                 return Ok();
             }
-            var column: usize? = null;
-            var op = c.op;
-            var onLeft = false;
-            if (c.left is XExpr.Column(s, k) && s == slot && knownBefore(borrow c.right, slot)) {
-                column = k;
-                onLeft = true;
-            } else if (c.right is XExpr.Column(s, k) && s == slot && knownBefore(borrow c.left, slot)) {
-                column = k;
-                op = flipped(c.op);
+            let leftKnown = knownBefore(borrow c.left, slot);
+            let rightKnown = knownBefore(borrow c.right, slot);
+            if (leftKnown == rightKnown) {
+                return Ok();
             }
-            let other = if (onLeft) borrow c.right else borrow c.left;
-            let Some(at) = column else {
+            let target = if (rightKnown) borrow c.left else borrow c.right;
+            let other = if (rightKnown) borrow c.right else borrow c.left;
+            let Some(t) = cloneTarget(target)? else {
                 return Ok();
             };
             let Some(key) = cloneSimple(other)? else {
@@ -97,79 +178,92 @@ fn columnBounds(
             };
             out.push(
                 ColumnBound {
-                    column: at,
-                    op: op,
+                    target: t,
+                    op: if (rightKnown) c.op else flipped(c.op),
                     key: key,
                     affinity: c.affinity,
                     collation: c.collation,
                     inList: Vector<XExpr>.create(),
+                    inTerm: null,
+                    inOn: inOn,
                 },
             )?;
         }
         XExpr.Between(b) => {
-            if (b.negated) {
+            if (b.negated || knownBefore(borrow b.operand, slot) || !knownBefore(borrow b.low, slot) || !knownBefore(
+                borrow b.high,
+                slot,
+            )) {
                 return Ok();
             }
-            let XExpr.Column(s, k) = b.operand else {
-                return Ok();
-            };
-            if (s != slot || !knownBefore(borrow b.low, slot) || !knownBefore(borrow b.high, slot)) {
-                return Ok();
-            }
-            if (cloneSimple(borrow b.low)? is Some(low)) {
+            if (cloneTarget(borrow b.operand)? is Some(t) && cloneSimple(borrow b.low)? is Some(low)) {
                 out.push(
                     ColumnBound {
-                        column: k,
+                        target: t,
                         op: CompareOp.GreaterOrEqual,
                         key: low,
                         affinity: b.lowAffinity,
                         collation: b.lowCollation,
                         inList: Vector<XExpr>.create(),
+                        inTerm: null,
+                        inOn: inOn,
                     },
                 )?;
             }
-            if (cloneSimple(borrow b.high)? is Some(high)) {
+            if (cloneTarget(borrow b.operand)? is Some(t) && cloneSimple(borrow b.high)? is Some(high)) {
                 out.push(
                     ColumnBound {
-                        column: k,
+                        target: t,
                         op: CompareOp.LessOrEqual,
                         key: high,
                         affinity: b.highAffinity,
                         collation: b.highCollation,
                         inList: Vector<XExpr>.create(),
+                        inTerm: null,
+                        inOn: inOn,
                     },
                 )?;
             }
         }
         XExpr.In(x) => {
-            // `column IN (values)`, the values known before the table is read.
-            if (x.negated || x.subquery.isSome() || x.items.length == 0) {
+            if (x.negated || knownBefore(borrow x.operand, slot)) {
                 return Ok();
             }
-            let XExpr.Column(s, k) = x.operand else {
+            let Some(t) = cloneTarget(borrow x.operand)? else {
                 return Ok();
             };
-            if (s != slot) {
-                return Ok();
-            }
             var values = Vector<XExpr>.withCapacity(x.items.length)?;
-            for (i in 0..x.items.length) {
-                if (!knownBefore(borrow x.items[i], slot)) {
+            var term: usize? = null;
+            if (borrow x.subquery is Some(sub)) {
+                // A subquery that reads the row (or any row of the query) is not known beforehand.
+                if (sub.correlated) {
                     return Ok();
                 }
-                let Some(v) = cloneSimple(borrow x.items[i])? else {
+                term = at;
+            } else {
+                if (x.items.length == 0) {
                     return Ok();
-                };
-                values.push(v)?;
+                }
+                for (i in 0..x.items.length) {
+                    if (!knownBefore(borrow x.items[i], slot)) {
+                        return Ok();
+                    }
+                    let Some(v) = cloneSimple(borrow x.items[i])? else {
+                        return Ok();
+                    };
+                    values.push(v)?;
+                }
             }
             out.push(
                 ColumnBound {
-                    column: k,
+                    target: t,
                     op: CompareOp.Equal,
                     key: XExpr.Value(SqliteValue.Null),
                     affinity: x.affinity,
                     collation: x.collation,
                     inList: values,
+                    inTerm: term,
+                    inOn: inOn,
                 },
             )?;
         }
@@ -178,6 +272,9 @@ fn columnBounds(
     return Ok();
 }
 
+/// Whether a bound is an IN, of values or of a subquery.
+fn isInBound(bound: borrow ColumnBound) -> bool => bound.inList.length != 0 || bound.inTerm.isSome();
+
 /// Whether a comparison under `affinity` leaves the values of a column of `column` affinity as they are stored.
 fn affinityKeepsColumn(affinity: ExprAffinity, column: Affinity) -> bool => match (affinity) {
     ExprAffinity.None | ExprAffinity.Blob => true,
@@ -185,120 +282,329 @@ fn affinityKeepsColumn(affinity: ExprAffinity, column: Affinity) -> bool => matc
     _ => column == Affinity.Numeric || column == Affinity.Integer || column == Affinity.Real,
 };
 
-/// An index of a table, as the planner sees it: its plain columns.
-struct IndexCandidate {
-    root: u32;
-    unique: bool;
-    columns: Vector<usize>;
-    collations: Vector<Collation>;
-    descending: Vector<bool>;
-}
+// ── comparing compiled expressions ───────────────────────────────────────────────────────────────────────────
 
-/// The indexes of a rowid table that can serve a seek: the automatic ones, and CREATE INDEX ones on plain columns
-/// without WHERE.
-fn indexCandidates(db: borrow mut Session, table: borrow TableSchema) -> Result<Vector<IndexCandidate>, SqliteError> {
-    var out = Vector<IndexCandidate>.create();
-    var prefix = String.from("sqlite_autoindex_")?;
-    prefix.append(table.name.view())?;
-    prefix.append("_")?;
-    for (e in 0..db.entries.length) {
-        let entry = borrow db.entries[e];
-        if (entry.kind.view() != "index" || entry.sql.isSome() || !entry.tableName.view().equalsIgnoreAsciiCase(
-            table.name.view(),
-        )) {
-            continue;
-        }
-        let name = entry.name.view();
-        if (name.length <= prefix.length || !name[0..prefix.length].equalsIgnoreAsciiCase(prefix.view())) {
-            continue;
-        }
-        let n = name[prefix.length..].parseInt<usize>() ?? 0;
-        if (n == 0 || n > table.keys.length) {
-            continue;
-        }
-        let key = borrow table.keys[n - 1];
-        var candidate = IndexCandidate {
-            root: entry.rootPage,
-            unique: true,
-            columns: Vector<usize>.create(),
-            collations: Vector<Collation>.create(),
-            descending: Vector<bool>.create(),
-        };
-        var plain = true;
-        for (c in 0..key.columns.length) {
-            let Some(at) = table.indexOf(key.columns[c].name.view()) else {
-                plain = false;
-                break;
-            };
-            candidate.columns.push(at)?;
-            candidate.collations.push(table.keyCollation(borrow key.columns[c]))?;
-            candidate.descending.push(key.columns[c].descending)?;
-        }
-        if (plain) {
-            out.push(candidate)?;
+fn sameValue(a: borrow SqliteValue, b: borrow SqliteValue) -> bool => match (a) {
+    SqliteValue.Null => b.isNull(),
+    SqliteValue.Integer(x) => b is SqliteValue.Integer(y) && x == y,
+    SqliteValue.Real(x) => b is SqliteValue.Real(y) && x.bits() == y.bits(),
+    SqliteValue.Text(x) => b is SqliteValue.Text(y) && x.view() == y.view(),
+    SqliteValue.Blob(x) => b is SqliteValue.Blob(y) && sameBytes(x.view(), y.view()),
+};
+
+fn sameBytes(a: Slice<u8>, b: Slice<u8>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (a[i] != b[i]) {
+            return false;
         }
     }
-    for (i in 0..db.catalog.indexes.length) {
-        let index = borrow db.catalog.indexes[i];
-        if (!index.table.view().equalsIgnoreAsciiCase(table.name.view()) || index.filter.isSome()) {
-            continue;
+    return true;
+}
+
+fn sameOptional(a: borrow XExpr?, b: borrow XExpr?) -> bool {
+    if (a is Some(x)) {
+        return b is Some(y) && sameExpr(x, y);
+    }
+    return b.isNull();
+}
+
+fn sameList(a: borrow Vector<XExpr>, b: borrow Vector<XExpr>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (!sameExpr(borrow a[i], borrow b[i])) {
+            return false;
         }
-        var candidate = IndexCandidate {
-            root: index.rootPage,
-            unique: index.unique,
-            columns: Vector<usize>.create(),
-            collations: Vector<Collation>.create(),
-            descending: Vector<bool>.create(),
-        };
-        var plain = true;
-        for (c in 0..index.columns.length) {
-            let column = borrow index.columns[c];
-            if (column.expression.isSome()) {
-                plain = false;
-                break;
+    }
+    return true;
+}
+
+/// Whether two compiled expressions are the same: the same operators, values, columns, affinities and collations
+/// (sqlite3ExprCompare). Subqueries, aggregates and windows are never the same.
+fn sameExpr(a: borrow XExpr, b: borrow XExpr) -> bool {
+    match (a) {
+        XExpr.Value(x) => { return b is XExpr.Value(y) && sameValue(x, y); }
+        XExpr.Column(s, k) => { return b is XExpr.Column(t, j) && s == t && k == j; }
+        XExpr.Rowid(s) => { return b is XExpr.Rowid(t) && s == t; }
+        XExpr.Param(i) => { return b is XExpr.Param(j) && i == j; }
+        XExpr.Negate(x) => { return b is XExpr.Negate(y) && sameExpr(x, y); }
+        XExpr.Plus(x) => { return b is XExpr.Plus(y) && sameExpr(x, y); }
+        XExpr.BitNot(x) => { return b is XExpr.BitNot(y) && sameExpr(x, y); }
+        XExpr.Not(x) => { return b is XExpr.Not(y) && sameExpr(x, y); }
+        XExpr.Arith(op, x, y) => {
+            return b is XExpr.Arith(op2, x2, y2) && op == op2 && sameExpr(x, x2) && sameExpr(y, y2);
+        }
+        XExpr.Bits(op, x, y) => {
+            return b is XExpr.Bits(op2, x2, y2) && op == op2 && sameExpr(x, x2) && sameExpr(y, y2);
+        }
+        XExpr.Concat(x, y) => { return b is XExpr.Concat(x2, y2) && sameExpr(x, x2) && sameExpr(y, y2); }
+        XExpr.And(x, y) => { return b is XExpr.And(x2, y2) && sameExpr(x, x2) && sameExpr(y, y2); }
+        XExpr.Or(x, y) => { return b is XExpr.Or(x2, y2) && sameExpr(x, x2) && sameExpr(y, y2); }
+        XExpr.JsonGet(x, y, text) => {
+            return b is XExpr.JsonGet(x2, y2, text2) && text == text2 && sameExpr(x, x2) && sameExpr(y, y2);
+        }
+        XExpr.Compare(c) => {
+            let XExpr.Compare(d) = b else {
+                return false;
+            };
+            return c.op == d.op && c.affinity == d.affinity && c.collation == d.collation && sameExpr(
+                borrow c.left,
+                borrow d.left,
+            ) && sameExpr(borrow c.right, borrow d.right);
+        }
+        XExpr.Between(x) => {
+            let XExpr.Between(y) = b else {
+                return false;
+            };
+            return x.negated == y.negated && x.lowAffinity == y.lowAffinity && x.highAffinity == y.highAffinity &&
+                x.lowCollation == y.lowCollation && x.highCollation == y.highCollation && sameExpr(
+                borrow x.operand,
+                borrow y.operand,
+            ) && sameExpr(borrow x.low, borrow y.low) && sameExpr(borrow x.high, borrow y.high);
+        }
+        XExpr.In(x) => {
+            let XExpr.In(y) = b else {
+                return false;
+            };
+            return x.subquery.isNull() && y.subquery.isNull() && x.negated == y.negated && x.affinity == y.affinity &&
+                x.collation == y.collation && sameExpr(borrow x.operand, borrow y.operand) && sameList(
+                borrow x.items,
+                borrow y.items,
+            );
+        }
+        XExpr.Like(x) => {
+            let XExpr.Like(y) = b else {
+                return false;
+            };
+            return x.op == y.op && x.negated == y.negated && sameExpr(borrow x.operand, borrow y.operand) && sameExpr(
+                borrow x.pattern,
+                borrow y.pattern,
+            ) && sameOptional(borrow x.escape, borrow y.escape);
+        }
+        XExpr.Case(x) => {
+            let XExpr.Case(y) = b else {
+                return false;
+            };
+            if (x.branches.length != y.branches.length || !sameOptional(
+                borrow x.operand,
+                borrow y.operand,
+            ) || !sameOptional(borrow x.otherwise, borrow y.otherwise)) {
+                return false;
             }
-            let Some(at) = table.indexOf(column.name.view()) else {
-                plain = false;
-                break;
+            for (i in 0..x.branches.length) {
+                let p = borrow x.branches[i];
+                let q = borrow y.branches[i];
+                if (p.affinity != q.affinity || p.collation != q.collation || !sameExpr(
+                    borrow p.when,
+                    borrow q.when,
+                ) || !sameExpr(borrow p.then, borrow q.then)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        XExpr.Cast(x, affinity) => { return b is XExpr.Cast(y, affinity2) && affinity == affinity2 && sameExpr(x, y); }
+        XExpr.Call(c) => {
+            let XExpr.Call(d) = b else {
+                return false;
             };
-            candidate.columns.push(at)?;
-            candidate.collations.push(column.collation)?;
-            candidate.descending.push(column.descending)?;
+            return c.function == d.function && c.collation == d.collation && sameList(borrow c.args, borrow d.args);
         }
-        if (plain) {
-            out.push(candidate)?;
-        }
+        XExpr.RowValue(x) => { return b is XExpr.RowValue(y) && sameList(x, y); }
+        _ => { return false; }
     }
-    return Ok(out);
 }
 
-/// The bound among `bounds` that index column `c` of `candidate` can use with operator class `wantEqual`.
+// ── partial indexes: whether the query implies the index's WHERE ─────────────────────────────────────────────
+
+/// Whether `term` being true makes `wanted` true (sqlite3ExprImpliesExpr).
+fn impliesTerm(term: borrow XExpr, wanted: borrow XExpr) -> bool {
+    if (sameExpr(term, wanted)) {
+        return true;
+    }
+    if (wanted is XExpr.Or(a, b) && (impliesTerm(term, a) || impliesTerm(term, b))) {
+        return true;
+    }
+    // `x IS NOT NULL` (and `x NOTNULL`, `x NOT NULL`).
+    if (wanted is XExpr.Compare(c) && c.op == CompareOp.IsNot && c.right is XExpr.Value(SqliteValue.Null) &&
+        impliesNotNull(term, borrow c.left, false)) {
+        return true;
+    }
+    return false;
+}
+
+/// Whether `p` can be true only when `nn` is not NULL; with `seenNot`, whether `p` can be other than NULL only
+/// then (exprImpliesNotNull).
+fn impliesNotNull(p: borrow XExpr, nn: borrow XExpr, seenNot: bool) -> bool {
+    if (sameExpr(p, nn)) {
+        return !(nn is XExpr.Value(SqliteValue.Null));
+    }
+    match (p) {
+        XExpr.In(x) => {
+            // `x NOT IN (…)` is NOT over IN in SQLite's tree.
+            let not = seenNot || x.negated;
+            if (not && x.subquery.isSome()) {
+                return false;
+            }
+            return impliesNotNull(borrow x.operand, nn, true);
+        }
+        XExpr.Between(b) => {
+            if (seenNot || b.negated) {
+                return false;
+            }
+            return impliesNotNull(borrow b.low, nn, true) || impliesNotNull(borrow b.high, nn, true) || impliesNotNull(
+                borrow b.operand,
+                nn,
+                true,
+            );
+        }
+        XExpr.Compare(c) => {
+            let ordered = match (c.op) {
+                CompareOp.Equal | CompareOp.NotEqual | CompareOp.Less | CompareOp.LessOrEqual | CompareOp.Greater | CompareOp.GreaterOrEqual =>
+                    true,
+                _ => false,
+            };
+            if (!ordered) {
+                return false;
+            }
+            return impliesNotNull(borrow c.right, nn, true) || impliesNotNull(borrow c.left, nn, true);
+        }
+        XExpr.Arith(op, a, b) => {
+            let not = seenNot || op == ArithmeticOp.Add || op == ArithmeticOp.Subtract;
+            return impliesNotNull(b, nn, not) || impliesNotNull(a, nn, not);
+        }
+        XExpr.Bits(op, a, b) => {
+            let not = seenNot || op != BitOp.And;
+            return impliesNotNull(b, nn, not) || impliesNotNull(a, nn, not);
+        }
+        XExpr.Concat(a, b) => { return impliesNotNull(b, nn, true) || impliesNotNull(a, nn, true); }
+        XExpr.Negate(x) | XExpr.Plus(x) => { return impliesNotNull(x, nn, seenNot); }
+        XExpr.BitNot(x) | XExpr.Not(x) => { return impliesNotNull(x, nn, true); }
+        _ => { return false; }
+    }
+}
+
+/// Whether an AND-term of `condition` implies `wanted`.
+fn conditionImplies(condition: borrow XExpr, wanted: borrow XExpr) -> bool {
+    if (condition is XExpr.And(a, b)) {
+        return conditionImplies(a, wanted) || conditionImplies(b, wanted);
+    }
+    return impliesTerm(condition, wanted);
+}
+
+/// Whether every AND-term of a partial index's WHERE is implied by an AND-term of `filter` or of `on`.
+fn indexWhereHolds(indexWhere: borrow XExpr, filter: borrow XExpr?, on: borrow XExpr?) -> bool {
+    if (indexWhere is XExpr.And(a, b)) {
+        return indexWhereHolds(a, filter, on) && indexWhereHolds(b, filter, on);
+    }
+    if (filter is Some(f) && conditionImplies(f, indexWhere)) {
+        return true;
+    }
+    return on is Some(o) && conditionImplies(o, indexWhere);
+}
+
+// ── indexes ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The indexes of a table for a query reading it in `slot`, their expressions compiled for that slot. A schema
+/// this cannot read gives none: the table is scanned.
+fn planIndexes(
+    compiler: borrow mut Compiler,
+    table: borrow TableSchema,
+    slot: usize,
+    db: borrow mut Session,
+) -> Vector<TableIndex> {
+    // The index's expressions name the table in a scope of their own: that must not make the subquery being
+    // compiled look correlated.
+    let context = compiler.context;
+    let useAliases = compiler.useAliases;
+    let shallowest = compiler.shallowest;
+    compiler.context = CallContext.Plain;
+    compiler.useAliases = false;
+    let result = tableIndexes(compiler, table, slot, db);
+    compiler.context = context;
+    compiler.useAliases = useAliases;
+    compiler.shallowest = shallowest;
+    return match (result) {
+        Ok(indexes) => indexes,
+        Err(_) => Vector<TableIndex>.create(),
+    };
+}
+
+/// Whether index column `column` holds the value of `e`: the table column, or the same expression.
+fn indexColumnMatches(column: borrow IndexKeyColumn, e: borrow XExpr, table: borrow TableSchema, slot: usize) -> bool {
+    if (column.column is Some(k)) {
+        if (e is XExpr.Column(s, j) && s == slot && j == k) {
+            return true;
+        }
+        return table.rowidAlias == Some(k) && e is XExpr.Rowid(s) && s == slot;
+    }
+    if (borrow column.expr is Some(x)) {
+        return sameExpr(e, x);
+    }
+    return false;
+}
+
+/// The affinity of an index column's values: its table column's, or the expression's (none but for CAST and a
+/// column).
+fn indexColumnAffinity(column: borrow IndexKeyColumn, table: borrow TableSchema) -> Affinity {
+    if (column.column is Some(k)) {
+        return table.columns[k].affinity;
+    }
+    if (borrow column.expr is Some(x)) {
+        return match (x) {
+            XExpr.Cast(_, affinity) => affinity,
+            XExpr.Column(_, k) => if (k < table.columns.length) table.columns[k].affinity else Affinity.Blob,
+            XExpr.Rowid(_) => Affinity.Integer,
+            _ => Affinity.Blob,
+        };
+    }
+    return Affinity.Blob;
+}
+
+/// Whether an index is left to be rebuilt by the running statement, and so cannot be read.
+fn indexIsStale(db: borrow Session, root: u32) -> bool {
+    for (i in 0..db.staleIndexes.length) {
+        if (db.staleIndexes[i].root == root) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The bound among `bounds` that index column `c` can use: an equality (a plain `=` before an IN) with
+/// `wantEqual`, else the low or high end of a range.
 fn usableBound(
     bounds: borrow Vector<ColumnBound>,
     table: borrow TableSchema,
-    candidate: borrow IndexCandidate,
+    index: borrow TableIndex,
     c: usize,
+    slot: usize,
     wantEqual: bool,
     wantLow: bool,
     allowIn: bool,
 ) -> usize? {
-    // A plain `=` first, then an IN list.
+    let column = borrow index.columns[c];
+    let affinity = indexColumnAffinity(column, table);
+    let collation = if (c < index.order.collations.length) index.order.collations[c] else Collation.Binary;
     var inBound: usize? = null;
     for (b in 0..bounds.length) {
         let bound = borrow bounds[b];
-        if (bound.column != candidate.columns[c] || bound.collation != candidate.collations[c]) {
+        if (bound.collation != collation || !affinityKeepsColumn(bound.affinity, affinity) || !indexColumnMatches(
+            column,
+            borrow bound.target,
+            table,
+            slot,
+        )) {
             continue;
         }
-        if (bound.inList.length != 0) {
-            if (allowIn && wantEqual && inBound.isNull() && affinityKeepsColumn(
-                bound.affinity,
-                table.columns[bound.column].affinity,
-            )) {
+        if (isInBound(bound)) {
+            if (allowIn && wantEqual && inBound.isNull()) {
                 inBound = b;
             }
-            continue;
-        }
-        if (!affinityKeepsColumn(bound.affinity, table.columns[bound.column].affinity)) {
             continue;
         }
         let isEqual = bound.op == CompareOp.Equal || bound.op == CompareOp.Is;
@@ -316,140 +622,1247 @@ fn usableBound(
     return inBound;
 }
 
-/// The best index seek for table `table` in `slot` from `bounds`; `null` when no index helps.
-fn chooseIndexSeek(
-    db: borrow mut Session,
-    table: borrow TableSchema,
-    bounds: borrow Vector<ColumnBound>,
-) -> Result<IndexSeek?, SqliteError> {
-    if (bounds.length == 0 || table.withoutRowid) {
-        return Ok(null);
+// ── statistics and estimates (SQLite's, in LogEst: 10 × log2 of the value) ───────────────────────────────────
+
+/// A row of sqlite_stat1: the table, the index (empty for the table's own row), and its numbers.
+struct IndexStat {
+    table: String;
+    index: String;
+    numbers: Vector<u64>;
+}
+
+/// sqlite_stat1, as ANALYZE left it.
+struct PlanStats {
+    rows: Vector<IndexStat>;
+}
+
+/// sqlite3LogEst: about 10 × log2(n).
+fn logEst(n: u64) -> i64 {
+    let a = [0, 2, 3, 5, 6, 7, 8, 9];
+    var x = n;
+    var y: i64 = 40;
+    if (x < 8) {
+        if (x < 2) {
+            return 0;
+        }
+        while (x < 8) {
+            y -= 10;
+            x = x << 1;
+        }
+    } else {
+        while (x > 255) {
+            y += 40;
+            x = x >> 4;
+        }
+        while (x > 15) {
+            y += 10;
+            x = x >> 1;
+        }
     }
-    let candidates = indexCandidates(db, table)?;
-    var best: IndexSeek? = null;
-    var bestScore: usize = 0;
-    for (i in 0..candidates.length) {
-        let candidate = borrow candidates[i];
-        var seek = IndexSeek {
-            root: candidate.root,
-            order: IndexOrder.plain(),
-            equal: Vector<XExpr>.create(),
-            affinities: Vector<ExprAffinity>.create(),
-            nullMatches: Vector<bool>.create(),
-            inAt: null,
-            inValues: Vector<XExpr>.create(),
-            low: null,
-            lowInclusive: true,
-            high: null,
-            highInclusive: true,
+    return (a[truncate<usize>(x & 7)] as i64) + y - 10;
+}
+
+/// sqlite3LogEstAdd: the LogEst of the sum of two values given as LogEsts.
+fn logEstAdd(a: i64, b: i64) -> i64 {
+    let x = [10, 10, 9, 9, 8, 8, 7, 7, 7, 6, 6, 6, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2];
+    let high = if (a >= b) a else b;
+    let low = if (a >= b) b else a;
+    if (high > low + 49) {
+        return high;
+    }
+    if (high > low + 31) {
+        return high + 1;
+    }
+    return high + (x[truncate<usize>(high - low)] as i64);
+}
+
+/// estLog: the cost of one search among `n` (a LogEst) entries.
+fn estLog(n: i64) -> i64 => if (n <= 10) 0 else logEst(truncate<u64>(n)) - 33;
+
+/// The LogEst of a count.
+fn countEst(n: usize) -> i64 => logEst(truncate<u64>(n));
+
+/// Reads sqlite_stat1; none when there is no such table. Rows that are not `table, index, "n n …"` are skipped.
+fn loadStats(db: borrow mut Session) -> Result<PlanStats, SqliteError> {
+    var stats = PlanStats { rows: Vector<IndexStat>.create() };
+    var root: u32? = null;
+    for (e in 0..db.entries.length) {
+        let entry = borrow db.entries[e];
+        if (entry.kind.view() == "table" && entry.name.view().equalsIgnoreAsciiCase("sqlite_stat1")) {
+            root = entry.rootPage;
+        }
+    }
+    let Some(page) = root else {
+        return Ok(stats);
+    };
+    var cursor = TableCursor.scan(page);
+    while (cursor.next(mut db.pager)? is Some(row)) {
+        if (row.columns.length < 3) {
+            continue;
+        }
+        let SqliteValue.Text(table) = borrow row.columns[0] else {
+            continue;
         };
-        var c: usize = 0;
-        while (c < candidate.columns.length) {
-            let Some(b) = usableBound(bounds, table, candidate, c, true, false, seek.inAt.isNull()) else {
+        let SqliteValue.Text(stat) = borrow row.columns[2] else {
+            continue;
+        };
+        var index = String.create();
+        if (borrow row.columns[1] is SqliteValue.Text(name)) {
+            index = name.clone()?;
+        }
+        var numbers = Vector<u64>.create();
+        var parts = stat.view().split(" ");
+        while (parts.next() is Some(part)) {
+            let Some(n) = part.parseInt<u64>() else {
                 break;
             };
-            if (bounds[b].inList.length != 0) {
-                seek.inAt = seek.equal.length;
-                for (v in 0..bounds[b].inList.length) {
-                    seek.inValues.push(cloneSimple(borrow bounds[b].inList[v])? ?? XExpr.Value(SqliteValue.Null))?;
-                }
-            }
-            seek.equal.push(cloneSimple(borrow bounds[b].key)? ?? XExpr.Value(SqliteValue.Null))?;
-            seek.affinities.push(bounds[b].affinity)?;
-            seek.nullMatches.push(bounds[b].op == CompareOp.Is)?;
-            seek.order.collations.push(candidate.collations[c])?;
-            seek.order.descending.push(candidate.descending[c])?;
-            c += 1;
+            numbers.push(n)?;
         }
-        var score = seek.equal.length * 4;
-        if (c == candidate.columns.length && candidate.unique) {
-            score += 2;
-        }
-        if (c < candidate.columns.length && !candidate.descending[c]) {
-            let low = usableBound(bounds, table, candidate, c, false, true, false);
-            let high = usableBound(bounds, table, candidate, c, false, false, false);
-            if (low.isSome() || high.isSome()) {
-                var affinity = ExprAffinity.None;
-                if (low is Some(b)) {
-                    seek.low = cloneSimple(borrow bounds[b].key)?;
-                    seek.lowInclusive = bounds[b].op == CompareOp.GreaterOrEqual;
-                    affinity = bounds[b].affinity;
-                }
-                if (high is Some(b)) {
-                    seek.high = cloneSimple(borrow bounds[b].key)?;
-                    seek.highInclusive = bounds[b].op == CompareOp.LessOrEqual;
-                    affinity = bounds[b].affinity;
-                }
-                // Both bounds must convert their keys alike; else keep only the high one's.
-                if (low is Some(l) && high is Some(h) && bounds[l].affinity != bounds[h].affinity) {
-                    seek.low = null;
-                    seek.lowInclusive = true;
-                }
-                seek.affinities.push(affinity)?;
-                seek.order.collations.push(candidate.collations[c])?;
-                seek.order.descending.push(false)?;
-                score += 1;
-            }
-        }
-        if (score > bestScore) {
-            bestScore = score;
-            best = seek;
+        if (numbers.length != 0) {
+            stats.rows.push(IndexStat { table: table.clone()?, index: index, numbers: numbers })?;
         }
     }
-    return Ok(best);
+    return Ok(stats);
 }
 
-/// The keys of a seek for the current outer rows: the range of index entries to read, or `null` when no row can
-/// match (a NULL key where only `=` holds).
-fn seekRange(
-    seek: borrow IndexSeek,
-    frame: borrow mut Frame,
-    db: borrow mut Session,
-) -> Result<IndexRange?, SqliteError> {
-    let none: SqliteValue? = null;
-    return seekRangeWith(seek, borrow none, frame, db);
-}
-
-/// The ranges of a seek: one, or with an IN list one for each distinct value, in the index's order.
-fn seekRanges(
-    seek: borrow IndexSeek,
-    frame: borrow mut Frame,
-    db: borrow mut Session,
-) -> Result<Vector<IndexRange>, SqliteError> {
-    var ranges = Vector<IndexRange>.create();
-    let Some(at) = seek.inAt else {
-        if (seekRange(seek, frame, db)? is Some(range)) {
-            ranges.push(range)?;
+/// The statistic of index `name` for `column` columns fixed (0: the rows in the index).
+fn statFor(stats: borrow PlanStats, name: StringView, column: usize) -> u64? {
+    for (i in 0..stats.rows.length) {
+        let row = borrow stats.rows[i];
+        if (row.index.length != 0 && row.index.view().equalsIgnoreAsciiCase(name)) {
+            return if (column < row.numbers.length) row.numbers[column] else null;
         }
-        return Ok(ranges);
+    }
+    return null;
+}
+
+/// The table's rows by sqlite_stat1: its own row's count, or that of an index without WHERE.
+fn statTableRows(stats: borrow PlanStats, table: borrow TableSchema, indexes: borrow Vector<TableIndex>) -> u64? {
+    for (i in 0..stats.rows.length) {
+        let row = borrow stats.rows[i];
+        if (!row.table.view().equalsIgnoreAsciiCase(table.name.view())) {
+            continue;
+        }
+        var whole = row.index.length == 0;
+        for (k in 0..indexes.length) {
+            if (indexes[k].filter.isNull() && indexes[k].name.view().equalsIgnoreAsciiCase(row.index.view())) {
+                whole = true;
+            }
+        }
+        if (whole) {
+            return row.numbers[0];
+        }
+    }
+    return null;
+}
+
+/// The rows of an index sharing the values of its first `columns` columns (0: the rows in it), as SQLite keeps
+/// them in aiRowLogEst: from sqlite_stat1, else sqlite3DefaultRowEst's (a partial index holding half the table).
+fn indexEstimate(stats: borrow PlanStats, index: borrow TableIndex, columns: usize, tableRows: i64) -> i64 {
+    if (statFor(stats, index.name.view(), columns) is Some(n)) {
+        return logEst(n);
+    }
+    if (columns == 0) {
+        let rows = if (tableRows < 99) 99 else tableRows;
+        return if (index.filter.isSome()) rows - 10 else rows;
+    }
+    if (index.unique && columns >= index.columns.length) {
+        return 0;
+    }
+    return match (columns) {
+        1 => 33,
+        2 => 32,
+        3 => 30,
+        4 => 28,
+        5 => 26,
+        _ => 23,
     };
-    var values = Vector<SqliteValue>.create();
-    for (i in 0..seek.inValues.length) {
-        let v = evaluate(borrow seek.inValues[i], frame, db)?;
-        if (v.isNull()) {
-            continue;
-        }
-        values.push(comparisonForm(borrow v, seek.affinities[at])? ?? v)?;
-    }
-    let collation = seek.order.collations[at];
-    let descending = seek.order.descending[at];
-    values.sortBy((a, b) => {
-        let c = compareValues(a, b, collation);
-        return if (descending) 0 - c else c;
-    });
-    for (i in 0..values.length) {
-        if (i > 0 && compareValues(borrow values[i], borrow values[i - 1], collation) == 0) {
-            continue;
-        }
-        let one: SqliteValue? = values[i].clone()?;
-        if (seekRangeWith(seek, borrow one, frame, db)? is Some(range)) {
-            ranges.push(range)?;
-        }
-    }
-    return Ok(ranges);
 }
 
-/// The range of a seek, with `inValue` for its IN key.
+/// whereRangeScanEst without STAT4: a range on one end keeps a quarter of the rows, on both ends a 64th, and at
+/// least two.
+fn rangeEstimate(rows: i64, ends: i64) -> i64 {
+    if (ends == 0) {
+        return rows;
+    }
+    var kept = rows - 20 * ends;
+    if (ends == 2) {
+        kept -= 20;
+    }
+    if (kept < 10) {
+        kept = 10;
+    }
+    let out = rows - ends;
+    return if (kept < out) kept else out;
+}
+
+/// What the costs of reading a table are measured against: its rows and its width.
+struct CostBasis {
+    tableRows: i64;
+    tableWidth: i64;
+}
+
+// ── choices ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// A way to read a table: a seek (`null` for a scan of the table), the index whose order the rows come in (`null`
+/// for the rowid's), and SQLite's estimates of the rows it gives and of its cost.
+struct AccessChoice {
+    seek: IndexSeek?;
+    index: usize?;
+    rows: i64;
+    cost: i64;
+}
+
+/// A scan of the whole table: SQLite's rSize + 16.
+fn tableScanChoice(basis: borrow CostBasis) -> AccessChoice =>
+    AccessChoice { seek: null, index: null, rows: basis.tableRows, cost: basis.tableRows + 16 };
+
+/// A scan of a whole index, read from its entries alone with `covering`.
+fn indexScanChoice(
+    indexes: borrow Vector<TableIndex>,
+    i: usize,
+    table: borrow TableSchema,
+    stats: borrow PlanStats,
+    basis: borrow CostBasis,
+    covering: Vector<usize?>?,
+) -> AccessChoice {
+    let index = borrow indexes[i];
+    let rows = indexEstimate(stats, index, 0, basis.tableRows);
+    var cost = rows + 1 + (15 * indexWidth(index, table)) / basis.tableWidth;
+    if (covering.isNull()) {
+        cost = logEstAdd(cost, rows + 16);
+    }
+    var seek = newSeek(index.root, false);
+    seek.covering = covering;
+    return AccessChoice { seek: seek, index: i, rows: rows, cost: cost };
+}
+
+/// A seek by rowid: `rowid IN (…)`, or a range.
+fn rowidChoice(
+    bounds: borrow Vector<ColumnBound>,
+    slot: usize,
+    root: u32,
+    basis: borrow CostBasis,
+) -> Result<AccessChoice?, AllocError> {
+    var seek = newSeek(root, true);
+    for (b in 0..bounds.length) {
+        let bound = borrow bounds[b];
+        if (!(bound.target is XExpr.Rowid(s) && s == slot) || !isInBound(bound)) {
+            continue;
+        }
+        seek.inAt = 0;
+        seek.inTerm = bound.inTerm;
+        seek.inOn = bound.inOn;
+        for (v in 0..bound.inList.length) {
+            seek.inValues.push(cloneSimple(borrow bound.inList[v])? ?? XExpr.Value(SqliteValue.Null))?;
+        }
+        // One row a value; a subquery is taken to give 25 (whereLoopAddBtreeIndex).
+        let values = if (bound.inTerm.isSome()) 46 else countEst(bound.inList.length);
+        let cost = logEstAdd(estLog(basis.tableRows), 16) + values;
+        return Ok(AccessChoice { seek: seek, index: null, rows: values, cost: cost });
+    }
+    var ends: i64 = 0;
+    for (b in 0..bounds.length) {
+        let bound = borrow bounds[b];
+        if (!(bound.target is XExpr.Rowid(s) && s == slot) || isInBound(bound)) {
+            continue;
+        }
+        let low = bound.op == CompareOp.Greater || bound.op == CompareOp.GreaterOrEqual;
+        let high = bound.op == CompareOp.Less || bound.op == CompareOp.LessOrEqual;
+        if (low && seek.low.isNull()) {
+            seek.low = cloneSimple(borrow bound.key)?;
+            seek.lowInclusive = bound.op == CompareOp.GreaterOrEqual;
+            ends += 1;
+        } else if (high && seek.high.isNull()) {
+            seek.high = cloneSimple(borrow bound.key)?;
+            seek.highInclusive = bound.op == CompareOp.LessOrEqual;
+            ends += 1;
+        }
+    }
+    if (ends == 0) {
+        return Ok(null);
+    }
+    let rows = rangeEstimate(basis.tableRows, ends);
+    let cost = logEstAdd(estLog(basis.tableRows), rows + 16);
+    return Ok(AccessChoice { seek: seek, index: null, rows: rows, cost: cost });
+}
+
+/// The seek through index `i`: equal keys on its leading columns, an IN among them, then a range on the next;
+/// `null` when no term bounds its first column.
+fn indexChoice(
+    indexes: borrow Vector<TableIndex>,
+    i: usize,
+    table: borrow TableSchema,
+    bounds: borrow Vector<ColumnBound>,
+    slot: usize,
+    stats: borrow PlanStats,
+    basis: borrow CostBasis,
+    covering: Vector<usize?>?,
+) -> Result<AccessChoice?, AllocError> {
+    let index = borrow indexes[i];
+    var seek = newSeek(index.root, false);
+    var values: i64 = 0;
+    var c: usize = 0;
+    while (c < index.columns.length) {
+        let Some(b) = usableBound(bounds, table, index, c, slot, true, false, seek.inAt.isNull()) else {
+            break;
+        };
+        let bound = borrow bounds[b];
+        if (isInBound(bound)) {
+            seek.inAt = seek.equal.length;
+            seek.inTerm = bound.inTerm;
+            seek.inOn = bound.inOn;
+            for (v in 0..bound.inList.length) {
+                seek.inValues.push(cloneSimple(borrow bound.inList[v])? ?? XExpr.Value(SqliteValue.Null))?;
+            }
+            values = if (bound.inTerm.isSome()) 46 else countEst(bound.inList.length);
+        }
+        seek.equal.push(cloneSimple(borrow bound.key)? ?? XExpr.Value(SqliteValue.Null))?;
+        seek.affinities.push(bound.affinity)?;
+        seek.nullMatches.push(bound.op == CompareOp.Is)?;
+        seek.order.collations.push(index.order.collations[c])?;
+        seek.order.descending.push(index.order.descending[c])?;
+        c += 1;
+    }
+    let equalColumns = c;
+    var ends: i64 = 0;
+    if (c < index.columns.length) {
+        let low = usableBound(bounds, table, index, c, slot, false, true, false);
+        let high = usableBound(bounds, table, index, c, slot, false, false, false);
+        if (low.isSome() || high.isSome()) {
+            var affinity = ExprAffinity.None;
+            if (low is Some(b)) {
+                seek.low = cloneSimple(borrow bounds[b].key)?;
+                seek.lowInclusive = bounds[b].op == CompareOp.GreaterOrEqual;
+                affinity = bounds[b].affinity;
+                ends += 1;
+            }
+            if (high is Some(b)) {
+                seek.high = cloneSimple(borrow bounds[b].key)?;
+                seek.highInclusive = bounds[b].op == CompareOp.LessOrEqual;
+                affinity = bounds[b].affinity;
+                ends += 1;
+            }
+            // Both bounds must convert their keys alike; else keep only the high one's.
+            if (low is Some(l) && high is Some(h) && bounds[l].affinity != bounds[h].affinity) {
+                seek.low = null;
+                seek.lowInclusive = true;
+                ends = 1;
+            }
+            seek.affinities.push(affinity)?;
+            seek.order.collations.push(index.order.collations[c])?;
+            seek.order.descending.push(index.order.descending[c])?;
+            seek.rangeDescending = index.order.descending[c];
+        }
+    }
+    if (equalColumns == 0 && ends == 0) {
+        return Ok(null);
+    }
+    // A search, the entries stepped through, and a lookup in the table for each unless the index covers the query.
+    let rows = rangeEstimate(indexEstimate(stats, index, equalColumns, basis.tableRows), ends);
+    var cost = logEstAdd(
+        estLog(indexEstimate(stats, index, 0, basis.tableRows)),
+        rows + 1 + (15 * indexWidth(index, table)) / basis.tableWidth,
+    );
+    if (covering.isNull()) {
+        cost = logEstAdd(cost, rows + 16);
+    }
+    seek.covering = covering;
+    return Ok(AccessChoice { seek: seek, index: i, rows: rows + values, cost: cost + values });
+}
+
+/// For a covering read through `index`: each table column's place in its entries; `null` when a column the query
+/// reads is not there (or is generated).
+fn coveringMap(
+    index: borrow TableIndex,
+    needed: borrow Vector<bool>,
+    table: borrow TableSchema,
+) -> Result<Vector<usize?>?, AllocError> {
+    var map = Vector<usize?>.withCapacity(needed.length)?;
+    for (c in 0..needed.length) {
+        var at: usize? = null;
+        if (needed[c] && table.rowidAlias != Some(c)) {
+            if (c >= table.columns.length || table.columns[c].generated.isSome()) {
+                return Ok(null);
+            }
+            for (j in 0..index.columns.length) {
+                if (at.isNull() && index.columns[j].column == Some(c)) {
+                    at = j;
+                }
+            }
+            if (at.isNull()) {
+                return Ok(null);
+            }
+        }
+        map.push(at)?;
+    }
+    return Ok(map);
+}
+
+// ── which columns a query reads ──────────────────────────────────────────────────────────────────────────────
+
+/// Marks in `needed` the columns of `slot` that `e` reads; false when that cannot be known (a subquery that
+/// depends on the row, a window).
+fn markColumns(e: borrow XExpr, slot: usize, needed: borrow mut Vector<bool>) -> bool {
+    match (e) {
+        XExpr.Column(s, k) => {
+            if (s != slot) {
+                return true;
+            }
+            if (k >= needed.length) {
+                return false;
+            }
+            needed[k] = true;
+            return true;
+        }
+        XExpr.Value(_) | XExpr.Rowid(_) | XExpr.Param(_) | XExpr.Now(_) | XExpr.Aggregate(_) => { return true; }
+        XExpr.Negate(x) | XExpr.Plus(x) | XExpr.BitNot(x) | XExpr.Not(x) | XExpr.Cast(x, _) => {
+            return markColumns(x, slot, needed);
+        }
+        XExpr.Arith(_, a, b) | XExpr.Bits(_, a, b) | XExpr.Concat(a, b) | XExpr.And(a, b) | XExpr.Or(a, b) | XExpr.JsonGet(a, b, _) => {
+            return markColumns(a, slot, needed) && markColumns(b, slot, needed);
+        }
+        XExpr.Compare(c) => {
+            return markColumns(borrow c.left, slot, needed) && markColumns(borrow c.right, slot, needed);
+        }
+        XExpr.Between(b) => {
+            return markColumns(borrow b.operand, slot, needed) && markColumns(borrow b.low, slot, needed) &&
+                markColumns(borrow b.high, slot, needed);
+        }
+        XExpr.In(x) => {
+            if (borrow x.subquery is Some(sub) && sub.correlated) {
+                return false;
+            }
+            return markColumns(borrow x.operand, slot, needed) && markAll(borrow x.items, slot, needed);
+        }
+        XExpr.Like(l) => {
+            return markColumns(borrow l.operand, slot, needed) && markColumns(borrow l.pattern, slot, needed) &&
+                markOptional(borrow l.escape, slot, needed);
+        }
+        XExpr.Case(c) => {
+            if (!markOptional(borrow c.operand, slot, needed) || !markOptional(borrow c.otherwise, slot, needed)) {
+                return false;
+            }
+            for (i in 0..c.branches.length) {
+                if (!markColumns(borrow c.branches[i].when, slot, needed) || !markColumns(
+                    borrow c.branches[i].then,
+                    slot,
+                    needed,
+                )) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        XExpr.Call(c) => { return markAll(borrow c.args, slot, needed); }
+        XExpr.Subquery(s) | XExpr.Exists(s) => { return !s.correlated; }
+        XExpr.Raise(_, message) => {
+            if (message is Some(m)) {
+                return markColumns(m, slot, needed);
+            }
+            return true;
+        }
+        XExpr.RowValue(items) => { return markAll(items, slot, needed); }
+        XExpr.Window(_) => { return false; }
+    }
+}
+
+fn markAll(list: borrow Vector<XExpr>, slot: usize, needed: borrow mut Vector<bool>) -> bool {
+    for (i in 0..list.length) {
+        if (!markColumns(borrow list[i], slot, needed)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn markOptional(e: borrow XExpr?, slot: usize, needed: borrow mut Vector<bool>) -> bool {
+    if (e is Some(x)) {
+        return markColumns(x, slot, needed);
+    }
+    return true;
+}
+
+fn markOrder(terms: borrow Vector<XOrderTerm>, slot: usize, needed: borrow mut Vector<bool>) -> bool {
+    for (i in 0..terms.length) {
+        if (!markColumns(borrow terms[i].expr, slot, needed)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// The columns of `slot` the core reads anywhere; `null` when that cannot be known.
+fn neededColumns(core: borrow CorePlan, slot: usize, count: usize) -> Result<Vector<bool>?, AllocError> {
+    if (core.windows.length != 0) {
+        return Ok(null);
+    }
+    var needed = Vector<bool>.withCapacity(count)?;
+    for (i in 0..count) {
+        needed.push(false)?;
+    }
+    var known = markOptional(borrow core.filter, slot, mut needed) && markAll(borrow core.outputs, slot, mut needed) &&
+        markAll(
+            borrow core.groupBy,
+            slot,
+            mut needed,
+        ) && markOptional(borrow core.having, slot, mut needed) && markOrder(
+        borrow core.sortKeys,
+        slot,
+        mut needed,
+    );
+    for (a in 0..core.aggregates.length) {
+        let spec = borrow core.aggregates[a];
+        known = known && markAll(borrow spec.args, slot, mut needed) && markOptional(
+            borrow spec.filter,
+            slot,
+            mut needed,
+        ) && markOrder(borrow spec.orderBy, slot, mut needed);
+    }
+    for (s in 0..core.sources.length) {
+        let source = borrow core.sources[s];
+        known = known && markOptional(borrow source.on, slot, mut needed) && markOptional(
+            borrow source.rowidSeek,
+            slot,
+            mut needed,
+        );
+        if (borrow source.kind is SourceKind.Pragma(_, argument)) {
+            known = known && markOptional(argument, slot, mut needed);
+        }
+    }
+    return Ok(if (known) needed else null);
+}
+
+// ── widths (estimateTableWidth, estimateIndexWidth) ──────────────────────────────────────────────────────────
+
+/// SQLite's estimate of a column's size from its declared type, in units of 4 bytes (sqlite3AffinityType): 1 for
+/// none and for numbers, `k/4 + 1` for `CHAR(k)` and the like, else 5 for text and blobs.
+fn columnWidth(declared: StringView) -> u64 {
+    let bytes = declared.bytes();
+    if (bytes.length == 0) {
+        return 1;
+    }
+    var h: u32 = 0;
+    // 0: numeric, 1: text, 2: blob, 3: real, 4: integer.
+    var kind: u8 = 0;
+    var sizeAt: usize? = null;
+    for (i in 0..bytes.length) {
+        var x = bytes[i];
+        if (x >= 'A' && x <= 'Z') {
+            x = x + 32;
+        }
+        h = ((h & 0x00FFFFFF) << 8) | (x as u32);
+        if (h == 0x63686172) {
+            // CHAR
+            kind = 1;
+            sizeAt = i + 1;
+        } else if (h == 0x636C6F62 || h == 0x74657874) {
+            // CLOB, TEXT
+            kind = 1;
+        } else if (h == 0x626C6F62 && (kind == 0 || kind == 3)) {
+            // BLOB
+            kind = 2;
+            if (i + 1 < bytes.length && bytes[i + 1] == '(') {
+                sizeAt = i + 1;
+            }
+        } else if ((h == 0x7265616C || h == 0x666C6F61 || h == 0x646F7562) && kind == 0) {
+            // REAL, FLOA, DOUB
+            kind = 3;
+        } else if ((h & 0x00FFFFFF) == 0x00696E74) {
+            // INT
+            kind = 4;
+            break;
+        }
+    }
+    var v: u64 = 0;
+    if (kind == 1 || kind == 2) {
+        if (sizeAt is Some(start)) {
+            var i = start;
+            while (i < bytes.length && !(bytes[i] >= '0' && bytes[i] <= '9')) {
+                i += 1;
+            }
+            while (i < bytes.length && bytes[i] >= '0' && bytes[i] <= '9' && v < 100000) {
+                v = v * 10 + ((bytes[i] - '0') as u64);
+                i += 1;
+            }
+        } else {
+            v = 16;
+        }
+    }
+    let width = v / 4 + 1;
+    return if (width > 255) 255 else width;
+}
+
+fn tableWidth(table: borrow TableSchema) -> i64 {
+    var w: u64 = 0;
+    for (c in 0..table.columns.length) {
+        w += columnWidth(table.columns[c].declaredType.view());
+    }
+    if (table.rowidAlias.isNull()) {
+        w += 1;
+    }
+    return logEst(w * 4);
+}
+
+fn indexWidth(index: borrow TableIndex, table: borrow TableSchema) -> i64 {
+    // The rowid at the end counts 1, as does an expression.
+    var w: u64 = 1;
+    for (c in 0..index.columns.length) {
+        if (index.columns[c].column is Some(k) && k < table.columns.length) {
+            w += columnWidth(table.columns[k].declaredType.view());
+        } else {
+            w += 1;
+        }
+    }
+    return logEst(w * 4);
+}
+
+// ── order ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Whether reading the index's entries in order (columns `fixed` of them by `=`, then the rowid) gives ORDER BY's
+/// order: `null` when not, else whether they must be read backwards. An empty `columns` is the rowid alone.
+/// `alone`: the table is the query's only one, so that once the rowid is ordered, nothing else needs to be.
+fn orderFromIndex(
+    terms: borrow Vector<XOrderTerm>,
+    outputs: borrow Vector<XExpr>,
+    columns: borrow Vector<IndexKeyColumn>,
+    order: borrow IndexOrder,
+    fixed: borrow Vector<bool>,
+    table: borrow TableSchema,
+    slot: usize,
+    alone: bool,
+) -> bool? {
+    var position: usize = 0;
+    var direction: bool? = null;
+    for (t in 0..terms.length) {
+        let term = borrow terms[t];
+        let e = if (term.output is Some(at) && at < outputs.length) borrow outputs[at] else borrow term.expr;
+        if (term.output is Some(at) && at >= outputs.length) {
+            return null;
+        }
+        // A column fixed by `=` has one value under its collation: it orders nothing.
+        var isFixed = false;
+        for (j in 0..columns.length) {
+            if (fixed[j] && order.collations[j] == term.collation && indexColumnMatches(
+                borrow columns[j],
+                e,
+                table,
+                slot,
+            )) {
+                isFixed = true;
+            }
+        }
+        if (isFixed) {
+            continue;
+        }
+        while (position < columns.length && fixed[position]) {
+            position += 1;
+        }
+        var backwards = false;
+        if (position < columns.length) {
+            if (order.collations[position] != term.collation || !indexColumnMatches(
+                borrow columns[position],
+                e,
+                table,
+                slot,
+            )) {
+                return null;
+            }
+            // NULLs come first going up the index, last going down: as the default puts them.
+            if (term.nullsFirst == term.descending) {
+                return null;
+            }
+            backwards = term.descending != order.descending[position];
+            position += 1;
+        } else if (e is XExpr.Rowid(s) && s == slot) {
+            backwards = term.descending;
+            // Every row's place is known: alone, later terms order nothing (with other tables, they order the
+            // rows joined to each row of this one).
+            if (alone && (direction.isNull() || direction == Some(backwards))) {
+                return backwards;
+            }
+        } else {
+            return null;
+        }
+        if (direction is Some(d) && d != backwards) {
+            return null;
+        }
+        direction = backwards;
+    }
+    return direction ?? false;
+}
+
+fn noFixedColumns(count: usize) -> Result<Vector<bool>, AllocError> {
+    var fixed = Vector<bool>.withCapacity(count)?;
+    for (i in 0..count) {
+        fixed.push(false)?;
+    }
+    return Ok(fixed);
+}
+
+/// Whether the choice's order gives ORDER BY's: `null` when not, else whether backwards.
+fn choiceOrder(
+    choice: borrow AccessChoice,
+    core: borrow CorePlan,
+    indexes: borrow Vector<TableIndex>,
+    table: borrow TableSchema,
+    slot: usize,
+) -> Result<bool?, AllocError> {
+    let alone = core.sources.length == 1;
+    let Some(i) = choice.index else {
+        let none = Vector<IndexKeyColumn>.create();
+        let noFixed = Vector<bool>.create();
+        let noOrder = IndexOrder.plain();
+        return Ok(
+            orderFromIndex(
+                borrow core.sortKeys,
+                borrow core.outputs,
+                borrow none,
+                borrow noOrder,
+                borrow noFixed,
+                table,
+                slot,
+                alone,
+            ),
+        );
+    };
+    let index = borrow indexes[i];
+    var fixed = noFixedColumns(index.columns.length)?;
+    if (borrow choice.seek is Some(seek)) {
+        for (k in 0..seek.equal.length) {
+            if (seek.inAt != Some(k)) {
+                fixed[k] = true;
+            }
+        }
+    }
+    return Ok(
+        orderFromIndex(
+            borrow core.sortKeys,
+            borrow core.outputs,
+            borrow index.columns,
+            borrow index.order,
+            borrow fixed,
+            table,
+            slot,
+            alone,
+        ),
+    );
+}
+
+/// The best choice so far: its cost with the sort it needs, and whether (and how) its rows come in ORDER BY's
+/// order.
+struct Pick {
+    choice: AccessChoice?;
+    total: i64;
+    order: bool?;
+}
+
+/// Keeps `choice` when it costs less than the best so far (the first of equal cost stays, as in SQLite). With
+/// `sortColumns`, an ORDER BY is wanted: a choice whose rows do not come in its order (`order`) pays for a sort of
+/// them (whereSortingCost).
+fn consider(pick: borrow mut Pick, choice: AccessChoice, order: bool?, sortColumns: i64?) {
+    var total = choice.cost;
+    if (sortColumns is Some(columns) && order.isNull()) {
+        total = logEstAdd(total, choice.rows + columns + estLog(choice.rows));
+    }
+    if (pick.choice.isNull() || total < pick.total) {
+        pick.choice = choice;
+        pick.total = total;
+        pick.order = order;
+    }
+}
+
+/// The order a choice gives ORDER BY when one is wanted.
+fn orderWanted(
+    choice: borrow AccessChoice,
+    want: bool,
+    core: borrow CorePlan,
+    indexes: borrow Vector<TableIndex>,
+    table: borrow TableSchema,
+    slot: usize,
+) -> Result<bool?, AllocError> => if (want) choiceOrder(choice, core, indexes, table, slot) else Ok(null);
+
+// ── planning a SELECT's tables ───────────────────────────────────────────────────────────────────────────────
+
+/// How a source is read: its seek (`null` for a scan of the table), and whether its rows come in ORDER BY's order.
+struct SourceAccess {
+    seek: IndexSeek?;
+    ordered: bool;
+}
+
+fn scanAccess() -> SourceAccess => SourceAccess { seek: null, ordered: false };
+
+/// Chooses how each table of the core is read, and drops the core's ORDER BY when the first table's rows come in
+/// its order.
+fn planCore(
+    compiler: borrow mut Compiler,
+    core: borrow mut CorePlan,
+    db: borrow mut Session,
+) -> Result<void, SqliteError> {
+    let stats = loadStats(db)?;
+    var ordered = false;
+    for (s in 0..core.sources.length) {
+        let access = planSource(compiler, core, s, borrow stats, db)?;
+        if (access.seek.isSome()) {
+            core.sources[s].indexSeek = access.seek;
+        }
+        ordered = ordered || access.ordered;
+    }
+    if (ordered) {
+        core.sortKeys.clear();
+    }
+    return Ok();
+}
+
+/// Plans source `s` with its table's database active, so that its indexes are that database's.
+fn planSource(
+    compiler: borrow mut Compiler,
+    core: borrow CorePlan,
+    s: usize,
+    stats: borrow PlanStats,
+    db: borrow mut Session,
+) -> Result<SourceAccess, SqliteError> {
+    var database = db.active;
+    if (borrow core.sources[s].kind is SourceKind.Table(plan)) {
+        database = plan.database;
+    }
+    let previous = db.swapTo(database);
+    let result = planSourceHere(compiler, core, s, stats, db);
+    let _ = db.swapTo(previous);
+    return result;
+}
+
+fn planSourceHere(
+    compiler: borrow mut Compiler,
+    core: borrow CorePlan,
+    s: usize,
+    stats: borrow PlanStats,
+    db: borrow mut Session,
+) -> Result<SourceAccess, SqliteError> {
+    let source = borrow core.sources[s];
+    // A table inside a LEFT JOIN group can be NULL-extended as a LEFT JOIN's own table is.
+    let nullable = source.left || inLeftGroup(core.sources.view(), s);
+    // A RIGHT JOIN source is scanned whole: its rows are known by their place in the scan.
+    if (source.right || source.rowidSeek.isSome()) {
+        return Ok(scanAccess());
+    }
+    let SourceKind.Table(plan) = borrow source.kind else {
+        return Ok(scanAccess());
+    };
+    // sqlite_schema and the like have no indexes.
+    if (plan.withoutRowid || db.catalog.table(plan.name.view())?.isNull()) {
+        return Ok(scanAccess());
+    }
+    let table = db.catalog.tableCopy(plan.name.view())?;
+    let slot = source.slot;
+    let indexes = planIndexes(compiler, borrow table, slot, db);
+    let hasRight = hasRightJoin(core);
+    let needed = neededColumns(core, slot, table.columns.length)?;
+    var bounds = Vector<ColumnBound>.create();
+    var count: usize = 0;
+    if (borrow core.filter is Some(f)) {
+        termBounds(f, slot, !nullable, false, mut count, mut bounds)?;
+    }
+    count = 0;
+    if (borrow source.on is Some(on)) {
+        termBounds(on, slot, true, true, mut count, mut bounds)?;
+    }
+    // A LEFT JOIN table's partial index must follow from its ON alone; none to the left of a RIGHT JOIN.
+    let nothing: XExpr? = null;
+    let implying = if (nullable) borrow nothing else borrow core.filter;
+    var usable = Vector<bool>.withCapacity(indexes.length)?;
+    for (i in 0..indexes.length) {
+        var ok = !indexIsStale(db, indexes[i].root);
+        if (borrow indexes[i].filter is Some(w)) {
+            ok = ok && !hasRight && indexWhereHolds(w, implying, borrow source.on);
+        }
+        usable.push(ok)?;
+    }
+    let statRows = statTableRows(stats, borrow table, borrow indexes);
+    let basis = CostBasis {
+        tableRows: if (statRows is Some(n)) logEst(n) else 200,
+        tableWidth: tableWidth(borrow table),
+    };
+    let wantOrder = s == 0 && core.sortKeys.length != 0 && !core.isAggregate && core.windows.length == 0 && !hasRight;
+    let sortColumns: i64? = if (wantOrder) countEst((core.outputs.length + 59) / 30) else null;
+    let alone = core.sources.length == 1;
+    // The table scanned, the rowid, then each index, the newest first, as SQLite probes them.
+    var pick = Pick { choice: null, total: 0, order: null };
+    let scan = tableScanChoice(borrow basis);
+    let scanOrder = orderWanted(borrow scan, wantOrder, core, borrow indexes, borrow table, slot)?;
+    consider(mut pick, scan, scanOrder, sortColumns);
+    if (rowidChoice(borrow bounds, slot, table.rootPage, borrow basis)? is Some(choice)) {
+        let order = orderWanted(borrow choice, wantOrder, core, borrow indexes, borrow table, slot)?;
+        consider(mut pick, choice, order, sortColumns);
+    }
+    var i = indexes.length;
+    while (i > 0) {
+        i -= 1;
+        if (!usable[i]) {
+            continue;
+        }
+        var covering: Vector<usize?>? = null;
+        if (borrow needed is Some(n)) {
+            covering = coveringMap(borrow indexes[i], n, borrow table)?;
+        }
+        // A whole index: one that covers the query and is narrower than the table, a partial one, or one in
+        // ORDER BY's order.
+        var whole = indexes[i].filter.isSome() || (covering.isSome() && indexWidth(
+            borrow indexes[i],
+            borrow table,
+        ) < basis.tableWidth);
+        if (!whole && wantOrder) {
+            let fixed = noFixedColumns(indexes[i].columns.length)?;
+            whole = orderFromIndex(
+                borrow core.sortKeys,
+                borrow core.outputs,
+                borrow indexes[i].columns,
+                borrow indexes[i].order,
+                borrow fixed,
+                borrow table,
+                slot,
+                alone,
+            ).isSome();
+        }
+        if (whole) {
+            let map = if (borrow covering is Some(m)) Some(cloneMap(m)?) else null;
+            let choice = indexScanChoice(borrow indexes, i, borrow table, stats, borrow basis, map);
+            let order = orderWanted(borrow choice, wantOrder, core, borrow indexes, borrow table, slot)?;
+            consider(mut pick, choice, order, sortColumns);
+        }
+        if (indexChoice(
+            borrow indexes,
+            i,
+            borrow table,
+            borrow bounds,
+            slot,
+            stats,
+            borrow basis,
+            covering,
+        )? is Some(choice,)) {
+            let order = orderWanted(borrow choice, wantOrder, core, borrow indexes, borrow table, slot)?;
+            consider(mut pick, choice, order, sortColumns);
+        }
+    }
+    let Some(choice) = pick.choice else {
+        return Ok(scanAccess());
+    };
+    var seek = choice.seek;
+    if (pick.order == Some(true)) {
+        // Backwards: through the index, or the table's rows by rowid.
+        var backwards = seek ?? newSeek(table.rootPage, true);
+        backwards.backwards = true;
+        seek = backwards;
+    }
+    return Ok(SourceAccess { seek: seek, ordered: pick.order.isSome() });
+}
+
+fn cloneMap(map: borrow Vector<usize?>) -> Result<Vector<usize?>, AllocError> {
+    var out = Vector<usize?>.withCapacity(map.length)?;
+    for (i in 0..map.length) {
+        out.push(map[i])?;
+    }
+    return Ok(out);
+}
+
+// ── UPDATE and DELETE ────────────────────────────────────────────────────────────────────────────────────────
+
+/// The rowids of the rows a seek finds for WHERE `filter` of an UPDATE or DELETE, in rowid order; `null` when no
+/// index (or rowid range) helps.
+fn seekRowids(
+    writer: borrow TableWriter,
+    filter: borrow XExpr,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<i64>?, SqliteError> {
+    let table = borrow writer.table;
+    let slot = writer.slot;
+    var bounds = Vector<ColumnBound>.create();
+    var count: usize = 0;
+    termBounds(filter, slot, true, false, mut count, mut bounds)?;
+    if (bounds.length == 0) {
+        return Ok(null);
+    }
+    let stats = loadStats(db)?;
+    let indexes = borrow writer.indexes;
+    let statRows = statTableRows(borrow stats, table, indexes);
+    let basis = CostBasis { tableRows: if (statRows is Some(n)) logEst(n) else 200, tableWidth: tableWidth(table) };
+    var pick = Pick { choice: null, total: 0, order: null };
+    consider(mut pick, tableScanChoice(borrow basis), null, null);
+    if (rowidChoice(borrow bounds, slot, writer.read.root, borrow basis)? is Some(choice)) {
+        consider(mut pick, choice, null, null);
+    }
+    var i = indexes.length;
+    while (i > 0) {
+        i -= 1;
+        if (indexIsStale(db, indexes[i].root) || indexes[i].stale.get()) {
+            continue;
+        }
+        if (borrow indexes[i].filter is Some(w) && !indexWhereHoldsIn(w, filter)) {
+            continue;
+        }
+        if (indexChoice(indexes, i, table, borrow bounds, slot, borrow stats, borrow basis, null)? is Some(choice)) {
+            consider(mut pick, choice, null, null);
+        }
+    }
+    let Some(choice) = pick.choice else {
+        return Ok(null);
+    };
+    let Some(seek) = choice.seek else {
+        return Ok(null);
+    };
+    let some: XExpr? = null;
+    var ranges = seekRangesOf(borrow seek, filter, borrow some, frame, db)?;
+    var found = Vector<i64>.create();
+    for (r in 0..ranges.length) {
+        match (replace(mut ranges[r], SeekRange.Rowids(1, 0))) {
+            SeekRange.Entries(range) => {
+                var entries = IndexCursor.create(seek.root, range, false);
+                while (entries.next(mut db.pager)? is Some(entry)) {
+                    found.push(indexEntryRowId(entry.view())?)?;
+                }
+            }
+            SeekRange.Rowids(min, max) => {
+                var rows = TableCursor.range(writer.read.root, min, max);
+                while (rows.nextRaw(mut db.pager)? is Some(row)) {
+                    found.push(row.rowId)?;
+                }
+            }
+        }
+    }
+    // In rowid order, as a scan would give them.
+    found.sortBy((a, b) => compareI64(a, b));
+    return Ok(found);
+}
+
+/// Whether every AND-term of a partial index's WHERE follows from an AND-term of `filter`.
+fn indexWhereHoldsIn(indexWhere: borrow XExpr, filter: borrow XExpr) -> bool {
+    if (indexWhere is XExpr.And(a, b)) {
+        return indexWhereHoldsIn(a, filter) && indexWhereHoldsIn(b, filter);
+    }
+    return conditionImplies(filter, indexWhere);
+}
+
+// ── reading through a seek ───────────────────────────────────────────────────────────────────────────────────
+
+/// Where a seek reads: the entries of an index in a range, or the rows between two rowids.
+enum SeekRange {
+    Entries(IndexRange),
+    Rowids(i64, i64),
+}
+
+enum SeekCursor {
+    Done,
+    Entries(IndexCursor),
+    Rowids(TableCursor),
+}
+
+/// The ranges of a seek, in the order they are read: one, or with an IN one for each distinct value, in the
+/// index's order (reversed when the seek reads backwards). `filter` and `on` hold an IN's subquery.
+fn seekRangesOf(
+    seek: borrow IndexSeek,
+    filter: borrow XExpr?,
+    on: borrow XExpr?,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<SeekRange>, SqliteError> {
+    var ranges = Vector<SeekRange>.create();
+    if (seek.byRowid) {
+        rowidRanges(seek, filter, on, frame, db, mut ranges)?;
+    } else if (seek.inAt is Some(at)) {
+        var values = inValuesOf(seek, filter, on, frame, db)?;
+        var kept = Vector<SqliteValue>.create();
+        for (i in 0..values.length) {
+            let v = replace(mut values[i], SqliteValue.Null);
+            if (v.isNull()) {
+                continue;
+            }
+            kept.push(comparisonForm(borrow v, seek.affinities[at])? ?? v)?;
+        }
+        let collation = seek.order.collations[at];
+        let descending = seek.order.descending[at];
+        kept.sortBy((a, b) => {
+            let c = compareValues(a, b, collation);
+            return if (descending) 0 - c else c;
+        });
+        for (i in 0..kept.length) {
+            if (i > 0 && compareValues(borrow kept[i], borrow kept[i - 1], collation) == 0) {
+                continue;
+            }
+            let one: SqliteValue? = kept[i].clone()?;
+            if (seekRangeWith(seek, borrow one, frame, db)? is Some(range)) {
+                ranges.push(SeekRange.Entries(range))?;
+            }
+        }
+    } else {
+        let one: SqliteValue? = null;
+        if (seekRangeWith(seek, borrow one, frame, db)? is Some(range)) {
+            ranges.push(SeekRange.Entries(range))?;
+        }
+    }
+    if (!seek.backwards) {
+        return Ok(ranges);
+    }
+    var reversed = Vector<SeekRange>.withCapacity(ranges.length)?;
+    var i = ranges.length;
+    while (i > 0) {
+        i -= 1;
+        reversed.push(replace(mut ranges[i], SeekRange.Rowids(1, 0)))?;
+    }
+    return Ok(reversed);
+}
+
+/// The values of a seek's IN: its list, or its subquery's first column.
+fn inValuesOf(
+    seek: borrow IndexSeek,
+    filter: borrow XExpr?,
+    on: borrow XExpr?,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<SqliteValue>, SqliteError> {
+    if (seek.inTerm is Some(n)) {
+        let condition = if (seek.inOn) on else filter;
+        if (condition is Some(c)) {
+            var count: usize = 0;
+            if (subqueryOfTerm(c, n, mut count, frame, db)? is Some(values)) {
+                return Ok(values);
+            }
+        }
+        return Err(corrupt("the planner lost an IN subquery"));
+    }
+    var values = Vector<SqliteValue>.withCapacity(seek.inValues.length)?;
+    for (i in 0..seek.inValues.length) {
+        values.push(evaluate(borrow seek.inValues[i], frame, db)?)?;
+    }
+    return Ok(values);
+}
+
+/// The values of the subquery of the `n`-th AND-term of `condition`, an IN.
+fn subqueryOfTerm(
+    condition: borrow XExpr,
+    n: usize,
+    count: borrow mut usize,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<SqliteValue>?, SqliteError> {
+    if (condition is XExpr.And(a, b)) {
+        if (subqueryOfTerm(a, n, count, frame, db)? is Some(values)) {
+            return Ok(values);
+        }
+        return subqueryOfTerm(b, n, count, frame, db);
+    }
+    let at = *count;
+    *count = at + 1;
+    if (at == n && condition is XExpr.In(x) && borrow x.subquery is Some(sub)) {
+        return Ok(subqueryFirstColumn(sub, frame, db)?);
+    }
+    return Ok(null);
+}
+
+/// What a value compared with a rowid allows of it, as a low or a high end.
+enum RowidLimit {
+    /// Every rowid.
+    Every,
+    /// No rowid.
+    Nothing,
+    At(i64),
+}
+
+/// The rowid limit of `rowid > v` (`lower`, or `<` without), `>=` and `<=` with `inclusive`. The value is compared
+/// as a number: a real between two integers, text or a blob above every number, NULL matching nothing.
+fn rowidLimit(value: borrow SqliteValue, lower: bool, inclusive: bool) -> Result<RowidLimit, AllocError> {
+    let v = comparisonForm(value, ExprAffinity.Numeric)? ?? value.clone()?;
+    match (v) {
+        SqliteValue.Null => { return Ok(RowidLimit.Nothing); }
+        SqliteValue.Integer(n) => {
+            if (inclusive) {
+                return Ok(RowidLimit.At(n));
+            }
+            if (lower) {
+                return Ok(if (n == 9223372036854775807) RowidLimit.Nothing else RowidLimit.At(n + 1));
+            }
+            return Ok(if (n == -9223372036854775808) RowidLimit.Nothing else RowidLimit.At(n - 1));
+        }
+        SqliteValue.Real(r) => {
+            if (r >= 9223372036854775807.0) {
+                return Ok(if (lower) RowidLimit.Nothing else RowidLimit.Every);
+            }
+            if (r < -9223372036854775808.0) {
+                return Ok(if (lower) RowidLimit.Every else RowidLimit.Nothing);
+            }
+            let f = r.floor();
+            let n = realToInteger(f);
+            if (lower) {
+                return Ok(RowidLimit.At(if (f == r && inclusive) n else n + 1));
+            }
+            if (f == r && !inclusive) {
+                return Ok(if (n == -9223372036854775808) RowidLimit.Nothing else RowidLimit.At(n - 1));
+            }
+            return Ok(RowidLimit.At(n));
+        }
+        _ => { return Ok(if (lower) RowidLimit.Nothing else RowidLimit.Every); }
+    }
+}
+
+/// The rowid a value names for `rowid = v` and IN: `null` when none does.
+fn rowidOfValue(value: borrow SqliteValue) -> Result<i64?, AllocError> {
+    let v = comparisonForm(value, ExprAffinity.Numeric)? ?? value.clone()?;
+    return Ok(match (v) {
+        SqliteValue.Integer(n) => n,
+        SqliteValue.Real(r) => realAsExactInteger(r),
+        _ => null,
+    });
+}
+
+/// The rowid ranges of a seek by rowid: each distinct IN value, or one range.
+fn rowidRanges(
+    seek: borrow IndexSeek,
+    filter: borrow XExpr?,
+    on: borrow XExpr?,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+    out: borrow mut Vector<SeekRange>,
+) -> Result<void, SqliteError> {
+    if (seek.inAt.isSome()) {
+        let values = inValuesOf(seek, filter, on, frame, db)?;
+        var rowids = Vector<i64>.create();
+        for (i in 0..values.length) {
+            if (rowidOfValue(borrow values[i])? is Some(n)) {
+                rowids.push(n)?;
+            }
+        }
+        rowids.sortBy((a, b) => compareI64(a, b));
+        for (i in 0..rowids.length) {
+            if (i == 0 || rowids[i] != rowids[i - 1]) {
+                out.push(SeekRange.Rowids(rowids[i], rowids[i]))?;
+            }
+        }
+        return Ok();
+    }
+    var min: i64 = -9223372036854775808;
+    var max: i64 = 9223372036854775807;
+    if (borrow seek.low is Some(low)) {
+        let v = evaluate(low, frame, db)?;
+        match (rowidLimit(borrow v, true, seek.lowInclusive)?) {
+            RowidLimit.Nothing => { return Ok(); }
+            RowidLimit.At(n) => { min = n; }
+            RowidLimit.Every => {}
+        }
+    }
+    if (borrow seek.high is Some(high)) {
+        let v = evaluate(high, frame, db)?;
+        match (rowidLimit(borrow v, false, seek.highInclusive)?) {
+            RowidLimit.Nothing => { return Ok(); }
+            RowidLimit.At(n) => { max = n; }
+            RowidLimit.Every => {}
+        }
+    }
+    out.push(SeekRange.Rowids(min, max))?;
+    return Ok();
+}
+
+/// The range of a seek through an index, with `inValue` for its IN key: `null` when no entry can match (a NULL
+/// key where only `=` holds).
 fn seekRangeWith(
     seek: borrow IndexSeek,
     inValue: borrow SqliteValue?,
@@ -472,29 +1885,53 @@ fn seekRangeWith(
     }
     let rangeAffinity =
         if (seek.affinities.length > seek.equal.length) seek.affinities[seek.equal.length] else ExprAffinity.None;
-    var min = cloneValues(prefix.view())?;
-    var max = cloneValues(prefix.view())?;
-    var minInclusive = true;
-    var maxInclusive = true;
+    var lowValue: SqliteValue? = null;
+    var highValue: SqliteValue? = null;
     if (borrow seek.low is Some(low)) {
         let v = evaluate(low, frame, db)?;
         if (v.isNull()) {
             return Ok(null);
         }
-        min.push(comparisonForm(borrow v, rangeAffinity)? ?? v)?;
-        minInclusive = seek.lowInclusive;
-    } else if (seek.high.isSome()) {
-        // `c < x` is false for a NULL c, and NULLs sort first: start past them.
-        min.push(SqliteValue.Null)?;
-        minInclusive = false;
+        lowValue = comparisonForm(borrow v, rangeAffinity)? ?? v;
     }
     if (borrow seek.high is Some(high)) {
         let v = evaluate(high, frame, db)?;
         if (v.isNull()) {
             return Ok(null);
         }
-        max.push(comparisonForm(borrow v, rangeAffinity)? ?? v)?;
-        maxInclusive = seek.highInclusive;
+        highValue = comparisonForm(borrow v, rangeAffinity)? ?? v;
+    }
+    var min = cloneValues(prefix.view())?;
+    var max = cloneValues(prefix.view())?;
+    var minInclusive = true;
+    var maxInclusive = true;
+    // `c < x` is false for a NULL c, and NULL is the smallest value: an end the range leaves open stops short of
+    // the NULLs, which come first in an ascending column and last in a descending one.
+    let openEndsAtNull = seek.low.isNull() && seek.high.isSome();
+    if (!seek.rangeDescending) {
+        if (lowValue is Some(v)) {
+            min.push(v)?;
+            minInclusive = seek.lowInclusive;
+        } else if (openEndsAtNull) {
+            min.push(SqliteValue.Null)?;
+            minInclusive = false;
+        }
+        if (highValue is Some(v)) {
+            max.push(v)?;
+            maxInclusive = seek.highInclusive;
+        }
+    } else {
+        if (lowValue is Some(v)) {
+            max.push(v)?;
+            maxInclusive = seek.lowInclusive;
+        } else if (openEndsAtNull) {
+            max.push(SqliteValue.Null)?;
+            maxInclusive = false;
+        }
+        if (highValue is Some(v)) {
+            min.push(v)?;
+            minInclusive = seek.highInclusive;
+        }
     }
     return Ok(
         IndexRange {
@@ -505,4 +1942,123 @@ fn seekRangeWith(
             maxInclusive: maxInclusive,
         },
     );
+}
+
+/// The nested loop at `level` through a seek: the rows its ranges hold, in its order.
+fn seekLevel(
+    core: borrow CorePlan,
+    level: usize,
+    table: borrow TablePlan,
+    seek: borrow IndexSeek,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+    sink: borrow mut CoreSink,
+) -> Result<void, SqliteError> {
+    let source = borrow core.sources[level];
+    var matched = false;
+    var ranges = seekRangesOf(seek, borrow core.filter, borrow source.on, frame, db)?;
+    var r: usize = 0;
+    var cursor = SeekCursor.Done;
+    loop {
+        if (sink.stopAfter is Some(n) && sink.rows.length >= n) {
+            return Ok();
+        }
+        if (cursor is SeekCursor.Done) {
+            if (r == ranges.length) {
+                break;
+            }
+            cursor = match (replace(mut ranges[r], SeekRange.Rowids(1, 0))) {
+                SeekRange.Entries(range) => SeekCursor.Entries(IndexCursor.create(seek.root, range, seek.backwards)),
+                SeekRange.Rowids(min, max) => SeekCursor.Rowids(
+                    if (seek.backwards) TableCursor.range(table.root, min, max).walkingBackwards()
+                        else TableCursor.range(table.root, min, max),
+                ),
+            };
+            r += 1;
+        }
+        if (!nextSeekRow(seek, table, mut cursor, mut frame.slots[source.slot], db.pagerOf(table.database))?) {
+            cursor = SeekCursor.Done;
+            continue;
+        }
+        if (table.generated.length != 0 && seek.covering.isNull()) {
+            computeGenerated(table, source.slot, frame, db)?;
+        }
+        if (borrow source.on is Some(on)) {
+            let ok = evaluate(on, frame, db)?;
+            if (!isTrue(borrow ok)) {
+                continue;
+            }
+        }
+        matched = true;
+        joinLevel(core, level + 1, frame, db, sink)?;
+    }
+    return finishLeft(core, level, matched, frame, db, sink);
+}
+
+/// Reads the cursor's next row into `slot`: from the index entry when the seek covers the query, else from the
+/// table. False after the last.
+fn nextSeekRow(
+    seek: borrow IndexSeek,
+    table: borrow TablePlan,
+    cursor: borrow mut SeekCursor,
+    slot: borrow mut Slot,
+    pager: borrow mut WritablePager,
+) -> Result<bool, SqliteError> {
+    match (cursor) {
+        SeekCursor.Done => { return Ok(false); }
+        SeekCursor.Entries(c) => {
+            let Some(entry) = c.next(pager)? else {
+                return Ok(false);
+            };
+            if (borrow seek.covering is Some(map)) {
+                loadEntryRow(table, map, entry, slot)?;
+                return Ok(true);
+            }
+            let rowId = indexEntryRowId(entry.view())?;
+            let Some(row) = seekTableRow(pager, table.root, rowId)? else {
+                return Err(corrupt("an index entry names a row its table does not have"));
+            };
+            loadTableRow(table, row.rowId, row.columns, slot)?;
+            return Ok(true);
+        }
+        SeekCursor.Rowids(c) => {
+            let Some(row) = c.next(pager)? else {
+                return Ok(false);
+            };
+            loadTableRow(table, row.rowId, row.columns, slot)?;
+            return Ok(true);
+        }
+    }
+}
+
+/// Makes a row from an index entry: the columns the map places, the rowid alias from the entry's rowid, a REAL
+/// column's integer as a real (as the table's record would read); the others NULL, as nothing reads them.
+fn loadEntryRow(
+    table: borrow TablePlan,
+    map: borrow Vector<usize?>,
+    entry: Vector<SqliteValue>,
+    slot: borrow mut Slot,
+) -> Result<void, SqliteError> {
+    let rowId = indexEntryRowId(entry.view())?;
+    var stored = entry;
+    var values = Vector<SqliteValue>.withCapacity(map.length)?;
+    for (c in 0..map.length) {
+        var v = SqliteValue.Null;
+        if (map[c] is Some(at)) {
+            if (at + 1 >= stored.length) {
+                return Err(corrupt("an index entry is shorter than its index"));
+            }
+            v = replace(mut stored[at], SqliteValue.Null);
+        }
+        if (table.rowidAlias == Some(c)) {
+            v = SqliteValue.Integer(rowId);
+        } else if (c < table.realColumns.length && table.realColumns[c] && v is SqliteValue.Integer(i)) {
+            v = SqliteValue.Real(round<f64>(i));
+        }
+        values.push(v)?;
+    }
+    slot.values = values;
+    slot.rowId = rowId;
+    slot.isNull = false;
+    return Ok();
 }

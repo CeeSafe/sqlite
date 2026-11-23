@@ -1379,7 +1379,7 @@ fn compileCoreBody(
                 sources.view(),
                 s,
             ) && sources[s].kind is SourceKind.Table(TablePlan { withoutRowid: false, .. })) {
-                sources[s].rowidSeek = rowidEqualityFor(f, sources[s].slot)?;
+                sources[s].rowidSeek = rowidEqualityFor(f, sources[s].slot, !sources[s].left)?;
             }
         }
     }
@@ -1389,41 +1389,11 @@ fn compileCoreBody(
             ..
         })) {
             if (borrow sources[s].on is Some(on)) {
-                sources[s].rowidSeek = rowidEqualityFor(on, sources[s].slot)?;
+                sources[s].rowidSeek = rowidEqualityFor(on, sources[s].slot, true)?;
             }
         }
     }
-    // Index seeks: for each table without a rowid seek, the index its WHERE and ON terms use best.
-    for (s in 0..sources.length) {
-        if (sources[s].rowidSeek.isSome() || sources[s].right) {
-            continue;
-        }
-        let SourceKind.Table(plan) = borrow sources[s].kind else {
-            continue;
-        };
-        if (plan.withoutRowid) {
-            continue;
-        }
-        // sqlite_schema and the like have no indexes.
-        if (db.catalogOf(plan.database).table(plan.name.view())?.isNull()) {
-            continue;
-        }
-        let table = db.catalogOf(plan.database).tableCopy(plan.name.view())?;
-        // The planner reads the table's own database's indexes.
-        let planned = plan.database;
-        var bounds = Vector<ColumnBound>.create();
-        if (borrow filter is Some(f)) {
-            columnBounds(f, sources[s].slot, !sources[s].left && !inLeftGroup(sources.view(), s), mut bounds)?;
-        }
-        if (borrow sources[s].on is Some(on)) {
-            columnBounds(on, sources[s].slot, true, mut bounds)?;
-        }
-        let previous = db.swapTo(planned);
-        let chosen = chooseIndexSeek(db, borrow table, borrow bounds);
-        let _ = db.swapTo(previous);
-        sources[s].indexSeek = chosen?;
-    }
-    return Ok(CorePlan {
+    var plan = CorePlan {
         sources: sources,
         filter: filter,
         groupBy: groupBy,
@@ -1438,7 +1408,10 @@ fn compileCoreBody(
         distinct: core.distinct,
         windows: windows,
         windowSlot: windowSlot,
-    });
+    };
+    // Index seeks, covering reads and ORDER BY from an index (plan.cee).
+    planCore(compiler, mut plan, db)?;
+    return Ok(plan);
 }
 
 /// The expression of result column `at` of a core (for GROUP BY and ORDER BY ordinals).
@@ -1500,16 +1473,17 @@ fn slotUse(e: borrow XExpr, acc: borrow mut SlotUse) {
 }
 
 /// From the AND-terms of `condition`, an expression the rowid of `slot` must equal, that uses earlier slots only.
-fn rowidEqualityFor(condition: borrow XExpr, slot: usize) -> Result<XExpr?, SqliteError> {
+fn rowidEqualityFor(condition: borrow XExpr, slot: usize, allowIs: bool) -> Result<XExpr?, SqliteError> {
     match (condition) {
         XExpr.And(a, b) => {
-            if (rowidEqualityFor(a, slot)? is Some(found)) {
+            if (rowidEqualityFor(a, slot, allowIs)? is Some(found)) {
                 return Ok(found);
             }
-            return rowidEqualityFor(b, slot);
+            return rowidEqualityFor(b, slot, allowIs);
         }
         XExpr.Compare(c) => {
-            if (c.op != CompareOp.Equal && c.op != CompareOp.Is) {
+            // A LEFT JOIN table takes no IS from WHERE, where its row of NULLs could make one true.
+            if (c.op != CompareOp.Equal && (c.op != CompareOp.Is || !allowIs)) {
                 return Ok(null);
             }
             let leftIsRowid = c.left is XExpr.Rowid(s) && s == slot;

@@ -1318,7 +1318,7 @@ fn matchingRows(
     var cursor = RowCursor.scan(borrow writer.read);
     var rowidSeek = false;
     if (filter is Some(f) && !writer.table.withoutRowid) {
-        if (rowidEqualityFor(f, writer.slot)? is Some(seek)) {
+        if (rowidEqualityFor(f, writer.slot, true)? is Some(seek)) {
             rowidSeek = true;
             let Some(rowId) = seekRowid(borrow seek, frame, db)? else {
                 return Ok(Vector<RowKey>.create());
@@ -1327,25 +1327,9 @@ fn matchingRows(
         }
     }
     var rowids = Vector<RowKey>.create();
-    // An index that narrows the rows, as in a SELECT.
+    // An index (or a rowid range) that narrows the rows, as in a SELECT (plan.cee).
     if (filter is Some(f) && !writer.table.withoutRowid && !rowidSeek) {
-        var bounds = Vector<ColumnBound>.create();
-        columnBounds(f, writer.slot, true, mut bounds)?;
-        if (chooseIndexSeek(db, borrow writer.table, borrow bounds)? is Some(seek)) {
-            var ranges = seekRanges(borrow seek, frame, db)?;
-            var found = Vector<i64>.create();
-            for (r in 0..ranges.length) {
-                var entries = IndexCursor.create(
-                    seek.root,
-                    replace(mut ranges[r], IndexRange.all(IndexOrder.plain())),
-                    false,
-                );
-                while (entries.next(mut db.pager)? is Some(entry)) {
-                    found.push(indexEntryRowId(entry.view())?)?;
-                }
-            }
-            // In rowid order, as a scan would give them.
-            found.sortBy((a, b) => compareI64(a, b));
+        if (seekRowids(writer, f, frame, db)? is Some(found)) {
             for (i in 0..found.length) {
                 let key = RowKey.Rowid(found[i]);
                 if (!writer.loadRow(borrow key, frame, db)?) {
