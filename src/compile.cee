@@ -717,9 +717,7 @@ impl Compiler {
             }
             // ORDER BY matters to the aggregates that join their rows; the others take it and ignore it.
             var orderBy = this.orderTerms(call.orderBy.view(), db)?;
-            let ordered =
-                function == AggregateFunction.GroupConcat ||
-                    function == AggregateFunction.JsonGroupArray || function == AggregateFunction.JsonGroupObject;
+            let ordered = function == AggregateFunction.GroupConcat || isJsonGroup(function);
             var replaySlot: usize = 0;
             if (orderBy.length != 0 && ordered) {
                 replaySlot = this.slotsInUse;

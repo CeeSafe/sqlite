@@ -26,7 +26,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Scalar functions, aggregates | `Exec/Functions`, `LikeMatcher` | `functions.cee`, `aggregate.cee`, `libm.cee` | done, with every math function (`libm.cee`: msun and double-double, a last-bit difference from macOS's libm on some arguments) |
 | Date and time functions | `Exec/Functions` (date/time part) | `datetime.cee` | done: a port of SQLite's date.c; 'localtime' and 'utc' are an error where they need the time zone, which CeeSafe lacks |
 | printf() and format() | `Exec/Functions` (`Printf`) | `printf.cee` | done: a port of SQLite's `sqlite3_str_vappendf`, every conversion and flag of the SQL path |
-| JSON functions | `Exec/Json`, `Functions` (JSON1) | `json.cee` | done: SQLite 3.53.4's text JSON functions, `->`, `->>`, `json_group_array` and `json_group_object`, JSON5 input, JSONB blobs as input; the `jsonb_*` functions and the table-valued `json_each` and `json_tree` are not ported and are "no such function" |
+| JSON functions | `Exec/Json`, `Functions` (JSON1) | `json.cee`, `json_each.cee` | done: SQLite 3.53.4's JSON functions, `->`, `->>`, the aggregates, JSON5 input, JSONB blobs as input, the `jsonb_*` functions (their JSONB byte for byte as sqlite3's) and the table-valued `json_each`, `json_tree`, `jsonb_each` and `jsonb_tree` (every column, `id` as SQLite's JSONB offsets, arguments from earlier FROM items) |
 | SELECT: joins, subqueries, views, CTEs, grouping, compounds | `Exec/QueryExecutor` | `select.cee`, `run.cee` | done but table functions; RIGHT and FULL joins, rowid and index seeks done |
 | Planner: index seeks | `Exec/QueryPlanner` | `plan.cee` | `=`, IS, IN (value lists) and range terms on the leading columns of plain indexes, for SELECT, UPDATE and DELETE; partial and expression indexes, IN (SELECT …), rowid IN and covering scans next |
 | Window functions | `Exec/WindowEvaluator` | `window.cee` | done: every built-in window function, aggregates over frames, ROWS/RANGE/GROUPS, EXCLUDE, named windows |
@@ -262,7 +262,15 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   - the subtype rule: text a JSON function returns nests as JSON in another JSON function, so
     `json_array(json('[1]'))` is `[[1]]`; the C# made it `["[1]"]` (`jsonNestsJsonResultsBySubtype`);
   - json_error_position() reports the character where SQLite's parser stops, and json_valid() takes SQLite's
-    FLAGS argument; json_pretty() and json_array_insert() exist.
+    FLAGS argument; json_pretty() and json_array_insert() exist;
+  - the jsonb_* functions, jsonb_group_array() and jsonb_group_object() return SQLite's JSONB, including the
+    headers SQLite widens in place when an edit shrinks a value (jsonBlobOverwrite); the C# had none
+    (`jsonbFunctionsReturnJsonb`, `jsonbMatchesSqliteOnRandomInput`);
+  - json_each(), json_tree(), jsonb_each() and jsonb_tree() exist, with SQLite's columns and its `id`s (offsets
+    in the JSONB), a root path, and arguments that name the tables before them (`jsonEachWalksContainers`,
+    `jsonEachJoinsTables`); the `value` of an array or object nests as JSON (`jsonEachValueHasJsonSubtype`);
+  - a JSONB blob with a damaged element header makes json_each() and json_tree() report "malformed JSON", where
+    sqlite3 loops for ever on the element (`jsonEachStopsOnDamagedJsonb`).
 - **Math functions** (`math_tests.cee`). The C# called .NET's `Math` with SQLite's names, and differed:
   - an infinite result was NULL; SQLite returns it: `exp(710)`, `pow(0, -1)` and `atanh(1)` are `Inf`;
   - arguments went through the numeric prefix of text, so `sin('1abc')` and `floor(x'33')` were numbers; SQLite
@@ -442,11 +450,19 @@ would take Apple's algorithms, which are not published. The tests use arguments 
 - **A scalar subquery drops the JSON subtype.** `json_array((SELECT json('[1]')))` is `[[1]]` in SQLite and
   `["[1]"]` here. This engine's values carry no subtype; JSON-function arguments are evaluated by
   `evaluateWithSubtype` (`json.cee`), which sees through CASE, coalesce, ifnull, iif, nullif, likely, unlikely,
-  the scalar min and max, unary `+`, CAST, COLLATE, `->` and the JSON aggregates, but not into a subquery.
+  the scalar min and max, unary `+`, CAST, COLLATE, `->`, the JSON aggregates and json_each's `value`, but not
+  into a subquery (`SELECT json_array(x.value) FROM (SELECT value FROM json_each('[[1]]')) x` quotes it).
 - **Unpaired surrogates.** SQLite decodes `"\ud800"` to the bytes ED A0 80, which are not UTF-8. Text values here
   are valid UTF-8, so each such byte becomes U+FFFD.
 - **Window functions.** json_group_array() and json_group_object() run as window functions, but their arguments
   lose the JSON subtype on the way through the window, so a JSON argument is quoted as text.
+- **json_each() and json_tree() compute every column of a row.** SQLite reads only the columns a query uses, so
+  over a damaged JSONB blob `SELECT key FROM json_each(…)` can succeed in SQLite where this engine reports
+  "malformed JSON" from the `value` column.
+- **The arguments of json_each() and json_tree() come from the parentheses.** A json_each source has no rowid
+  (SQLite numbers its rows from 0), a constraint on its hidden `json` or `root` column in WHERE does not stand
+  for the argument, and an argument may name only the FROM items before it: SQLite's planner also accepts
+  `FROM json_each(t.doc), t`, which here is "no such column".
 - **Nesting depth.** The limit is 3.53.4's 1000 levels; the `sqlite3` shell the tests run (3.54.0 on macOS) was
   built with 800, so the tests stay on depths where the two agree.
 

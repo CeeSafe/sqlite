@@ -50,6 +50,8 @@ enum SourceKind {
     Working(usize),
     /// A pragma_* table-valued function: the pragma's name and its argument.
     Pragma(String, XExpr?),
+    /// json_each, json_tree, jsonb_each or jsonb_tree (json_each.cee).
+    JsonEach(JsonEachPlan),
 }
 
 struct SourcePlan {
@@ -943,6 +945,10 @@ fn compileFromItem(
         }
         FromItem.TableFunction(f) => {
             let name = f.name.view();
+            if (jsonEachNamed(name) is Some(kind)) {
+                sources.push(compileJsonEach(compiler, f, kind, slot, scope, db)?)?;
+                return Ok();
+            }
             let isPragma = name.length > 7 && name[0..7].equalsIgnoreAsciiCase("pragma_");
             let columnNames = (if (isPragma) pragmaColumns(name[7..]) else null) ?? {
                 return Err(namedError("no such table: ", name));

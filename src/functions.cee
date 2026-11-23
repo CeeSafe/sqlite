@@ -22,7 +22,7 @@
 // may differ in the last bit from the platform's libm that sqlite3 uses. floor(), ceil(), trunc(), sqrt() and
 // mod() of a blob or of text that is not a number are NULL, as in SQLite.
 //
-// Not yet ported: the jsonb_* functions, json_each and json_tree. Calling one is "no such function".
+// json_each, json_tree, jsonb_each and jsonb_tree are table-valued functions (json_each.cee).
 
 enum ScalarFunction {
     Abs,
@@ -60,6 +60,17 @@ enum ScalarFunction {
     JsonSubtype,
     JsonType,
     JsonValid,
+    // The jsonb_* functions: as their json_* namesakes, returning JSONB (json.cee).
+    Jsonb,
+    JsonbArray,
+    JsonbArrayInsert,
+    JsonbExtract,
+    JsonbInsert,
+    JsonbObject,
+    JsonbPatch,
+    JsonbRemove,
+    JsonbReplace,
+    JsonbSet,
     JulianDay,
     LastInsertRowid,
     Length,
@@ -175,6 +186,17 @@ fn scalarEntry(name: StringView, argc: usize) -> FunctionEntry? {
         "json_set" => entry(ScalarFunction.JsonSet, argc, 0, MANY),
         "json_type" => entry(ScalarFunction.JsonType, argc, 1, 2),
         "json_valid" => entry(ScalarFunction.JsonValid, argc, 1, 2),
+        "jsonb" => entry(ScalarFunction.Jsonb, argc, 1, 1),
+        "jsonb_array" => entry(ScalarFunction.JsonbArray, argc, 0, MANY),
+        "jsonb_array_insert" => entry(ScalarFunction.JsonbArrayInsert, argc, 0, MANY),
+        "jsonb_extract" => entry(ScalarFunction.JsonbExtract, argc, 0, MANY),
+        "jsonb_group_array" | "jsonb_group_object" => entry(ScalarFunction.JsonGroup, argc, 1, 0),
+        "jsonb_insert" => entry(ScalarFunction.JsonbInsert, argc, 0, MANY),
+        "jsonb_object" => entry(ScalarFunction.JsonbObject, argc, 0, MANY),
+        "jsonb_patch" => entry(ScalarFunction.JsonbPatch, argc, 2, 2),
+        "jsonb_remove" => entry(ScalarFunction.JsonbRemove, argc, 0, MANY),
+        "jsonb_replace" => entry(ScalarFunction.JsonbReplace, argc, 0, MANY),
+        "jsonb_set" => entry(ScalarFunction.JsonbSet, argc, 0, MANY),
         "julianday" => entry(ScalarFunction.JulianDay, argc, 0, MANY),
         "last_insert_rowid" => entry(ScalarFunction.LastInsertRowid, argc, 0, 0),
         "length" => entry(ScalarFunction.Length, argc, 1, 1),
@@ -260,6 +282,8 @@ enum AggregateFunction {
     GroupConcat,
     JsonGroupArray,
     JsonGroupObject,
+    JsonbGroupArray,
+    JsonbGroupObject,
 }
 
 /// The aggregate `name` taking `argc` arguments, if it is one.
@@ -298,6 +322,12 @@ fn aggregateFunctionNamed(name: StringView, argc: usize, star: bool) -> Aggregat
     }
     if (name.equalsIgnoreAsciiCase("json_group_object") && argc == 2) {
         return AggregateFunction.JsonGroupObject;
+    }
+    if (name.equalsIgnoreAsciiCase("jsonb_group_array") && argc == 1) {
+        return AggregateFunction.JsonbGroupArray;
+    }
+    if (name.equalsIgnoreAsciiCase("jsonb_group_object") && argc == 2) {
+        return AggregateFunction.JsonbGroupObject;
     }
     return null;
 }
@@ -1299,7 +1329,7 @@ fn callFunction(
         }
         ScalarFunction.Coalesce | ScalarFunction.IfNull | ScalarFunction.Iif => { return Ok(SqliteValue.Null); }
         // Computed in json.cee, above.
-        ScalarFunction.Json | ScalarFunction.JsonArray | ScalarFunction.JsonArrayInsert | ScalarFunction.JsonArrayLength | ScalarFunction.JsonErrorPosition | ScalarFunction.JsonExtract | ScalarFunction.JsonGroup | ScalarFunction.JsonInsert | ScalarFunction.JsonObject | ScalarFunction.JsonPatch | ScalarFunction.JsonPretty | ScalarFunction.JsonQuote | ScalarFunction.JsonRemove | ScalarFunction.JsonReplace | ScalarFunction.JsonSet | ScalarFunction.JsonSubtype | ScalarFunction.JsonType | ScalarFunction.JsonValid => {
+        ScalarFunction.Json | ScalarFunction.JsonArray | ScalarFunction.JsonArrayInsert | ScalarFunction.JsonArrayLength | ScalarFunction.JsonErrorPosition | ScalarFunction.JsonExtract | ScalarFunction.JsonGroup | ScalarFunction.JsonInsert | ScalarFunction.JsonObject | ScalarFunction.JsonPatch | ScalarFunction.JsonPretty | ScalarFunction.JsonQuote | ScalarFunction.JsonRemove | ScalarFunction.JsonReplace | ScalarFunction.JsonSet | ScalarFunction.JsonSubtype | ScalarFunction.JsonType | ScalarFunction.JsonValid | ScalarFunction.Jsonb | ScalarFunction.JsonbArray | ScalarFunction.JsonbArrayInsert | ScalarFunction.JsonbExtract | ScalarFunction.JsonbInsert | ScalarFunction.JsonbObject | ScalarFunction.JsonbPatch | ScalarFunction.JsonbRemove | ScalarFunction.JsonbReplace | ScalarFunction.JsonbSet => {
             return Ok(SqliteValue.Null);
         }
     }

@@ -1,0 +1,521 @@
+// The table-valued functions json_each(), json_tree(), jsonb_each() and jsonb_tree(): a port of the json_each
+// virtual table of SQLite's json.c (3.53.4): jsonEachConnect's columns, jsonEachFilter, jsonEachNext and
+// jsonEachColumn.
+//
+// The argument is translated into JSONB, as json.cee translates any JSON argument, and the cursor walks the JSONB.
+// json_each() visits the elements of the array or object at the root (or the root itself when it is neither), and
+// json_tree() every element below and including the root, with an explicit stack of the containers it is inside.
+// Each row's `id` is the element's offset in the JSONB, its label's offset for an object's member, as in SQLite.
+//
+// The `value` of an array or object has SQLite's JSON subtype: the slots of these sources are listed in the frame,
+// and evaluateWithSubtype (json.cee) marks their `value` column when the row's `type` is an array or an object.
+//
+// Differences from SQLite:
+// - every column of a row is computed when the row is made, so a damaged JSONB blob is "malformed JSON" even when
+//   the query does not read the column that SQLite would have found damaged;
+// - an element whose JSONB header is damaged stops the walk with "malformed JSON", where SQLite's cursor stays on
+//   it and loops for ever;
+// - the rowid of a row is not available (SQLite numbers the rows from 0), and a constraint on the hidden `json`
+//   and `root` columns in WHERE does not give the arguments: they are given in the parentheses.
+
+/// The columns of the four functions (jsonEachConnect), the last two hidden: the arguments.
+const JSON_EACH_KEY: usize = 0;
+const JSON_EACH_VALUE: usize = 1;
+const JSON_EACH_TYPE: usize = 2;
+const JSON_EACH_COLUMN_COUNT: usize = 10;
+
+fn jsonEachColumnName(k: usize) -> StringView => match (k) {
+    0 => "key",
+    1 => "value",
+    2 => "type",
+    3 => "atom",
+    4 => "id",
+    5 => "parent",
+    6 => "fullkey",
+    7 => "path",
+    8 => "json",
+    _ => "root",
+};
+
+/// A json_each, json_tree, jsonb_each or jsonb_tree source.
+struct JsonEachPlan {
+    /// json_tree and jsonb_tree.
+    recursive: bool;
+    /// jsonb_each and jsonb_tree: the value of an array or object is its JSONB.
+    jsonb: bool;
+    /// The arguments: the JSON, and the path to its root.
+    json: XExpr?;
+    root: XExpr?;
+    /// The slot its rows go in.
+    slot: usize;
+}
+
+/// Which of the four functions `name` is, if one: whether it walks the tree, and whether it gives JSONB.
+struct JsonEachName {
+    recursive: bool;
+    jsonb: bool;
+}
+
+fn jsonEachNamed(name: StringView) -> JsonEachName? {
+    if (name.equalsIgnoreAsciiCase("json_each")) {
+        return JsonEachName { recursive: false, jsonb: false };
+    }
+    if (name.equalsIgnoreAsciiCase("json_tree")) {
+        return JsonEachName { recursive: true, jsonb: false };
+    }
+    if (name.equalsIgnoreAsciiCase("jsonb_each")) {
+        return JsonEachName { recursive: false, jsonb: true };
+    }
+    if (name.equalsIgnoreAsciiCase("jsonb_tree")) {
+        return JsonEachName { recursive: true, jsonb: true };
+    }
+    return null;
+}
+
+/// Compiles the arguments of a json_each source. They may name the columns of the FROM items before it
+/// (`FROM t, json_each(t.doc)`), so the scope built so far is visible while they compile.
+fn compileJsonEachArguments(
+    compiler: borrow mut Compiler,
+    args: Slice<Expr>,
+    scope: borrow mut Scope,
+    db: borrow mut Session,
+) -> Result<Vector<XExpr>, SqliteError> {
+    let visible = replace(mut scope.sources, Vector<ScopeSource>.create());
+    compiler.scopes.push(Scope { sources: visible })?;
+    var compiled = Vector<XExpr>.create();
+    var failure: SqliteError? = null;
+    for (k in 0..args.length) {
+        match (compiler.compile(borrow args[k], db)) {
+            Ok(x) => {
+                if (compiled.push(x) is Err(e)) {
+                    failure = SqliteError.Alloc(e);
+                    break;
+                }
+            }
+            Err(e) => {
+                failure = e;
+                break;
+            }
+        }
+    }
+    if (compiler.scopes.pop() is Some(back)) {
+        scope.sources = back.sources;
+    }
+    if (failure is Some(e)) {
+        return Err(e);
+    }
+    return Ok(compiled);
+}
+
+/// A json_each source: its plan, and its columns in the scope.
+fn compileJsonEach(
+    compiler: borrow mut Compiler,
+    f: borrow TableFunctionSource,
+    kind: JsonEachName,
+    slot: usize,
+    scope: borrow mut Scope,
+    db: borrow mut Session,
+) -> Result<SourcePlan, SqliteError> {
+    let name = f.name.view();
+    if (f.args.length > 2) {
+        // SQLite names the module as it registered it, in lower case.
+        var message = String.from("too many arguments on ")?;
+        message.append(if (kind.jsonb) "jsonb_" else "json_")?;
+        message.append(if (kind.recursive) "tree" else "each")?;
+        message.append("() - max 2")?;
+        return Err(SqliteError.Sql(message));
+    }
+    var args = compileJsonEachArguments(compiler, f.args.view(), scope, db)?;
+    let root = if (args.length == 2) args.pop() else null;
+    let json = args.pop();
+    var columns = Vector<ScopeColumn>.create();
+    for (k in 0..JSON_EACH_COLUMN_COUNT) {
+        columns.push(
+            ScopeColumn {
+                name: String.from(jsonEachColumnName(k))?,
+                affinity: Affinity.Blob,
+                collation: Collation.Binary,
+                hidden: k >= 8,
+            },
+        )?;
+    }
+    let alias = if (borrow f.alias is Some(a)) a.clone()? else String.from(name)?;
+    scope.sources.push(
+        ScopeSource {
+            name: alias,
+            columns: columns,
+            slot: slot,
+            hasRowid: false,
+            rowidAlias: null,
+            merged: Vector<String>.create(),
+            coalesceMerged: false,
+        },
+    )?;
+    let plan = JsonEachPlan { recursive: kind.recursive, jsonb: kind.jsonb, json: json, root: root, slot: slot };
+    return Ok(
+        SourcePlan {
+            kind: SourceKind.JsonEach(plan),
+            slot: slot,
+            columnCount: JSON_EACH_COLUMN_COUNT,
+            left: false,
+            right: false,
+            on: null,
+            rowidSeek: null,
+            indexSeek: null,
+            group: 0,
+            groupOn: null,
+        },
+    );
+}
+
+/// Whether the value column of `slot` holds an array or an object of a json_each row: JSON text with the JSON
+/// subtype.
+fn jsonEachValueIsJson(frame: borrow Frame, slot: usize, column: usize) -> bool {
+    if (column != JSON_EACH_VALUE || slot >= frame.slots.length) {
+        return false;
+    }
+    var listed = false;
+    for (k in 0..frame.jsonEachSlots.length) {
+        listed = listed || frame.jsonEachSlots[k] == slot;
+    }
+    let s = borrow frame.slots[slot];
+    if (!listed || s.isNull || s.values.length != JSON_EACH_COLUMN_COUNT) {
+        return false;
+    }
+    let SqliteValue.Text(t) = borrow s.values[JSON_EACH_TYPE] else {
+        return false;
+    };
+    return s.values[JSON_EACH_VALUE] is SqliteValue.Text(_) && (t.view() == "array" || t.view() == "object");
+}
+
+/// The rows of a json_each source, for the current values of its arguments.
+fn jsonEachRows(
+    plan: borrow JsonEachPlan,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<Vector<Vector<SqliteValue>>, SqliteError> {
+    var listed = false;
+    for (k in 0..frame.jsonEachSlots.length) {
+        listed = listed || frame.jsonEachSlots[k] == plan.slot;
+    }
+    if (!listed) {
+        frame.jsonEachSlots.push(plan.slot)?;
+    }
+    var rows = Vector<Vector<SqliteValue>>.create();
+    let Some(jsonExpr) = borrow plan.json else {
+        // No JSON: SQLite's plan without the argument finds nothing.
+        return Ok(rows);
+    };
+    let json = evaluate(jsonExpr, frame, db)?;
+    var root: SqliteValue? = null;
+    if (borrow plan.root is Some(r)) {
+        root = evaluate(r, frame, db)?;
+    }
+    var cursor = JsonEachCursor.create(plan.recursive, plan.jsonb);
+    if (!cursor.filter(borrow json, borrow root)?) {
+        return Ok(rows);
+    }
+    while (cursor.i < cursor.iEnd) {
+        rows.push(cursor.row()?)?;
+        cursor.next()?;
+    }
+    return Ok(rows);
+}
+
+/// A container the cursor is inside (JsonParent).
+struct JsonEachParent {
+    /// Its label when it is an object's member, else the container.
+    iHead: usize;
+    /// The container.
+    iValue: usize;
+    /// The first byte past it.
+    iEnd: usize;
+    /// The length of the path before it.
+    nPath: usize;
+    /// The index of the current element, in an array.
+    iKey: i64;
+}
+
+/// The walk of one argument (JsonEachCursor).
+struct JsonEachCursor {
+    rowid: usize;
+    /// The current element (its label, for an object's member).
+    i: usize;
+    /// The end of the walk.
+    iEnd: usize;
+    /// The length of the root path.
+    nRoot: usize;
+    /// The type of the container of the current element, 0 at the root.
+    eType: u8;
+    recursive: bool;
+    jsonb: bool;
+    parents: Vector<JsonEachParent>;
+    path: Vector<u8>;
+    parse: JsonParse;
+    /// The `json` column: the argument's text, or its JSONB.
+    input: SqliteValue;
+
+    fn create(recursive: bool, jsonb: bool) -> JsonEachCursor => JsonEachCursor {
+        rowid: 0,
+        i: 0,
+        iEnd: 0,
+        nRoot: 0,
+        eType: 0,
+        recursive: recursive,
+        jsonb: jsonb,
+        parents: Vector<JsonEachParent>.create(),
+        path: Vector<u8>.create(),
+        parse: JsonParse.create(),
+        input: SqliteValue.Null,
+    };
+
+    /// Starts the walk (jsonEachFilter). False when there are no rows.
+    fn filter(borrow mut this, json: borrow SqliteValue, root: borrow SqliteValue?) -> Result<bool, SqliteError> {
+        var isJsonb = false;
+        if (json is SqliteValue.Blob(b)) {
+            if (jsonArgIsJsonb(b.view())) {
+                this.parse.blob.extend(b.view())?;
+                this.input = SqliteValue.Blob(b.clone()?);
+                isJsonb = true;
+            }
+        }
+        if (!isJsonb) {
+            if (json.isNull()) {
+                return Ok(false);
+            }
+            let text = valueBytes(json)?;
+            this.input = SqliteValue.Text(textFromBytesLossy(beforeNul(text.view()))?);
+            if (!this.parse.convertText(text.view())?) {
+                return Err(sqlError("malformed JSON"));
+            }
+        }
+        var i: usize = 0;
+        if (root is Some(rootValue)) {
+            let path = jsonPathBytes(rootValue)? ?? {
+                return Ok(false);
+            };
+            let z = path.view();
+            if (jsonAt(z, 0) != '$') {
+                return Err(jsonBadPathError(z, 0));
+            }
+            this.nRoot = z.length;
+            if (jsonAt(z, 1) == 0) {
+                this.i = 0;
+                this.eType = 0;
+            } else {
+                this.parse.iLabel = 0;
+                let found = this.parse.lookupStep(0, z, 1, 0)?;
+                if (jsonLookupIsError(found)) {
+                    if (found == JSON_LOOKUP_NOTFOUND) {
+                        return Ok(false);
+                    }
+                    return Err(jsonBadPathError(z, 0));
+                }
+                i = found;
+                if (this.parse.iLabel != 0) {
+                    this.i = this.parse.iLabel;
+                    this.eType = JSONB_OBJECT;
+                } else {
+                    this.i = found;
+                    this.eType = JSONB_ARRAY;
+                }
+            }
+            this.path.extend(z)?;
+        } else {
+            this.i = 0;
+            this.eType = 0;
+            this.nRoot = 1;
+            this.path.push('$')?;
+        }
+        let blob = this.parse.blob.view();
+        let h = jsonbPayloadSize(blob, 0, i);
+        this.iEnd = i + h.n + h.sz;
+        let t = jsonAt(blob, i) & 0x0F;
+        if (t >= JSONB_ARRAY && !this.recursive) {
+            this.i = i + h.n;
+            this.eType = t;
+            this.parents.push(JsonEachParent { iHead: this.i, iValue: i, iEnd: this.iEnd, nPath: 0, iKey: 0 })?;
+        }
+        return Ok(true);
+    }
+
+    /// The value of the current element: past its label, for an object's member (jsonSkipLabel).
+    fn skipLabel(borrow this) -> usize {
+        if (this.eType != JSONB_OBJECT) {
+            return this.i;
+        }
+        let h = jsonbPayloadSize(this.parse.blob.view(), 0, this.i);
+        let at = this.i + h.n + h.sz;
+        return if (at >= this.parse.blob.length) this.i else at;
+    }
+
+    /// The header of the element at `i`; a damaged one is malformed JSON.
+    fn header(borrow this, i: usize) -> Result<JsonbHeader, SqliteError> {
+        let h = jsonbPayloadSize(this.parse.blob.view(), 0, i);
+        if (h.n == 0) {
+            return Err(sqlError("malformed JSON"));
+        }
+        return Ok(h);
+    }
+
+    /// Moves to the next element (jsonEachNext).
+    fn next(borrow mut this) -> Result<void, SqliteError> {
+        let i = this.skipLabel();
+        let h = this.header(i)?;
+        if (this.recursive) {
+            var levelChange = false;
+            let x = jsonAt(this.parse.blob.view(), i) & 0x0F;
+            if (x == JSONB_OBJECT || x == JSONB_ARRAY) {
+                levelChange = true;
+                let nPath = this.path.length;
+                if (this.eType != 0 && this.parents.length != 0) {
+                    this.appendPathName()?;
+                }
+                this.parents.push(
+                    JsonEachParent { iHead: this.i, iValue: i, iEnd: i + h.n + h.sz, nPath: nPath, iKey: -1 },
+                )?;
+                this.i = i + h.n;
+            } else {
+                this.i = i + h.n + h.sz;
+            }
+            while (this.parents.length > 0 && this.i >= this.parents[this.parents.length - 1].iEnd) {
+                let top = this.parents.length - 1;
+                let nPath = this.parents[top].nPath;
+                let _ = this.parents.pop();
+                this.path.truncate(nPath);
+                levelChange = true;
+            }
+            if (levelChange) {
+                if (this.parents.length > 0) {
+                    let iValue = this.parents[this.parents.length - 1].iValue;
+                    this.eType = jsonAt(this.parse.blob.view(), iValue) & 0x0F;
+                } else {
+                    this.eType = 0;
+                }
+            }
+        } else {
+            this.i = i + h.n + h.sz;
+        }
+        if (this.eType == JSONB_ARRAY && this.parents.length != 0) {
+            let top = this.parents.length - 1;
+            this.parents[top].iKey += 1;
+        }
+        this.rowid += 1;
+        return Ok();
+    }
+
+    /// Appends the current element's name in its container to the path (jsonAppendPathName).
+    fn appendPathName(borrow mut this) -> Result<void, AllocError> {
+        if (this.eType == JSONB_ARRAY) {
+            var text = String.from("[")?;
+            text.appendNumber(this.parents[this.parents.length - 1].iKey)?;
+            text.append("]")?;
+            return this.path.extend(text.view().bytes());
+        }
+        let blob = this.parse.blob.view();
+        let h = jsonbPayloadSize(blob, 0, this.i);
+        let k = this.i + h.n;
+        let z = jsonBytes(blob, k, k + h.sz);
+        var needQuote = z.length == 0 || !jsonIsAlpha(z[0]);
+        for (c in 0..z.length) {
+            needQuote = needQuote || !jsonIsAlnum(z[c]);
+        }
+        // "%.*s" stops at a NUL.
+        let label = beforeNul(z);
+        if (needQuote) {
+            this.path.extend(".\"".bytes())?;
+            this.path.extend(label)?;
+            return this.path.push('"');
+        }
+        this.path.push('.')?;
+        return this.path.extend(label);
+    }
+
+    /// The length of the `path` column: for the first row of json_tree() under a root path, the part of the root
+    /// path that leads to the root's container (jsonEachPathLength).
+    fn pathLength(borrow mut this) -> Result<usize, AllocError> {
+        var n = this.path.length;
+        if (this.rowid != 0 || !this.recursive || n < 2) {
+            return Ok(n);
+        }
+        while (n > 1) {
+            n -= 1;
+            let c = this.path[n];
+            if (c != '[' && c != '.') {
+                continue;
+            }
+            var prefix = Vector<u8>.create();
+            prefix.extend(this.path.view()[0..n])?;
+            let x = this.parse.lookupStep(0, prefix.view(), 1, 0)?;
+            if (jsonLookupIsError(x)) {
+                continue;
+            }
+            let h = jsonbPayloadSize(this.parse.blob.view(), 0, x);
+            if (x + h.n == this.i) {
+                break;
+            }
+        }
+        return Ok(n);
+    }
+
+    /// The `key` column.
+    fn key(borrow mut this) -> Result<SqliteValue, SqliteError> {
+        if (this.parents.length == 0) {
+            if (this.nRoot == 1) {
+                return Ok(SqliteValue.Null);
+            }
+            let j = this.pathLength()?;
+            let n = this.nRoot.saturatingSub(j);
+            let z = this.path.view();
+            if (n == 0) {
+                return Ok(SqliteValue.Null);
+            }
+            if (jsonAt(z, j) == '[') {
+                let x = jsonAtoi64(jsonBytes(z, j + 1, j + n));
+                return Ok(SqliteValue.Integer(truncate<i64>(x.bits)));
+            }
+            if (jsonAt(z, j + 1) == '"') {
+                return Ok(SqliteValue.Text(textFromBytesLossy(jsonBytes(z, j + 2, j + 2 + n.saturatingSub(3)))?));
+            }
+            return Ok(SqliteValue.Text(textFromBytesLossy(jsonBytes(z, j + 1, j + n))?));
+        }
+        if (this.eType == JSONB_OBJECT) {
+            return jsonReturnFromBlob(this.parse.blob.view(), this.i);
+        }
+        return Ok(SqliteValue.Integer(this.parents[this.parents.length - 1].iKey));
+    }
+
+    /// The current row's columns (jsonEachColumn).
+    fn row(borrow mut this) -> Result<Vector<SqliteValue>, SqliteError> {
+        var row = Vector<SqliteValue>.withCapacity(JSON_EACH_COLUMN_COUNT)?;
+        row.push(this.key()?)?;
+        let i = this.skipLabel();
+        let blob = this.parse.blob.view();
+        let t = jsonAt(blob, i) & 0x0F;
+        if (t >= JSONB_ARRAY && this.jsonb) {
+            row.push(jsonReturnBlobFromBlob(blob, i)?)?;
+        } else {
+            row.push(jsonReturnFromBlob(blob, i)?)?;
+        }
+        row.push(SqliteValue.text(jsonbTypeName(t))?)?;
+        row.push(if (t < JSONB_ARRAY) jsonReturnFromBlob(blob, i)? else SqliteValue.Null)?;
+        row.push(SqliteValue.Integer(truncate<i64>(this.i)))?;
+        let hasParent = this.recursive && this.parents.length > 0;
+        row.push(
+            if (hasParent) SqliteValue.Integer(
+                truncate<i64>(this.parents[this.parents.length - 1].iHead),
+            ) else SqliteValue.Null,
+        )?;
+        let base = this.path.length;
+        if (this.parents.length != 0) {
+            this.appendPathName()?;
+        }
+        row.push(SqliteValue.Text(textFromBytesLossy(this.path.view())?))?;
+        this.path.truncate(base);
+        let n = this.pathLength()?;
+        row.push(SqliteValue.Text(textFromBytesLossy(jsonBytes(this.path.view(), 0, n))?))?;
+        row.push(this.input.clone()?)?;
+        row.push(SqliteValue.Text(textFromBytesLossy(jsonBytes(this.path.view(), 0, this.nRoot))?))?;
+        return Ok(row);
+    }
+}

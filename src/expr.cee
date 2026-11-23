@@ -38,6 +38,8 @@ struct Frame {
     working: Vector<Vector<Vector<SqliteValue>>>;
     /// The statement's notion of now, as a Julian day number in milliseconds, fixed for the statement.
     nowMillis: i64;
+    /// The slots of json_each sources, whose `value` of an array or object has the JSON subtype (json_each.cee).
+    jsonEachSlots: Vector<usize>;
 
     fn create() -> Frame => Frame {
         slots: Vector<Slot>.create(),
@@ -49,6 +51,7 @@ struct Frame {
         cteRows: Vector<Vector<Vector<SqliteValue>>?>.create(),
         working: Vector<Vector<Vector<SqliteValue>>>.create(),
         nowMillis: 0,
+        jsonEachSlots: Vector<usize>.create(),
     };
 
     /// Makes room for `count` more slots, empty, and returns the first.
