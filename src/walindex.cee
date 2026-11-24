@@ -524,18 +524,25 @@ struct SharedWal {
         return Ok();
     }
 
-    /// Writes the words of `block` that changed since `loadBlock` back into the index, each atomically, leaving
-    /// the first block's header alone.
+    /// Writes the entries of `block` that changed since `loadBlock` back into the index, each atomically as wal.c
+    /// stores it (a page number in 32 bits, a hash slot in 16), leaving the first block's header alone.
     private fn writeBlock(borrow this, block: usize) {
         var at = walIndexPagesAt(block);
         let changed = this.block.view();
         let old = this.before.view();
-        while (at < WALINDEX_BLOCK) {
-            let word = changed.readLE<u32>(at);
-            if (word != old.readLE<u32>(at)) {
-                this.regions[block].store32(at, word, StoreOrdering.Release);
+        while (at < HASH_TABLE_AT) {
+            let page = changed.readLE<u32>(at);
+            if (page != old.readLE<u32>(at)) {
+                this.regions[block].store32(at, page, StoreOrdering.Release);
             }
             at += 4;
+        }
+        while (at < WALINDEX_BLOCK) {
+            let slot = changed.readLE<u16>(at);
+            if (slot != old.readLE<u16>(at)) {
+                this.regions[block].store16(at, slot, StoreOrdering.Release);
+            }
+            at += 2;
         }
     }
 
@@ -673,8 +680,7 @@ struct SharedWal {
         var found: u32 = 0;
         var collisions: usize = 0;
         loop {
-            let word = region.load32(HASH_TABLE_AT + (key / 2) * 4, LoadOrdering.Acquire);
-            let slot = if (key % 2 == 0) word & 0xFFFF else word >> 16;
+            let slot = region.load16(HASH_TABLE_AT + 2 * key, LoadOrdering.Acquire) as u32;
             if (slot == 0) {
                 return Ok(found);
             }
