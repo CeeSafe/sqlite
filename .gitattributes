@@ -1,0 +1,3 @@
+# Every text file is checked out with "\n" line endings on every system, as `ceesafec fmt` writes them and as the
+# tests' expected outputs and fixtures are written: Git for Windows would otherwise turn them into "\r\n".
+* text=auto eol=lf
