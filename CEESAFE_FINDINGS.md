@@ -28,9 +28,14 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 32 | fixed in 0.95.0: `sortStableBy`, ADR 0225; workaround removed (every ORDER BY sort, the compound one included, which was unstable) |
 | 34 | fixed in 0.95.0 for an expected slice or number (ADR 0226); `let a = [1, 2];` stays `i32`, as `let x = 1;` does; `logEst`'s tables are typed `[i64; N]` |
 | 9, 10, 12, 18, 21 | by design: closures are typed where a function type is expected; reserved words, now named as such in the error; references are not re-pointed; ranges are half-open (ADR 0085) |
-| 6, 15, 19, 26 | open: two interfaces sharing a method name, file-private names, byte-string text, shared memory mappings |
-| 35 | open: found while fixing these (below) |
+| 6 | fixed in 0.95.2: methods of one name from several interfaces, and `I.m(x, …)` to name one (N0267 when a call on the type is ambiguous), ADR 0229; the workaround (`usableBytes`) stays until this package moves to 0.95.2 |
+| 15 | fixed in 0.95.2: a file's `private` items have a scope of their own, so two files may each have a private item of one name, ADR 0230; the workaround (`printfInteger` and the other prefixed helpers) stays until this package moves to 0.95.2 |
+| 19 | fixed in 0.95.2: `ByteString`/`ByteStringView` in lib/core, any bytes kept as they are, with `toUtf8`, `toUtf8Lossy` and `chunks`, ADR 0231; the workaround (`textFromBytesLossy`, U+FFFD for invalid bytes) stays until this package moves to 0.95.2 |
+| 26 | fixed in 0.95.2: `SharedMapping`, `f.mapShared(offset, length)`, with `readAt`/`writeAt` and 32- and 64-bit atomics, checked against a live sqlite3 `-shm`, ADR 0232; WAL mode still takes turns until this package writes a shared `-shm` (what is still missing for that: finding 37) |
+| 35 | fixed in 0.95.2: a `Thread<void>` in a generic signature is checked as a return type, no longer N0226 |
 | 36 | open: found while removing the workarounds for 3, 23, 24 and 27 (below) |
+| 37 | open: found with 26's fix (below) |
+| 38 | open: found with 19's fix (below) |
 
 ## Gaps
 
@@ -334,3 +339,23 @@ os_unix.c (POSIX hosts only); a Windows build would need the os_win.c scheme.
 
 Workaround: `tryLock` then `unlock` (`WritablePager.tryStart`, `src/pagerw.cee`); README.md, Limits, "Sharing a
 file".
+
+### 37. A shared mapping lacks what SQLite's wal-index uses beyond reads, writes and atomics
+
+Found with finding 26's fix (ADR 0232, 0.95.2). `SharedMapping` maps a region read-write and gives copies and
+atomics, which covers the wal-index's header and hash tables. Still missing for a full `-shm` as os_unix.c keeps it:
+a read-only mapping (SQLite's `readonly_shm`, for a database whose `-shm` cannot be written); a shortened file is
+SIGBUS, which ends the program instead of becoming an `IoError` (CeeSafe never shortens one itself, and Windows
+refuses to); the interpreter models a mapping by positional reads and writes, so its atomics are atomic among the
+program's threads but not against another process. The Windows code is compiled by the release workflow but has
+not been run against sqlite3 there.
+
+Workaround: none needed yet; this package does not write a `-shm` (finding 26's row).
+
+### 38. An optional borrow cannot be compared with `Some(…)`
+
+Found with finding 19's fix. `m.get(k) == Some(x)`, where `get` gives a `borrow V?`, is N0205 or N0207, though
+`o == Some(3)` works on an owned optional (the guide's "Common mistakes"). The tests match instead:
+`match (m.get(k)) { Some(v) => …, null => … }`.
+
+Workaround: `match`, or `m.get(k).isSome()` and a separate comparison.
