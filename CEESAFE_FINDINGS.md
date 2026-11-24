@@ -432,3 +432,37 @@ Found while testing the hot-journal check: a test opens one database file throug
 not see a journal planted for this engine, and `File` has no `hardLink(existing, new)` (nor `symlink`). The test
 runs `ln` through `Process.run`. (`File.setPermissions`, which the read-only tests use, is there.)
 
+
+### 45. `Process.capture` always fails on Windows
+
+Found making CI pass on Windows (ceesafec 0.95.5). `HostServices.captureIn` (lib/std/host.cee) creates the input
+file with `File.create` and keeps that handle open while `ceesafe_host_spawn` opens the same file again with
+`CreateFileW(…, GENERIC_READ, FILE_SHARE_READ, …)`. The second open refuses to share with a handle that writes, so
+it fails with a sharing violation, and `Process.capture` returns an error for every program, input or none. Every
+test that asks sqlite3 for an answer failed with "the sqlite3 shell is needed". docs/p8-plan.md already lists the
+gap ("upstream gaps"), and ceesafec works around it for its own tools (`runThroughBatch`). The fix is to drop the
+handle (close the file) before spawning, or to open it again with `FILE_SHARE_WRITE`.
+
+Workaround: on Windows the tests start `tests/capture.py` with `Process.spawn` (which quotes its arguments), and it
+runs the program with its streams in files (`tests/shell_runner_tests.cee`, copied in `cli/` and `pgwire/`). A
+package cannot call `ceesafe_host_spawn` itself: its name is reserved for the runtime (N0292).
+
+### 46. `Process.run` splits arguments with spaces on Windows
+
+`ceesafe_process_run` (runtime/hosted/ceesafe_rt_io.c) hands the arguments to `_wspawnvp`, which joins them with
+spaces into one command line without quoting, so the child splits them again: `Process.run("sqlite3", [path,
+"CREATE TABLE t(a, b)"])` gives sqlite3 four arguments, and an argument with a `"` loses it. `Process.spawn` and
+`ceesafe_host_spawn` quote each argument for `CommandLineToArgvW` (`ceesafe_host_quote`); `Process.run` should
+too (or build its command line the same way and call `CreateProcessW`).
+
+Workaround: as finding 45, the tests run programs through `tests/capture.py` on Windows.
+
+### 47. File names are text
+
+`File.open`, `File.create` and the rest take a `StringView`, so a path must be UTF-8. SQLite takes a file name as
+bytes: on Linux, `ATTACH 'a\xffb.db'` makes that file. The engine cannot name it and refuses it with "unable to open
+database", as sqlite3 does on macOS, whose file system refuses such names (README.md, "Text of any bytes"). A path
+type of bytes (`ByteStringView` on POSIX, UTF-16 on Windows) would let it follow SQLite there.
+
+Workaround: `fileNamesThatAreNotUtf8AreRefused` compares with sqlite3 on macOS only, and elsewhere checks the
+engine's refusal.

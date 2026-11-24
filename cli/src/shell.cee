@@ -758,8 +758,8 @@ fn runShell(arguments: Slice<StringView>, input: Lines, live: bool) -> Result<Sh
     let file = match (path) {
         Some(p) => p,
         null => {
-            temporary.append(Environment.variable("TMPDIR") ?? "/tmp/")?;
-            if (!temporary.view().endsWith("/")) {
+            temporary.append(Environment.variable("TMPDIR") ?? Environment.variable("TEMP") ?? "/tmp/")?;
+            if (!temporary.view().endsWith("/") && !temporary.view().endsWith("\\")) {
                 temporary.append("/")?;
             }
             temporary.append("sqlite-shell-")?;

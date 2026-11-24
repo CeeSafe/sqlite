@@ -121,7 +121,8 @@ jobs:
       - name: Tests, cli
         if: always()
         working-directory: cli
-        run: ceesafec test
+        # atATerminalAsSqlite3 builds the shell first, which takes a runner longer than the default 60 s.
+        run: ceesafec test --timeout 300
 
       - name: Tests, pgwire
         if: always()
