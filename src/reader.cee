@@ -18,8 +18,8 @@ fn asciiLower(text: StringView) -> Result<String, AllocError> {
     for (b in text.bytes()) {
         out.push(if (b >= 'A' && b <= 'Z') b + 32 else b)?;
     }
-    // Only ASCII bytes changed, so the text is still UTF-8.
-    return String.from(StringView.fromUtf8(out.view())!);
+    // Only ASCII bytes changed, so the text is still UTF-8, and the bytes become the string without a copy.
+    return Ok(String.fromUtf8(out)!);
 }
 
 struct DatabaseReader {
