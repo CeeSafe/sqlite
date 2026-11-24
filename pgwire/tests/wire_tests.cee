@@ -710,7 +710,7 @@ fn clientsShareTheDatabaseFile() -> Result<void, TestFailure> {
     var arguments = Vector<StringView>.create();
     arguments.push("out/pg-tests/shared/main.db")!;
     arguments.push("PRAGMA integrity_check; SELECT count(*) FROM t")!;
-    let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
+    let output = captureSqlite(borrow arguments, "".bytes())!;
     Check.equalBytes("ok\n2\n".bytes(), output.stdout.view())?;
     return stopped;
 }
@@ -747,7 +747,7 @@ fn malformedMessagesEndTheSession() -> Result<void, TestFailure> {
 fn psqlTalksToTheServer() -> Result<void, TestFailure> {
     var probe = Vector<StringView>.create();
     probe.push("--version")!;
-    if (Process.capture("psql", borrow probe, "".bytes()) is Err(_)) {
+    if (captureProgram("psql", borrow probe, "".bytes()) is Err(_)) {
         Console.writeLine("psql is not installed: skipped");
         return Ok();
     }
@@ -772,7 +772,7 @@ fn psqlTalksToTheServer() -> Result<void, TestFailure> {
         SELECT b FROM t WHERE a = 2;
         SELECT $1::text;
         """;
-    let output = Process.capture("psql", borrow arguments, script.bytes())!;
+    let output = captureProgram("psql", borrow arguments, script.bytes())!;
     let stopped = stopServer(running);
     Check.equalText("""
         a|b|c
