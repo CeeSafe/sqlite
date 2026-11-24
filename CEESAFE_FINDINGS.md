@@ -9,7 +9,7 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 |---|---|
 | 1, 20 | fixed in 0.95.0: float math methods (`exp`, `ln`, `pow`, trigonometry, `fma`, `copySign`, `scaleB`, `roundEven`, …), ADR 0218; hexadecimal float literals and `frexp` not added; workaround removed (`src/libm.cee` deleted: the math functions call the platform's libm, and match sqlite3 bit for bit) |
 | 2 | fixed in 0.95.0: `wrappingShl`/`wrappingShr` on signed integers (arithmetic shift), ADR 0223; workaround removed (`pwr10to2`/`pwr2to10` shift; `floorDivide` stays for divisions by 27, 1000, 146097) |
-| 3 | fixed in 0.95.0: byte-range advisory locks `lock`/`tryLock`/`unlock`, interoperating with sqlite3's, ADR 0220; workaround removed: the writable pager takes os_unix.c's locks (`src/pagerw.cee`), README.md's "one process at a time" limit is gone (WAL mode takes turns, finding 26) |
+| 3 | fixed in 0.95.0: byte-range advisory locks `lock`/`tryLock`/`unlock`, interoperating with sqlite3's, ADR 0220; workaround removed: the writable pager takes os_unix.c's locks (`src/pagerw.cee`), README.md's "one process at a time" limit is gone (and with 26's, WAL mode's turns too) |
 | 4 | fixed in 0.95.0: `Arc.getMut()`, ADR 0224; workaround removed (the writable pager keeps `Arc` pages: a read shares the page, a write copies it only while a reader still has it) |
 | 5 | already there: `appendChar`/`appendUtf8` are documented; now used (`appendAscii` is `appendUtf8` checked) |
 | 7 | diagnostic in 0.95.0: float patterns say to use a guard or `==` (ADR 0228); not added as patterns, by choice |
@@ -22,7 +22,7 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 23, 30 | fixed in 0.95.0: `Thread.sleep`, `recvTimeout`, `t.isFinished()`, ADR 0222; 30's workaround removed (`pgwire` reaps its client threads, the daemon waits with `Thread.sleep`); 23's workaround removed: the polling `takeFrom` is gone, a busy wait sleeps as SQLite's busy handler does (`busyWait`, `src/pagerw.cee`) and a pool checkout waits with `recvTimeout` |
 | 24 | fixed in 0.94.5: `Mutex.constant`, `OnceLock.constant`, `Vector.empty` in statics; workaround removed, and no registry needed: file locks owned by each open file keep every connection apart, so the pool's gate is gone |
 | 25 | fixed by 0.94.5 |
-| 27, 29 | fixed in 0.95.0: `File.createReadWrite`, `IoError.BadDescriptor`, `Console.isTerminal`, ADR 0221; 29's workaround removed (`cli` prompts at a terminal); 27's workaround removed: `WalLog.beginCommit` makes the log with `File.createReadWrite` |
+| 27, 29 | fixed in 0.95.0: `File.createReadWrite`, `IoError.BadDescriptor`, `Console.isTerminal`, ADR 0221; 29's workaround removed (`cli` prompts at a terminal); 27's workaround removed: the log is made with `File.openOrCreate` when a connection opens it in WAL mode (`SharedWal.open`, `src/walindex.cee`) |
 | 28, 33 | fixed in 0.95.0: `borrow` of a value lent to its statement; a field moved out of `e?.f`/`e!.f`, ADR 0227; 33's site was since rewritten (`let Some(choice) = … else`) |
 | 31 | diagnostic in 0.95.0: N0245 names a region parameter for a result holding a reference (ADR 0228); workaround removed (`Cursor.skip` returns the slice) |
 | 32 | fixed in 0.95.0: `sortStableBy`, ADR 0225; workaround removed (every ORDER BY sort, the compound one included, which was unstable) |
@@ -31,11 +31,12 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 6 | fixed in 0.95.2: methods of one name from several interfaces, and `I.m(x, …)` to name one (N0267 when a call on the type is ambiguous), ADR 0229; workaround removed (`PageSink.usableSize` again, beside `PageSource.usableSize`) |
 | 15 | fixed in 0.95.2: a file's `private` items have a scope of their own, so two files may each have a private item of one name, ADR 0230; workaround removed (`datetime.cee` and `printf.cee` each have a private `appendInteger` and `appendFloat`) |
 | 19 | fixed in 0.95.2: `ByteString`/`ByteStringView` in lib/core, any bytes kept as they are, with `toUtf8`, `toUtf8Lossy` and `chunks`, ADR 0231; the workaround (`textFromBytesLossy`, U+FFFD for invalid bytes) stays until this package moves to 0.95.2 |
-| 26 | fixed in 0.95.2: `SharedMapping`, `f.mapShared(offset, length)`, with `readAt`/`writeAt` and 32- and 64-bit atomics, checked against a live sqlite3 `-shm`, ADR 0232; WAL mode still takes turns until this package writes a shared `-shm` (what is still missing for that: finding 37) |
+| 26 | fixed in 0.95.2: `SharedMapping`, `f.mapShared(offset, length)`, with `readAt`/`writeAt` and 32- and 64-bit atomics, checked against a live sqlite3 `-shm`, ADR 0232; workaround removed: the `-shm` is mapped in 32 KiB blocks and kept as wal.c keeps it, with os_unix.c's fcntl locks on its bytes (`src/walindex.cee`), and the turns are gone: a connection in WAL mode holds SHARED on the database file while it has it open, readers take read marks beside the writer, in this engine and with a running sqlite3, both ways (`tests/shm_tests.cee`); what is still missing (finding 37) is worked around or refused, and README.md's Limits say how |
 | 35 | fixed in 0.95.2: a `Thread<void>` in a generic signature is checked as a return type, no longer N0226; workaround removed (`pgwire`'s client threads are `Thread<void>`) |
 | 36 | open: found while removing the workarounds for 3, 23, 24 and 27 (below) |
-| 37 | open: found with 26's fix (below) |
+| 37 | open: found with 26's fix (below); met by the `-shm` port: no 16-bit atomics either (the hash slots are reached through the aligned 32-bit word holding two) |
 | 38 | open: found with 19's fix (below) |
+| 40 | open: found while removing 26's workaround (below) |
 
 ## Gaps
 
@@ -338,7 +339,8 @@ from SHARED to EXCLUSIVE; os_win.c instead unlocks and relocks a random byte of 
 os_unix.c (POSIX hosts only); a Windows build would need the os_win.c scheme.
 
 Workaround: `tryLock` then `unlock` (`WritablePager.tryStart`, `src/pagerw.cee`); README.md, Limits, "Sharing a
-file".
+file". The `-shm`'s DMS byte, which os_unix.c tests with `F_GETLK` (unixLockSharedMemory), is tried exclusively
+and, failing that, shared (`SharedWal.open`, `src/walindex.cee`), which takes the same decision without a test.
 
 ### 37. A shared mapping lacks what SQLite's wal-index uses beyond reads, writes and atomics
 
@@ -350,7 +352,15 @@ refuses to); the interpreter models a mapping by positional reads and writes, so
 program's threads but not against another process. The Windows code is compiled by the release workflow but has
 not been run against sqlite3 there.
 
-Workaround: none needed yet; this package does not write a `-shm` (finding 26's row).
+Also missing, found while writing the `-shm` (finding 26's workaround removed): 16-bit atomics. wal.c's hash
+tables are arrays of `u16` slots that readers load atomically while the writer stores; `SharedMapping` has 32- and
+64-bit atomics only, and `readAt` of two bytes is a copy that could, in principle, tear.
+
+Workaround: the `-shm` is opened read-write, and a database whose `-shm` cannot be written fails with the
+`IoError` (SQLite would fall back to `readonly_shm` or heap memory); a hash slot is read with `load32` of the
+aligned word that holds it and its neighbour, and the writer stores whole words (`findInBlock`, `writeBlock`,
+`src/walindex.cee`); nothing protects against another process shortening the file (SQLite has the same exposure).
+The DMS test uses `tryLock` (finding 36).
 
 ### 38. An optional borrow cannot be compared with `Some(…)`
 
@@ -359,3 +369,13 @@ Found with finding 19's fix. `m.get(k) == Some(x)`, where `get` gives a `borrow 
 `match (m.get(k)) { Some(v) => …, null => … }`.
 
 Workaround: `match`, or `m.get(k).isSome()` and a separate comparison.
+
+### 40. A program cannot ask which system it runs on
+
+Found while removing finding 26's workaround. The WAL locking follows os_unix.c, which converts a held lock in
+place; os_win.c instead unlocks and relocks (finding 36), so on Windows WAL mode must be refused until it is
+ported. There is no `Host.system()` (or a compile-time `[target.windows]` source set): the manifest's target tables
+hold link settings only, and nothing in lib/std names the system at run time.
+
+Workaround: `onWindows()` (`src/pagerw.cee`) reads the environment variable `OS`, which Windows sets to
+`Windows_NT`; a POSIX program could set it too, and then WAL mode is refused there as well.
