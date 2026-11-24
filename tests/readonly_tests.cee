@@ -4,14 +4,11 @@
 // own, rebuilt from the log, when none does (wal.c's readonly_shm and heap-memory index). Answers and errors are
 // compared with sqlite3's on the same files.
 
-/// Sets the permissions of each file in `paths` to `mode` (as chmod takes it).
-fn chmod(mode: StringView, paths: Slice<StringView>) {
-    var arguments = Vector<StringView>.create();
-    arguments.push(mode)!;
+/// Sets the permissions of each file in `paths` to `mode`, as chmod does; a file that is not there is skipped.
+fn chmod(mode: u32, paths: Slice<StringView>) {
     for (i in 0..paths.length) {
-        arguments.push(paths[i])!;
+        let _ = File.setPermissions(paths[i], mode);
     }
-    let _ = Process.run("chmod", borrow arguments);
 }
 
 /// The database at `path` and the log and wal-index beside it.
@@ -23,7 +20,7 @@ fn walFiles(path: StringView) -> Vector<String> {
     return files;
 }
 
-fn chmodAll(mode: StringView, files: borrow Vector<String>) {
+fn chmodAll(mode: u32, files: borrow Vector<String>) {
     var views = Vector<StringView>.create();
     for (i in 0..files.length) {
         views.push(files[i].view())!;
@@ -58,7 +55,7 @@ fn theirReadOnlyAnswer(path: StringView, sql: StringView) -> String {
 /// frames, so that the wal-index has two blocks.
 fn walFixtureKeptInLog(path: StringView) -> Result<void, TestFailure> {
     let files = walFiles(path);
-    chmodAll("644", borrow files);
+    chmodAll(0o644, borrow files);
     for (i in 0..files.length) {
         let _ = File.remove(files[i].view());
     }
@@ -138,7 +135,7 @@ fn readOnlyWalFilesAreReadThroughAnIndexOfTheirOwn() -> Result<void, TestFailure
     let files = walFiles(path);
     let shmBefore = fileLength(files[2].view())!;
     let logBefore = fileLength(files[1].view())!;
-    chmodAll("444", borrow files);
+    chmodAll(0o444, borrow files);
     {
         var connection = Connection.open(path)!;
         // sqlite3 answers "disk I/O error" to leaving WAL mode here; this engine "attempt to write a readonly
@@ -152,7 +149,7 @@ fn readOnlyWalFilesAreReadThroughAnIndexOfTheirOwn() -> Result<void, TestFailure
     }
     Check.isTrue(fileLength(files[1].view())! == logBefore, "the log is left as it was")?;
     Check.isTrue(fileLength(files[2].view())! == shmBefore, "and the wal-index")?;
-    chmodAll("644", borrow files);
+    chmodAll(0o644, borrow files);
     return expectIntact(path);
 }
 
@@ -168,7 +165,7 @@ fn readOnlyShmIsMappedBesideAConnectionThatWrites() -> Result<void, TestFailure>
     let marker2 = "out/ro-shm.marker2";
     let go2 = "out/ro-shm.go2";
     let files = walFiles(path);
-    chmodAll("644", borrow files);
+    chmodAll(0o644, borrow files);
     let _ = File.remove(marker2);
     let _ = File.remove(go2);
     shmFixture(path, marker, go)?;
@@ -181,7 +178,7 @@ fn readOnlyShmIsMappedBesideAConnectionThatWrites() -> Result<void, TestFailure>
         ["INSERT INTO t VALUES (2)", "SELECT count(*) FROM t", touch.view(), wait.view(), "INSERT INTO t VALUES (3)", "SELECT count(*) FROM t", touch2.view(), wait2.view()][..],
     );
     waitForFile(marker)?;
-    chmod("444", [files[2].view()][..]);
+    chmod(0o444, [files[2].view()][..]);
     var connection = Connection.open(path)!;
     let queries = """
         SELECT count(*), sum(v) FROM t
@@ -198,7 +195,7 @@ fn readOnlyShmIsMappedBesideAConnectionThatWrites() -> Result<void, TestFailure>
     touchFile(go2);
     Check.isTrue(writer.join() == 0, "the writer's commits ran")?;
     connection.close()!;
-    chmodAll("644", borrow files);
+    chmodAll(0o644, borrow files);
     Check.equalText("3\n", theirAnswer(path, "SELECT count(*) FROM t").view())?;
     return expectIntact(path);
 }
@@ -283,11 +280,11 @@ fn readOnlyIndexOfItsOwnGivesWayToAWriter() -> Result<void, TestFailure> {
     let _ = File.remove(go);
     walFixtureKeptInLog(path)?;
     let files = walFiles(path);
-    chmod("444", [files[2].view()][..]);
+    chmod(0o444, [files[2].view()][..]);
     var connection = Connection.open(path)!;
     Check.equalText("3|6\n", ours(mut connection.session, "SELECT count(*), sum(v) FROM t").view())?;
     Check.equalText("error: attempt to write a readonly database\n", ours(mut connection.session, "INSERT INTO t VALUES (9)").view())?;
-    chmod("644", [files[2].view()][..]);
+    chmod(0o644, [files[2].view()][..]);
     let touch = shellTouch(marker);
     let wait = shellWaitFor(go);
     let writer = sqliteInBackground(
