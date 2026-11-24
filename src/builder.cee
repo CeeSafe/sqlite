@@ -26,16 +26,22 @@ struct PageStore {
 
     fn create(pageSize: usize) -> PageStore => PageStore { pageSize: pageSize, pages: Vector<Vector<u8>>.create() };
 
-    /// Adds a zeroed page and returns its number.
+    /// Adds a zeroed page and returns its number. The page that holds SQLite's lock bytes stays empty, as SQLite
+    /// leaves it: no b-tree uses it.
     fn allocatePage(borrow mut this) -> Result<u32, SqliteError> {
-        // SQLite's largest page number.
-        if (this.pages.length >= 4294967294) {
-            return Err(unsupported("the database would have more pages than the file format allows"));
+        let lockPage = PENDING_BYTE / (this.pageSize as u64) + 1;
+        loop {
+            // SQLite's largest page number.
+            if (this.pages.length >= 4294967294) {
+                return Err(unsupported("the database would have more pages than the file format allows"));
+            }
+            var page = Vector<u8>.create();
+            page.resize(this.pageSize, 0)?;
+            this.pages.push(page)?;
+            if ((this.pages.length as u64) != lockPage) {
+                return Ok(truncate<u32>(this.pages.length));
+            }
         }
-        var page = Vector<u8>.create();
-        page.resize(this.pageSize, 0)?;
-        this.pages.push(page)?;
-        return Ok(truncate<u32>(this.pages.length));
     }
 
     fn page(borrow mut this, number: u32) -> SliceMut<u8> => this.pages[(number - 1) as usize].viewMut();

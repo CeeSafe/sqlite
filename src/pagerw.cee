@@ -821,6 +821,9 @@ struct WritablePager {
                 }
                 this.freeTrunk = next;
             }
+            if (taken == this.pendingPage()) {
+                return Err(corrupt("the freelist names the page that holds the lock bytes"));
+            }
             this.freeCount = this.freeCount.saturatingSub(1);
             this.write(taken)?.fill(0);
             return Ok(taken);
@@ -831,16 +834,19 @@ struct WritablePager {
                 return Err(unsupported("the database would have more pages than the file format allows"));
             }
             number += 1;
+            this.pageCount = number;
+            if (number == this.pendingPage()) {
+                // The page that holds the lock bytes is part of the file but never written (nor journaled, nor put
+                // in the log), as in SQLite: on Windows those bytes are locked, and locks there are mandatory.
+                continue;
+            }
             var bytes = Vector<u8>.create();
             bytes.resize(this.pageSize, 0)?;
             let slot = this.pages.length;
             this.pages.push(Arc<Vector<u8>>.create(bytes)?)?;
             let _ = this.slots.put(number, slot)?;
             let _ = this.dirty.put(number, true)?;
-            this.pageCount = number;
-            if (number != this.pendingPage()) {
-                return Ok(number);
-            }
+            return Ok(number);
         }
     }
 
@@ -1013,12 +1019,14 @@ struct WritablePager {
         this.freeCount = 0;
         for (i in 0..pages.length) {
             let number = truncate<u32>(i + 1);
-            if (number <= this.pageCount) {
-                this.write(number)?.copyFrom(pages[i].view());
-            } else {
-                let added = this.allocatePage()?;
-                this.write(added)?.copyFrom(pages[i].view());
+            if (number == this.pendingPage()) {
+                // The lock bytes' page, which the store leaves empty (`PageStore.allocatePage`), is not written.
+                continue;
             }
+            if (number > this.pageCount && this.allocatePage()? != number) {
+                return Err(corrupt("the rebuilt database's pages do not follow the file's"));
+            }
+            this.write(number)?.copyFrom(pages[i].view());
         }
         this.pageCount = truncate<u32>(pages.length);
         this.freeTrunk = 0;
