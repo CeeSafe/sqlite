@@ -138,27 +138,50 @@ struct Journal {
         return Ok();
     }
 
-    /// Undoes an interrupted commit of the database at `path`, if its journal shows one, and removes the
-    /// journal. True when pages were put back.
-    fn recover(path: StringView) -> Result<bool, SqliteError> {
+    /// Whether the database at `path` has a journal that may be hot, as SQLite's hasHotJournal reads it before
+    /// asking whether a writer holds RESERVED: the journal has something in it and its first byte is not zero
+    /// (a journal whose header was zeroed belongs to a commit that finished).
+    fn mayBeHot(path: StringView) -> Result<bool, SqliteError> {
         let name = withSuffix(path, JOURNAL_SUFFIX)?;
         var journal = match (File.open(name.view())) {
             Ok(file) => file,
             Err(IoError.NotFound) => { return Ok(false); }
             Err(e) => { return Err(SqliteError.Io(e)); }
         };
+        var first = [0u8; 1];
+        return Ok(readFully(mut journal, mut first[..], 0)? && first[0] != 0);
+    }
+
+    /// Undoes an interrupted commit of the database at `path`, if its journal shows one, and removes the
+    /// journal. True when pages were put back. The caller holds the database's EXCLUSIVE lock, or is alone.
+    fn recover(path: StringView) -> Result<bool, SqliteError> {
+        match (File.openReadWrite(path)) {
+            Ok(database) => {
+                var db = database;
+                return Journal.rollBack(path, mut db);
+            }
+            // A journal without its database has nothing to undo.
+            Err(IoError.NotFound) => {
+                Journal.remove(path)?;
+                return Ok(false);
+            }
+            Err(e) => { return Err(SqliteError.Io(e)); }
+        }
+    }
+
+    /// `recover` through `db`, the database file already open (the handle that holds its lock).
+    fn rollBack(path: StringView, db: borrow mut File) -> Result<bool, SqliteError> {
+        let name = withSuffix(path, JOURNAL_SUFFIX)?;
+        var journal = match (File.open(name.view())) {
+            Ok(file) => file,
+            // Another connection rolled it back first.
+            Err(IoError.NotFound) => { return Ok(false); }
+            Err(e) => { return Err(SqliteError.Io(e)); }
+        };
         let size = journal.length()?;
         var rolledBack = false;
         if (size >= 28 && !Journal.superJournalIsGone(mut journal, size)?) {
-            match (File.openReadWrite(path)) {
-                Ok(database) => {
-                    var db = database;
-                    rolledBack = Journal.playBack(mut journal, size, mut db)?;
-                }
-                // A journal without its database has nothing to undo.
-                Err(IoError.NotFound) => {}
-                Err(e) => { return Err(SqliteError.Io(e)); }
-            }
+            rolledBack = Journal.playBack(mut journal, size, db)?;
         }
         Journal.remove(path)?;
         return Ok(rolledBack);

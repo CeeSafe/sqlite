@@ -516,7 +516,7 @@ fn executePragma(stmt: borrow PragmaStmt, db: borrow mut Session) -> Result<Quer
             }
             rows.push(intRow(0)?)?;
         }
-        "data_version" => { rows.push(intRow(1)?)?; }
+        "data_version" => { rows.push(intRow(db.pager.dataVersion)?)?; }
         "integrity_check" | "quick_check" => {
             var argument: StringView? = null;
             if (borrow stmt.value is Some(v)) {

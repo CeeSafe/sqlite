@@ -56,7 +56,11 @@ public struct Session {
     activeTriggers: Vector<String>;
 
     /// Opens the database file at `path`, making an empty database if there is none.
-    public fn open(name: StringView) -> Result<Session, SqliteError> {
+    public fn open(name: StringView) -> Result<Session, SqliteError> => Session.openWaiting(name, 0);
+
+    /// `open`, waiting up to `busyTimeout` milliseconds (which also becomes PRAGMA busy_timeout) for another
+    /// connection's lock on the file.
+    fn openWaiting(name: StringView, busyTimeout: i64) -> Result<Session, SqliteError> {
         // `:memory:` and the empty name: a private database, a file of its own removed when the session closes.
         let isPrivate = name.length == 0 || name == ":memory:";
         var privatePath = String.create();
@@ -64,13 +68,11 @@ public struct Session {
             privatePath = privateDatabasePath("sqlite-memory-")?;
         }
         let path = if (isPrivate) privatePath.view() else name;
-        if ((fileLength(path)? ?? 0) == 0) {
-            var writer = DatabaseWriter.create(WriterOptions.defaults())?;
-            writer.writeToFile(path)?;
-        }
-        var pager = WritablePager.open(path)?;
+        // The pager comes back in a read transaction, which ends once the schema is read.
+        var pager = WritablePager.openWaiting(path, busyTimeout)?;
         let entries = readSchemaEntries(mut pager)?;
         let catalog = SchemaCatalog.fromEntries(entries.view())?;
+        pager.endTransaction()?;
         var stash = Vector<DatabaseState?>.create();
         stash.push(null)?;
         var names = Vector<String>.create();
@@ -97,7 +99,7 @@ public struct Session {
             foreignKeys: false,
             synchronous: 2,
             cacheSize: -2000,
-            busyTimeout: 0,
+            busyTimeout: busyTimeout,
             legacyAlterTable: false,
             savepoints: Vector<NamedSavepoint>.create(),
             conflictFailure: null,
@@ -107,15 +109,6 @@ public struct Session {
             trigger: null,
             activeTriggers: Vector<String>.create(),
         });
-    }
-
-    /// Forgets every page and the schema read so far, after another connection changed the file: the next
-    /// statement reads them afresh. The settings and change counts stay. (For the API's connections, which call it
-    /// when a transaction starts and the file's change counter moved since their last one.)
-    fn reopen(borrow mut this) -> Result<void, SqliteError> {
-        let path = String.from(this.pager.filePath())?;
-        this.pager = WritablePager.open(path.view())?;
-        return this.reloadSchema();
     }
 
     /// Closes the database, forgetting a transaction in progress. In WAL mode the log is checkpointed into the
@@ -241,6 +234,26 @@ public struct Session {
 
     /// Runs one SQL statement with positional parameters (?, ?N, :name in order of first use).
     public fn query(borrow mut this, sql: StringView, params: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> {
+        let result = this.queryLocked(sql, params);
+        if (!this.inTransaction) {
+            // The transaction ended (or was the statement's own): what it left uncommitted is forgotten, and every
+            // lock goes.
+            var ended: Result<void, SqliteError> = Ok();
+            if (this.anyChanges()) {
+                this.rollbackAll();
+                ended = this.reloadAllSchemas();
+            }
+            let unlocked = this.endTransactionAll();
+            if (result.isOk()) {
+                ended?;
+                unlocked?;
+            }
+        }
+        return result;
+    }
+
+    /// `query`, between taking the locks the statement needs and its transaction's end.
+    fn queryLocked(borrow mut this, sql: StringView, params: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> {
         // The statement's text, as sqlite_schema keeps a definition; token offsets are into it.
         let written = sql.trim();
         var text = written;
@@ -250,6 +263,7 @@ public struct Session {
         // Parsed as written, so that `SELECT 3 +;` is an error near ";" as in SQLite; the text without its
         // semicolons is what a definition keeps.
         let stmt = Parser.parseStatement(written)?;
+        this.lockFor(borrow stmt)?;
         this.beginStatementAll();
         this.conflictFailure = null;
         this.runningChanges = 0;
@@ -279,7 +293,8 @@ public struct Session {
         }
         this.staleIndexes.clear();
         if (!this.inTransaction) {
-            // Each statement outside BEGIN is a transaction of its own.
+            // Each statement outside BEGIN is a transaction of its own; one whose commit fails (another
+            // connection's readers did not leave within the busy timeout) is rolled back by `query`.
             if (keep) {
                 this.commitAll()?;
             } else {
@@ -287,6 +302,58 @@ public struct Session {
                 this.reloadAllSchemas()?;
             }
         }
+        return result;
+    }
+
+    /// Takes the locks `stmt` needs before it runs (SQLite's OP_Transaction): a read transaction on every
+    /// database, reading a database's schema again when another connection changed it, and a write transaction
+    /// on the one a statement that writes writes to. BEGIN IMMEDIATE takes RESERVED on every database, and BEGIN
+    /// EXCLUSIVE EXCLUSIVE, as in SQLite.
+    fn lockFor(borrow mut this, stmt: borrow Stmt) -> Result<void, SqliteError> {
+        var idle = Vector<bool>.create();
+        let timeout = this.busyTimeout;
+        for (i in 0..this.databaseCount()) {
+            let pager = this.pagerOf(i);
+            pager.busyTimeout = timeout;
+            idle.push(pager.lockLevel() == LOCK_NONE)?;
+        }
+        if (stmt is Stmt.Begin(kind)) {
+            if (this.inTransaction || kind == TransactionKind.Deferred) {
+                return Ok();
+            }
+            for (i in 0..this.databaseCount()) {
+                if (this.pagerOf(i).startWrite(idle[i])?) {
+                    this.reloadSchemaOf(i)?;
+                }
+                if (kind == TransactionKind.Exclusive) {
+                    this.pagerOf(i).lockForCommit()?;
+                }
+            }
+            return Ok();
+        }
+        for (i in 0..this.databaseCount()) {
+            if (this.pagerOf(i).startRead()?) {
+                this.reloadSchemaOf(i)?;
+            }
+        }
+        if (statementWrites(stmt)) {
+            let target = this.statementDatabase(stmt)?;
+            // A database the statement made (TEMP) was not locked before it.
+            let mayRestart = if (target < idle.length) idle[target] else true;
+            let pager = this.pagerOf(target);
+            pager.busyTimeout = timeout;
+            if (pager.startWrite(mayRestart)?) {
+                this.reloadSchemaOf(target)?;
+            }
+        }
+        return Ok();
+    }
+
+    /// Reads database `i`'s schema again.
+    fn reloadSchemaOf(borrow mut this, i: usize) -> Result<void, SqliteError> {
+        let previous = this.swapTo(i);
+        let result = this.reloadSchema();
+        let _ = this.swapTo(previous);
         return result;
     }
 
@@ -649,7 +716,7 @@ impl Session {
             return Ok(i);
         }
         let path = privateDatabasePath("sqlite-temp-")?;
-        let state = openDatabaseState(path.view())?;
+        let state = openDatabaseState(path.view(), this.busyTimeout)?;
         this.attachState("temp", path.view(), state)?;
         this.databaseShownPaths.push(String.create())?;
         let index = this.databaseNames.length - 1;
@@ -772,6 +839,13 @@ impl Session {
     /// Commits every database the transaction changed, main first. Each file commits atomically with its own
     /// journal; together they do not (SQLite's super-journal is not written).
     fn commitAll(borrow mut this) -> Result<void, SqliteError> {
+        // Every changed database's EXCLUSIVE first, so that one whose readers stay does not leave the others
+        // committed and itself not.
+        for (i in 0..this.databaseCount()) {
+            if (this.pagerOf(i).hasChanges()) {
+                this.pagerOf(i).lockForCommit()?;
+            }
+        }
         for (i in 0..this.databaseCount()) {
             this.pagerOf(i).commit()?;
         }
@@ -784,25 +858,49 @@ impl Session {
         }
     }
 
+    /// Whether any database has changes not committed.
+    fn anyChanges(borrow mut this) -> bool {
+        for (i in 0..this.databaseCount()) {
+            if (this.pagerOf(i).hasChanges()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Ends every database's transaction, releasing its locks.
+    fn endTransactionAll(borrow mut this) -> Result<void, SqliteError> {
+        var result: Result<void, SqliteError> = Ok();
+        for (i in 0..this.databaseCount()) {
+            let ended = this.pagerOf(i).endTransaction();
+            if (result.isOk() && ended.isErr()) {
+                result = ended;
+            }
+        }
+        return result;
+    }
+
     /// Reads every database's schema again.
+    /// A database this transaction has not locked has not changed in it, and is read again (if another
+    /// connection changed it) when it is next locked.
     fn reloadAllSchemas(borrow mut this) -> Result<void, SqliteError> {
         let previous = this.active;
+        var result: Result<void, SqliteError> = Ok();
         for (i in 0..this.databaseCount()) {
             let _ = this.swapTo(i);
-            this.reloadSchema()?;
+            if (result.isOk() && this.pager.lockLevel() != LOCK_NONE) {
+                result = this.reloadSchema();
+            }
         }
         let _ = this.swapTo(previous);
-        return Ok();
+        return result;
     }
 }
 
 /// A database file opened for a session, made empty when it does not exist.
-fn openDatabaseState(path: StringView) -> Result<DatabaseState, SqliteError> {
-    if ((fileLength(path)? ?? 0) == 0) {
-        var writer = DatabaseWriter.create(WriterOptions.defaults())?;
-        writer.writeToFile(path)?;
-    }
-    var pager = WritablePager.open(path)?;
+/// Its pager holds SHARED until the statement's transaction ends.
+fn openDatabaseState(path: StringView, busyTimeout: i64) -> Result<DatabaseState, SqliteError> {
+    var pager = WritablePager.openWaiting(path, busyTimeout)?;
     let entries = readSchemaEntries(mut pager)?;
     let catalog = SchemaCatalog.fromEntries(entries.view())?;
     return Ok(DatabaseState { pager: pager, catalog: catalog, entries: entries });
@@ -845,7 +943,7 @@ impl Session {
             path = privateDatabasePath("sqlite-attached-")?;
             shown = String.create();
         }
-        let state = openDatabaseState(path.view())?;
+        let state = openDatabaseState(path.view(), this.busyTimeout)?;
         this.attachState(name, path.view(), state)?;
         let at = this.databasePaths.length - 1;
         this.databaseShownPaths.push(shown)?;
@@ -938,4 +1036,24 @@ fn removeDatabaseFiles(path: StringView) -> Result<void, SqliteError> {
     let _ = File.remove(withSuffix(path, "-journal")?.view());
     let _ = File.remove(withSuffix(path, "-wal")?.view());
     return Ok();
+}
+
+/// Whether `stmt` writes to its database, so that it takes RESERVED before it reads (and may wait for it, where
+/// a write found later could only fail at once). A pragma writes when it sets a header field or the journal mode.
+fn statementWrites(stmt: borrow Stmt) -> bool {
+    match (stmt) {
+        Stmt.Insert(_) | Stmt.Update(_) | Stmt.Delete(_) | Stmt.CreateTable(_) | Stmt.CreateIndex(_) | Stmt.CreateView(_) | Stmt.CreateTrigger(_) | Stmt.Drop(_) | Stmt.AlterTable(_) | Stmt.Analyze(_) | Stmt.Reindex => {
+            return true;
+        }
+        Stmt.Vacuum(into) => { return into.isNull(); }
+        Stmt.Pragma(p) => {
+            if (p.value.isNull()) {
+                return false;
+            }
+            let name = p.name.name.view();
+            return name.equalsIgnoreAsciiCase("user_version") || name.equalsIgnoreAsciiCase("application_id") ||
+                name.equalsIgnoreAsciiCase("schema_version") || name.equalsIgnoreAsciiCase("journal_mode");
+        }
+        _ => { return false; }
+    }
 }

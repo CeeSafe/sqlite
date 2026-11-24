@@ -35,12 +35,12 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Triggers | `Exec/QueryExecutor` (`FireTriggers`) | `triggers.cee` | BEFORE and AFTER on tables, INSTEAD OF on views done |
 | ALTER TABLE | `Exec/QueryExecutor` (`ExecuteAlterTable`) | `alter.cee` | RENAME TO, RENAME COLUMN, ADD COLUMN, DROP COLUMN done, with views and triggers following renames |
 | PRAGMAs, pragma_* table functions | `Exec/QueryExecutor` (`ExecutePragma`) | `pragma.cee`, `integrity.cee` | schema pragmas, header fields, integrity_check and quick_check done |
-| Connection, transactions | `SqliteConnection`, `EngineGlue` | `session.cee` | done: statements commit on their own outside BEGIN, and a failed statement undoes only itself inside it; SAVEPOINT, RELEASE, ROLLBACK TO; OR FAIL and OR ROLLBACK |
+| Connection, transactions | `SqliteConnection`, `EngineGlue` | `session.cee` | done: statements commit on their own outside BEGIN, and a failed statement undoes only itself inside it; SAVEPOINT, RELEASE, ROLLBACK TO; OR FAIL and OR ROLLBACK; SQLite's file locks (SHARED, RESERVED, PENDING, EXCLUSIVE), hot journals rolled back, `busy_timeout`, BEGIN IMMEDIATE and EXCLUSIVE, `data_version` |
 | VACUUM, ANALYZE, REINDEX | (refused by the C#) | `vacuum.cee`, `analyze.cee` | done, with VACUUM INTO |
 | TEMP tables, ATTACH | (refused by the C#) | `session.cee` (databases), `select.cee` (names) | done: TEMP tables, views, indexes and triggers (on any database's tables), ATTACH and DETACH, schema-qualified names, SQLite's search order, `database_list` |
-| WAL | `Storage/Wal*`, `Shm*` | `wal.cee`, `pagerw.cee`, `pragma.cee` | done: logs read (either checksum byte order) and written with SQLite's salts and checksums, damaged tails ignored as SQLite ignores them, `journal_mode` WAL and DELETE, `wal_checkpoint` (all four modes), `wal_autocheckpoint`, a checkpoint and removal of the log on `Session.close`; no `-shm` (see Limits) |
+| WAL | `Storage/Wal*`, `Shm*` | `wal.cee`, `pagerw.cee`, `pragma.cee` | done: logs read (either checksum byte order) and written with SQLite's salts and checksums, damaged tails ignored as SQLite ignores them, `journal_mode` WAL and DELETE, `wal_checkpoint` (all four modes), `wal_autocheckpoint`, a checkpoint and removal of the log on close when no other connection has the database open; no `-shm`, so each transaction in WAL mode holds the file's EXCLUSIVE lock (see Limits) |
 | Connection, command, transaction | `SqliteConnection`, `SqliteCommand`, `SqliteTransaction`, `EngineGlue` | `api.cee`, `params.cee` | done: `Connection` with `execute`, `query`, `scalar`, `executeScript`, `begin`/`commit`/`rollback` and `transaction(work)`; `Params` bound by SQLite's rules; results materialised (see below) |
-| Connection pool | `SqliteConnectionPool`, `SharedStore` | `pool.cee` | done: shareable across threads (`Arc<ConnectionPool>`), transactions serialised, connections rolled back on return; no `:memory:` |
+| Connection pool | `SqliteConnectionPool`, `SharedStore` | `pool.cee` | done: shareable across threads (`Arc<ConnectionPool>`), connections kept apart by the file locks, rolled back on return, a full pool waited for up to the busy timeout; no `:memory:` |
 | Scripts | `SqliteScript` | `script.cee` | done: `splitScript`/`splitStatements` end statements where sqlite3_complete does |
 | PostgreSQL wire front end, daemon, CLI | `CosmoNova.Engine.Sqlite.PgWire`, `CosmoSqliteD`, `.Cli` | `pgwire/`, `daemon/`, `cli/` (packages of their own) | done: a sqlite3-like shell (list, csv, line and column modes, `.headers`, `.tables`, `.schema`, `.read`, `.bail`, sqlite3's error messages and exit status), and a PostgreSQL protocol 3.0 server (simple and extended query, binary formats, portal suspension, cleartext password or trust) with a pool per database; see "Front ends" |
 
@@ -402,15 +402,34 @@ The port fixes what was wrong in the source instead of copying it. Each item has
 - **Connections kept apart.** The C# connections to one file shared one in-memory database: statements were
   serialised, transactions were not, so a connection saw another's uncommitted rows, and a pooled connection given
   back inside a transaction went to the next caller with the transaction open. For `:memory:` the pool handed
-  every caller the same connection at once. Here a pool's connections share a gate that a transaction holds from
-  start to end, a connection given back inside a transaction is rolled back first, and a connection reads the file
-  afresh when another committed since its last transaction, by the header's change counter
+  every caller the same connection at once. Here every connection is kept apart from the others, in this process
+  or another, by SQLite's file locks (below); a connection given back to a pool inside a transaction is rolled
+  back first; and a connection reads the file afresh when another committed since its last transaction
   (`poolConnectionsComeBackRolledBack`, `threadsShareAPool`, `connectionsSeeEachOthersCommits`).
-- **Busy.** Since a pool's transaction holds the gate, another connection waiting for it waits at most the busy
-  timeout (`PRAGMA busy_timeout`, `setBusyTimeout`; 5000 ms in a pool, 0 for a lone connection, as in SQLite) and
-  then fails with `SqliteError.Busy`, "database is locked", as SQLite does; so does a checkout when every
-  connection is out. A thread that holds one transaction and asks a second connection for the file gets the error
-  rather than a deadlock.
+- **File locks.** The C# took none, so it could not share a file with another process, sqlite3 included. Here the
+  writable pager takes os_unix.c's locks on the bytes from 0x40000000 (PENDING, RESERVED, the 510-byte SHARED
+  range), which sqlite3 sees: a statement takes SHARED on every database (EXCLUSIVE in WAL mode, see Limits) and,
+  if it writes, RESERVED on its own as it begins; a commit takes PENDING and EXCLUSIVE, waiting for readers to
+  leave; the locks go when the transaction ends. BEGIN IMMEDIATE and BEGIN EXCLUSIVE take RESERVED and EXCLUSIVE
+  at once. A reader inside a transaction keeps writers from committing, so it sees one snapshot. Before reading, a
+  hot journal (one with its header synced while no writer holds RESERVED) is rolled back under EXCLUSIVE; a
+  journal whose writer still holds RESERVED is left alone. A connection forgets its pages when the file's header
+  or the log changed since it last held a lock, as SQLite checks its change counter, and PRAGMA data_version
+  counts such changes as sqlite3 does (`locksSqliteHoldingExclusiveMakesThisEngineWait`,
+  `locksThisEngineHoldingLocksMakesSqliteWait`, `locksAReaderInATransactionSeesAStableSnapshot`,
+  `locksConcurrentWritersNeverLoseACommit`, `locksHotJournalsAreRolledBackAndLiveOnesLeftAlone`,
+  `locksAJournalWhoseWriterHoldsReservedIsNotHot`, `locksTwoSessionsInOneProcessAreKeptApart`,
+  `locksDataVersionCountsOtherConnectionsCommits`, `locksWalModeConnectionsTakeTurns`). Before CeeSafe had file
+  locks this port passed a gate between a pool's connections and could not keep apart connections opened on
+  their own; both workarounds are gone.
+- **Busy.** A connection that meets another's lock retries as sqliteDefaultBusyCallback does (sleeps of 1, 2, 5,
+  … 100 ms) until its busy timeout (`PRAGMA busy_timeout`, `setBusyTimeout`; 5000 ms in a pool, 0 for a lone
+  connection, as in SQLite), then fails with `SqliteError.Busy`, "database is locked". As in SQLite, a connection
+  that already reads in a transaction and then wants to write while another holds RESERVED fails at once, since
+  waiting would deadlock with that writer waiting for it to leave; a COMMIT that cannot get EXCLUSIVE leaves the
+  transaction open, to be tried again; a statement outside BEGIN whose commit cannot is rolled back. A checkout
+  with every connection of the pool out waits for one to come back, up to the same timeout (`recvTimeout`, no
+  longer a polling loop that spun a core).
 - **`:memory:` is a database of the connection's own**, as in SQLite, not a file of that name: here a private file
   removed when the connection closes (the C# shared one in-memory database among every `:memory:` connection);
   `file:` URIs are refused.
@@ -551,13 +570,11 @@ Choices where the C# concept does not fit CeeSafe:
   `execute` counts every INSERT, UPDATE and DELETE.
 - **The pool and threads.** CeeSafe checks `Send` and `Share`: a `ConnectionPool` is `Share`, so threads share it
   through `Arc`, and a `Connection` is `Send`, so a checked-out one may move between threads but is used by one
-  at a time. The pool's connections pass one gate between them (a one-slot `Channel`), held for a whole
-  transaction: transactions of the pool run one at a time, and readers wait for a writer's transaction, which is
-  stricter than SQLite's shared locks but needs no file locks. Connections opened on their own each have their own
-  gate: two of them on one file in one process are not kept apart, any more than two processes are (CeeSafe has
-  no process-wide statics to share a gate through, and no file locks: CEESAFE_FINDINGS.md 3 and 24). Use one pool
-  per file. Settings a borrower changes with PRAGMA (foreign_keys, busy_timeout) stay with the connection for the
-  next borrower, as in other pools.
+  at a time. A pool's connections, connections opened on their own and other processes are all kept apart by
+  SQLite's file locks, which belong to each connection's open file (open-file-description locks), so two
+  connections of one process exclude each other as two processes do; a pool only holds idle connections and
+  bounds how many there are. Settings a borrower changes with PRAGMA (foreign_keys, busy_timeout) stay with the
+  connection for the next borrower, as in other pools.
 - **Configuration.** There is no connection string; a path is given. `:memory:` and the empty name give a
   private database of the connection's own (a file removed when it closes); a pool refuses them, and `file:` URIs
   are refused.
@@ -668,15 +685,24 @@ Collations other than BINARY, NOCASE and RTRIM are refused.
   CeeSafe's library has no time zone (CEESAFE_FINDINGS.md). 'now' and date functions with it are also not refused
   in CHECK constraints, index expressions and generated columns, as SQLite refuses them.
 
-- **One process at a time.** The engine does not take SQLite's file locks, which CeeSafe's library does not
-  offer, so it must not have a database open while another process writes it. (The C# engine has the same
-  limit.)
-- **No wal-index.** In WAL mode the `-shm` file, which SQLite's connections share as memory, is neither read nor
-  written (CeeSafe can neither map shared memory nor lock bytes of a file: CEESAFE_FINDINGS.md findings 3
-  and 23). The index of the log's frames is
-  built in memory from the `-wal` file when the database is opened, as SQLite rebuilds it when it is the first
-  to open the database, and sqlite3 rebuilds its own from the logs this engine writes. A stale `-shm` that
-  sqlite3 left is harmless for the same reason.
+- **Sharing a file.** In rollback-journal mode the engine takes SQLite's locks as os_unix.c does, so it shares a
+  database with sqlite3 and other processes (and its own connections) as SQLite connections share one. What
+  differs: the RESERVED byte is tested for a hot journal by taking it for a moment (CeeSafe offers no `F_GETLK`),
+  so another connection's RESERVED attempt in that instant fails once and goes to its busy handler; locks are
+  converted in place (shared to exclusive on the SHARED range), which POSIX allows and Windows' `LockFileEx` does
+  not, so on Windows the engine does not yet follow os_win.c's scheme; a file system without byte-range locks (some
+  network mounts) is not detected.
+- **No wal-index: WAL mode takes turns.** SQLite's WAL readers and writers lock bytes of the `-shm` file, which
+  they map as shared memory; CeeSafe cannot map memory (CEESAFE_FINDINGS.md finding 26), so the `-shm` is neither
+  read nor written. Instead each transaction on a database in WAL mode, a read too, holds the database file's
+  EXCLUSIVE lock, as SQLite does in `locking_mode=EXCLUSIVE`, and reads the log afresh (rebuilding its index of
+  frames) when the log changed since its last transaction. So in WAL mode readers do not run beside a writer or
+  each other, as they do in SQLite. sqlite3 holds SHARED on the database file for as long as it has a WAL
+  database open, so this engine waits for it to close (`busy_timeout`), and sqlite3 waits for this engine's
+  transaction to end; neither reads the other's half-written state (`locksWalModeConnectionsTakeTurns`). sqlite3
+  rebuilds its wal-index from the logs this engine writes when it is the first to open the database again, which
+  it is whenever this engine has the file (a stale `-shm` it left is reset then). On close the log is
+  checkpointed and removed only when the EXCLUSIVE lock is free at once, as SQLite's last connection does.
 - **Journal modes.** WAL and DELETE only: TRUNCATE, PERSIST, MEMORY and OFF are taken as DELETE, and
   `PRAGMA journal_mode` then answers `delete`. Leaving WAL mode writes the header's format numbers 1 and 1 and
   removes the log, as SQLite does.

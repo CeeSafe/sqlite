@@ -9,7 +9,7 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 |---|---|
 | 1, 20 | fixed in 0.95.0: float math methods (`exp`, `ln`, `pow`, trigonometry, `fma`, `copySign`, `scaleB`, `roundEven`, …), ADR 0218; hexadecimal float literals and `frexp` not added |
 | 2 | fixed in 0.95.0: `wrappingShl`/`wrappingShr` on signed integers (arithmetic shift), ADR 0223 |
-| 3 | fixed in 0.95.0: byte-range advisory locks `lock`/`tryLock`/`unlock`, interoperating with sqlite3's, ADR 0220 |
+| 3 | fixed in 0.95.0: byte-range advisory locks `lock`/`tryLock`/`unlock`, interoperating with sqlite3's, ADR 0220; workaround removed: the writable pager takes os_unix.c's locks (`src/pagerw.cee`), README.md's "one process at a time" limit is gone (WAL mode takes turns, finding 26) |
 | 4 | fixed in 0.95.0: `Arc.getMut()`, ADR 0224 |
 | 5 | already there: `appendChar`/`appendUtf8` are documented |
 | 7 | diagnostic in 0.95.0: float patterns say to use a guard or `==` (ADR 0228); not added as patterns, by choice |
@@ -19,10 +19,10 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 14 | fixed in 0.55.0 (missed by the port): `Clock.localOffset(at)`, ADR 0153 |
 | 16 | fixed in 0.95.0: floats in constant arrays, ADR 0226 |
 | 17 | diagnostic in 0.95.0: N0245 shows the `static` table form (ADR 0226) |
-| 23, 30 | fixed in 0.95.0: `Thread.sleep`, `recvTimeout`, `t.isFinished()`, ADR 0222 |
-| 24 | fixed in 0.94.5: `Mutex.constant`, `OnceLock.constant`, `Vector.empty` in statics |
+| 23, 30 | fixed in 0.95.0: `Thread.sleep`, `recvTimeout`, `t.isFinished()`, ADR 0222; 23's workaround removed: the polling `takeFrom` is gone, a busy wait sleeps as SQLite's busy handler does (`busyWait`, `src/pagerw.cee`) and a pool checkout waits with `recvTimeout` |
+| 24 | fixed in 0.94.5: `Mutex.constant`, `OnceLock.constant`, `Vector.empty` in statics; workaround removed, and no registry needed: file locks owned by each open file keep every connection apart, so the pool's gate is gone |
 | 25 | fixed by 0.94.5 |
-| 27, 29 | fixed in 0.95.0: `File.createReadWrite`, `IoError.BadDescriptor`, `Console.isTerminal`, ADR 0221 |
+| 27, 29 | fixed in 0.95.0: `File.createReadWrite`, `IoError.BadDescriptor`, `Console.isTerminal`, ADR 0221; 27's workaround removed: `WalLog.beginCommit` makes the log with `File.createReadWrite` |
 | 28, 33 | fixed in 0.95.0: `borrow` of a value lent to its statement; a field moved out of `e?.f`/`e!.f`, ADR 0227 |
 | 31 | diagnostic in 0.95.0: N0245 names a region parameter for a result holding a reference (ADR 0228) |
 | 32 | fixed in 0.95.0: `sortStableBy`, ADR 0225 |
@@ -30,6 +30,7 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 9, 10, 12, 18, 21 | by design: closures are typed where a function type is expected; reserved words, now named as such in the error; references are not re-pointed; ranges are half-open (ADR 0085) |
 | 6, 15, 19, 26 | open: two interfaces sharing a method name, file-private names, byte-string text, shared memory mappings |
 | 35 | open: found while fixing these (below) |
+| 36 | open: found while removing the workarounds for 3, 23, 24 and 27 (below) |
 
 ## Gaps
 
@@ -57,7 +58,7 @@ signed types, defined as arithmetic) would say it directly.
 There is no `flock`/`fcntl` locking on `File`. SQLite's locking protocol (shared, reserved, pending, exclusive locks
 on the database file) cannot be followed, so this engine cannot safely share a database with another process.
 
-Workaround: documented as a limit in README.md ("one process at a time").
+Workaround (removed with 0.95.0): documented as a limit in README.md ("one process at a time").
 
 ### 4. Arc has no access for mutation
 
@@ -207,7 +208,7 @@ There is no blocking sleep outside async code (`Timer.sleep` is async), no `Chan
 condition variable. A connection waiting for another's transaction to end (SQLite's busy timeout), and a pool
 checkout waiting for a free connection, must give up after a time, so neither can use the blocking `recv()`.
 
-Workaround: `takeFrom` (`src/api.cee`) polls `tryRecv()` against `Timer.now()` until the deadline, which spins a
+Workaround (removed with 0.95.0): `takeFrom` (`src/api.cee`) polled `tryRecv()` against `Timer.now()` until the deadline, which spins a
 core while it waits. A `recvTimeout(ms)` on `Channel`, or `Thread.sleep(ms)`, would do it without spinning.
 
 ### 24. No process-wide mutable state
@@ -216,7 +217,8 @@ The guide lists `Mutex<T>.constant(v)`, `OnceLock<T>.constant()` and `Vector<T>.
 `ceesafec 0.94.4` has none of them (N0200: "has no function named 'constant'"), so a `static` cannot hold a
 registry. The C# kept one per process (`SharedStore`) so that every connection to a file found the same lock.
 
-Workaround: only connections of one `ConnectionPool` share a gate; connections opened on their own each have
+Workaround (removed with 0.95.0, file locks making a registry unnecessary): only connections of one
+`ConnectionPool` shared a gate; connections opened on their own each have
 their own, and README.md says to use one pool per file.
 
 ### 25. A generic type argument is not inferred from a function passed by name
@@ -234,8 +236,9 @@ wal-index in `<database>-shm`, mapped by every connection, with locks on bytes o
 mapping, the index cannot be shared with sqlite3 or kept current across processes.
 
 Workaround: the index is built in memory from the `-wal` file when the database is opened (`src/wal.cee`), and
-no `-shm` is written; sqlite3 rebuilds its own. This is sound only with one process at a time (README.md,
-Limits).
+no `-shm` is written; sqlite3 rebuilds its own. Since finding 3's locks, each transaction in WAL mode holds the
+database file's EXCLUSIVE lock (as SQLite's `locking_mode=EXCLUSIVE` does without a `-shm`), so connections in WAL
+mode take turns instead of reading beside a writer (README.md, Limits, "No wal-index").
 
 ### 27. A file cannot be created for reading and writing
 
@@ -244,7 +247,7 @@ file does not exist; there is no `O_RDWR | O_CREAT`. Reading from the handle `Fi
 "Input/output error", which does not say that the handle was opened write-only (EBADF), so the WAL writer's
 first checkpoint failed in a way that took a while to trace.
 
-Workaround: create the file, drop the handle, and open it again with `File.openReadWrite`
+Workaround (removed with 0.95.0): create the file, drop the handle, and open it again with `File.openReadWrite`
 (`WalLog.beginCommit` in `src/wal.cee`); between the two another process could replace it. An open-options
 builder (read, write, create, truncate, exclusive) would cover this and `O_EXCL`.
 
@@ -313,3 +316,17 @@ Workaround: `(a[i] as i64) + y` (`logEst` in `src/plan.cee`).
 
 Found while adding `t.isFinished()` (ADR 0222): `swapRemove` on a vector of `Thread<void>` is N0226, though a
 `Thread<u64>` works. Workaround: give the threads a result type.
+
+### 36. A lock cannot be tested without taking it
+
+Found while following os_unix.c with ADR 0220's locks. SQLite's hot-journal check asks whether another
+connection holds RESERVED (`unixCheckReservedLock`, an `F_GETLK` on the RESERVED byte), which changes nothing.
+`File` has `lock`, `tryLock` and `unlock` only, so the test takes the byte with `tryLock` and releases it: in that
+instant another connection's RESERVED attempt fails once and goes to its busy handler. A `f.testLock(kind, start,
+length) -> Result<bool, IoError>` (or the holder's process id, as `F_GETLK` gives) would say it without side
+effect. Also, ADR 0220's portable contract forbids converting a held lock in place, which is how os_unix.c goes
+from SHARED to EXCLUSIVE; os_win.c instead unlocks and relocks a random byte of the range. The port follows
+os_unix.c (POSIX hosts only); a Windows build would need the os_win.c scheme.
+
+Workaround: `tryLock` then `unlock` (`WritablePager.tryStart`, `src/pagerw.cee`); README.md, Limits, "Sharing a
+file".

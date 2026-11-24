@@ -10,9 +10,10 @@
 // belong to a transaction that did not finish, and are ignored.
 //
 // The wal-index (`-shm`) is not written or read: it is shared memory between connections, which CeeSafe cannot
-// map, and this engine has one connection at a time (README.md, Limits). The index is built here from the log
-// when the database is opened, as SQLite rebuilds the wal-index when it finds none. sqlite3 does the same with
-// the logs this engine leaves.
+// map (CEESAFE_FINDINGS.md, finding 26). Instead a connection holds the database file's EXCLUSIVE lock for each
+// transaction in WAL mode (pagerw.cee), and builds the index here from the log whenever the log changed since
+// its last transaction, as SQLite rebuilds the wal-index when it finds none. sqlite3 does the same with the logs
+// this engine leaves.
 //
 // Differences from the C# engine, which this replaces:
 // - each new log has random salts, and a restarted log the next salt-1 and a new salt-2, as SQLite does. The C#
@@ -98,10 +99,19 @@ struct WalLog {
             Err(IoError.NotFound) => null,
             Err(e) => { return Err(SqliteError.Io(e)); },
         };
-        var log = WalLog {
-            file: file,
-            path: name,
-            writable: writable,
+        var log = WalLog.closed(path)?;
+        log.file = file;
+        log.writable = writable;
+        log.recover()?;
+        return Ok(log);
+    }
+
+    /// An empty log of the database at `path`, not yet read: a pager's before its first transaction.
+    fn closed(path: StringView) -> Result<WalLog, SqliteError> {
+        return Ok(WalLog {
+            file: null,
+            path: withSuffix(path, WAL_SUFFIX)?,
+            writable: false,
             pageSize: 0,
             bigEndian: false,
             hasHeader: false,
@@ -117,9 +127,7 @@ struct WalLog {
             nextFrame: 0,
             pendingSum: WalSum { first: 0, second: 0 },
             scratch: Vector<u8>.create(),
-        };
-        log.recover()?;
-        return Ok(log);
+        });
     }
 
     /// Whether the log holds a committed frame.
@@ -223,10 +231,10 @@ struct WalLog {
     fn beginCommit(borrow mut this, pageSize: usize) -> Result<void, SqliteError> {
         assert(this.writable, "only a writable log takes commits");
         if (this.file.isNull()) {
-            // Made, then opened again for reading as well: a checkpoint reads the frames back.
-            let _ = File.create(this.path.view())?;
+            // Read as well as written: a checkpoint reads the frames back. The connection holds the database's
+            // EXCLUSIVE lock and found no log when its transaction began, so nothing is emptied.
+            this.file = File.createReadWrite(this.path.view())?;
             Directory.sync(directoryOf(this.path.view()))?;
-            this.file = File.openReadWrite(this.path.view())?;
         }
         if (this.frames == this.backfilled) {
             this.restart(pageSize)?;
