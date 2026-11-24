@@ -170,6 +170,67 @@ struct WalIndexHeader {
     }
 }
 
+/// A block of the wal-index: the `-shm`'s bytes mapped for reading and writing, or for reading only when this
+/// process may not write the file (os_unix.c's readonly_shm, mapped PROT_READ), or this connection's own memory
+/// when the read-only `-shm` cannot be trusted (wal.c's heap-memory index, bShmUnreliable).
+enum IndexBlock {
+    Shared(SharedMapping),
+    ReadOnly(ReadOnlyMapping),
+    Heap(Vector<u8>),
+}
+
+impl IndexBlock {
+    fn load32(borrow this, at: usize, order: LoadOrdering) -> u32 => match (this) {
+        IndexBlock.Shared(m) => m.load32(at, order),
+        IndexBlock.ReadOnly(m) => m.load32(at, order),
+        IndexBlock.Heap(v) => v.view().readLE<u32>(at),
+    };
+
+    fn load16(borrow this, at: usize, order: LoadOrdering) -> u16 => match (this) {
+        IndexBlock.Shared(m) => m.load16(at, order),
+        IndexBlock.ReadOnly(m) => m.load16(at, order),
+        IndexBlock.Heap(v) => v.view().readLE<u16>(at),
+    };
+
+    fn readAt(borrow this, at: usize, into: SliceMut<u8>) {
+        match (this) {
+            IndexBlock.Shared(m) => { m.readAt(at, into); }
+            IndexBlock.ReadOnly(m) => { m.readAt(at, into); }
+            IndexBlock.Heap(v) => {
+                let end = at + into.length;
+                into.copyFrom(v.view()[at..end]);
+            }
+        }
+    }
+
+    // The writes: never on a read-only block, which only a connection that cannot write has, and which takes no
+    // lock that would let it write.
+
+    fn store32(borrow mut this, at: usize, value: u32, order: StoreOrdering) {
+        match (this) {
+            IndexBlock.Shared(m) => { m.store32(at, value, order); }
+            IndexBlock.ReadOnly(_) => { assert(false, "a read-only wal-index is not written"); }
+            IndexBlock.Heap(v) => { v.viewMut().writeLE(at, value); }
+        }
+    }
+
+    fn store16(borrow mut this, at: usize, value: u16, order: StoreOrdering) {
+        match (this) {
+            IndexBlock.Shared(m) => { m.store16(at, value, order); }
+            IndexBlock.ReadOnly(_) => { assert(false, "a read-only wal-index is not written"); }
+            IndexBlock.Heap(v) => { v.viewMut().writeLE(at, value); }
+        }
+    }
+
+    fn writeAt(borrow mut this, at: usize, bytes: Slice<u8>) {
+        match (this) {
+            IndexBlock.Shared(m) => { m.writeAt(at, bytes); }
+            IndexBlock.ReadOnly(_) => { assert(false, "a read-only wal-index is not written"); }
+            IndexBlock.Heap(v) => { v.viewMut()[at..at + bytes.length].copyFrom(bytes); }
+        }
+    }
+}
+
 /// One try at a read transaction (walTryBeginRead).
 enum ReadTry {
     Done,
@@ -183,8 +244,17 @@ struct SharedWal {
     private shmPath: String;
     private logPath: String;
     private log: File;
-    /// The index's blocks mapped so far, from the first.
-    private regions: Vector<SharedMapping>;
+    /// Whether the `-shm` and the log were opened for writing; a connection that has either for reading only
+    /// (wal.c's WAL_SHM_RDONLY, WAL_RDONLY) reads and never writes, and takes only shared locks.
+    private shmWritable: bool;
+    private logWritable: bool;
+    /// Whether the index is this connection's own, rebuilt from the log in its memory, because the `-shm` can only
+    /// be read and no connection that could write it holds its DMS byte (bShmUnreliable).
+    private unreliable: bool;
+    /// While the index is rebuilt in this connection's memory: its locks take nothing (WAL_HEAPMEMORY_MODE).
+    private heapLocks: bool;
+    /// The index's blocks mapped (or kept) so far, from the first.
+    private regions: Vector<IndexBlock>;
     /// The header of this connection's snapshot (wal.c's pWal->hdr).
     hdr: WalIndexHeader;
     /// The read mark held (0 to 4), or -1; whether the writer's lock is held.
@@ -203,23 +273,50 @@ struct SharedWal {
 
     /// Opens the log and the wal-index of the database at `path`, creating them when missing, and takes the DMS
     /// lock (unixLockSharedMemory): the first connection empties the index, which is then rebuilt. Null when
-    /// another connection is doing that now.
+    /// another connection is doing that now. A file this process may not write is opened for reading, as
+    /// unixOpenSharedMemory and sqlite3WalOpen fall back: the connection then only reads.
     fn open(path: StringView) -> Result<SharedWal?, SqliteError> {
         let shmPath = withSuffix(path, SHM_SUFFIX)?;
         let logPath = withSuffix(path, WAL_SUFFIX)?;
-        var shm = File.openOrCreate(shmPath.view())?;
-        // os_unix.c asks with F_GETLK whether anyone holds the DMS byte; without a test of another's lock
-        // (CEESAFE_FINDINGS.md, finding 36) the exclusive lock is tried: it is granted only when nobody holds it.
-        if (shm.tryLock(FileLock.Exclusive, SHM_DMS, 1)?) {
-            shm.setLength(3)?;
-            // The handle's own lock becomes a shared one (fcntl converts it in place).
-            if (!shm.tryLock(FileLock.Shared, SHM_DMS, 1)?) {
-                return Ok(null);
+        var shmWritable = true;
+        var shm = match (File.openOrCreate(shmPath.view())) {
+            Ok(f) => f,
+            Err(_) => {
+                shmWritable = false;
+                File.open(shmPath.view())?
             }
-        } else if (!shm.tryLock(FileLock.Shared, SHM_DMS, 1)?) {
+        };
+        // unixLockSharedMemory: F_GETLK on the DMS byte, which takes nothing. Nobody holding it: this connection
+        // is the first, takes it exclusively and empties the file; one that cannot write the file cannot, and
+        // keeps an index of its own instead (SQLITE_READONLY_CANTINIT). A shared holder: others have the index
+        // open. An exclusive holder is emptying it now: busy.
+        var unreliable = false;
+        match (shm.testLock(FileLock.Exclusive, SHM_DMS, 1)?) {
+            null => {
+                if (!shmWritable) {
+                    unreliable = true;
+                } else {
+                    if (!shm.tryLock(FileLock.Exclusive, SHM_DMS, 1)?) {
+                        return Ok(null);
+                    }
+                    shm.setLength(3)?;
+                }
+            }
+            Some(FileLock.Exclusive) => { return Ok(null); }
+            Some(FileLock.Shared) => {}
+        }
+        // The exclusive lock, if taken, becomes a shared one in place (fcntl converts it atomically).
+        if (!unreliable && !shm.tryLock(FileLock.Shared, SHM_DMS, 1)?) {
             return Ok(null);
         }
-        let log = File.openOrCreate(logPath.view())?;
+        var logWritable = true;
+        let log = match (File.openOrCreate(logPath.view())) {
+            Ok(f) => f,
+            Err(_) => {
+                logWritable = false;
+                File.open(logPath.view())?
+            }
+        };
         var block = Vector<u8>.create();
         block.resize(WALINDEX_BLOCK, 0)?;
         var before = Vector<u8>.create();
@@ -229,7 +326,11 @@ struct SharedWal {
             shmPath: shmPath,
             logPath: logPath,
             log: log,
-            regions: Vector<SharedMapping>.create(),
+            shmWritable: shmWritable,
+            logWritable: logWritable,
+            unreliable: unreliable,
+            heapLocks: false,
+            regions: Vector<IndexBlock>.create(),
             hdr: WalIndexHeader.zero(),
             readLock: -1,
             writeLock: false,
@@ -245,13 +346,24 @@ struct SharedWal {
 
     // ── locks ────────────────────────────────────────────────────────────────────────────────────────────────
 
-    private fn tryShm(borrow this, kind: FileLock, lock: u64, count: u64) -> Result<bool, SqliteError> =>
-        Ok(this.shm.tryLock(kind, SHM_LOCKS_AT + lock, count)?);
+    private fn tryShm(borrow this, kind: FileLock, lock: u64, count: u64) -> Result<bool, SqliteError> {
+        if (this.heapLocks) {
+            return Ok(true);
+        }
+        return Ok(this.shm.tryLock(kind, SHM_LOCKS_AT + lock, count)?);
+    }
 
     private fn unlockShm(borrow this, lock: u64, count: u64) {
+        if (this.heapLocks) {
+            return;
+        }
         // An unlock fails only for a handle that is not open; closing it releases every lock.
         let _ = this.shm.unlock(SHM_LOCKS_AT + lock, count);
     }
+
+    /// Whether this connection may write the log and the index: false when either could only be opened for
+    /// reading (wal.c's readOnly), and the database is then read only.
+    fn writable(borrow this) -> bool => this.shmWritable && this.logWritable;
 
     /// An exclusive lock, waiting as the busy handler does when `waits` (walBusyLock).
     private fn exclusiveWaiting(
@@ -280,19 +392,32 @@ struct SharedWal {
 
     // ── the shared memory ─────────────────────────────────────────────────────────────────────────────────────
 
-    /// Maps the index's blocks up to `block`; a mapping grows a shorter file with zeros.
+    /// Maps the index's blocks up to `block`; a mapping for writing grows a shorter file with zeros. A read-only
+    /// `-shm` must already hold them (unixShmMap does not extend it then); the index in memory starts zeroed.
     private fn mapThrough(borrow mut this, block: usize) -> Result<void, SqliteError> {
         while (this.regions.length <= block) {
             let at = (this.regions.length as u64) * (WALINDEX_BLOCK as u64);
-            let mapped = this.shm.mapShared(at, WALINDEX_BLOCK)?;
-            this.regions.push(mapped)?;
+            if (this.unreliable) {
+                var memory = Vector<u8>.create();
+                memory.resize(WALINDEX_BLOCK, 0)?;
+                this.regions.push(IndexBlock.Heap(memory))?;
+            } else if (!this.shmWritable) {
+                if (this.shm.length()? < at + (WALINDEX_BLOCK as u64)) {
+                    return Err(corrupt("the wal-index is shorter than its header says"));
+                }
+                let mapped = this.shm.mapSharedReadOnly(at, WALINDEX_BLOCK)?;
+                this.regions.push(IndexBlock.ReadOnly(mapped))?;
+            } else {
+                let mapped = this.shm.mapShared(at, WALINDEX_BLOCK)?;
+                this.regions.push(IndexBlock.Shared(mapped))?;
+            }
         }
         return Ok();
     }
 
     private fn load(borrow this, at: usize) -> u32 => this.regions[0].load32(at, LoadOrdering.Acquire);
 
-    private fn store(borrow this, at: usize, value: u32) {
+    private fn store(borrow mut this, at: usize, value: u32) {
         this.regions[0].store32(at, value, StoreOrdering.Release);
     }
 
@@ -333,6 +458,10 @@ struct SharedWal {
     /// header with an impossible page size, or naming frames the log does not hold, is taken as unreadable too, and
     /// the index is rebuilt.
     private fn tryHeader(borrow mut this, changed: borrow mut bool) -> Result<bool, SqliteError> {
+        if (this.regions.length == 0 && !this.shmWritable && this.shm.length()? < (WALINDEX_BLOCK as u64)) {
+            // A read-only `-shm` too short for the header (unixShmMap gives no page): unreadable.
+            return Ok(true);
+        }
         this.mapThrough(0)?;
         var first = [0u8; 48];
         var second = [0u8; 48];
@@ -376,6 +505,14 @@ struct SharedWal {
         var changed = false;
         if (!this.tryHeader(mut changed)?) {
             return Ok(changed);
+        }
+        if (!this.shmWritable) {
+            // The index cannot be rebuilt here. With the writer's lock free, no connection is rebuilding it either:
+            // SQLITE_READONLY_RECOVERY. Otherwise one is, and the caller tries again.
+            if (this.shm.testLock(FileLock.Shared, SHM_LOCKS_AT + SHM_WRITE_LOCK, 1)?.isNull()) {
+                return Err(readOnlyError());
+            }
+            return Ok(null);
         }
         let held = this.writeLock;
         if (!held) {
@@ -518,18 +655,23 @@ struct SharedWal {
         return Ok();
     }
 
-    /// Writes the words of `block` that changed since `loadBlock` back into the index, each atomically, leaving
-    /// the first block's header alone.
-    private fn writeBlock(borrow this, block: usize) {
+    /// Writes the entries of `block` that changed since `loadBlock` back into the index, each atomically as wal.c
+    /// stores it (a page number in 32 bits, a hash slot in 16), leaving the first block's header alone.
+    private fn writeBlock(borrow mut this, block: usize) {
         var at = walIndexPagesAt(block);
-        let changed = this.block.view();
-        let old = this.before.view();
-        while (at < WALINDEX_BLOCK) {
-            let word = changed.readLE<u32>(at);
-            if (word != old.readLE<u32>(at)) {
-                this.regions[block].store32(at, word, StoreOrdering.Release);
+        while (at < HASH_TABLE_AT) {
+            let page = this.block.view().readLE<u32>(at);
+            if (page != this.before.view().readLE<u32>(at)) {
+                this.regions[block].store32(at, page, StoreOrdering.Release);
             }
             at += 4;
+        }
+        while (at < WALINDEX_BLOCK) {
+            let slot = this.block.view().readLE<u16>(at);
+            if (slot != this.before.view().readLE<u16>(at)) {
+                this.regions[block].store16(at, slot, StoreOrdering.Release);
+            }
+            at += 2;
         }
     }
 
@@ -563,6 +705,9 @@ struct SharedWal {
     /// walTryBeginRead. With `useWal` the header is not read again, and read mark 0 is not taken.
     private fn tryBeginRead(borrow mut this, changed: borrow mut bool, useWal: bool) -> Result<ReadTry, SqliteError> {
         if (!useWal) {
+            if (this.unreliable) {
+                return this.beginUnreliable(changed);
+            }
             match (this.readHeader()?) {
                 Some(moved) => {
                     if (moved) {
@@ -602,7 +747,8 @@ struct SharedWal {
                 chosen = i;
             }
         }
-        if (best < frames || chosen == 0) {
+        // A connection that cannot write the index cannot set a mark: it uses those there are.
+        if (this.shmWritable && (best < frames || chosen == 0)) {
             for (i in 1..SHM_READERS) {
                 if (this.tryShm(FileLock.Exclusive, SHM_READ_LOCK0 + (i as u64), 1)?) {
                     this.store(SharedWal.readMarkAt(i), frames);
@@ -614,6 +760,10 @@ struct SharedWal {
             }
         }
         if (chosen == 0) {
+            if (!this.shmWritable) {
+                // SQLITE_READONLY_CANTINIT: no mark fits this snapshot, and none can be set.
+                return Err(readOnlyError());
+            }
             return Ok(ReadTry.Retry);
         }
         if (!this.tryShm(FileLock.Shared, SHM_READ_LOCK0 + (chosen as u64), 1)?) {
@@ -626,6 +776,109 @@ struct SharedWal {
         }
         this.readLock = truncate<i32>(chosen);
         return Ok(ReadTry.Done);
+    }
+
+    /// walBeginShmUnreliable: a read transaction on an index of this connection's own, the `-shm` being read-only
+    /// with no connection that could write it holding its DMS byte. The index is rebuilt from the log in memory
+    /// when there is none (walIndexReadHdr after SQLITE_READONLY_CANTINIT, its locks taking nothing); read mark 0
+    /// is then held so that no checkpoint runs. The index is given up (Retry) when a connection that can write has
+    /// come, or the log changed since it was built: its salts, or a commit appended after its last frame.
+    private fn beginUnreliable(borrow mut this, changed: borrow mut bool) -> Result<ReadTry, SqliteError> {
+        if (this.regions.length == 0) {
+            this.heapLocks = true;
+            let built = this.rebuild();
+            this.heapLocks = false;
+            *changed = true;
+            if (built.isErr()) {
+                this.regions.clear();
+                built?;
+            }
+        }
+        if (!this.tryShm(FileLock.Shared, SHM_READ_LOCK0, 1)?) {
+            this.leaveUnreliable(changed);
+            return Ok(ReadTry.Retry);
+        }
+        this.readLock = 0;
+        // As unixShmMap asks again (isUnlocked): a shared holder of the DMS byte keeps the `-shm` current, and it is
+        // used from now on.
+        match (this.shm.testLock(FileLock.Exclusive, SHM_DMS, 1)?) {
+            null => {}
+            Some(FileLock.Shared) => {
+                if (this.shm.tryLock(FileLock.Shared, SHM_DMS, 1)?) {
+                    this.unreliable = false;
+                }
+                this.leaveUnreliable(changed);
+                return Ok(ReadTry.Retry);
+            }
+            Some(FileLock.Exclusive) => {
+                this.leaveUnreliable(changed);
+                return Ok(ReadTry.Busy);
+            }
+        }
+        this.hdr = WalIndexHeader.decode(this.liveHeader()[..]);
+        this.minFrame = 1;
+        let size = this.log.length()?;
+        if (size < WAL_HEADER_SIZE) {
+            // No log: the database file alone is read, but pages held may be stale.
+            *changed = true;
+            if (this.hdr.frames == 0) {
+                return Ok(ReadTry.Done);
+            }
+            this.leaveUnreliable(changed);
+            return Ok(ReadTry.Retry);
+        }
+        var header = [0u8; 32];
+        if (!readFully(mut this.log, mut header[..], 0)? || header[..].readBE<u32>(16) != this.hdr.salt1 ||
+            header[..].readBE<u32>(20) != this.hdr.salt2) {
+            this.leaveUnreliable(changed);
+            return Ok(ReadTry.Retry);
+        }
+        // A commit appended after the index's last frame (walDecodeFrame from the header's running checksum).
+        let pageSize = header[..].readBE<u32>(8) as usize;
+        if (!isPowerOfTwoBetween(pageSize, 512, 65536)) {
+            return Ok(ReadTry.Done);
+        }
+        let bigEndian = this.hdr.bigEndian == 1;
+        let frameSize = (WAL_FRAME_HEADER_SIZE + pageSize) as u64;
+        this.frame.resize(WAL_FRAME_HEADER_SIZE + pageSize, 0)?;
+        var running = this.hdr.frameSum;
+        var offset = SharedWal.frameOffset(this.hdr.frames + 1, pageSize);
+        while (offset + frameSize <= size) {
+            if (!readFully(mut this.log, this.frame.viewMut(), offset)?) {
+                break;
+            }
+            let bytes = this.frame.view();
+            if (bytes.readBE<u32>(0) == 0 || bytes.readBE<u32>(8) != this.hdr.salt1 ||
+                bytes.readBE<u32>(12) != this.hdr.salt2) {
+                break;
+            }
+            let sum = walChecksum(
+                walChecksum(running, bytes[0..8], bigEndian),
+                bytes[WAL_FRAME_HEADER_SIZE..],
+                bigEndian,
+            );
+            if (sum.first != bytes.readBE<u32>(16) || sum.second != bytes.readBE<u32>(20)) {
+                break;
+            }
+            if (bytes.readBE<u32>(4) != 0) {
+                this.leaveUnreliable(changed);
+                return Ok(ReadTry.Retry);
+            }
+            running = sum;
+            offset += frameSize;
+        }
+        return Ok(ReadTry.Done);
+    }
+
+    /// Gives up the index of this connection's own and the read mark taken for it; the next try builds another,
+    /// or maps the `-shm` if a connection that can write it has come.
+    private fn leaveUnreliable(borrow mut this, changed: borrow mut bool) {
+        this.regions.clear();
+        if (this.readLock == 0) {
+            this.unlockShm(SHM_READ_LOCK0, 1);
+        }
+        this.readLock = -1;
+        *changed = true;
     }
 
     /// Ends the read transaction (and a write transaction in it).
@@ -641,7 +894,9 @@ struct SharedWal {
     /// database file.
     private fn findFrame(borrow mut this, page: u32) -> Result<u32, SqliteError> {
         let last = this.hdr.frames;
-        if (last == 0 || this.readLock <= 0 || this.minFrame > last) {
+        // Under read mark 0 the database file has every frame, except in an index of this connection's own, which
+        // holds mark 0 only to keep checkpoints away (walBeginShmUnreliable).
+        if (last == 0 || this.readLock < 0 || (this.readLock == 0 && !this.unreliable) || this.minFrame > last) {
             return Ok(0);
         }
         let lowest = walIndexBlockOf(this.minFrame);
@@ -667,8 +922,7 @@ struct SharedWal {
         var found: u32 = 0;
         var collisions: usize = 0;
         loop {
-            let word = region.load32(HASH_TABLE_AT + (key / 2) * 4, LoadOrdering.Acquire);
-            let slot = if (key % 2 == 0) word & 0xFFFF else word >> 16;
+            let slot = region.load16(HASH_TABLE_AT + 2 * key, LoadOrdering.Acquire) as u32;
             if (slot == 0) {
                 return Ok(found);
             }
@@ -721,6 +975,9 @@ struct SharedWal {
     fn beginWrite(borrow mut this) -> Result<bool, SqliteError> {
         if (this.writeLock) {
             return Ok(true);
+        }
+        if (!this.writable() || this.unreliable) {
+            return Err(readOnlyError());
         }
         assert(this.readLock >= 0, "a write transaction is inside a read transaction");
         if (!this.tryShm(FileLock.Exclusive, SHM_WRITE_LOCK, 1)?) {
@@ -904,6 +1161,9 @@ struct SharedWal {
         changed: borrow mut bool,
     ) -> Result<WalCheckpoint, SqliteError> {
         assert(this.readLock < 0, "a checkpoint is made outside a read transaction");
+        if (!this.writable() || this.unreliable) {
+            return Err(readOnlyError());
+        }
         var outcome = WalCheckpoint { busy: true, logFrames: -1, checkpointed: -1 };
         if (!this.tryShm(FileLock.Exclusive, SHM_CHECKPOINT_LOCK, 1)?) {
             return Ok(outcome);

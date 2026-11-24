@@ -25,8 +25,10 @@
 // - RESERVED, at a transaction's first write: a write lock on RESERVED_BYTE, which one connection at a time holds;
 // - PENDING, on the way to EXCLUSIVE: a write lock on PENDING_BYTE, which keeps new readers out;
 // - EXCLUSIVE, to commit: a write lock on the SHARED range, granted once every reader has left.
-// A transaction ends with no lock. Before reading, a connection that took SHARED looks for a hot journal (one
-// that exists while no writer holds RESERVED): it then takes EXCLUSIVE, plays the journal back, and goes on.
+// Locks are converted in place (SHARED to EXCLUSIVE on the SHARED range and back), atomically, as fcntl does and
+// ADR 0234 promises on POSIX hosts. A transaction ends with no lock. Before reading, a connection that took SHARED
+// looks for a hot journal (one that exists while no writer holds RESERVED, which it tests without taking it): it
+// then takes EXCLUSIVE, plays the journal back, and goes on.
 // It also compares the files with what they were when it last held a lock, and forgets every page it holds when
 // another connection committed since (SQLite's change-counter check).
 //
@@ -97,6 +99,9 @@ struct FilesSeen {
 
 struct WritablePager {
     private file: File;
+    /// Whether the file is open for reading only (SQLITE_OPEN_READONLY, or a file this process may not write):
+    /// a statement that would write fails with SQLITE_READONLY, and no lock but SHARED is taken.
+    readOnly: bool;
     /// The lock this pager's file handle holds (LOCK_NONE … LOCK_EXCLUSIVE).
     private lock: u8;
     /// Milliseconds to wait for another connection's lock (PRAGMA busy_timeout), which the session sets.
@@ -145,10 +150,28 @@ struct WritablePager {
     fn open(path: StringView) -> Result<WritablePager, SqliteError> => WritablePager.openWaiting(path, 0);
 
     /// `open`, waiting up to `busyTimeout` milliseconds for another connection's lock.
-    fn openWaiting(path: StringView, busyTimeout: i64) -> Result<WritablePager, SqliteError> {
-        let file = File.openOrCreate(path)?;
+    fn openWaiting(path: StringView, busyTimeout: i64) -> Result<WritablePager, SqliteError> =>
+        WritablePager.openWith(path, busyTimeout, false);
+
+    /// `openWaiting`, for reading only when `readOnly` (SQLITE_OPEN_READONLY: the file must exist). A file that
+    /// cannot be opened for writing is opened for reading, as unixOpen falls back, and the pager is read-only.
+    fn openWith(path: StringView, busyTimeout: i64, readOnly: bool) -> Result<WritablePager, SqliteError> {
+        var onlyReads = readOnly;
+        var opened: Result<File, IoError> = Err(IoError.NotFound);
+        if (!readOnly) {
+            opened = File.openOrCreate(path);
+        }
+        let file = match (opened) {
+            Ok(f) => f,
+            Err(IoError.IsDirectory) => { return Err(SqliteError.Io(IoError.IsDirectory)); }
+            Err(_) => {
+                onlyReads = true;
+                File.open(path)?
+            }
+        };
         var pager = WritablePager {
             file: file,
+            readOnly: onlyReads,
             lock: LOCK_NONE,
             busyTimeout: busyTimeout,
             seen: null,
@@ -296,6 +319,9 @@ struct WritablePager {
     /// The writer's lock: RESERVED on the file, or in WAL mode the `-shm` writer's lock, which a transaction
     /// whose snapshot is no longer the last commit cannot have. False when another connection is writing.
     private fn tryWriter(borrow mut this) -> Result<bool, SqliteError> {
+        if (this.readOnly) {
+            return Err(readOnlyError());
+        }
         if (borrow mut this.shared is Some(wal)) {
             return wal.beginWrite();
         }
@@ -376,13 +402,15 @@ struct WritablePager {
             return this.startWal();
         }
         // A hot journal: one that exists while no writer holds RESERVED (a writer's own journal is not hot). The
-        // RESERVED byte is tested by taking it for a moment, as no fcntl test of another's lock is offered.
+        // RESERVED byte is tested without taking it (unixCheckReservedLock's F_GETLK), so that a writer taking it
+        // at that moment is not turned away.
         if (Journal.mayBeHot(this.path.view())?) {
-            let free = this.file.tryLock(FileLock.Exclusive, RESERVED_BYTE, 1)?;
-            if (free) {
-                this.file.unlock(RESERVED_BYTE, 1)?;
-            }
+            let free = this.file.testLock(FileLock.Exclusive, RESERVED_BYTE, 1)?.isNull();
             if (free && this.file.length()? > 0) {
+                if (this.readOnly) {
+                    // SQLITE_READONLY_ROLLBACK: the journal must be played back, which needs writing.
+                    return Err(readOnlyError());
+                }
                 if (!this.tryExclusive()?) {
                     return Ok(null);
                 }
@@ -393,6 +421,9 @@ struct WritablePager {
         var now = this.filesNow()?;
         // An empty file is an empty database: page 1 is written now, under EXCLUSIVE.
         if (now.length == 0) {
+            if (this.readOnly) {
+                return Err(readOnlyError());
+            }
             if (!this.tryReserved()? || !this.tryExclusive()?) {
                 return Ok(null);
             }
@@ -1107,6 +1138,9 @@ struct WritablePager {
     /// the running statement's own ends first. The transaction must have no changes.
     fn checkpoint(borrow mut this, mode: CheckpointMode) -> Result<WalCheckpoint, SqliteError> {
         assert(this.dirty.length() == 0, "a checkpoint is made between transactions");
+        if (this.readOnly && this.walMode) {
+            return Err(readOnlyError());
+        }
         let pageSize = this.pageSize;
         let timeout = this.busyTimeout;
         let Some(wal) = borrow mut this.shared else {
@@ -1150,6 +1184,9 @@ struct WritablePager {
         if (!this.walMode) {
             return Ok();
         }
+        if (this.readOnly) {
+            return Err(readOnlyError());
+        }
         if (borrow mut this.shared is Some(wal)) {
             wal.endRead();
         }
@@ -1190,7 +1227,17 @@ struct WritablePager {
                 Err(e) => { result = Err(e); }
             }
         }
-        if (this.walMode && result.isOk()) {
+        // A connection that cannot write leaves the log and the index as they are, as sqlite3WalClose does when its
+        // checkpoint is refused.
+        let writable = match (borrow this.shared) {
+            Some(wal) => !this.readOnly && wal.writable(),
+            null => !this.readOnly,
+        };
+        if (this.walMode && result.isOk() && !writable) {
+            if (borrow mut this.shared is Some(wal)) {
+                wal.endRead();
+            }
+        } else if (this.walMode && result.isOk()) {
             if (borrow mut this.shared is Some(wal)) {
                 wal.endRead();
             }

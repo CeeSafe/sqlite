@@ -36,6 +36,7 @@ fn sqlState(e: borrow SqliteError) -> StringView {
         SqliteError.NotADatabase(_) => { return "XX001"; }
         SqliteError.Unsupported(_) => { return "0A000"; }
         SqliteError.Busy(_) => { return "55P03"; }
+        SqliteError.ReadOnly(_) => { return "25006"; }
         SqliteError.RaiseIgnore => { return "XX000"; }
         SqliteError.Constraint(m) => {
             let text = m.toUtf8Lossy().ok() ?? String.create();

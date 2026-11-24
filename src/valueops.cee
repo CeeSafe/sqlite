@@ -93,8 +93,11 @@ fn appendValueText(out: borrow mut ByteString, value: borrow SqliteValue) -> Res
 
 /// A value as text.
 fn valueText(value: borrow SqliteValue) -> Result<ByteString, AllocError> {
-    if (value is SqliteValue.Text(s)) {
-        return s.clone();
+    match (value) {
+        SqliteValue.Text(s) => { return s.clone(); }
+        // A real is written in a String, whose bytes become the text's without a copy.
+        SqliteValue.Real(r) => { return Ok(ByteString.fromString(realText(r)?)); }
+        _ => {}
     }
     var out = ByteString.create();
     appendValueText(mut out, value)?;

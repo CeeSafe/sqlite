@@ -174,6 +174,17 @@ public struct Connection {
         return Ok(Connection { session: Session.openWaiting(path, busyTimeout.max(0))? });
     }
 
+    /// Opens the database file at `path` for reading only, as SQLITE_OPEN_READONLY (`sqlite3 -readonly`) does: the
+    /// file must exist, and a statement that would write it fails with `SqliteError.ReadOnly`. A database file
+    /// this process may not write is opened so by `open` too. In WAL mode the `-shm` and the log are opened for
+    /// writing when they can be, as SQLite opens them, and for reading otherwise.
+    public fn openReadOnly(path: StringView) -> Result<Connection, SqliteError> {
+        if (path.startsWith("file:")) {
+            return Err(unsupported("URI file names are not supported; give a file's path"));
+        }
+        return Ok(Connection { session: Session.openWith(path, 0, true)? });
+    }
+
     /// Closes the connection, rolling back a transaction it left open.
     public fn close(this) -> Result<void, SqliteError> {
         var me = this;

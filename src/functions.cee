@@ -1428,5 +1428,5 @@ fn nowText(kind: LiteralKind, unixMillis: i64) -> Result<SqliteValue, SqliteErro
         out.append(":")?;
         appendTwoDigits(mut out, inDay % 60)?;
     }
-    return Ok(SqliteValue.sqlText(out.view())?);
+    return Ok(SqliteValue.sqlTextFrom(out)?);
 }
