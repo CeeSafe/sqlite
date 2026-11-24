@@ -22,14 +22,18 @@ fn makeDatabase(path: StringView, sql: StringView) -> Result<void, TestFailure> 
     }
 }
 
-/// `bytes` as text, for messages.
+/// `bytes` as text, for messages: a byte from 0x80 as `\xHH`, and a carriage return as `\r`, so that what differs
+/// shows.
 fn shown(bytes: Slice<u8>) -> String {
     var text = String.create();
     for (i in 0..bytes.length) {
-        if (bytes[i] < 0x80) {
+        if (bytes[i] == '\r') {
+            text.append("\\r")!;
+        } else if (bytes[i] < 0x80) {
             let _ = text.appendChar(bytes[i] as u32)!;
         } else {
-            text.append("?")!;
+            text.append("\\x")!;
+            text.appendHex(bytes[i] as u64, 2, true)!;
         }
     }
     return text;
