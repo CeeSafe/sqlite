@@ -41,7 +41,7 @@ fn captureProgram(program: StringView, arguments: borrow Vector<StringView>, inp
         return Process.capture(program, arguments, input);
     }
     let directory = Directory.temporary()?;
-    let result = captureThroughPython(directory.view(), program, arguments, input);
+    let result = captureThroughPython(directory.view(), "", program, arguments, input);
     for (name in ["in", "out", "err"]) {
         let _ = File.remove(pathIn(directory.view(), name).view());
     }
@@ -58,17 +58,33 @@ fn runProgram(program: StringView, arguments: borrow Vector<StringView>) -> Resu
     return Ok(captureProgram(program, arguments, "".bytes())?.status);
 }
 
-/// The sqlite3 shell run with `arguments` and `input`. On Windows the shell writes "\r\n" for each "\n" (the C
-/// runtime's text mode); each "\r\n" becomes "\n" again, which undoes exactly that (a "\r\n" in a value was written
-/// "\r\r\n"). `.crlf off` would do it in the shell, but it says so on standard error and, given as `-cmd`, changes
-/// the arguments' numbers in messages.
+/// The sqlite3 shell run with `arguments` and `input`. On Windows the shell ends its lines with "\r\n", except in
+/// csv mode, where it writes "\r\n" itself in binary: `.crlf off`, in a `.sqliterc` it reads before the arguments,
+/// has it write what it writes elsewhere, without changing the arguments' numbers in its messages as `-cmd` would.
+/// It says so ("crlf is OFF") on standard error, which is dropped.
 fn captureSqlite(arguments: borrow Vector<StringView>, input: Slice<u8>) -> Result<ProcessOutput, IoError> {
     if (!onWindowsHost()) {
         return Process.capture("sqlite3", arguments, input);
     }
-    var output = captureProgram("sqlite3", arguments, input)?;
-    output.stdout = withoutCarriageReturns(output.stdout.view());
-    output.stderr = withoutCarriageReturns(output.stderr.view());
+    let directory = Directory.temporary()?;
+    let result = captureThroughPython(directory.view(), ".crlf off", "sqlite3", arguments, input);
+    for (name in ["in", "out", "err"]) {
+        let _ = File.remove(pathIn(directory.view(), name).view());
+    }
+    let _ = Directory.remove(directory.view());
+    var output = result?;
+    let said = "crlf is OFF".bytes();
+    var errors = withoutCarriageReturns(output.stderr.view());
+    if (errors.view().startsWith(said)) {
+        var at = said.length;
+        if (at < errors.length && errors[at] == '\n') {
+            at += 1;
+        }
+        var rest = Vector<u8>.create();
+        rest.extend(errors.view()[at..])!;
+        errors = rest;
+    }
+    output.stderr = errors;
     return Ok(output);
 }
 
@@ -117,8 +133,9 @@ fn wholeFileOf(path: StringView) -> Result<Vector<u8>, IoError> {
     return Ok(bytes);
 }
 
-/// `program` run by `tests/capture.py` with its streams in files of `directory`.
-fn captureThroughPython(directory: StringView, program: StringView, arguments: borrow Vector<StringView>, input: Slice<u8>) -> Result<ProcessOutput, IoError> {
+/// `program` run by `tests/capture.py` with its streams in files of `directory` (and a `.sqliterc` of `sqliterc`
+/// unless it is empty).
+fn captureThroughPython(directory: StringView, sqliterc: StringView, program: StringView, arguments: borrow Vector<StringView>, input: Slice<u8>) -> Result<ProcessOutput, IoError> {
     let inPath = pathIn(directory, "in");
     let outPath = pathIn(directory, "out");
     let errPath = pathIn(directory, "err");
@@ -126,8 +143,13 @@ fn captureThroughPython(directory: StringView, program: StringView, arguments: b
         var file = File.create(inPath.view())?;
         file.write(input)?;
     }
+    var rc = String.from("--sqliterc=")!;
+    rc.append(sqliterc)!;
     var all = Vector<StringView>.create();
     all.push(CAPTURE_SCRIPT)!;
+    if (sqliterc.length > 0) {
+        all.push(rc.view())!;
+    }
     all.push(inPath.view())!;
     all.push(outPath.view())!;
     all.push(errPath.view())!;
