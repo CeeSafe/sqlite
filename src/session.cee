@@ -1058,10 +1058,12 @@ impl Session {
     }
 }
 
-/// A file name in `$TMPDIR` for a private database (TEMP, `:memory:`, `ATTACH ''`), starting with `prefix`.
+/// A file name in the temporary directory for a private database (TEMP, `:memory:`, `ATTACH ''`), starting with
+/// `prefix`: `$TMPDIR` or /tmp, and on Windows `%TMP%` or `%TEMP%` as GetTempPath gives it (os_win.c), since /tmp
+/// names nothing there.
 fn privateDatabasePath(prefix: StringView) -> Result<String, AllocError> {
-    var path = String.from(Environment.variable("TMPDIR") ?? "/tmp")?;
-    if (!path.view().endsWith("/")) {
+    var path = String.from(temporaryDirectory())?;
+    if (!path.view().endsWith("/") && !path.view().endsWith("\\")) {
         path.append("/")?;
     }
     path.append(prefix)?;
@@ -1071,6 +1073,14 @@ fn privateDatabasePath(prefix: StringView) -> Result<String, AllocError> {
     }
     path.append(".db")?;
     return Ok(path);
+}
+
+/// The directory private databases go in.
+fn temporaryDirectory() -> StringView {
+    if (cfg("target.windows")) {
+        return Environment.variable("TMP") ?? Environment.variable("TEMP") ?? ".";
+    }
+    return Environment.variable("TMPDIR") ?? "/tmp";
 }
 
 /// Removes a private database's file and the journal or log beside it.
