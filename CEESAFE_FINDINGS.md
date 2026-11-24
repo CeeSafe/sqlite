@@ -3,6 +3,34 @@
 Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed in CeeSafe later. Compiler:
 `ceesafec 0.93.7`. Each entry says what was needed, what happened, and the workaround used in this package.
 
+## Status (ceesafec 0.95.0)
+
+| Finding | Status |
+|---|---|
+| 1, 20 | fixed in 0.95.0: float math methods (`exp`, `ln`, `pow`, trigonometry, `fma`, `copySign`, `scaleB`, `roundEven`, …), ADR 0218; hexadecimal float literals and `frexp` not added |
+| 2 | fixed in 0.95.0: `wrappingShl`/`wrappingShr` on signed integers (arithmetic shift), ADR 0223 |
+| 3 | fixed in 0.95.0: byte-range advisory locks `lock`/`tryLock`/`unlock`, interoperating with sqlite3's, ADR 0220 |
+| 4 | fixed in 0.95.0: `Arc.getMut()`, ADR 0224 |
+| 5 | already there: `appendChar`/`appendUtf8` are documented |
+| 7 | diagnostic in 0.95.0: float patterns say to use a guard or `==` (ADR 0228); not added as patterns, by choice |
+| 8 | diagnostic in 0.95.0: `*b` on a box says `let inner: T = b;` (ADR 0228) |
+| 11 | fixed in 0.94.5: arrays whose elements need drop |
+| 13, 22 | fixed in 0.95.0: `v.drain()`, ADR 0224 |
+| 14 | fixed in 0.55.0 (missed by the port): `Clock.localOffset(at)`, ADR 0153 |
+| 16 | fixed in 0.95.0: floats in constant arrays, ADR 0226 |
+| 17 | diagnostic in 0.95.0: N0245 shows the `static` table form (ADR 0226) |
+| 23, 30 | fixed in 0.95.0: `Thread.sleep`, `recvTimeout`, `t.isFinished()`, ADR 0222 |
+| 24 | fixed in 0.94.5: `Mutex.constant`, `OnceLock.constant`, `Vector.empty` in statics |
+| 25 | fixed by 0.94.5 |
+| 27, 29 | fixed in 0.95.0: `File.createReadWrite`, `IoError.BadDescriptor`, `Console.isTerminal`, ADR 0221 |
+| 28, 33 | fixed in 0.95.0: `borrow` of a value lent to its statement; a field moved out of `e?.f`/`e!.f`, ADR 0227 |
+| 31 | diagnostic in 0.95.0: N0245 names a region parameter for a result holding a reference (ADR 0228) |
+| 32 | fixed in 0.95.0: `sortStableBy`, ADR 0225 |
+| 34 | fixed in 0.95.0 for an expected slice or number (ADR 0226); `let a = [1, 2];` stays `i32`, as `let x = 1;` does |
+| 9, 10, 12, 18, 21 | by design: closures are typed where a function type is expected; reserved words, now named as such in the error; references are not re-pointed; ranges are half-open (ADR 0085) |
+| 6, 15, 19, 26 | open: two interfaces sharing a method name, file-private names, byte-string text, shared memory mappings |
+| 35 | open: found while fixing these (below) |
+
 ## Gaps
 
 ### 1. No transcendental math on floats
@@ -280,3 +308,8 @@ Workaround: bind it first, `if (best is Some(b)) { var seek = b.seek; … }` (`p
 is not taken from its use, and an array literal has no suffix or annotation in the expression to give it.
 
 Workaround: `(a[i] as i64) + y` (`logEst` in `src/plan.cee`).
+
+### 35. `Vector<Thread<void>>.swapRemove` is refused
+
+Found while adding `t.isFinished()` (ADR 0222): `swapRemove` on a vector of `Thread<void>` is N0226, though a
+`Thread<u64>` works. Workaround: give the threads a result type.
