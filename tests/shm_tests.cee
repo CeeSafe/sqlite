@@ -33,7 +33,7 @@ fn sqliteOutputInBackground(path: StringView, script: StringView) -> Thread<Stri
             return String.create();
         }
         return match (Process.capture("sqlite3", borrow arguments, input.view().bytes())) {
-            Ok(output) => match (textFromBytesLossy(output.stdout.view())) {
+            Ok(output) => match (ByteStringView.fromBytes(output.stdout.view()).toUtf8Lossy()) {
                 Ok(text) => text,
                 Err(_) => String.create(),
             },

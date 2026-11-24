@@ -729,8 +729,8 @@ Collations other than BINARY, NOCASE and RTRIM are refused.
   a restart (either way no old frame can pass for a new one); the index is in the host's byte order, as SQLite's,
   and every host CeeSafe builds for is little-endian; another process that shortens the `-shm` while this engine
   maps it ends the program with SIGBUS (finding 37), as it would SQLite. The locking is POSIX-only: on Windows
-  (os_win.c's scheme, and CeeSafe does not say which system it runs on, finding 40) WAL mode is refused with
-  `Unsupported`. The read-only `DatabaseReader` takes no locks: it reads the log as it finds it, rebuilding its own
+  (os_win.c's scheme is not ported) WAL mode is refused with `Unsupported`, in a build for
+  Windows (`cfg("target.windows")`). The read-only `DatabaseReader` takes no locks: it reads the log as it finds it, rebuilding its own
   index of the frames.
 - **Journal modes.** WAL and DELETE only: TRUNCATE, PERSIST, MEMORY and OFF are taken as DELETE, and
   `PRAGMA journal_mode` then answers `delete`. Leaving WAL mode writes the header's format numbers 1 and 1 and

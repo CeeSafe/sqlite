@@ -37,7 +37,7 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 37 | open: found with 26's fix (below); met by the `-shm` port: no 16-bit atomics either (the hash slots are reached through the aligned 32-bit word holding two) |
 | 38 | open: found with 19's fix (below) |
 | 39 | open: found while removing 19's workaround (below) |
-| 40 | open: found while removing 26's workaround (below) |
+| 40 | misreported: `cfg("target.windows")` (ADR 0179, guide/unsafe-and-c.md "Code for one system") names the system a build is for, in any code; `onWindows()` uses it, and the environment-variable check is gone |
 
 ## Gaps
 
@@ -382,12 +382,3 @@ lib/core type are found in its source or through the MCP server.
 
 Workaround: the copy (`SqliteValue.text(s.view())`), or building the bytes in a `ByteString` or `Vector<u8>` from
 the start where the text is a function's result (`concat`, `group_concat`, `printf`, `hex`, `upper`).
-### 40. A program cannot ask which system it runs on
-
-Found while removing finding 26's workaround. The WAL locking follows os_unix.c, which converts a held lock in
-place; os_win.c instead unlocks and relocks (finding 36), so on Windows WAL mode must be refused until it is
-ported. There is no `Host.system()` (or a compile-time `[target.windows]` source set): the manifest's target tables
-hold link settings only, and nothing in lib/std names the system at run time.
-
-Workaround: `onWindows()` (`src/pagerw.cee`) reads the environment variable `OS`, which Windows sets to
-`Windows_NT`; a POSIX program could set it too, and then WAL mode is refused there as well.

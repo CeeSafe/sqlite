@@ -1238,12 +1238,13 @@ struct WritablePager {
     }
 }
 
-/// Whether the program runs on Windows, whose locks (os_win.c's scheme) the WAL code does not follow yet. CeeSafe
-/// does not say which system it runs on (CEESAFE_FINDINGS.md, finding 40); Windows sets OS to Windows_NT.
-fn onWindows() -> bool => match (Environment.variable("OS")) {
-    Some(name) => name == "Windows_NT",
-    null => false,
-};
+/// Whether the program is built for Windows, whose locks (os_win.c's scheme) the WAL code does not follow yet.
+fn onWindows() -> bool {
+    if (cfg("target.windows")) {
+        return true;
+    }
+    return false;
+}
 
 impl PageSource for WritablePager {
     fn readPage(borrow mut this, number: u32) -> Result<Page, SqliteError> {
