@@ -622,9 +622,17 @@ fn runCore(
             order.push(g)?;
         }
         let collations = core.groupCollations.view();
+        let encoding = db.textEncoding();
         order.sortStableBy((a, b) => {
             for (k in 0..collations.length) {
-                let c = compareForOrder(borrow groups[a].key[k], borrow groups[b].key[k], collations[k], false, true);
+                let c = compareForOrder(
+                    borrow groups[a].key[k],
+                    borrow groups[b].key[k],
+                    collations[k],
+                    false,
+                    true,
+                    encoding,
+                );
                 if (c != 0) {
                     return c;
                 }
@@ -677,9 +685,16 @@ fn runCore(
 }
 
 /// Compares two rows' sort keys.
-fn compareKeys(a: Slice<SqliteValue>, b: Slice<SqliteValue>, terms: Slice<XOrderTerm>) -> i32 {
+fn compareKeys(a: Slice<SqliteValue>, b: Slice<SqliteValue>, terms: Slice<XOrderTerm>, encoding: TextEncoding) -> i32 {
     for (i in 0..terms.length) {
-        let c = compareForOrder(borrow a[i], borrow b[i], terms[i].collation, terms[i].descending, terms[i].nullsFirst);
+        let c = compareForOrder(
+            borrow a[i],
+            borrow b[i],
+            terms[i].collation,
+            terms[i].descending,
+            terms[i].nullsFirst,
+            encoding,
+        );
         if (c != 0) {
             return c;
         }
@@ -694,6 +709,7 @@ fn compareForOrder(
     collation: Collation,
     descending: bool,
     nullsFirst: bool,
+    encoding: TextEncoding,
 ) -> i32 {
     if (a.isNull() || b.isNull()) {
         if (a.isNull() && b.isNull()) {
@@ -701,7 +717,7 @@ fn compareForOrder(
         }
         return if (a.isNull() == nullsFirst) -1 else 1;
     }
-    let c = compareValues(a, b, collation);
+    let c = compareValuesIn(a, b, collation, encoding);
     return if (descending) 0 - c else c;
 }
 
@@ -723,7 +739,8 @@ fn runSelect(
         if (core.sortKeys.length != 0) {
             let terms = core.sortKeys.view();
             // Stable, as SQLite's sorter is: rows with equal keys stay in the order they came.
-            rows.sortStableBy((x, y) => compareKeys(x.keys.view(), y.keys.view(), terms));
+            let encoding = db.textEncoding();
+            rows.sortStableBy((x, y) => compareKeys(x.keys.view(), y.keys.view(), terms, encoding));
         }
         var out = Vector<Vector<SqliteValue>>.withCapacity(rows.length)?;
         var index: usize = 0;
@@ -756,7 +773,8 @@ fn runSelect(
     if (plan.compoundOrder.length != 0) {
         let order = plan.compoundOrder.view();
         // Stable, as SQLite's sorter is: rows equal on the ORDER BY columns keep the compound's order.
-        result.sortStableBy((x, y) => compareByColumns(x.view(), y.view(), order));
+        let encoding = db.textEncoding();
+        result.sortStableBy((x, y) => compareByColumns(x.view(), y.view(), order, encoding));
     }
     var out = Vector<Vector<SqliteValue>>.create();
     var index: usize = 0;
@@ -769,7 +787,12 @@ fn runSelect(
     return Ok(out);
 }
 
-fn compareByColumns(a: Slice<SqliteValue>, b: Slice<SqliteValue>, order: Slice<ColumnOrder>) -> i32 {
+fn compareByColumns(
+    a: Slice<SqliteValue>,
+    b: Slice<SqliteValue>,
+    order: Slice<ColumnOrder>,
+    encoding: TextEncoding,
+) -> i32 {
     for (i in 0..order.length) {
         let at = order[i].column;
         let c = compareForOrder(
@@ -778,6 +801,7 @@ fn compareByColumns(a: Slice<SqliteValue>, b: Slice<SqliteValue>, order: Slice<C
             order[i].collation,
             order[i].descending,
             order[i].nullsFirst,
+            encoding,
         );
         if (c != 0) {
             return c;

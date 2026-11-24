@@ -226,8 +226,13 @@ struct Accumulator {
             AggregateState.Best(best) => {
                 if (!value.isNull()) {
                     let replace = best.isNull() || match (spec.function) {
-                        AggregateFunction.Min => compareValues(borrow value, best, spec.collation) < 0,
-                        _ => compareValues(borrow value, best, spec.collation) > 0,
+                        AggregateFunction.Min => compareValuesIn(
+                            borrow value,
+                            best,
+                            spec.collation,
+                            db.textEncoding(),
+                        ) < 0,
+                        _ => compareValuesIn(borrow value, best, spec.collation, db.textEncoding()) > 0,
                     };
                     if (replace) {
                         best = value;
@@ -242,13 +247,13 @@ struct Accumulator {
                 if (started) {
                     if (spec.args.length == 2) {
                         let separator = evaluate(borrow spec.args[1], frame, db)?;
-                        appendValueText(text, borrow separator)?;
+                        appendValueTextIn(text, borrow separator, db.textEncoding())?;
                     } else {
                         text.append(",")?;
                     }
                 }
                 started = true;
-                appendValueText(text, borrow value)?;
+                appendValueTextIn(text, borrow value, db.textEncoding())?;
             }
             AggregateState.Json(out, started) => {
                 let isObject = jsonGroupIsObject(spec.function);
@@ -275,7 +280,8 @@ struct Accumulator {
             order.push(i)?;
         }
         let terms = spec.orderBy.view();
-        order.sortStableBy((a, b) => compareKeys(kept[a].keys.view(), kept[b].keys.view(), terms));
+        let encoding = db.textEncoding();
+        order.sortStableBy((a, b) => compareKeys(kept[a].keys.view(), kept[b].keys.view(), terms, encoding));
         var args = Vector<XExpr>.withCapacity(spec.args.length)?;
         for (k in 0..spec.args.length) {
             args.push(XExpr.Column(spec.replaySlot, k))?;

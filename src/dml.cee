@@ -641,10 +641,11 @@ impl TableWriter {
         }
         frame.slots[this.slot] = saved;
         let order = borrow index.order;
-        entries.sortBy((a, b) => order.comparePrefix(a.view(), b.view()));
+        let encoding = db.pager.textEncoding;
+        entries.sortBy((a, b) => order.comparePrefixIn(a.view(), b.view(), encoding));
         var records = Vector<Vector<u8>>.withCapacity(entries.length)?;
         for (i in 0..entries.length) {
-            records.push(Record.encode(entries[i].view())?)?;
+            records.push(Record.encodeIn(entries[i].view(), db.pager.textEncoding)?)?;
         }
         IndexMutator.rebuild(mut db.pager, index.root, records.view())?;
         return Ok();
@@ -666,7 +667,7 @@ impl TableWriter {
         var cursor = RowCursor.scan(borrow this.read);
         while (cursor.next(mut db.pager)? is Some(other)) {
             if (order.comparePrefix(other.columns.view(), row.columns.view()[0..this.primaryKey.columns.length]) != 0) {
-                records.push(Record.encode(other.columns.view())?)?;
+                records.push(Record.encodeIn(other.columns.view(), db.pager.textEncoding)?)?;
             }
         }
         IndexMutator.rebuild(mut db.pager, this.read.root, records.view())?;
@@ -710,7 +711,12 @@ impl TableWriter {
             let _ = IndexMutator.applyBatch(mut db.pager, this.read.root, op.view(), borrow this.primaryKey.order)?;
         } else {
             var op = Vector<TableOp>.create();
-            op.push(TableOp { rowId: frame.slots[this.slot].rowId, record: Record.encode(stored.view())? })?;
+            op.push(
+                TableOp {
+                    rowId: frame.slots[this.slot].rowId,
+                    record: Record.encodeIn(stored.view(), db.pager.textEncoding)?,
+                },
+            )?;
             TableMutator.applyBatch(mut db.pager, this.read.root, op.view())?;
         }
         for (i in 0..this.indexes.length) {

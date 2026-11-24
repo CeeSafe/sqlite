@@ -14,21 +14,31 @@
 struct IndexOrder {
     collations: Vector<Collation>;
     descending: Vector<bool>;
+    /// The database's text encoding, which BINARY compares in (textenc.cee); a cursor sets it from its pager.
+    encoding: TextEncoding;
 
     /// Every column BINARY and ascending.
-    fn plain() -> IndexOrder =>
-        IndexOrder { collations: Vector<Collation>.create(), descending: Vector<bool>.create() };
+    fn plain() -> IndexOrder => IndexOrder {
+        collations: Vector<Collation>.create(),
+        descending: Vector<bool>.create(),
+        encoding: TextEncoding.Utf8,
+    };
 
     /// Compares the leading columns of `entry` with `key`, in the index's order.
-    fn comparePrefix(borrow this, entry: Slice<SqliteValue>, key: Slice<SqliteValue>) -> i32 {
+    fn comparePrefix(borrow this, entry: Slice<SqliteValue>, key: Slice<SqliteValue>) -> i32 =>
+        this.comparePrefixIn(entry, key, this.encoding);
+
+    /// `comparePrefix` in a database whose text is in `encoding`.
+    fn comparePrefixIn(borrow this, entry: Slice<SqliteValue>, key: Slice<SqliteValue>, encoding: TextEncoding) -> i32 {
         let missing = SqliteValue.Null;
         for (i in 0..key.length) {
             let collation = if (i < this.collations.length) this.collations[i] else Collation.Binary;
-            var c = if (i < entry.length) compareValues(
+            var c = if (i < entry.length) compareValuesIn(
                 borrow entry[i],
                 borrow key[i],
                 collation,
-            ) else compareValues(borrow missing, borrow key[i], collation);
+                encoding,
+            ) else compareValuesIn(borrow missing, borrow key[i], collation, encoding);
             if (i < this.descending.length && this.descending[i]) {
                 c = 0 - c;
             }
@@ -211,6 +221,8 @@ struct IndexCursor {
     fn next<P: PageSource>(borrow mut this, pager: borrow mut P) -> Result<Vector<SqliteValue>?, SqliteError> {
         if (!this.started) {
             this.started = true;
+            // The range's keys compare as the database orders its text.
+            this.range.order.encoding = pager.textEncoding();
             this.push(pager, this.root, true)?;
         }
         loop {

@@ -124,8 +124,10 @@ fn textFromRecordsIsKept() -> Result<void, TestFailure> {
 @test
 fn utf16TextIsTranslatedAsSqliteDoes() -> Result<void, TestFailure> {
     // sqlite3VdbeMemTranslate: a lone surrogate becomes its three UTF-8 bytes, a surrogate takes the unit after it
-    // whatever that is, and an odd last byte is dropped. Compared as printed: SQLite's hex() and length() of text
-    // in a UTF-16 database see its UTF-16 bytes.
+    // whatever that is, and an odd last byte is dropped. Compared as printed: SQLite's hex() of such text shows
+    // the bytes it never translated, where this engine's UTF-8 cannot keep an odd byte or a surrogate followed by
+    // a unit that is not its pair (README.md, "UTF-16 databases"); `utf16TextMeetsBytesAsInSqlite` compares hex()
+    // of text that translates both ways.
     let path = "out/text-bytes-utf16.db";
     makeDatabase(path, """
         PRAGMA encoding = 'UTF-16le';

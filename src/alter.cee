@@ -169,7 +169,7 @@ fn schemaRows(db: borrow mut Session) -> Result<Vector<SchemaRow>, SqliteError> 
 
 fn writeSchemaRow(db: borrow mut Session, row: borrow SchemaRow) -> Result<void, SqliteError> {
     var op = Vector<TableOp>.create();
-    op.push(TableOp { rowId: row.rowId, record: Record.encode(row.values.view())? })?;
+    op.push(TableOp { rowId: row.rowId, record: Record.encodeIn(row.values.view(), db.pager.textEncoding)? })?;
     TableMutator.applyBatch(mut db.pager, 1, op.view())?;
     return Ok();
 }
@@ -713,7 +713,7 @@ fn dropColumn(tableName: StringView, column: StringView, db: borrow mut Session)
             if (position < values.length) {
                 let _ = values.remove(position);
             }
-            records.push(Record.encode(values.view())?)?;
+            records.push(Record.encodeIn(values.view(), db.pager.textEncoding)?)?;
         }
         IndexMutator.rebuild(mut db.pager, table.rootPage, records.view())?;
         return Ok();
@@ -726,7 +726,7 @@ fn dropColumn(tableName: StringView, column: StringView, db: borrow mut Session)
         }
         var values = row.columns;
         let _ = values.remove(position);
-        ops.push(TableOp { rowId: row.rowId, record: Record.encode(values.view())? })?;
+        ops.push(TableOp { rowId: row.rowId, record: Record.encodeIn(values.view(), db.pager.textEncoding)? })?;
     }
     TableMutator.applyBatch(mut db.pager, table.rootPage, ops.view())?;
     return Ok();

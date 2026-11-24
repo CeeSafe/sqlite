@@ -37,6 +37,7 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 37 | open: found with 26's fix (below); met by the `-shm` port: no 16-bit atomics either (the hash slots are reached through the aligned 32-bit word holding two) |
 | 38 | open: found with 19's fix (below) |
 | 39 | open: found while removing 19's workaround (below) |
+| 41 | open: found while making SQL text bytes (below) |
 | 40 | misreported: `cfg("target.windows")` (ADR 0179, guide/unsafe-and-c.md "Code for one system") names the system a build is for, in any code; `onWindows()` uses it, and the environment-variable check is gone |
 
 ## Gaps
@@ -382,3 +383,19 @@ lib/core type are found in its source or through the MCP server.
 
 Workaround: the copy (`SqliteValue.text(s.view())`), or building the bytes in a `ByteString` or `Vector<u8>` from
 the start where the text is a function's result (`concat`, `group_concat`, `printf`, `hex`, `upper`).
+
+### 41. Text code written for `StringView` cannot take a `ByteStringView`
+
+Found while making the engine take SQL as bytes (README's "SQL text of any bytes"). The tokenizer, the parser, the
+catalog's names and every error message are written against `String` and `StringView`: `==` with a literal,
+`equalsIgnoreAsciiCase`, `split`, `splitOnce`, `parseInt`, slicing, `String.append`. `ByteStringView` has a
+subset of these, its search methods take a `Slice<u8>` rather than text (`m.startsWith("UNIQUE")` is N0205,
+"expected 'Slice<u8>', found 'StringView'"; it must be `m.startsWith("UNIQUE".bytes())`), and no interface covers
+both views, so a function cannot be written once for either. Moving some 36,000 lines from `String` names to
+`ByteString` ones would have meant rewriting every name comparison, message and slice.
+
+Workaround: SQL text stays a `String` inside the engine, in a lossless form: each byte of a sequence that is not
+UTF-8 stands as one code point of U+10FF80..U+10FFFF, and a real one of those is escaped the same way
+(`src/sqltext.cee`); the API takes `ByteStringView`, and names leave as bytes where they become values or
+messages. A text-view interface implemented by both `StringView` and `ByteStringView` (or `ByteStringView`
+methods that take text, as `ByteString.append` does) would let such code be generic.

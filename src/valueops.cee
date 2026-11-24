@@ -255,15 +255,31 @@ fn bitNot(value: borrow SqliteValue) -> SqliteValue {
     return SqliteValue.Integer(truncate<i64>(truncate<u64>(integerValue(value)) ^ 0xFFFF_FFFF_FFFF_FFFF));
 }
 
-/// `left || right`.
-fn concatenate(left: borrow SqliteValue, right: borrow SqliteValue) -> Result<SqliteValue, AllocError> {
+/// `left || right`, in a database whose text is in `encoding` (a blob is read as text in it).
+fn concatenate(
+    left: borrow SqliteValue,
+    right: borrow SqliteValue,
+    encoding: TextEncoding,
+) -> Result<SqliteValue, AllocError> {
     if (left.isNull() || right.isNull()) {
         return Ok(SqliteValue.Null);
     }
     var out = ByteString.create();
-    appendValueText(mut out, left)?;
-    appendValueText(mut out, right)?;
+    appendValueTextIn(mut out, left, encoding)?;
+    appendValueTextIn(mut out, right, encoding)?;
     return Ok(SqliteValue.Text(out));
+}
+
+/// `appendValueText`, with a blob read as text in `encoding`.
+fn appendValueTextIn(
+    out: borrow mut ByteString,
+    value: borrow SqliteValue,
+    encoding: TextEncoding,
+) -> Result<void, AllocError> {
+    if (encoding != TextEncoding.Utf8 && value is SqliteValue.Blob(b)) {
+        return out.appendBytes(decodeText(b.view(), encoding)?.bytes());
+    }
+    return appendValueText(out, value);
 }
 
 // ── affinity and casts ───────────────────────────────────────────────────────────────────────────────────────
@@ -330,6 +346,7 @@ fn compareWithAffinity(
     right: borrow SqliteValue,
     affinity: ExprAffinity,
     collation: Collation,
+    encoding: TextEncoding,
 ) -> Result<i32, AllocError> {
     // The common case needs no conversion.
     if (left is SqliteValue.Integer(a) && right is SqliteValue.Integer(b)) {
@@ -345,13 +362,18 @@ fn compareWithAffinity(
         Some(converted) => converted,
         null => right,
     };
-    return Ok(compareValues(leftForm, rightForm, collation));
+    return Ok(compareValuesIn(leftForm, rightForm, collation, encoding));
 }
 
-/// CAST(value AS type), where `affinity` is the type's (sqlite3VdbeMemCast).
-fn castValue(value: SqliteValue, affinity: Affinity) -> Result<SqliteValue, AllocError> {
+/// CAST(value AS type), where `affinity` is the type's (sqlite3VdbeMemCast), in a database whose text is in
+/// `encoding`: a value becomes a blob as its text's bytes in the encoding, and a blob is read as text in it.
+fn castValue(value: SqliteValue, affinity: Affinity, encoding: TextEncoding) -> Result<SqliteValue, AllocError> {
     if (value.isNull()) {
         return Ok(SqliteValue.Null);
+    }
+    if (encoding != TextEncoding.Utf8 && affinity != Affinity.Blob && value is SqliteValue.Blob(b)) {
+        let text = blobAsText(b.view(), encoding)?;
+        return castValue(text, affinity, TextEncoding.Utf8);
     }
     match (affinity) {
         Affinity.Blob => {
@@ -359,7 +381,7 @@ fn castValue(value: SqliteValue, affinity: Affinity) -> Result<SqliteValue, Allo
                 SqliteValue.Blob(b) => { return Ok(SqliteValue.Blob(b)); }
                 other => {
                     let text = valueText(borrow other)?;
-                    return SqliteValue.blob(text.view().bytes());
+                    return Ok(SqliteValue.Blob(encodedText(text.bytes(), encoding)?));
                 }
             }
         }

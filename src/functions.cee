@@ -1005,6 +1005,10 @@ fn callFunction(
     for (i in 0..args.length) {
         values.push(evaluate(borrow args[i], frame, db)?)?;
     }
+    let encoding = db.textEncoding();
+    if (encoding != TextEncoding.Utf8) {
+        adaptArgumentsToEncoding(call.function, mut values, encoding)?;
+    }
     let v = values.view();
     match (call.function) {
         ScalarFunction.Abs => {
@@ -1190,7 +1194,7 @@ fn callFunction(
                 if (i == 0) {
                     continue;
                 }
-                let c = compareValues(borrow v[best], borrow v[i], call.collation);
+                let c = compareValuesIn(borrow v[best], borrow v[i], call.collation, db.textEncoding());
                 // min keeps the later of equals, max the earlier, as SQLite's minmaxFunc does.
                 if ((call.function == ScalarFunction.Min && c >= 0) || (call.function == ScalarFunction.Max && c < 0)) {
                     best = i;
@@ -1204,7 +1208,12 @@ fn callFunction(
             return Ok(realResult(x.truncatingRemainder(y)));
         }
         ScalarFunction.NullIf => {
-            if (!v[0].isNull() && !v[1].isNull() && compareValues(borrow v[0], borrow v[1], call.collation) == 0) {
+            if (!v[0].isNull() && !v[1].isNull() && compareValuesIn(
+                borrow v[0],
+                borrow v[1],
+                call.collation,
+                db.textEncoding(),
+            ) == 0) {
                 return Ok(SqliteValue.Null);
             }
             return Ok(values.swapRemove(0));

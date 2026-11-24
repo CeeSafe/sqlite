@@ -8,7 +8,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 
 | Part | C# source | Here | State |
 |---|---|---|---|
-| Varints, records, values | `Engine/Format` | `varint.cee`, `record.cee`, `value.cee` | done: TEXT keeps any bytes (`ByteString`), as SQLite's does |
+| Varints, records, values | `Engine/Format` | `varint.cee`, `record.cee`, `value.cee` | done: TEXT keeps any bytes (`ByteString`), as SQLite's does; a UTF-16 database's text is written, ordered and seen as bytes in its encoding (`textenc.cee`) |
 | Database header, pager, freelist count | `Storage/DatabaseHeader`, `Pager`, `FreelistReader` | `header.cee`, `pager.cee` | done, reading through a write-ahead log |
 | Table b-tree reader | `Btree/BTreeReader` | `btree.cee` | done |
 | Index b-tree reader | `Btree/IndexBTreeReader` | `index.cee` | done, except the integer batch-count fast paths, which belong with the executor |
@@ -95,6 +95,35 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   `connectionsTakeSqlOfAnyBytes`). A file name for ATTACH or VACUUM INTO that is not UTF-8 is refused with
   SQLite's "unable to open database: …", as macOS's file system makes sqlite3 refuse it
   (`fileNamesThatAreNotUtf8AreRefused`); on Linux SQLite would make such a file.
+- **UTF-16 databases.** The C# translated a UTF-16 database's text to .NET strings on reading, but wrote text
+  into its records as UTF-8 (so sqlite3 then read `wörld` as `썷状摬`), kept its indexes in UTF-8 order, and showed
+  UTF-8 wherever text met bytes. SQLite holds text in the database's encoding, and that shows; here text is held as
+  UTF-8 and translated where SQLite would see the encoding (`src/textenc.cee`):
+  - records hold text in UTF-16, translated as sqlite3VdbeMemTranslate does (READ_UTF8: bytes that are not UTF-8,
+    overlong forms, U+FFFE and U+FFFF become U+FFFD), sqlite_schema's names and SQL included;
+  - BINARY compares the encoding's bytes: in UTF-16LE `'Ā' < 'a'` (00 01 against 61 00), and in UTF-16BE a
+    character above U+FFFF sorts before U+E000..U+FFFF; so do indexes (seeks in sqlite3's, entries written here),
+    ORDER BY, GROUP BY, comparisons, min() and max(), window orders and compound ORDER BY. NOCASE and RTRIM exist
+    in UTF-8 only in SQLite, so they compare the translation, as before;
+  - text becomes a blob as the encoding's bytes: CAST(text AS BLOB), CAST of a number AS BLOB, hex() of text (of
+    a number it stays UTF-8, as SQLite's sqlite3_value_blob gives), octet_length() of text and of numbers; so
+    `length(CAST(t AS BLOB))`, substr() and instr() of such blobs count UTF-16 bytes;
+  - a blob is read as text in the encoding: CAST(blob AS TEXT) (and AS a number), `||`, group_concat(), and every
+    function that reads text (upper(), trim(), replace(), unicode(), LIKE, printf('%s'), …); length(), quote(),
+    substr(), typeof() and the functions that pass a value on keep the blob, and instr() of two blobs compares
+    bytes;
+  - ATTACH of a database in another encoding is refused, as in SQLite.
+  (`utf16TextMeetsBytesAsInSqlite`, `utf16DatabasesAreWrittenInTheirEncoding`, on UTF-16le and UTF-16be fixtures
+  made by sqlite3.) What still differs, because the engine holds text as UTF-8: SQLite never translates text it
+  read from a record, so an odd last byte and a high surrogate followed by a unit that is not its pair keep their
+  bytes there (hex() shows them, and an UPDATE of another column writes them back), where here they are dropped or
+  paired on reading; a lone surrogate read from a record is kept (ED A0 80 here, and written back as D800), but
+  text made in UTF-8 with such bytes (`char(0xd800)`) is written as the surrogate where SQLite writes U+FFFD;
+  `x'00' || 'a'` concatenates bytes in SQLite (and drops an odd byte) where here each side is translated first;
+  arithmetic on a blob (`x'3100' + 1`) reads its bytes as UTF-8. A new database is always UTF-8 here (PRAGMA
+  encoding cannot set it), so a TEMP or newly attached database of a UTF-16 session is UTF-8 where SQLite would
+  make it UTF-16; VACUUM of a UTF-16 database is still refused (sqlite3 on macOS reserves 12 bytes per page in the
+  files it makes, which VACUUM here refuses anyway, so it cannot be tested).
 - **Names in messages and definitions.** A name the shell's tests met while checking the above: a CREATE TABLE,
   VIEW or TRIGGER of a name in use says `table "t" already exists` with the name as written (SQLite's `%T`); a CHECK
   constraint's failure names it by its CONSTRAINT name, else by its text dequoted as sqlite3Dequote does

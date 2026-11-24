@@ -598,7 +598,7 @@ struct IndexMutator {
         while (low < high) {
             let middle = low + (high - low) / 2;
             let there = IndexMutator.entryAt(pager, page, header.cellOffset(page, middle)? + lead)?;
-            let c = order.comparePrefix(there.view(), entry);
+            let c = order.comparePrefixIn(there.view(), entry, pager.textEncoding);
             if (c == 0 && there.length == entry.length) {
                 equal = true;
                 return Ok(middle);
@@ -755,7 +755,7 @@ struct IndexMutator {
                 }
                 continue;
             }
-            let record = Record.encode(entry)?;
+            let record = Record.encodeIn(entry, pager.textEncoding)?;
             if (IndexMutator.insert(pager, root, entry, record.view(), order, 0)? is Some(split)) {
                 // The root split: its left half moves to a new page, and the root becomes their parent.
                 let left = pager.allocatePage()?;

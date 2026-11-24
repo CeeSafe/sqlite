@@ -3267,7 +3267,7 @@ fn evaluateWithSubtype(
         XExpr.Cast(operand, affinity) => {
             let v = evaluateWithSubtype(operand, frame, db)?;
             let json = v.json;
-            return Ok(JsonValue { value: castValue(v.value, affinity)?, json: json });
+            return Ok(JsonValue { value: castValue(v.value, affinity, db.textEncoding())?, json: json });
         }
         XExpr.Case(c) => {
             match (chooseCase(c, frame, db)?) {
@@ -3343,7 +3343,12 @@ fn callWithSubtype(
                 if (k == 0) {
                     continue;
                 }
-                let c = compareValues(borrow values[best].value, borrow values[k].value, call.collation);
+                let c = compareValuesIn(
+                    borrow values[best].value,
+                    borrow values[k].value,
+                    call.collation,
+                    db.textEncoding(),
+                );
                 if ((call.function == ScalarFunction.Min && c >= 0) || (call.function == ScalarFunction.Max && c < 0)) {
                     best = k;
                 }

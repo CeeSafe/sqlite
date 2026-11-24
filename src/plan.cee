@@ -1726,11 +1726,11 @@ fn seekRangesOf(
         let collation = seek.order.collations[at];
         let descending = seek.order.descending[at];
         kept.sortBy((a, b) => {
-            let c = compareValues(a, b, collation);
+            let c = compareValuesIn(a, b, collation, db.textEncoding());
             return if (descending) 0 - c else c;
         });
         for (i in 0..kept.length) {
-            if (i > 0 && compareValues(borrow kept[i], borrow kept[i - 1], collation) == 0) {
+            if (i > 0 && compareValuesIn(borrow kept[i], borrow kept[i - 1], collation, db.textEncoding()) == 0) {
                 continue;
             }
             let one: SqliteValue? = kept[i].clone()?;

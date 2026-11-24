@@ -108,11 +108,16 @@ struct Record {
 
     /// Encodes a row. Each value gets the smallest serial type that holds it exactly, as SQLite chooses. Text is
     /// written as UTF-8.
-    fn encode(columns: Slice<SqliteValue>) -> Result<Vector<u8>, SqliteError> {
+    fn encode(columns: Slice<SqliteValue>) -> Result<Vector<u8>, SqliteError> =>
+        Record.encodeIn(columns, TextEncoding.Utf8);
+
+    /// Encodes a row for a database whose text is in `encoding`: text in UTF-16 there, translated as
+    /// sqlite3VdbeMemTranslate translates (textenc.cee). The C# wrote UTF-8 into a UTF-16 database's records.
+    fn encodeIn(columns: Slice<SqliteValue>, encoding: TextEncoding) -> Result<Vector<u8>, SqliteError> {
         var serialBytes: usize = 0;
         var bodyLength: usize = 0;
         for (i in 0..columns.length) {
-            let st = Record.serialTypeOf(columns[i]);
+            let st = Record.serialTypeIn(columns[i], encoding);
             serialBytes += Varint.length(st);
             bodyLength += Record.serialTypeSize(st);
         }
@@ -126,7 +131,7 @@ struct Record {
         var record = Vector<u8>.withCapacity(headerLength + bodyLength)?;
         Varint.append(truncate<i64>(headerLength), mut record)?;
         for (i in 0..columns.length) {
-            Varint.append(Record.serialTypeOf(columns[i]), mut record)?;
+            Varint.append(Record.serialTypeIn(columns[i], encoding), mut record)?;
         }
         for (i in 0..columns.length) {
             match (borrow columns[i]) {
@@ -139,7 +144,13 @@ struct Record {
                     )?;
                 }
                 SqliteValue.Real(r) => { Record.appendIntBE(mut record, r.bits(), 8)?; }
-                SqliteValue.Text(s) => { record.extend(s.view().bytes())?; }
+                SqliteValue.Text(s) => {
+                    if (encoding == TextEncoding.Utf8) {
+                        record.extend(s.view().bytes())?;
+                    } else {
+                        record.extend(encodedText(s.bytes(), encoding)?.view())?;
+                    }
+                }
                 SqliteValue.Blob(b) => { record.extend(b.view())?; }
             }
         }
@@ -170,6 +181,12 @@ struct Record {
         }
         return 6;
     }
+
+    /// `serialTypeOf` for a database whose text is in `encoding`.
+    fn serialTypeIn(value: borrow SqliteValue, encoding: TextEncoding) -> i64 => match (value) {
+        SqliteValue.Text(s) => truncate<i64>(encodedLength(s.bytes(), encoding)) * 2 + 13,
+        other => Record.serialTypeOf(other),
+    };
 
     fn serialTypeOf(value: borrow SqliteValue) -> i64 => match (value) {
         SqliteValue.Null => 0,

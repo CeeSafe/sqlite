@@ -34,7 +34,7 @@ fn addSchemaRow(
     values.push(if (sql is Some(s)) SqliteValue.sqlText(s)? else SqliteValue.Null)?;
     let rowId = (lastRowid(mut db.pager, 1)? ?? 0) + 1;
     var op = Vector<TableOp>.create();
-    op.push(TableOp { rowId: rowId, record: Record.encode(values.view())? })?;
+    op.push(TableOp { rowId: rowId, record: Record.encodeIn(values.view(), db.pager.textEncoding)? })?;
     TableMutator.applyBatch(mut db.pager, 1, op.view())?;
     return Ok();
 }

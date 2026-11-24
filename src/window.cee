@@ -126,16 +126,35 @@ fn sameKeys(a: Slice<SqliteValue>, b: Slice<SqliteValue>, collations: Slice<Coll
     return true;
 }
 
-fn compareWindowRows(spec: borrow WindowSpec, a: borrow WindowInput, b: borrow WindowInput) -> i32 {
+fn compareWindowRows(
+    spec: borrow WindowSpec,
+    a: borrow WindowInput,
+    b: borrow WindowInput,
+    encoding: TextEncoding,
+) -> i32 {
     for (k in 0..a.partition.length) {
-        let c = compareForOrder(borrow a.partition[k], borrow b.partition[k], spec.partitionCollations[k], false, true);
+        let c = compareForOrder(
+            borrow a.partition[k],
+            borrow b.partition[k],
+            spec.partitionCollations[k],
+            false,
+            true,
+            encoding,
+        );
         if (c != 0) {
             return c;
         }
     }
     for (k in 0..a.order.length) {
         let t = borrow spec.orderBy[k];
-        let c = compareForOrder(borrow a.order[k], borrow b.order[k], t.collation, t.descending, t.nullsFirst);
+        let c = compareForOrder(
+            borrow a.order[k],
+            borrow b.order[k],
+            t.collation,
+            t.descending,
+            t.nullsFirst,
+            encoding,
+        );
         if (c != 0) {
             return c;
         }
@@ -157,7 +176,10 @@ fn computeWindow(
     for (r in 0..rows.length) {
         order.push(r)?;
     }
-    order.sortStableBy((a, b) => compareWindowRows(spec, borrow rows[a].inputs[w], borrow rows[b].inputs[w]));
+    let encoding = db.textEncoding();
+    order.sortStableBy(
+        (a, b) => compareWindowRows(spec, borrow rows[a].inputs[w], borrow rows[b].inputs[w], encoding),
+    );
     let offsets = frameOffsets(spec, frame, db)?;
     var collations = Vector<Collation>.withCapacity(spec.orderBy.length)?;
     for (k in 0..spec.orderBy.length) {
@@ -398,6 +420,7 @@ fn computePartition(
             peerEnd.view(),
             group.view(),
             groupStarts.view(),
+            db.textEncoding(),
         )?;
         hi = frameEdge(
             endKind,
@@ -413,6 +436,7 @@ fn computePartition(
             peerEnd.view(),
             group.view(),
             groupStarts.view(),
+            db.textEncoding(),
         )?;
         lo = lo.max(0);
         hi = hi.min(truncate<i64>(m) - 1);
@@ -528,6 +552,7 @@ fn frameEdge(
     peerEnd: Slice<usize>,
     group: Slice<usize>,
     groupStarts: Slice<usize>,
+    encoding: TextEncoding,
 ) -> Result<i64, SqliteError> {
     let m = truncate<i64>(members.length);
     let i = truncate<usize>(at);
@@ -586,6 +611,7 @@ fn frameEdge(
                             term.collation,
                             term.descending,
                             term.nullsFirst,
+                            encoding,
                         ) >= 0) {
                             return Ok(j);
                         }
@@ -605,6 +631,7 @@ fn frameEdge(
                         term.collation,
                         term.descending,
                         term.nullsFirst,
+                        encoding,
                     ) <= 0) {
                         return Ok(j);
                     }

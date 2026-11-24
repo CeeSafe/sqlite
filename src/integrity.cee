@@ -1277,7 +1277,7 @@ fn checkTableRows(
                 key.push(frame.slots[writer.slot].values[writer.primaryKey.columns[k]].clone()?)?;
             }
             if (borrow previous is Some(p)) {
-                if (writer.primaryKey.order.comparePrefix(key.view(), p.view()) <= 0) {
+                if (writer.primaryKey.order.comparePrefixIn(key.view(), p.view(), db.textEncoding()) <= 0) {
                     var text = String.from("row not in PRIMARY KEY order for ")?;
                     text.append(tableName)?;
                     if (verdict.emit(text.view())?) {

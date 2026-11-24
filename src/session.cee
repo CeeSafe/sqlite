@@ -682,6 +682,16 @@ impl Session {
         });
     }
 
+    /// The text encoding of main, which every database of the session shares, as in SQLite (ENC(db)).
+    fn textEncoding(borrow this) -> TextEncoding {
+        if (this.active != 0 && this.stash.length != 0) {
+            if (borrow this.stash[0] is Some(state)) {
+                return state.pager.textEncoding;
+            }
+        }
+        return this.pager.textEncoding;
+    }
+
     fn pagerOf(borrow mut this, i: usize) -> borrow mut WritablePager {
         if (i != this.active && i < this.stash.length) {
             if (borrow mut this.stash[i] is Some(state)) {
@@ -962,6 +972,10 @@ impl Session {
             shown = String.create();
         }
         let state = openDatabaseState(path.view(), this.busyTimeout)?;
+        // As in SQLite, every database of a connection has main's text encoding (an empty file takes it).
+        if (state.pager.pageCount != 0 && state.pager.textEncoding != this.textEncoding()) {
+            return Err(sqlError("attached databases must use the same text encoding as main database"));
+        }
         this.attachState(name, path.view(), state)?;
         let at = this.databasePaths.length - 1;
         this.databaseShownPaths.push(shown)?;

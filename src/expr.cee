@@ -263,7 +263,7 @@ fn evaluate(expr: borrow XExpr, frame: borrow mut Frame, db: borrow mut Session)
         XExpr.Concat(left, right) => {
             let a = evaluate(left, frame, db)?;
             let b = evaluate(right, frame, db)?;
-            return Ok(concatenate(borrow a, borrow b)?);
+            return Ok(concatenate(borrow a, borrow b, db.textEncoding())?);
         }
         XExpr.JsonGet(left, right, asSql) => {
             let a = evaluate(left, frame, db)?;
@@ -302,8 +302,22 @@ fn evaluate(expr: borrow XExpr, frame: borrow mut Frame, db: borrow mut Session)
             let x = evaluate(borrow b.operand, frame, db)?;
             let low = evaluate(borrow b.low, frame, db)?;
             let high = evaluate(borrow b.high, frame, db)?;
-            let ge = compareOp(CompareOp.GreaterOrEqual, borrow x, borrow low, b.lowAffinity, b.lowCollation)?;
-            let le = compareOp(CompareOp.LessOrEqual, borrow x, borrow high, b.highAffinity, b.highCollation)?;
+            let ge = compareOp(
+                CompareOp.GreaterOrEqual,
+                borrow x,
+                borrow low,
+                b.lowAffinity,
+                b.lowCollation,
+                db.textEncoding(),
+            )?;
+            let le = compareOp(
+                CompareOp.LessOrEqual,
+                borrow x,
+                borrow high,
+                b.highAffinity,
+                b.highCollation,
+                db.textEncoding(),
+            )?;
             // x BETWEEN a AND b is (x >= a) AND (x <= b).
             var result: bool? = null;
             if (ge == Some(false) || le == Some(false)) {
@@ -334,7 +348,7 @@ fn evaluate(expr: borrow XExpr, frame: borrow mut Frame, db: borrow mut Session)
         }
         XExpr.Cast(operand, affinity) => {
             let v = evaluate(operand, frame, db)?;
-            return Ok(castValue(v, affinity)?);
+            return Ok(castValue(v, affinity, db.textEncoding())?);
         }
         XExpr.Call(call) => { return callFunction(call, frame, db); }
         XExpr.Aggregate(n) => { return Ok(frame.aggregates[n].clone()?); }
@@ -382,7 +396,14 @@ fn chooseCase(c: borrow XCase, frame: borrow mut Frame, db: borrow mut Session) 
         for (k in 0..c.branches.length) {
             let branch = borrow c.branches[k];
             let w = evaluate(borrow branch.when, frame, db)?;
-            if (compareOp(CompareOp.Equal, borrow x, borrow w, branch.affinity, branch.collation)? == Some(true)) {
+            if (compareOp(
+                CompareOp.Equal,
+                borrow x,
+                borrow w,
+                branch.affinity,
+                branch.collation,
+                db.textEncoding(),
+            )? == Some(true)) {
                 return Ok(CaseChoice.Branch(k));
             }
         }
@@ -404,6 +425,7 @@ fn compareOp(
     right: borrow SqliteValue,
     affinity: ExprAffinity,
     collation: Collation,
+    encoding: TextEncoding,
 ) -> Result<bool?, SqliteError> {
     if (left.isNull() || right.isNull()) {
         return match (op) {
@@ -412,7 +434,7 @@ fn compareOp(
             _ => Ok(null),
         };
     }
-    let c = compareWithAffinity(left, right, affinity, collation)?;
+    let c = compareWithAffinity(left, right, affinity, collation, encoding)?;
     return Ok(match (op) {
         CompareOp.Equal | CompareOp.Is => c == 0,
         CompareOp.NotEqual | CompareOp.IsNot => c != 0,
@@ -433,7 +455,7 @@ fn evaluateCompare(
     }
     let a = evaluate(borrow c.left, frame, db)?;
     let b = evaluate(borrow c.right, frame, db)?;
-    return Ok(boolValue(compareOp(c.op, borrow a, borrow b, c.affinity, c.collation)?));
+    return Ok(boolValue(compareOp(c.op, borrow a, borrow b, c.affinity, c.collation, db.textEncoding())?));
 }
 
 /// (a, b, …) op (c, d, …): element by element, as SQLite compares row values.
@@ -479,7 +501,7 @@ fn evaluateRowCompare(
             }
             return Ok(SqliteValue.Null);
         }
-        let order = compareWithAffinity(borrow a, b, c.affinity, c.collation)?;
+        let order = compareWithAffinity(borrow a, b, c.affinity, c.collation, db.textEncoding())?;
         if (order != 0) {
             return Ok(boolValue(match (c.op) {
                 CompareOp.Equal | CompareOp.Is => false,
@@ -524,7 +546,7 @@ fn evaluateIn(i: borrow XIn, frame: borrow mut Frame, db: borrow mut Session) ->
             sawNull = true;
             continue;
         }
-        if (compareWithAffinity(borrow x, borrow values[k], i.affinity, i.collation)? == 0) {
+        if (compareWithAffinity(borrow x, borrow values[k], i.affinity, i.collation, db.textEncoding())? == 0) {
             return Ok(SqliteValue.Integer(if (i.negated) 0 else 1));
         }
     }
@@ -774,7 +796,13 @@ fn evaluateRowIn(i: borrow XIn, frame: borrow mut Frame, db: borrow mut Session)
                 rowUnknown = true;
                 continue;
             }
-            if (compareWithAffinity(borrow operand[k], borrow rows[r][k], i.affinities[k], i.collations[k])? != 0) {
+            if (compareWithAffinity(
+                borrow operand[k],
+                borrow rows[r][k],
+                i.affinities[k],
+                i.collations[k],
+                db.textEncoding(),
+            )? != 0) {
                 equal = false;
                 break;
             }

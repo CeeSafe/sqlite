@@ -1,0 +1,193 @@
+// Text in a UTF-16 database. The engine holds TEXT as UTF-8 (records are translated as they are read, record.cee);
+// SQLite holds it in the database's encoding, and that shows wherever text meets bytes:
+//
+// - a record stores text in the database's encoding;
+// - BINARY compares the encoding's bytes (memcmp), so UTF-16LE orders 'Ā' (00 01) before 'a' (61 00), and in
+//   UTF-16BE a character above U+FFFF (a surrogate pair) sorts before U+E000..U+FFFF; NOCASE and RTRIM are
+//   UTF-8 only in SQLite, and compare the UTF-8 translation, as here;
+// - text becomes a blob as its encoding's bytes: CAST(text AS BLOB) and of a number, hex() of text,
+//   octet_length(), and the blob arguments of functions that read blobs;
+// - a blob becomes text by being read in the encoding: CAST(blob AS TEXT), `||`, and the functions that read
+//   text (upper(), trim(), unicode(), LIKE, printf('%s'), …).
+//
+// UTF-8 becomes UTF-16 as sqlite3VdbeMemTranslate makes it, by READ_UTF8 (bytes that are not UTF-8, overlong
+// forms, U+FFFE and U+FFFF become U+FFFD; a code point past U+10FFFF is written as WRITE_UTF16 writes it), with
+// one exception: a surrogate written in three bytes (ED A0 80..ED BF BF) becomes that unit again. Those bytes
+// are how record.cee keeps a lone surrogate read from a UTF-16 record, so text read from the file goes back
+// unchanged; SQLite, which never translated it, does the same. Text made in UTF-8 with such bytes (char(0xd800))
+// keeps the surrogate here where SQLite writes U+FFFD.
+
+/// The UTF-16 units of UTF-8 text, as a UTF-16 database holds it.
+struct Utf16Units<region r> {
+    bytes: Slice<r, u8>;
+    at: usize;
+    /// The low surrogate of a pair whose high one was given last.
+    pending: u16?;
+
+    fn of(bytes: Slice<r, u8>) -> Utf16Units<r> => Utf16Units { bytes: bytes, at: 0, pending: null };
+
+    fn next(borrow mut this) -> u16? {
+        if (replace(mut this.pending, null) is Some(low)) {
+            return low;
+        }
+        if (this.at >= this.bytes.length) {
+            return null;
+        }
+        let b = this.bytes[this.at];
+        // A surrogate written in UTF-8: the unit it stands for.
+        if (b == 0xED && this.at + 2 < this.bytes.length && (this.bytes[this.at + 1] & 0xE0) == 0xA0 &&
+            (this.bytes[this.at + 2] & 0xC0) == 0x80) {
+            let unit = 0xD000u32 | (((this.bytes[this.at + 1] & 0x3F) as u32) << 6) |
+                ((this.bytes[this.at + 2] & 0x3F) as u32);
+            this.at += 3;
+            return truncate<u16>(unit);
+        }
+        this.at += 1;
+        var code: u32 = b as u32;
+        if (b >= 0xC0) {
+            // READ_UTF8: sqlite3Utf8Trans1's bits of the first byte, then every continuation byte.
+            code =
+                if (b < 0xE0) (b - 0xC0) as u32
+                    else if (b < 0xF0) (b - 0xE0) as u32
+                    else if (b < 0xF8) (b - 0xF0) as u32
+                    else if (b < 0xFC) (b - 0xF8) as u32
+                    else if (b < 0xFE) (b - 0xFC) as u32
+                    else 0;
+            while (this.at < this.bytes.length && (this.bytes[this.at] & 0xC0) == 0x80) {
+                code = (code << 6) | ((this.bytes[this.at] & 0x3F) as u32);
+                this.at += 1;
+            }
+            if (code < 0x80 || (code & 0xFFFF_F800) == 0xD800 || (code & 0xFFFF_FFFE) == 0xFFFE) {
+                code = 0xFFFD;
+            }
+        }
+        if (code <= 0xFFFF) {
+            return truncate<u16>(code);
+        }
+        // WRITE_UTF16LE/BE, whose arithmetic this follows for a code point past U+10FFFF too.
+        let over = code.wrappingSub(0x10000);
+        let high = 0xD800u32 | (((over >> 18) & 0x03) << 8) | (((code >> 10) & 0x3F) + ((over >> 10) & 0xC0));
+        let low = 0xDC00u32 | (((code >> 8) & 0x03) << 8) | (code & 0xFF);
+        this.pending = truncate<u16>(low);
+        return truncate<u16>(high);
+    }
+}
+
+/// Text (UTF-8) as the bytes of `encoding`: itself in UTF-8.
+fn encodedText(text: Slice<u8>, encoding: TextEncoding) -> Result<Vector<u8>, AllocError> {
+    var out = Vector<u8>.withCapacity(text.length * 2)?;
+    if (encoding == TextEncoding.Utf8) {
+        out.extend(text)?;
+        return Ok(out);
+    }
+    let bigEndian = encoding == TextEncoding.Utf16BE;
+    var units = Utf16Units.of(text);
+    while (units.next() is Some(unit)) {
+        if (bigEndian) {
+            out.push(truncate<u8>(unit >> 8))?;
+            out.push(truncate<u8>(unit & 0xFF))?;
+        } else {
+            out.push(truncate<u8>(unit & 0xFF))?;
+            out.push(truncate<u8>(unit >> 8))?;
+        }
+    }
+    return Ok(out);
+}
+
+/// How many bytes `text` takes in `encoding`.
+fn encodedLength(text: Slice<u8>, encoding: TextEncoding) -> usize {
+    if (encoding == TextEncoding.Utf8) {
+        return text.length;
+    }
+    var n: usize = 0;
+    var units = Utf16Units.of(text);
+    while (units.next().isSome()) {
+        n += 2;
+    }
+    return n;
+}
+
+/// BINARY in a UTF-16 database: memcmp of the two texts' UTF-16 bytes.
+fn compareUtf16(a: Slice<u8>, b: Slice<u8>, bigEndian: bool) -> i32 {
+    var x = Utf16Units.of(a);
+    var y = Utf16Units.of(b);
+    while (true) {
+        let u = x.next();
+        let v = y.next();
+        if (u.isNull() || v.isNull()) {
+            return if (u.isNull() && v.isNull()) 0 else if (u.isNull()) -1 else 1;
+        }
+        let p = u ?? 0;
+        let q = v ?? 0;
+        if (p != q) {
+            // In little-endian order the low byte comes first.
+            let pk = if (bigEndian) p else (p << 8) | (p >> 8);
+            let qk = if (bigEndian) q else (q << 8) | (q >> 8);
+            return if (pk < qk) -1 else 1;
+        }
+    }
+    return 0;
+}
+
+/// `compareValues` in a database whose text is in `encoding`: BINARY compares text as that encoding's bytes.
+fn compareValuesIn(a: borrow SqliteValue, b: borrow SqliteValue, collation: Collation, encoding: TextEncoding) -> i32 {
+    if (encoding != TextEncoding.Utf8 && collation == Collation.Binary) {
+        if (a is SqliteValue.Text(x) && b is SqliteValue.Text(y)) {
+            return compareUtf16(x.bytes(), y.bytes(), encoding == TextEncoding.Utf16BE);
+        }
+    }
+    return compareValues(a, b, collation);
+}
+
+/// A blob read as text in `encoding` (sqlite3_value_text of a blob): its bytes translated to UTF-8, as a record's
+/// text is (an odd last byte is dropped).
+fn blobAsText(bytes: Slice<u8>, encoding: TextEncoding) -> Result<SqliteValue, AllocError> =>
+    Ok(SqliteValue.Text(decodeText(bytes, encoding)?));
+
+/// A value's text as `encoding`'s bytes (sqlite3_value_blob of text, or CAST(value AS BLOB)).
+fn textAsBlob(value: borrow SqliteValue, encoding: TextEncoding) -> Result<SqliteValue, AllocError> {
+    let text = valueText(value)?;
+    return Ok(SqliteValue.Blob(encodedText(text.bytes(), encoding)?));
+}
+
+/// The arguments of a scalar function in a UTF-16 database, as SQLite's sqlite3_value_text and
+/// sqlite3_value_blob give them: hex() reads text as the encoding's bytes, and octet_length() counts them for
+/// text and numbers; instr() of two blobs compares bytes; the functions that pass a value on (coalesce(), min(),
+/// …) or take a blob as it is (length(), quote(), substr(), typeof()) keep a blob; every other function reads a
+/// blob as text in the encoding.
+fn adaptArgumentsToEncoding(
+    function: ScalarFunction,
+    values: borrow mut Vector<SqliteValue>,
+    encoding: TextEncoding,
+) -> Result<void, AllocError> {
+    match (function) {
+        ScalarFunction.Hex => {
+            if (values[0] is SqliteValue.Text(_)) {
+                values[0] = textAsBlob(borrow values[0], encoding)?;
+            }
+            return Ok();
+        }
+        ScalarFunction.OctetLength => {
+            if (!values[0].isNull() && !(values[0] is SqliteValue.Blob(_))) {
+                values[0] = textAsBlob(borrow values[0], encoding)?;
+            }
+            return Ok();
+        }
+        ScalarFunction.Instr => {
+            if (values[0] is SqliteValue.Blob(_) && values[1] is SqliteValue.Blob(_)) {
+                return Ok();
+            }
+        }
+        ScalarFunction.Length | ScalarFunction.Quote | ScalarFunction.Substr | ScalarFunction.TypeOf | ScalarFunction.Coalesce | ScalarFunction.IfNull | ScalarFunction.NullIf | ScalarFunction.Iif | ScalarFunction.Max | ScalarFunction.Min | ScalarFunction.Likely | ScalarFunction.Unlikely | ScalarFunction.Likelihood => {
+            return Ok();
+        }
+        _ => {}
+    }
+    for (i in 0..values.length) {
+        if (borrow values[i] is SqliteValue.Blob(b)) {
+            let text = blobAsText(b.view(), encoding)?;
+            values[i] = text;
+        }
+    }
+    return Ok();
+}
