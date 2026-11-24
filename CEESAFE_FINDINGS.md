@@ -7,26 +7,26 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 
 | Finding | Status |
 |---|---|
-| 1, 20 | fixed in 0.95.0: float math methods (`exp`, `ln`, `pow`, trigonometry, `fma`, `copySign`, `scaleB`, `roundEven`, …), ADR 0218; hexadecimal float literals and `frexp` not added |
-| 2 | fixed in 0.95.0: `wrappingShl`/`wrappingShr` on signed integers (arithmetic shift), ADR 0223 |
+| 1, 20 | fixed in 0.95.0: float math methods (`exp`, `ln`, `pow`, trigonometry, `fma`, `copySign`, `scaleB`, `roundEven`, …), ADR 0218; hexadecimal float literals and `frexp` not added; workaround removed (`src/libm.cee` deleted: the math functions call the platform's libm, and match sqlite3 bit for bit) |
+| 2 | fixed in 0.95.0: `wrappingShl`/`wrappingShr` on signed integers (arithmetic shift), ADR 0223; workaround removed (`pwr10to2`/`pwr2to10` shift; `floorDivide` stays for divisions by 27, 1000, 146097) |
 | 3 | fixed in 0.95.0: byte-range advisory locks `lock`/`tryLock`/`unlock`, interoperating with sqlite3's, ADR 0220 |
 | 4 | fixed in 0.95.0: `Arc.getMut()`, ADR 0224 |
-| 5 | already there: `appendChar`/`appendUtf8` are documented |
+| 5 | already there: `appendChar`/`appendUtf8` are documented; now used (`appendAscii` is `appendUtf8` checked) |
 | 7 | diagnostic in 0.95.0: float patterns say to use a guard or `==` (ADR 0228); not added as patterns, by choice |
 | 8 | diagnostic in 0.95.0: `*b` on a box says `let inner: T = b;` (ADR 0228) |
-| 11 | fixed in 0.94.5: arrays whose elements need drop |
-| 13, 22 | fixed in 0.95.0: `v.drain()`, ADR 0224 |
-| 14 | fixed in 0.55.0 (missed by the port): `Clock.localOffset(at)`, ADR 0153 |
+| 11 | fixed in 0.94.5: arrays whose elements need drop; `CollationInfo` stays, as the snapshot taken before an operand moves into its node |
+| 13, 22 | fixed in 0.95.0: `v.drain()`, ADR 0224; workaround removed (`takeRow` gone; the recursive CTE's step is linear now) |
+| 14 | fixed in 0.55.0 (missed by the port): `Clock.localOffset(at)`, ADR 0153; workaround removed ('localtime' and 'utc' as SQLite's toLocaltime, tested under eight TZ values) |
 | 16 | fixed in 0.95.0: floats in constant arrays, ADR 0226 |
 | 17 | diagnostic in 0.95.0: N0245 shows the `static` table form (ADR 0226) |
 | 23, 30 | fixed in 0.95.0: `Thread.sleep`, `recvTimeout`, `t.isFinished()`, ADR 0222; 30's workaround removed (`pgwire` reaps its client threads, the daemon waits with `Thread.sleep`) |
 | 24 | fixed in 0.94.5: `Mutex.constant`, `OnceLock.constant`, `Vector.empty` in statics |
 | 25 | fixed by 0.94.5 |
 | 27, 29 | fixed in 0.95.0: `File.createReadWrite`, `IoError.BadDescriptor`, `Console.isTerminal`, ADR 0221; 29's workaround removed (`cli` prompts at a terminal) |
-| 28, 33 | fixed in 0.95.0: `borrow` of a value lent to its statement; a field moved out of `e?.f`/`e!.f`, ADR 0227 |
+| 28, 33 | fixed in 0.95.0: `borrow` of a value lent to its statement; a field moved out of `e?.f`/`e!.f`, ADR 0227; 33's site was since rewritten (`let Some(choice) = … else`) |
 | 31 | diagnostic in 0.95.0: N0245 names a region parameter for a result holding a reference (ADR 0228); workaround removed (`Cursor.skip` returns the slice) |
-| 32 | fixed in 0.95.0: `sortStableBy`, ADR 0225 |
-| 34 | fixed in 0.95.0 for an expected slice or number (ADR 0226); `let a = [1, 2];` stays `i32`, as `let x = 1;` does |
+| 32 | fixed in 0.95.0: `sortStableBy`, ADR 0225; workaround removed (every ORDER BY sort, the compound one included, which was unstable) |
+| 34 | fixed in 0.95.0 for an expected slice or number (ADR 0226); `let a = [1, 2];` stays `i32`, as `let x = 1;` does; `logEst`'s tables are typed `[i64; N]` |
 | 9, 10, 12, 18, 21 | by design: closures are typed where a function type is expected; reserved words, now named as such in the error; references are not re-pointed; ranges are half-open (ADR 0085) |
 | 6, 15, 19, 26 | open: two interfaces sharing a method name, file-private names, byte-string text, shared memory mappings |
 | 35 | open: found while fixing these (below) |
