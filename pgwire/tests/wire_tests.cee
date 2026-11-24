@@ -417,6 +417,24 @@ fn simpleQueries() -> Result<void, TestFailure> {
 }
 
 @test
+fn textThatIsNotUtf8IsSentAsUtf8() -> Result<void, TestFailure> {
+    // client_encoding is UTF8: SQLite's text of other bytes is sent with U+FFFD for each maximal ill-formed
+    // subpart (ED A0 80, a surrogate, is three), and as bytea, the bytes exactly.
+    let running = startServer("bytes", null);
+    var client = Client.connect(running.port);
+    Check.equalText("R 0\nZ I\n", client.logIn("u", "bytes", "").view())?;
+    Check.equalText("""
+        T a:25 b:17 c:25 d:25
+        D A�B|\x41ff42|���|é
+        C SELECT 1
+        Z I
+
+        """, client.query("SELECT CAST(x'41ff42' AS TEXT) AS a, CAST(x'41ff42' AS BLOB) AS b, char(0xd800) AS c, 'é' AS d").view())?;
+    client.terminate();
+    return stopServer(running);
+}
+
+@test
 fn columnTypesComeFromEveryRow() -> Result<void, TestFailure> {
     // The C# typed a column by its first row: bigint here, and then sent 'a' as a bigint.
     let running = startServer("types", null);

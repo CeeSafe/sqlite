@@ -177,7 +177,9 @@ fn appendFloat8(out: borrow mut Vector<u8>, f: f64) -> Result<void, AllocError> 
 
 /// `value` in the text format, for a column announced as `oid`: integers in decimal, reals as float8out writes
 /// them in a double precision column and as SQLite writes them as text in a text column, blobs as bytea's hex
-/// (`\x0aff`), text as it is.
+/// (`\x0aff`), text as it is when it is UTF-8. The session's client_encoding is UTF8, which a client may rely on,
+/// so text whose bytes are not UTF-8 (SQLite keeps any bytes) is sent with U+FFFD for each maximal ill-formed
+/// subpart; `CAST(x AS BLOB)` sends the bytes exactly, as bytea.
 fn appendText(out: borrow mut Vector<u8>, value: borrow SqliteValue, oid: u32) -> Result<void, AllocError> {
     match (value) {
         SqliteValue.Null => {}
@@ -191,10 +193,18 @@ fn appendText(out: borrow mut Vector<u8>, value: borrow SqliteValue, oid: u32) -
                 appendFloat8(mut out, r)?;
             } else {
                 let text = value.toText()?;
-                out.extend(text.view().bytes())?;
+                out.extend(text.bytes())?;
             }
         }
-        SqliteValue.Text(s) => { out.extend(s.view().bytes())?; }
+        SqliteValue.Text(s) => {
+            match (s.toUtf8()) {
+                Some(text) => { out.extend(text.bytes())?; }
+                null => {
+                    let text = s.toUtf8Lossy()?;
+                    out.extend(text.view().bytes())?;
+                }
+            }
+        }
         SqliteValue.Blob(b) => {
             out.extend("\\x".bytes())?;
             for (i in 0..b.length) {
