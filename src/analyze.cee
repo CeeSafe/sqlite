@@ -123,7 +123,7 @@ fn analyzeTable(table: borrow TableSchema, only: StringView?, db: borrow mut Ses
             insert.push(SqliteValue.sqlText(table.name.view())?)?;
             var stat = String.create();
             stat.appendNumber(rows)?;
-            insert.push(SqliteValue.sqlText(stat.view())?)?;
+            insert.push(SqliteValue.sqlTextFrom(stat)?)?;
             let _ = db.runInternal("INSERT INTO sqlite_stat1 VALUES (?1, NULL, ?2)", insert.view())?;
         }
         return Ok();
@@ -165,7 +165,7 @@ fn analyzeTable(table: borrow TableSchema, only: StringView?, db: borrow mut Ses
         var insert = Vector<SqliteValue>.create();
         insert.push(SqliteValue.sqlText(table.name.view())?)?;
         insert.push(SqliteValue.sqlText(index.name.view())?)?;
-        insert.push(SqliteValue.sqlText(stat.view())?)?;
+        insert.push(SqliteValue.sqlTextFrom(stat)?)?;
         let _ = db.runInternal("INSERT INTO sqlite_stat1 VALUES (?1, ?2, ?3)", insert.view())?;
     }
     return Ok();

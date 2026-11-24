@@ -20,6 +20,8 @@ public enum SqliteError {
     Unsupported(ByteString),
     /// Another connection of the same pool holds the database (SQLITE_BUSY), and the busy timeout ran out.
     Busy(ByteString),
+    /// The database, or a file beside it, can only be read, and a statement would write it (SQLITE_READONLY).
+    ReadOnly(ByteString),
     /// RAISE(IGNORE) in a trigger: the row is skipped, and the statement goes on.
     RaiseIgnore,
 }
@@ -36,6 +38,7 @@ impl SqliteError {
         SqliteError.Constraint(m) => m.view(),
         SqliteError.Unsupported(m) => m.view(),
         SqliteError.Busy(m) => m.view(),
+        SqliteError.ReadOnly(m) => m.view(),
         SqliteError.RaiseIgnore => ByteStringView.fromText("RAISE(IGNORE)"),
     };
 
@@ -57,5 +60,8 @@ fn notADatabase(message: StringView) -> SqliteError => SqliteError.NotADatabase(
 fn sqlError(message: StringView) -> SqliteError => SqliteError.Sql(ownedMessage(message));
 
 fn unsupported(message: StringView) -> SqliteError => SqliteError.Unsupported(ownedMessage(message));
+
+/// SQLITE_READONLY's message, which SQLite gives for each of its read-only cases.
+fn readOnlyError() -> SqliteError => SqliteError.ReadOnly(ownedMessage("attempt to write a readonly database"));
 
 fn constraintError(message: StringView) -> SqliteError => SqliteError.Constraint(ownedMessage(message));

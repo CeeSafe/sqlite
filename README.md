@@ -38,8 +38,8 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Connection, transactions | `SqliteConnection`, `EngineGlue` | `session.cee` | done: statements commit on their own outside BEGIN, and a failed statement undoes only itself inside it; SAVEPOINT, RELEASE, ROLLBACK TO; OR FAIL and OR ROLLBACK; SQLite's file locks (SHARED, RESERVED, PENDING, EXCLUSIVE), hot journals rolled back, `busy_timeout`, BEGIN IMMEDIATE and EXCLUSIVE, `data_version` |
 | VACUUM, ANALYZE, REINDEX | (refused by the C#) | `vacuum.cee`, `analyze.cee` | done, with VACUUM INTO |
 | TEMP tables, ATTACH | (refused by the C#) | `session.cee` (databases), `select.cee` (names) | done: TEMP tables, views, indexes and triggers (on any database's tables), ATTACH and DETACH, schema-qualified names, SQLite's search order, `database_list` |
-| WAL | `Storage/Wal*`, `Shm*` | `wal.cee`, `walindex.cee`, `pagerw.cee`, `pragma.cee` | done: logs read (either checksum byte order) and written with SQLite's salts and checksums, damaged tails ignored as SQLite ignores them, `journal_mode` WAL and DELETE, `wal_checkpoint` (all four modes, waiting for readers as SQLite's do), `wal_autocheckpoint`; the `-shm` wal-index shared with other connections and sqlite3 as wal.c and os_unix.c share it (header copies, hash tables, read marks, checkpoint information, the `-shm` locks and DMS, recovery), so readers run beside a writer; the last connection to close checkpoints the log and removes it and the `-shm`; POSIX only (see Limits) |
-| Connection, command, transaction | `SqliteConnection`, `SqliteCommand`, `SqliteTransaction`, `EngineGlue` | `api.cee`, `params.cee` | done: `Connection` with `execute`, `query`, `scalar`, `executeScript`, `begin`/`commit`/`rollback` and `transaction(work)`; `Params` bound by SQLite's rules; results materialised (see below) |
+| WAL | `Storage/Wal*`, `Shm*` | `wal.cee`, `walindex.cee`, `pagerw.cee`, `pragma.cee` | done: logs read (either checksum byte order) and written with SQLite's salts and checksums, damaged tails ignored as SQLite ignores them, `journal_mode` WAL and DELETE, `wal_checkpoint` (all four modes, waiting for readers as SQLite's do), `wal_autocheckpoint`; the `-shm` wal-index shared with other connections and sqlite3 as wal.c and os_unix.c share it (header copies, hash tables, read marks, checkpoint information, the `-shm` locks and DMS, recovery), so readers run beside a writer; the last connection to close checkpoints the log and removes it and the `-shm`; a `-shm` that cannot be written mapped read-only or replaced by an index in memory (readonly_shm); POSIX only (see Limits) |
+| Connection, command, transaction | `SqliteConnection`, `SqliteCommand`, `SqliteTransaction`, `EngineGlue` | `api.cee`, `params.cee` | done: `Connection` with `execute`, `query`, `scalar`, `executeScript`, `begin`/`commit`/`rollback` and `transaction(work)`; `Connection.openReadOnly` (SQLITE_OPEN_READONLY), and files that can only be read opened for reading; `Params` bound by SQLite's rules; results materialised (see below) |
 | Connection pool | `SqliteConnectionPool`, `SharedStore` | `pool.cee` | done: shareable across threads (`Arc<ConnectionPool>`), connections kept apart by the file locks, rolled back on return, a full pool waited for up to the busy timeout; no `:memory:` |
 | Scripts | `SqliteScript` | `script.cee` | done: `splitScript`/`splitStatements` end statements where sqlite3_complete does |
 | PostgreSQL wire front end, daemon, CLI | `CosmoNova.Engine.Sqlite.PgWire`, `CosmoSqliteD`, `.Cli` | `pgwire/`, `daemon/`, `cli/` (packages of their own) | done: a sqlite3-like shell (prompts at a terminal, list, csv, line and column modes, `.headers`, `.tables`, `.schema`, `.read`, `.bail`, sqlite3's error messages and exit status), and a PostgreSQL protocol 3.0 server (simple and extended query, binary formats, portal suspension, cleartext password or trust) with a pool per database; see "Front ends" |
@@ -618,7 +618,12 @@ lease.get().execute(…)?;
 
 Choices where the C# concept does not fit CeeSafe:
 
-- **Errors** are `Result<T, SqliteError>`; `SqliteError.Busy` is new, for "database is locked".
+- **Errors** are `Result<T, SqliteError>`; `SqliteError.Busy` is new, for "database is locked", and
+  `SqliteError.ReadOnly` for "attempt to write a readonly database" (SQLITE_READONLY).
+- **Read-only connections.** `Connection.openReadOnly(path)` opens as SQLITE_OPEN_READONLY (`sqlite3 -readonly`):
+  the file must exist, statements that would write are refused, BEGIN IMMEDIATE and EXCLUSIVE are read
+  transactions, TEMP tables are the connection's own. `Connection.open` opens a file it may not write so too, as
+  unixOpen falls back to reading.
 - **Lifetimes.** There is no IDisposable: a `Connection` closes when it is dropped (rolling back), and `close()`
   says whether that rollback worked. A `PooledConnection` gives its connection back when dropped.
   `transaction(work)` takes a function rather than handing out a transaction object, so a transaction cannot
@@ -784,24 +789,33 @@ Collations other than BINARY, NOCASE and RTRIM are refused.
   expressions and generated columns, as SQLite refuses them.
 
 - **Sharing a file.** In rollback-journal mode the engine takes SQLite's locks as os_unix.c does, so it shares a
-  database with sqlite3 and other processes (and its own connections) as SQLite connections share one. What
-  differs: the RESERVED byte is tested for a hot journal by taking it for a moment (CeeSafe offers no `F_GETLK`),
-  so another connection's RESERVED attempt in that instant fails once and goes to its busy handler; locks are
-  converted in place (shared to exclusive on the SHARED range), which POSIX allows and Windows' `LockFileEx` does
+  database with sqlite3 and other processes (and its own connections) as SQLite connections share one; the RESERVED
+  byte is tested for a hot journal without taking it (`File.testLock`, F_GETLK), so no other connection's lock
+  attempt is turned away by the test (`locksTheHotJournalCheckTakesNoLock`). What differs: locks are converted in
+  place (shared to exclusive on the SHARED range, atomically), which POSIX allows and Windows' `LockFileEx` does
   not, so on Windows the engine does not yet follow os_win.c's scheme; a file system without byte-range locks (some
   network mounts) is not detected.
 - **WAL mode.** The wal-index is shared as wal.c and os_unix.c share it (walindex.cee), with fcntl locks on the
-  `-shm`'s bytes, so readers run beside a writer, this engine's and sqlite3's alike (`shm*` tests). What differs:
-  the DMS byte is tested by trying its exclusive lock rather than with `F_GETLK` (CEESAFE_FINDINGS.md finding 36),
-  as the hot-journal test is; the index is mapped read-write only, so a database whose `-shm` cannot be written
-  is refused where SQLite would fall back to `readonly_shm` or heap memory (finding 37); a new log's salts are
+  `-shm`'s bytes, so readers run beside a writer, this engine's and sqlite3's alike (`shm*` tests); the DMS byte is
+  tested with `F_GETLK` as unixLockSharedMemory tests it. A `-shm` or log this process may not write is opened for
+  reading, as SQLite's readonly_shm: while a connection that can write holds the DMS byte the index is mapped for
+  reading (PROT_READ) and read marks it set are used, else the index is rebuilt from the log in the connection's
+  memory and checked at each transaction as walBeginShmUnreliable checks it (`readOnly*` tests, against sqlite3
+  on chmod'ed files and `sqlite3 -readonly`). What differs: a new log's salts are
   always the old header's salt-1 plus one and a new salt-2 (or random), where SQLite reuses the index's salts after
   a restart (either way no old frame can pass for a new one); the index is in the host's byte order, as SQLite's,
   and every host CeeSafe builds for is little-endian; another process that shortens the `-shm` while this engine
-  maps it ends the program with SIGBUS (finding 37), as it would SQLite. The locking is POSIX-only: on Windows
+  maps it ends the program with SIGBUS, as it would SQLite (ADR 0235 keeps it a signal: SQLite shortens the file only
+  under the DMS byte's exclusive lock, which no connection mapping it allows). The locking is POSIX-only: on Windows
   (os_win.c's scheme is not ported) WAL mode is refused with `Unsupported`, in a build for
   Windows (`cfg("target.windows")`). The read-only `DatabaseReader` takes no locks: it reads the log as it finds it, rebuilding its own
   index of the frames.
+- **Read-only databases.** An empty file that can only be read is refused with "attempt to write a readonly
+  database", where SQLite reads it as an empty database. Leaving WAL mode on a database that can only be read is
+  refused with the same message, where sqlite3 answers "disk I/O error" (the write lock it tries on a file open for
+  reading fails with EBADF) or, while another connection holds the file, "database is locked". `file:` URIs, and
+  with them `?mode=ro` and `?readonly_shm=1`, are not taken: `Connection.openReadOnly` is SQLITE_OPEN_READONLY, and
+  a `-shm` is read-only when this process may not write it.
 - **Journal modes.** WAL and DELETE only: TRUNCATE, PERSIST, MEMORY and OFF are taken as DELETE, and
   `PRAGMA journal_mode` then answers `delete`. Leaving WAL mode writes the header's format numbers 1 and 1 and
   removes the log, as SQLite does.

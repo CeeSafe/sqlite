@@ -114,6 +114,15 @@ impl SqliteValue {
     /// A text value of the bytes `text`, SQL text in the engine's form, stands for: a string literal's value, a
     /// name or a definition.
     fn sqlText(text: StringView) -> Result<SqliteValue, AllocError> => Ok(SqliteValue.Text(sqlBytes(text)?));
+
+    /// `sqlText` of text built in a `String`: its bytes become the value's without a copy (ADR 0236), unless it
+    /// holds an escape, whose byte is written instead.
+    fn sqlTextFrom(text: String) -> Result<SqliteValue, AllocError> {
+        if (hasEscapes(text.view())) {
+            return SqliteValue.sqlText(text.view());
+        }
+        return Ok(SqliteValue.Text(ByteString.fromString(text)));
+    }
 }
 
 /// Result column names, made in the engine's form, as the bytes they stand for.

@@ -1,9 +1,9 @@
 # CeeSafe findings
 
 Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed in CeeSafe later. Compiler:
-`ceesafec 0.93.7`. Each entry says what was needed, what happened, and the workaround used in this package.
+`ceesafec 0.93.7` when the port began, `0.95.5` now. Each entry says what was needed, what happened, and the workaround used in this package.
 
-## Status (ceesafec 0.95.2)
+## Status (ceesafec 0.95.5)
 
 | Finding | Status |
 |---|---|
@@ -33,10 +33,11 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 19 | fixed in 0.95.2: `ByteString`/`ByteStringView` in lib/core, any bytes kept as they are, with `toUtf8`, `toUtf8Lossy` and `chunks`, ADR 0231; workaround removed: `SqliteValue.Text` holds a `ByteString`, `textFromBytesLossy` is gone, and the text functions read bytes by SQLite's rules (README's "Text of any bytes") |
 | 26 | fixed in 0.95.2: `SharedMapping`, `f.mapShared(offset, length)`, with `readAt`/`writeAt` and 32- and 64-bit atomics, checked against a live sqlite3 `-shm`, ADR 0232; workaround removed: the `-shm` is mapped in 32 KiB blocks and kept as wal.c keeps it, with os_unix.c's fcntl locks on its bytes (`src/walindex.cee`), and the turns are gone: a connection in WAL mode holds SHARED on the database file while it has it open, readers take read marks beside the writer, in this engine and with a running sqlite3, both ways (`tests/shm_tests.cee`); what is still missing (finding 37) is worked around or refused, and README.md's Limits say how |
 | 35 | fixed in 0.95.2: a `Thread<void>` in a generic signature is checked as a return type, no longer N0226; workaround removed (`pgwire`'s client threads are `Thread<void>`) |
-| 36 | open: found while removing the workarounds for 3, 23, 24 and 27 (below) |
-| 37 | open: found with 26's fix (below); met by the `-shm` port: no 16-bit atomics either (the hash slots are reached through the aligned 32-bit word holding two) |
+| 36 | fixed in 0.95.5: `f.testLock(kind, start, length)` (F_GETLK, takes nothing) and conversion of a held lock in place made part of the contract on POSIX, atomic, ADR 0234; workaround removed: the hot-journal check tests RESERVED as unixCheckReservedLock does (`WritablePager.tryStart`), and the `-shm`'s DMS byte is tested as unixLockSharedMemory tests it (`SharedWal.open`); `locksTheHotJournalCheckTakesNoLock` shows a sqlite3 taking RESERVED 400 times beside the check without a refusal (with `tryLock` and `unlock` some were "database is locked"); the conversions (SHARED to EXCLUSIVE and back, the DMS byte) were already in place and are now in the contract |
+| 37 | fixed in 0.95.5: `SharedMapping.load16`/`store16`/`compareExchange16`/`fetchAdd16` and `f.mapSharedReadOnly` (`ReadOnlyMapping`), ADR 0235; SIGBUS on a shortened file stays a signal, by decision (ADR 0235 §2.3, as SQLite has it); workaround removed: hash slots are loaded and stored as 16-bit atomics (`findInBlock`, `writeBlock`), and a `-shm` this process may not write is mapped read-only beside a connection that can write it, or replaced by an index rebuilt in memory when none does (SQLite's readonly_shm and heap-memory index, `src/walindex.cee`; `readOnly*` tests); `Connection.openReadOnly` is SQLITE_OPEN_READONLY |
 | 38 | open: found with 19's fix (below) |
-| 39 | open: found while removing 19's workaround (below) |
+| 39 | fixed in 0.95.5: `s.intoBytes()`, `String.fromUtf8(v)`, `ByteString.fromString(s)`, `b.intoString()`, and `ceesafec doc NAME` for a lib/core name, ADR 0236; workaround removed: text built in a `String` becomes TEXT without a copy (`SqliteValue.sqlTextFrom`: CURRENT_TIMESTAMP, ALTER TABLE's edited SQL, ANALYZE's statistics; a real's text in `valueText`), and ASCII case changes give their bytes to a `String` (`asciiLower`, `asciiUpper`) |
+| 42, 43, 44 | open: found while adopting 0.95.5 (below) |
 | 41 | open: found while making SQL text bytes (below) |
 | 40 | misreported: `cfg("target.windows")` (ADR 0179, guide/unsafe-and-c.md "Code for one system") names the system a build is for, in any code; `onWindows()` uses it, and the environment-variable check is gone |
 
@@ -344,6 +345,8 @@ Workaround: `tryLock` then `unlock` (`WritablePager.tryStart`, `src/pagerw.cee`)
 file". The `-shm`'s DMS byte, which os_unix.c tests with `F_GETLK` (unixLockSharedMemory), is tried exclusively
 and, failing that, shared (`SharedWal.open`, `src/walindex.cee`), which takes the same decision without a test.
 
+Fixed in 0.95.5 (ADR 0234): both checks use `testLock`, and the workaround is gone (status table).
+
 ### 37. A shared mapping lacks what SQLite's wal-index uses beyond reads, writes and atomics
 
 Found with finding 26's fix (ADR 0232, 0.95.2). `SharedMapping` maps a region read-write and gives copies and
@@ -363,6 +366,8 @@ Workaround: the `-shm` is opened read-write, and a database whose `-shm` cannot 
 aligned word that holds it and its neighbour, and the writer stores whole words (`findInBlock`, `writeBlock`,
 `src/walindex.cee`); nothing protects against another process shortening the file (SQLite has the same exposure).
 The DMS test uses `tryLock` (finding 36).
+
+Fixed in 0.95.5 (ADR 0235), SIGBUS aside, which stays a signal by decision; the workaround is gone (status table).
 
 ### 38. An optional borrow cannot be compared with `Some(…)`
 
@@ -384,6 +389,8 @@ lib/core type are found in its source or through the MCP server.
 Workaround: the copy (`SqliteValue.text(s.view())`), or building the bytes in a `ByteString` or `Vector<u8>` from
 the start where the text is a function's result (`concat`, `group_concat`, `printf`, `hex`, `upper`).
 
+Fixed in 0.95.5 (ADR 0236), `ceesafec doc NAME` too; the copies are gone (status table).
+
 ### 41. Text code written for `StringView` cannot take a `ByteStringView`
 
 Found while making the engine take SQL as bytes (README's "SQL text of any bytes"). The tokenizer, the parser, the
@@ -399,3 +406,29 @@ UTF-8 stands as one code point of U+10FF80..U+10FFFF, and a real one of those is
 (`src/sqltext.cee`); the API takes `ByteStringView`, and names leave as bytes where they become values or
 messages. A text-view interface implemented by both `StringView` and `ByteStringView` (or `ByteStringView`
 methods that take text, as `ByteString.append` does) would let such code be generic.
+
+### 42. `SharedMapping` and `ReadOnlyMapping` share no interface
+
+Found while adopting ADR 0235. The wal-index's blocks are mapped read-write, mapped read-only, or kept in memory
+(SQLite's heap-memory index), and the code that reads them (`load32`, `load16`, `readAt`) is the same for all three.
+The two mapping types have those methods under the same names, but no interface names them, so a function cannot
+take either; a generic `Mapping<Access>` was considered and not taken (ADR 0235 §3).
+
+Workaround: an enum of the three (`IndexBlock`, `src/walindex.cee`) whose methods match on the variant; its writes
+assert that a read-only block is never written, a check the types made at compile time before.
+
+### 43. An argument cannot read the receiver a method borrows mutably
+
+Found while writing `IndexBlock.readAt`: `into.copyFrom(v.view()[at..at + into.length])` is N0242 ("cannot use
+'into' while 'into' is mutably borrowed"): the receiver is borrowed mutably before the arguments are evaluated, so
+reading `into.length` in them is refused, though the read ends before the call. (Rust accepts this with two-phase
+borrows.)
+
+Workaround: read it into a local first (`let end = at + into.length;`).
+
+### 44. No hard link
+
+Found while testing the hot-journal check: a test opens one database file through two names, so that sqlite3 does
+not see a journal planted for this engine, and `File` has no `hardLink(existing, new)` (nor `symlink`). The test
+runs `ln` through `Process.run`. (`File.setPermissions`, which the read-only tests use, is there.)
+

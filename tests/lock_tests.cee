@@ -282,6 +282,80 @@ fn locksAJournalWhoseWriterHoldsReservedIsNotHot() -> Result<void, TestFailure> 
     return expectIntact(path);
 }
 
+/// The hot-journal check asks whether a writer holds RESERVED without taking it (unixCheckReservedLock's F_GETLK),
+/// so a sqlite3 that takes RESERVED at that moment is never turned away. This engine finds a journal that looks hot
+/// beside the file and checks for RESERVED on each of a few hundred reads in a row; it cannot play the journal back,
+/// since one sqlite3 holds SHARED throughout. A second sqlite3, inside read transactions (where SQLite's busy
+/// handler is not called), takes RESERVED 400 times meanwhile: none fails. Both shells open the file through a
+/// hard link, whose journal name differs, so the planted journal is not hot to them. When the check took RESERVED
+/// for an instant, some of those attempts were "database is locked".
+@test
+fn locksTheHotJournalCheckTakesNoLock() -> Result<void, TestFailure> {
+    let path = "out/lock-check.db";
+    let link = "out/lock-check-link.db";
+    let marker = "out/lock-check.marker";
+    let go = "out/lock-check.go";
+    let _ = File.remove(go);
+    let _ = File.remove(link);
+    let _ = File.remove(withSuffix(link, "-journal")!.view());
+    lockFixture(path, marker)?;
+    var ln = Vector<StringView>.create();
+    ln.push(path)!;
+    ln.push(link)!;
+    Check.isTrue(Process.run("ln", borrow ln)! == 0, "a hard link to the file")?;
+    var connection = Connection.open(path)!;
+    // One shell holds SHARED until told to go, so that the journal is never played back.
+    var waitForGo = String.from(".shell for i in $(seq 1 3000); do [ -f ")!;
+    waitForGo.append(go)!;
+    waitForGo.append(" ] && break; sleep 0.01; done")!;
+    let holder = sqliteInBackground(
+        link,
+        ["BEGIN", "SELECT count(*) FROM t", ".shell touch out/lock-check.marker", waitForGo.view(), "COMMIT"][..],
+    );
+    waitForFile(marker)?;
+    {
+        var journal = File.create(withSuffix(path, "-journal")!.view())!;
+        journal.write("hot?".bytes())!;
+    }
+    Check.isTrue(Journal.mayBeHot(path)!, "the journal looks hot to this engine")?;
+    var script = String.from(".timeout 10000\n")!;
+    for (i in 0..400) {
+        script.append("BEGIN; SELECT count(*) > 0 FROM t; INSERT INTO t VALUES (2); ROLLBACK;\n")!;
+    }
+    let owned = String.from(link)!;
+    let writer = Thread.spawn(move () => {
+        var arguments = Vector<StringView>.create();
+        if (arguments.push(owned.view()).isErr()) {
+            return String.from("no arguments").ok() ?? String.create();
+        }
+        return match (Process.capture("sqlite3", borrow arguments, script.view().bytes())) {
+            Ok(output) => shownText(output.stderr.view()),
+            Err(_) => String.from("sqlite3 did not run").ok() ?? String.create(),
+        };
+    })!;
+    var checks: usize = 0;
+    var unexpected = false;
+    while (!writer.isFinished()) {
+        // Each read finds the journal and checks for RESERVED: held by the writer, the journal is the writer's and
+        // the file is read; free, the journal looks hot and the read is busy, since the holder keeps EXCLUSIVE away.
+        match (rowsOfT(mut connection)) {
+            Ok(_) => {}
+            Err(SqliteError.Busy(_)) => {}
+            Err(_) => { unexpected = true; }
+        }
+        checks += 1;
+    }
+    let errors = writer.join();
+    touchFile(go);
+    Check.isTrue(holder.join() == 0, "the holder's transaction ended")?;
+    Check.isTrue(!unexpected, "reads were answered or busy")?;
+    Check.isTrue(checks >= 50, "the check ran all along")?;
+    Check.equalText("", errors.view())?;
+    let _ = File.remove(withSuffix(path, "-journal")!.view());
+    let _ = File.remove(link);
+    return expectIntact(path);
+}
+
 /// Two sessions of this engine on one file, in one process, are kept apart by the same locks: a reader sees the
 /// last commit, a second writer is refused, a writer's commit waits for readers, and a reader in a transaction
 /// that then writes while another writes fails at once rather than deadlock, as in SQLite.

@@ -61,7 +61,11 @@ public struct Session {
 
     /// `open`, waiting up to `busyTimeout` milliseconds (which also becomes PRAGMA busy_timeout) for another
     /// connection's lock on the file.
-    fn openWaiting(name: StringView, busyTimeout: i64) -> Result<Session, SqliteError> {
+    fn openWaiting(name: StringView, busyTimeout: i64) -> Result<Session, SqliteError> =>
+        Session.openWith(name, busyTimeout, false);
+
+    /// `openWaiting`, for reading only when `readOnly` (SQLITE_OPEN_READONLY).
+    fn openWith(name: StringView, busyTimeout: i64, readOnly: bool) -> Result<Session, SqliteError> {
         // `:memory:` and the empty name: a private database, a file of its own removed when the session closes.
         let isPrivate = name.length == 0 || name == ":memory:";
         var privatePath = String.create();
@@ -70,7 +74,7 @@ public struct Session {
         }
         let path = if (isPrivate) privatePath.view() else name;
         // The pager comes back in a read transaction, which ends once the schema is read.
-        var pager = WritablePager.openWaiting(path, busyTimeout)?;
+        var pager = WritablePager.openWith(path, busyTimeout, readOnly && !isPrivate)?;
         let entries = readSchemaEntries(mut pager)?;
         let catalog = SchemaCatalog.fromEntries(entries.view())?;
         pager.endTransaction()?;
@@ -338,6 +342,13 @@ public struct Session {
                 return Ok();
             }
             for (i in 0..this.databaseCount()) {
+                if (this.pagerOf(i).readOnly) {
+                    // A database that can only be read gets a read transaction (sqlite3BeginTransaction).
+                    if (this.pagerOf(i).startRead()?) {
+                        this.reloadSchemaOf(i)?;
+                    }
+                    continue;
+                }
                 if (this.pagerOf(i).startWrite(idle[i])?) {
                     this.reloadSchemaOf(i)?;
                 }
