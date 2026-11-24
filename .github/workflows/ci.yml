@@ -71,6 +71,9 @@ jobs:
             *) tar -xzf "${{ matrix.ceesafec }}" ;;
           esac
           dir=$(dirname "$(find "$PWD" -name 'ceesafec' -type f -o -name 'ceesafec.exe' -type f | head -1)")
+          # On Windows the directory goes on PATH in Windows' form: programs the tests start (sqlite3 through
+          # Python's subprocess) search PATH as Windows does, where /d/a/... names nothing.
+          if [ "$RUNNER_OS" = Windows ]; then dir=$(cygpath -w "$dir"); fi
           echo "$dir" >> "$GITHUB_PATH"
 
       - name: sqlite3 ${{ env.SQLITE_VERSION }}, sqlite.org's build
@@ -89,6 +92,7 @@ jobs:
           unzip -q -o "$zip"
           dir=$(dirname "$(find "$PWD" -name 'sqlite3' -type f -o -name 'sqlite3.exe' -type f | head -1)")
           chmod +x "$dir"/sqlite3* || true
+          if [ "$RUNNER_OS" = Windows ]; then dir=$(cygpath -w "$dir"); fi
           echo "$dir" >> "$GITHUB_PATH"
 
       - name: The C compiler (MSVC)
@@ -101,6 +105,8 @@ jobs:
         run: |
           ceesafec --version
           sqlite3 --version
+          # On Windows the tests run sqlite3 through tests/capture.py, with the python on PATH.
+          if [ "$RUNNER_OS" = Windows ]; then python -c "import shutil, sys; print(sys.version.split()[0], shutil.which('sqlite3'))"; fi
 
       - name: Check and format
         run: |

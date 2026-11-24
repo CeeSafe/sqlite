@@ -139,12 +139,25 @@ fn captureThroughPython(directory: StringView, program: StringView, arguments: b
     for (argument in arguments) {
         all.push(argument)!;
     }
-    var child = Process.spawn("python", borrow all, ChildOptions.quiet())?;
+    var child = match (Process.spawn("python", borrow all, ChildOptions.quiet())) {
+        Ok(c) => c,
+        Err(e) => {
+            // Shown under a test that fails for it.
+            Console.write("python could not be started: ");
+            Console.writeLine(e.message());
+            return Err(e);
+        }
+    };
     let status = match (child.wait()?) {
         ChildExit.Status(code) => code,
         ChildExit.Signal(number) => 128 + number,
     };
     if (status == 127) {
+        Console.write("capture.py could not start ");
+        Console.write(program);
+        Console.write(": ");
+        Console.writeBytes(wholeFileOf(errPath.view())?.view());
+        Console.writeLine("");
         return Err(IoError.NotFound);
     }
     return Ok(ProcessOutput { status: status, stdout: wholeFileOf(outPath.view())?, stderr: wholeFileOf(errPath.view())? });
