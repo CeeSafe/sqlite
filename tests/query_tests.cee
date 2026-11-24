@@ -2,7 +2,7 @@
 // them (list mode: columns joined by '|', NULL as nothing).
 
 fn listText(result: borrow QueryResult) -> String {
-    var out = String.create();
+    var out = ByteString.create();
     for (r in 0..result.rows.length) {
         let row = borrow result.rows[r];
         for (c in 0..row.length) {
@@ -12,6 +12,21 @@ fn listText(result: borrow QueryResult) -> String {
             appendValueText(mut out, borrow row[c])!;
         }
         out.append("\n")!;
+    }
+    return shownText(out.bytes());
+}
+
+/// Bytes as text, to compare answers: UTF-8 as it is, and each byte of a sequence that is not UTF-8 as `\xHH`,
+/// so that answers that differ in any byte differ here too.
+fn shownText(bytes: Slice<u8>) -> String {
+    var out = String.create();
+    var chunks = ByteStringView.fromBytes(bytes).chunks();
+    for (chunk in chunks) {
+        out.append(chunk.valid)!;
+        for (b in chunk.invalid) {
+            out.append("\\x")!;
+            out.appendHex(b as u64, 2, true)!;
+        }
     }
     return out;
 }
@@ -37,10 +52,10 @@ fn theirAnswer(path: StringView, sql: StringView) -> String {
     arguments.push(sql)!;
     let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
     if (output.status == 0) {
-        return textFromBytesLossy(output.stdout.view())!;
+        return shownText(output.stdout.view());
     }
     // "Parse error in 2nd command line argument: no such column: x" and the like.
-    let errors = textFromBytesLossy(output.stderr.view())!;
+    let errors = shownText(output.stderr.view());
     let firstLine = errors.view().splitOnce("\n") ?? TextHalves { left: errors.view(), right: "" };
     let message = match (firstLine.left.splitOnce("argument: ")) {
         Some(halves) => halves.right,
@@ -302,7 +317,7 @@ fn theirNames(path: StringView, sql: StringView) -> String {
     arguments.push(path)!;
     arguments.push(sql)!;
     let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
-    let text = textFromBytesLossy(output.stdout.view())!;
+    let text = shownText(output.stdout.view());
     let first = text.view().splitOnce("\n") ?? TextHalves { left: text.view(), right: "" };
     return String.from(first.left)!;
 }

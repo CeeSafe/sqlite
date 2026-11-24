@@ -131,8 +131,8 @@ fn readsOverflowPayloads() -> Result<void, TestFailure> {
     let first = reader.nextRow(mut cursor)!!;
     match (borrow first.columns[1]) {
         SqliteValue.Text(s) => {
-            Check.equalU64(50000, s.length as u64)?;
-            Check.isTrue(s.view()[0] == 'x' && s.view()[49999] == 'x', "the text is whole")?;
+            Check.equalU64(50000, s.length() as u64)?;
+            Check.isTrue(s.bytes()[0] == 'x' && s.bytes()[49999] == 'x', "the text is whole")?;
         }
         _ => { return Check.fail("expected text"); }
     }
@@ -142,12 +142,12 @@ fn readsOverflowPayloads() -> Result<void, TestFailure> {
     }
     let second = reader.nextRow(mut cursor)!!;
     match (borrow second.columns[1]) {
-        SqliteValue.Text(s) => { Check.equalText("small", s.view())?; }
+        SqliteValue.Text(s) => { Check.equalText("small", s.toUtf8() ?? "(not UTF-8)")?; }
         _ => { return Check.fail("expected text"); }
     }
     let third = reader.nextRow(mut cursor)!!;
     match (borrow third.columns[1]) {
-        SqliteValue.Text(s) => { Check.equalU64(4061, s.length as u64)?; }
+        SqliteValue.Text(s) => { Check.equalU64(4061, s.length() as u64)?; }
         _ => { return Check.fail("expected text"); }
     }
     Check.isTrue(reader.nextRow(mut cursor)!.isNull(), "three rows")?;
@@ -167,7 +167,7 @@ fn readsUtf16Databases() -> Result<void, TestFailure> {
     var cursor = reader.scanTable("words")!;
     let row = reader.nextRow(mut cursor)!!;
     match (borrow row.columns[0]) {
-        SqliteValue.Text(s) => { Check.equalText("héllo 😀", s.view())?; }
+        SqliteValue.Text(s) => { Check.equalText("héllo 😀", s.toUtf8() ?? "(not UTF-8)")?; }
         _ => { return Check.fail("expected text"); }
     }
     return Ok();

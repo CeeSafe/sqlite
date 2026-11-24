@@ -935,7 +935,8 @@ impl Session {
         let compiled = compiler.compile(target, this)?;
         var frame = newFrame(mut compiler, params, this)?;
         let value = evaluate(borrow compiled, mut frame, this)?;
-        let file = if (value.isNull()) String.create() else valueText(borrow value)?;
+        // A file name is UTF-8 here.
+        let file = if (value.isNull()) String.create() else valueText(borrow value)?.toUtf8Lossy()?;
         // An empty name (and :memory:) is a private database: a temporary file here, shown without a name.
         var path = file.clone()?;
         var shown = file.clone()?;

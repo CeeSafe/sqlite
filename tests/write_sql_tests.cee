@@ -168,9 +168,9 @@ fn sameSessionWith(name: StringView, scriptText: StringView, theirAux: StringVie
     var arguments = Vector<StringView>.create();
     arguments.push(theirPath.view())!;
     let output = Process.capture("sqlite3", borrow arguments, input.view().bytes())!;
-    var theirs = textFromBytesLossy(output.stdout.view())!;
+    var theirs = shownText(output.stdout.view());
     // Errors, in order, as "error: message".
-    let errors = textFromBytesLossy(output.stderr.view())!;
+    let errors = shownText(output.stderr.view());
     var errorLines = errors.view().split("\n");
     var theirErrors = String.create();
     while (errorLines.next() is Some(e)) {

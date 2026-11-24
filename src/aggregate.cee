@@ -56,7 +56,7 @@ struct SumState {
             SqliteValue.Integer(i) => SqliteValue.Integer(i),
             SqliteValue.Real(r) => SqliteValue.Real(r),
             SqliteValue.Text(s) => textWithNumericAffinity(
-                s.view().bytes(),
+                s.bytes(),
                 false,
             ) ?? SqliteValue.Real(realValue(value)),
             SqliteValue.Blob(_) => SqliteValue.Real(realValue(value)),
@@ -123,7 +123,7 @@ enum AggregateState {
     /// min() or max(): the best value so far.
     Best(SqliteValue),
     /// group_concat(): the text so far, and whether a value has been added.
-    Concat(String, bool),
+    Concat(ByteString, bool),
     /// json_group_array() and json_group_object() (json.cee): the JSON text so far, and whether a row was added.
     Json(JsonOut, bool),
 }
@@ -148,7 +148,7 @@ struct Accumulator {
                 SumState.create(),
             ),
             AggregateFunction.Min | AggregateFunction.Max => AggregateState.Best(SqliteValue.Null),
-            AggregateFunction.GroupConcat => AggregateState.Concat(String.create(), false),
+            AggregateFunction.GroupConcat => AggregateState.Concat(ByteString.create(), false),
             AggregateFunction.JsonGroupArray | AggregateFunction.JsonGroupObject | AggregateFunction.JsonbGroupArray | AggregateFunction.JsonbGroupObject =>
                 AggregateState.Json(
                     JsonOut.create(),

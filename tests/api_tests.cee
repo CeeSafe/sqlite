@@ -101,8 +101,8 @@ fn sameWithParameters(
     var arguments = Vector<StringView>.create();
     arguments.push(theirPath.view())!;
     let output = Process.capture("sqlite3", borrow arguments, input.view().bytes())!;
-    let theirs = textFromBytesLossy(output.stdout.view())!;
-    let errors = textFromBytesLossy(output.stderr.view())!;
+    let theirs = shownText(output.stdout.view());
+    let errors = shownText(output.stderr.view());
     var errorLines = errors.view().split("\n");
     var theirErrors = String.create();
     while (errorLines.next() is Some(e)) {

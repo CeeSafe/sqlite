@@ -1053,8 +1053,9 @@ fn appendTime(out: borrow mut Vector<u8>, x: borrow DateTime) -> Result<void, Al
     return Ok();
 }
 
+/// A result of bytes: strftime copies its format's other bytes as they are, UTF-8 or not.
 fn asciiText(bytes: Vector<u8>) -> Result<SqliteValue, SqliteError> =>
-    Ok(SqliteValue.Text(textFromBytesLossy(bytes.view())?));
+    Ok(SqliteValue.Text(ByteString.fromBytes(bytes)));
 
 /// The days since the most recent January 1st (0 for January 1st).
 fn daysAfterJan01(x: borrow DateTime) -> i64 {

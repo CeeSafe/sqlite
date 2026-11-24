@@ -2,7 +2,7 @@
 
 impl SqliteValue {
     /// The value as SQLite gives it as text (sqlite3_column_text, `CAST(v AS TEXT)`): NULL as the empty text, an
-    /// integer in decimal, a real as SQLite writes it (`%!.15g`: `2.0`, `0.3`, `1.0e+20`), a text as it is, and a
-    /// blob's bytes read as UTF-8, each byte of an invalid sequence replaced by U+FFFD.
-    public fn toText(borrow this) -> Result<String, AllocError> => valueText(this);
+    /// integer in decimal, a real as SQLite writes it (`%!.15g`: `2.0`, `0.3`, `1.0e+20`), a text's or a blob's
+    /// bytes as they are, UTF-8 or not (`toUtf8()` or `toUtf8Lossy()` on the result to get a `String`).
+    public fn toText(borrow this) -> Result<ByteString, AllocError> => valueText(this);
 }

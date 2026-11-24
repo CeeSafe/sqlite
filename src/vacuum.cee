@@ -23,10 +23,12 @@ fn executeVacuum(into: borrow Expr?, params: Slice<SqliteValue>, db: borrow mut 
         let SqliteValue.Text(name) = evaluate(borrow compiled, mut frame, db)? else {
             return Err(sqlError("non-text filename"));
         };
-        if (fileLength(name.view())?.isSome()) {
+        // A file name is UTF-8 here.
+        let path = name.toUtf8Lossy()?;
+        if (fileLength(path.view())?.isSome()) {
             return Err(sqlError("output file already exists"));
         }
-        target = name;
+        target = path;
     }
     if (db.pager.textEncoding() != TextEncoding.Utf8) {
         return Err(unsupported("VACUUM of a UTF-16 database is not supported yet"));
@@ -52,11 +54,11 @@ fn executeVacuum(into: borrow Expr?, params: Slice<SqliteValue>, db: borrow mut 
                 return Err(corrupt("a root page number is out of range"));
             };
             let kind = match (borrow values[0]) {
-                SqliteValue.Text(t) => t.clone()?,
+                SqliteValue.Text(t) => t.toUtf8Lossy()?,
                 _ => String.create(),
             };
             let name = match (borrow values[1]) {
-                SqliteValue.Text(t) => t.clone()?,
+                SqliteValue.Text(t) => t.toUtf8Lossy()?,
                 _ => String.create(),
             };
             var keyed = kind.view() == "index";

@@ -115,10 +115,10 @@ fn withoutTrailingSpaces(text: Slice<u8>) -> Slice<u8> {
 }
 
 /// Compares two texts under `collation`.
-fn compareText(a: StringView, b: StringView, collation: Collation) -> i32 => match (collation) {
-    Collation.Binary => compareBytes(a.bytes(), b.bytes()),
-    Collation.NoCase => compareNoCase(a.bytes(), b.bytes()),
-    Collation.RTrim => compareBytes(withoutTrailingSpaces(a.bytes()), withoutTrailingSpaces(b.bytes())),
+fn compareText(a: Slice<u8>, b: Slice<u8>, collation: Collation) -> i32 => match (collation) {
+    Collation.Binary => compareBytes(a, b),
+    Collation.NoCase => compareNoCase(a, b),
+    Collation.RTrim => compareBytes(withoutTrailingSpaces(a), withoutTrailingSpaces(b)),
 };
 
 fn storageRank(value: borrow SqliteValue) -> i32 => match (value) {
@@ -154,7 +154,7 @@ fn compareValues(a: borrow SqliteValue, b: borrow SqliteValue, collation: Collat
         }
         SqliteValue.Text(x) => {
             match (b) {
-                SqliteValue.Text(y) => { return compareText(x.view(), y.view(), collation); }
+                SqliteValue.Text(y) => { return compareText(x.bytes(), y.bytes(), collation); }
                 _ => { return 0; }
             }
         }
@@ -176,15 +176,14 @@ fn normalizeForKey(value: borrow SqliteValue, collation: Collation) -> Result<Sq
     match (collation) {
         Collation.Binary => { return value.clone(); }
         Collation.NoCase => {
-            var out = Vector<u8>.withCapacity(text.length)?;
-            for (b in text.view().bytes()) {
+            var out = Vector<u8>.withCapacity(text.length())?;
+            for (b in text.bytes()) {
                 out.push(if (b >= 'a' && b <= 'z') b - 32 else b)?;
             }
-            return Ok(SqliteValue.Text(String.from(StringView.fromUtf8(out.view())!)?));
+            return Ok(SqliteValue.Text(ByteString.fromBytes(out)));
         }
         Collation.RTrim => {
-            let trimmed = withoutTrailingSpaces(text.view().bytes());
-            return Ok(SqliteValue.Text(String.from(text.view()[0..trimmed.length])?));
+            return SqliteValue.textOfBytes(withoutTrailingSpaces(text.bytes()));
         }
     }
 }

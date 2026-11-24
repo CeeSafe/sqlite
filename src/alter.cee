@@ -190,7 +190,7 @@ fn refuseIfReferenced(db: borrow Session, table: StringView) -> Result<void, Sql
 }
 
 fn valueTextOf(value: borrow SqliteValue) -> StringView => match (value) {
-    SqliteValue.Text(s) => s.view(),
+    SqliteValue.Text(s) => s.toUtf8() ?? "",
     _ => "",
 };
 
@@ -259,7 +259,7 @@ fn renameTable(old: StringView, new: StringView, db: borrow mut Session) -> Resu
                 renamed.append(new)?;
                 renamed.append("_")?;
                 renamed.append(objectName.view()[oldPrefix.length..])?;
-                rows[r].values[1] = SqliteValue.Text(renamed);
+                rows[r].values[1] = SqliteValue.text(renamed.view())?;
             }
             rows[r].values[2] = SqliteValue.text(new)?;
             changed = true;
@@ -283,7 +283,7 @@ fn renameTable(old: StringView, new: StringView, db: borrow mut Session) -> Resu
             changed = edits.length != 0 || (isTrigger && ofTable);
         }
         if (edits.length != 0) {
-            rows[r].values[4] = SqliteValue.Text(applyEdits(sqlText.view(), mut edits)?);
+            rows[r].values[4] = SqliteValue.text(applyEdits(sqlText.view(), mut edits)?.view())?;
         }
         if (changed) {
             writeSchemaRow(db, borrow rows[r])?;
@@ -349,7 +349,7 @@ fn renameColumn(
         if (edits.length == 0) {
             continue;
         }
-        rows[r].values[4] = SqliteValue.Text(applyEdits(sqlText.view(), mut edits)?);
+        rows[r].values[4] = SqliteValue.text(applyEdits(sqlText.view(), mut edits)?.view())?;
         writeSchemaRow(db, borrow rows[r])?;
     }
     return Ok();
@@ -469,7 +469,7 @@ fn addColumn(
         var inserted = String.from(", ")?;
         inserted.append(definition)?;
         edits.push(TextEdit { start: point, end: point, text: inserted })?;
-        rows[r].values[4] = SqliteValue.Text(applyEdits(sqlText.view(), mut edits)?);
+        rows[r].values[4] = SqliteValue.text(applyEdits(sqlText.view(), mut edits)?.view())?;
         writeSchemaRow(db, borrow rows[r])?;
     }
     return Ok();
@@ -632,7 +632,7 @@ fn dropColumn(tableName: StringView, column: StringView, db: borrow mut Session)
         }
         var edits = Vector<TextEdit>.create();
         edits.push(TextEdit { start: start, end: end, text: String.create() })?;
-        rows[r].values[4] = SqliteValue.Text(applyEdits(sqlText.view(), mut edits)?);
+        rows[r].values[4] = SqliteValue.text(applyEdits(sqlText.view(), mut edits)?.view())?;
         writeSchemaRow(db, borrow rows[r])?;
     }
     db.pager.bumpSchemaCookie()?;

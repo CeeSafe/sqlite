@@ -261,11 +261,11 @@ fn keepsIndexesInStepWithTheirTable() -> Result<void, TestFailure> {
             let label = numbered("LABEL ", id - 4000);
             upsert(mut tableOps, id, id * 2, label.view());
             nOps.push(IndexOp { entry: entryOf(SqliteValue.Integer(id * 2), id), remove: false })!;
-            labelOps.push(IndexOp { entry: entryOf(SqliteValue.Text(label), id), remove: false })!;
+            labelOps.push(IndexOp { entry: entryOf(SqliteValue.text(label.view())!, id), remove: false })!;
         } else if (id % 3 == 0) {
             removal(mut tableOps, id);
             nOps.push(IndexOp { entry: entryOf(SqliteValue.Integer(id * 2), id), remove: true })!;
-            labelOps.push(IndexOp { entry: entryOf(SqliteValue.Text(labelOf(id)), id), remove: true })!;
+            labelOps.push(IndexOp { entry: entryOf(SqliteValue.text(labelOf(id).view())!, id), remove: true })!;
         }
     }
     TableMutator.applyBatch(mut pager, table, tableOps.view())!;
@@ -280,10 +280,10 @@ fn keepsIndexesInStepWithTheirTable() -> Result<void, TestFailure> {
         for (id in 1i64..7001) {
             if (id > 4000) {
                 nEntries.push(entryOf(SqliteValue.Integer(id * 2), id))!;
-                labelEntries.push(entryOf(SqliteValue.Text(numbered("LABEL ", id - 4000)), id))!;
+                labelEntries.push(entryOf(SqliteValue.text(numbered("LABEL ", id - 4000).view())!, id))!;
             } else if (id % 3 != 0) {
                 nEntries.push(entryOf(SqliteValue.Integer(id * 2), id))!;
-                labelEntries.push(entryOf(SqliteValue.Text(labelOf(id)), id))!;
+                labelEntries.push(entryOf(SqliteValue.text(labelOf(id).view())!, id))!;
             }
         }
         if (!inPlaceN) {
@@ -333,7 +333,7 @@ fn insertsIntoAnIndexSplitItsPages() -> Result<void, TestFailure> {
         upsert(mut one, id, id, label.view());
         TableMutator.applyBatch(mut pager, table, one.view())!;
         var ops = Vector<IndexOp>.create();
-        ops.push(IndexOp { entry: entryOf(SqliteValue.Text(label), id), remove: false })!;
+        ops.push(IndexOp { entry: entryOf(SqliteValue.text(label.view())!, id), remove: false })!;
         Check.isTrue(IndexMutator.applyBatch(mut pager, index, ops.view(), order)!, "an insertion is always done in place")?;
     }
     commitAndRead(mut pager);

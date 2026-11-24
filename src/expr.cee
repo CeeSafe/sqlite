@@ -350,11 +350,13 @@ fn evaluate(expr: borrow XExpr, frame: borrow mut Frame, db: borrow mut Session)
             return Ok(SqliteValue.Integer(if (row.isSome()) 1 else 0));
         }
         XExpr.Raise(action, message) => {
-            var text = String.create();
+            var bytes = ByteString.create();
             if (message is Some(m)) {
                 let v = evaluate(m, frame, db)?;
-                appendValueText(mut text, borrow v)?;
+                appendValueText(mut bytes, borrow v)?;
             }
+            // An error's message is a String: bytes that are not UTF-8 become U+FFFD there.
+            let text = bytes.toUtf8Lossy()?;
             // RAISE(FAIL) keeps the statement's earlier changes; RAISE(ROLLBACK) ends the transaction.
             match (action) {
                 RaiseAction.Fail => { db.conflictFailure = ConflictAction.Fail; }
@@ -543,7 +545,7 @@ fn evaluateLike(l: borrow XLike, frame: borrow mut Frame, db: borrow mut Session
             return Ok(SqliteValue.Null);
         }
         let text = valueText(borrow ev)?;
-        var chars = Utf8Chars.of(text.view().bytes());
+        var chars = Utf8Chars.of(text.bytes());
         let first = chars.next();
         if (first.isNull() || chars.next().isSome()) {
             return Err(sqlError("ESCAPE expression must be a single character"));
@@ -556,8 +558,8 @@ fn evaluateLike(l: borrow XLike, frame: borrow mut Frame, db: borrow mut Session
     let subject = valueText(borrow x)?;
     let p = valueText(borrow pattern)?;
     let matched = match (l.op) {
-        LikeOp.Like => likeMatch(p.view().bytes(), subject.view().bytes(), escape),
-        LikeOp.Glob => globMatch(p.view().bytes(), subject.view().bytes()),
+        LikeOp.Like => likeMatch(p.bytes(), subject.bytes(), escape),
+        LikeOp.Glob => globMatch(p.bytes(), subject.bytes()),
         LikeOp.Match => { return Err(sqlError("unable to use function MATCH in the requested context")); },
         LikeOp.Regexp => { return Err(sqlError("no such function: REGEXP")); },
     };

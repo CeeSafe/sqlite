@@ -1095,7 +1095,7 @@ struct JsonOut {
     /// The text as a function's result, or the error it reported (jsonReturnString).
     fn finish(borrow mut this, json: bool) -> Result<JsonValue, SqliteError> {
         if (this.err == 0) {
-            return Ok(JsonValue { value: SqliteValue.Text(textFromBytesLossy(this.buf.view())?), json: json });
+            return Ok(JsonValue { value: SqliteValue.textOfBytes(this.buf.view())?, json: json });
         }
         if ((this.err & JSTRING_TOODEEP) == 0 && (this.err & JSTRING_MALFORMED) != 0) {
             this.failure = JsonFailure.Malformed;
@@ -2458,7 +2458,8 @@ fn jsonBadPathError(path: Slice<u8>, rc: usize) -> SqliteError {
         return sqlError("JSON path too deep");
     }
     var message = String.create();
-    let text = match (textFromBytesLossy(path)) {
+    // An error's message is a String: path bytes that are not UTF-8 become U+FFFD there.
+    let text = match (ByteStringView.fromBytes(path).toUtf8Lossy()) {
         Ok(t) => t,
         Err(e) => {
             return SqliteError.Alloc(e);
@@ -2719,7 +2720,7 @@ fn jsonReturnFromBlob(blob: Slice<u8>, i: usize) -> Result<SqliteValue, SqliteEr
         return jsonRealFromText(payload);
     }
     if (t == JSONB_TEXT || t == JSONB_TEXTRAW) {
-        return Ok(SqliteValue.Text(textFromBytesLossy(payload)?));
+        return Ok(SqliteValue.textOfBytes(payload)?);
     }
     if (t == JSONB_TEXT5 || t == JSONB_TEXTJ) {
         var bytes = Vector<u8>.withCapacity(payload.length)?;
@@ -2752,7 +2753,7 @@ fn jsonReturnFromBlob(blob: Slice<u8>, i: usize) -> Result<SqliteValue, SqliteEr
             }
             k += u.size.max(1);
         }
-        return Ok(SqliteValue.Text(textFromBytesLossy(bytes.view())?));
+        return Ok(SqliteValue.Text(ByteString.fromBytes(bytes)));
     }
     if (t == JSONB_ARRAY || t == JSONB_OBJECT) {
         var out = JsonOut.create();
@@ -3467,7 +3468,7 @@ fn jsonGroupFinish(isObject: bool, group: borrow JsonOut, started: bool) -> Resu
             i += 1;
         }
         z.truncate(j);
-        return Ok(SqliteValue.Text(textFromBytesLossy(z.view())?));
+        return Ok(SqliteValue.Text(ByteString.fromBytes(z)));
     }
-    return Ok(SqliteValue.Text(textFromBytesLossy(out.buf.view())?));
+    return Ok(SqliteValue.textOfBytes(out.buf.view())?);
 }

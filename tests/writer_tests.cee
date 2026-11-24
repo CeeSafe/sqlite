@@ -40,14 +40,14 @@ fn writesTablesAndIndexesSqliteAccepts() -> Result<void, TestFailure> {
     while (i >= 1) {
         var row = Vector<SqliteValue>.create();
         row.push(SqliteValue.Integer(-1))!; // the rowid's alias: whatever is here, NULL is stored
-        row.push(SqliteValue.Text(numbered(if (i % 2 == 0) "Name" else "name", i)))!;
+        row.push(SqliteValue.text(numbered(if (i % 2 == 0) "Name" else "name", i).view())!)!;
         row.push(SqliteValue.Integer(i % 37))!;
         if (i % 1000 == 0) {
             var big = String.create();
             for (k in 0..3000) {
                 big.append("overflow ")!;
             }
-            row.push(SqliteValue.Text(big))!;
+            row.push(SqliteValue.text(big.view())!)!;
         } else {
             row.push(SqliteValue.Null)!;
         }
@@ -80,7 +80,7 @@ fn writesTablesAndIndexesSqliteAccepts() -> Result<void, TestFailure> {
         Some(row) => {
             Check.isTrue(row.columns[0].isNull(), "the rowid's alias is stored as NULL")?;
             match (borrow row.columns[1]) {
-                SqliteValue.Text(name) => { Check.equalText("name4321", name.view())?; }
+                SqliteValue.Text(name) => { Check.equalText("name4321", name.toUtf8() ?? "(not UTF-8)")?; }
                 _ => { return Check.fail("expected text"); }
             }
         }
@@ -97,8 +97,8 @@ fn writesKeysInTheirOwnOrder() -> Result<void, TestFailure> {
     var writer = DatabaseWriter.create(WriterOptions.defaults())!;
     let t = writer.addTable("CREATE TABLE k(a TEXT COLLATE NOCASE, b INT, c TEXT, PRIMARY KEY (a, b DESC), UNIQUE (c COLLATE RTRIM))")!;
     for (i in 0i64..2000) {
-        let a = SqliteValue.Text(numbered(if (i % 3 == 0) "KEY" else "key", i / 10));
-        let c = SqliteValue.Text(numbered("c", i));
+        let a = SqliteValue.text(numbered(if (i % 3 == 0) "KEY" else "key", i / 10).view())!;
+        let c = SqliteValue.text(numbered("c", i).view())!;
         writer.addRow(t, i + 1, rowOf3(a, SqliteValue.Integer(i % 10), c))!;
     }
     writer.writeToFile(path)!;
@@ -116,7 +116,7 @@ fn writesWithoutRowidTables() -> Result<void, TestFailure> {
     var writer = DatabaseWriter.create(WriterOptions.defaults())!;
     let t = writer.addTable("CREATE TABLE w(a INT, b TEXT, c INT, PRIMARY KEY (b, a DESC)) WITHOUT ROWID")!;
     for (i in 0i64..3000) {
-        writer.addRow(t, 0, rowOf3(SqliteValue.Integer(i), SqliteValue.Text(numbered("group", i % 50)), SqliteValue.Integer(i * 2)))!;
+        writer.addRow(t, 0, rowOf3(SqliteValue.Integer(i), SqliteValue.text(numbered("group", i % 50).view())!, SqliteValue.Integer(i * 2)))!;
     }
     // The index has `a` already, so its entries end with `b` alone; the C# engine appended `b` and `a` again.
     writer.addIndex("CREATE INDEX w_ca ON w(c, a)", null)!;
@@ -170,7 +170,7 @@ fn schemaLargerThanOnePage() -> Result<void, TestFailure> {
         sql.append(numbered("table_", i).view())!;
         sql.append("(id INTEGER PRIMARY KEY, a_column_with_a_long_name TEXT, another_long_column_name INT)")!;
         let t = writer.addTable(sql.view())!;
-        writer.addRow(t, 1, rowOf3(SqliteValue.Null, SqliteValue.Text(numbered("row of ", i)), SqliteValue.Integer(i)))!;
+        writer.addRow(t, 1, rowOf3(SqliteValue.Null, SqliteValue.text(numbered("row of ", i).view())!, SqliteValue.Integer(i)))!;
     }
     writer.writeToFile(path)!;
     expectIntact(path)?;
@@ -194,7 +194,7 @@ fn pageSizeRoundTrip(path: StringView, pageSize: usize) -> Result<void, TestFail
                 word.append(" and more")!;
             }
         }
-        writer.addRow(t, i, rowOf3(SqliteValue.Null, SqliteValue.Text(word), SqliteValue.Integer(i % 100)))!;
+        writer.addRow(t, i, rowOf3(SqliteValue.Null, SqliteValue.text(word.view())!, SqliteValue.Integer(i % 100)))!;
     }
     writer.addIndex("CREATE INDEX p_word ON p(word)", null)!;
     writer.addIndex("CREATE INDEX p_n ON p(n)", null)!;

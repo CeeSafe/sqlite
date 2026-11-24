@@ -410,7 +410,9 @@ struct Shell {
             this.out.extend(statement.view())?;
             let kind = cellBytes(borrow row[0])?;
             if (kind.view() == "view".bytes()) {
-                let name = row[1].toText()?;
+                let nameBytes = row[1].toText()?;
+                // SQL is UTF-8 here: a name that is not is probed with U+FFFD and shown as it is.
+                let name = nameBytes.toUtf8Lossy()?;
                 var probe = String.from("SELECT * FROM \"")?;
                 for (i in 0..name.length) {
                     if (name.view()[i] == '"') {
@@ -421,7 +423,7 @@ struct Shell {
                 probe.append("\" LIMIT 0")?;
                 if (this.connection.query(probe.view(), borrow none) is Ok(columns)) {
                     this.out.extend("\n/* ".bytes())?;
-                    this.out.extend(name.view().bytes())?;
+                    this.out.extend(nameBytes.bytes())?;
                     this.out.push('(')?;
                     for (c in 0..columns.columns.length) {
                         if (c != 0) {

@@ -39,9 +39,9 @@ fn theirAnswerTo(path: StringView, commands: Slice<StringView>) -> String {
     }
     let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
     if (output.status == 0) {
-        return textFromBytesLossy(output.stdout.view())!;
+        return shownText(output.stdout.view());
     }
-    let errors = textFromBytesLossy(output.stderr.view())!;
+    let errors = shownText(output.stderr.view());
     var text = String.from("error: ")!;
     text.append((errors.view().splitOnce("\n") ?? TextHalves { left: errors.view(), right: "" }).left)!;
     return text;

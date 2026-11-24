@@ -150,6 +150,21 @@ fn aCommentBeforeTheSemicolonNamesTheColumn() -> Result<void, TestFailure> {
 }
 
 @test
+fn textThatIsNotUtf8IsPrintedAsItIs() -> Result<void, TestFailure> {
+    // SQLite keeps TEXT's bytes; the shell writes them as they are, in each mode.
+    return sameInput("bytes", "CREATE TABLE t(x TEXT); INSERT INTO t VALUES (CAST(x'ff' AS TEXT)), (CAST(x'c3' AS TEXT) || 'a'), (char(0xd800)), ('é');", """
+        SELECT x, hex(x) FROM t;
+        SELECT CAST(x'41ff42' AS TEXT), CAST(x'ff' AS BLOB);
+        .mode csv
+        SELECT x FROM t;
+        .mode line
+        SELECT x FROM t;
+        .mode column
+        SELECT x, length(x) AS n FROM t;
+        """);
+}
+
+@test
 fn csvMode() -> Result<void, TestFailure> {
     return sameInput("csv", PEOPLE, """
         .mode csv
@@ -381,11 +396,11 @@ fn changesAreWrittenToTheFile() -> Result<void, TestFailure> {
 @test
 fn valueTextIsSqlites() -> Result<void, TestFailure> {
     // The library's SqliteValue.toText, which the shell prints reals with.
-    Check.equalText("2.0", SqliteValue.Real(2.0).toText()!.view())?;
-    Check.equalText("0.30000000000000004", SqliteValue.Real(0.1 + 0.2).toText()!.view())?;
-    Check.equalText("1.0e+20", SqliteValue.Real(1e20).toText()!.view())?;
-    Check.equalText("-7", SqliteValue.Integer(-7).toText()!.view())?;
-    Check.equalText("", SqliteValue.Null.toText()!.view())?;
+    Check.equalText("2.0", SqliteValue.Real(2.0).toText()!.toUtf8()!)?;
+    Check.equalText("0.30000000000000004", SqliteValue.Real(0.1 + 0.2).toText()!.toUtf8()!)?;
+    Check.equalText("1.0e+20", SqliteValue.Real(1e20).toText()!.toUtf8()!)?;
+    Check.equalText("-7", SqliteValue.Integer(-7).toText()!.toUtf8()!)?;
+    Check.equalText("", SqliteValue.Null.toText()!.toUtf8()!)?;
     return Ok();
 }
 

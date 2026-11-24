@@ -175,7 +175,7 @@ struct Record {
         SqliteValue.Null => 0,
         SqliteValue.Integer(i) => Record.integerSerialType(i),
         SqliteValue.Real(_) => 7,
-        SqliteValue.Text(s) => truncate<i64>(s.length) * 2 + 13,
+        SqliteValue.Text(s) => truncate<i64>(s.length()) * 2 + 13,
         SqliteValue.Blob(b) => truncate<i64>(b.length) * 2 + 12,
     };
 
@@ -189,37 +189,34 @@ struct Record {
     }
 }
 
-/// Text of a record in the database's encoding, as UTF-8.
-fn decodeText(bytes: Slice<u8>, encoding: TextEncoding) -> Result<String, AllocError> {
+/// Text of a record in the database's encoding, as UTF-8: UTF-8's bytes as they are.
+fn decodeText(bytes: Slice<u8>, encoding: TextEncoding) -> Result<ByteString, AllocError> {
     match (encoding) {
-        TextEncoding.Utf8 => { return textFromBytesLossy(bytes); }
+        TextEncoding.Utf8 => { return ByteString.copyOf(bytes); }
         TextEncoding.Utf16LE => { return textFromUtf16(bytes, false); }
         TextEncoding.Utf16BE => { return textFromUtf16(bytes, true); }
     }
 }
 
-/// UTF-16 bytes as UTF-8 text; an unpaired surrogate becomes U+FFFD.
-fn textFromUtf16(bytes: Slice<u8>, bigEndian: bool) -> Result<String, AllocError> {
+/// UTF-16 bytes as UTF-8, as sqlite3VdbeMemTranslate does without SQLITE_REPLACE_INVALID_UTF: an odd last byte
+/// is dropped, a surrogate is combined with the unit after it whatever that is, and a surrogate at the end is
+/// written as UTF-8 would write its value.
+fn textFromUtf16(bytes: Slice<u8>, bigEndian: bool) -> Result<ByteString, AllocError> {
     var out = Vector<u8>.withCapacity(bytes.length)?;
+    let end = bytes.length - bytes.length % 2;
     var i: usize = 0;
-    while (i + 1 < bytes.length) {
-        var unit = utf16Unit(bytes, i, bigEndian);
+    while (i < end) {
+        let unit = utf16Unit(bytes, i, bigEndian) as u32;
         i += 2;
-        var code: u32 = unit as u32;
-        if (unit >= 0xD800 && unit <= 0xDBFF && i + 1 < bytes.length) {
-            let low = utf16Unit(bytes, i, bigEndian);
-            if (low >= 0xDC00 && low <= 0xDFFF) {
-                code = 0x10000 + (((unit as u32) - 0xD800) << 10) + ((low as u32) - 0xDC00);
-                i += 2;
-            } else {
-                code = 0xFFFD;
-            }
-        } else if (unit >= 0xD800 && unit <= 0xDFFF) {
-            code = 0xFFFD;
+        var code = unit;
+        if (unit >= 0xD800 && unit < 0xE000 && i < end) {
+            let next = utf16Unit(bytes, i, bigEndian) as u32;
+            i += 2;
+            code = (next & 0x3FF) + ((unit & 0x3F) << 10) + (((unit & 0x3C0) + 0x40) << 10);
         }
         appendUtf8(mut out, code)?;
     }
-    return textFromBytesLossy(out.view());
+    return Ok(ByteString.fromBytes(out));
 }
 
 fn utf16Unit(bytes: Slice<u8>, at: usize, bigEndian: bool) -> u16 =>

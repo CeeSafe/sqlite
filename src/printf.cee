@@ -105,11 +105,11 @@ struct PrintfArguments<region r> {
         var bytes = Vector<u8>.create();
         match (value) {
             SqliteValue.Null => { return Ok(null); }
-            SqliteValue.Text(s) => { bytes.extend(beforeNul(s.view().bytes()))?; }
+            SqliteValue.Text(s) => { bytes.extend(beforeNul(s.bytes()))?; }
             SqliteValue.Blob(b) => { bytes.extend(beforeNul(b.view()))?; }
             _ => {
                 let text = valueText(value)?;
-                bytes.extend(text.view().bytes())?;
+                bytes.extend(text.bytes())?;
             }
         }
         return Ok(Some(bytes));
@@ -138,11 +138,11 @@ fn printfFunction(values: Slice<SqliteValue>) -> Result<SqliteValue, SqliteError
     }
     var format = Vector<u8>.create();
     match (borrow values[0]) {
-        SqliteValue.Text(s) => { format.extend(beforeNul(s.view().bytes()))?; }
+        SqliteValue.Text(s) => { format.extend(beforeNul(s.bytes()))?; }
         SqliteValue.Blob(b) => { format.extend(beforeNul(b.view()))?; }
         other => {
             let text = valueText(other)?;
-            format.extend(text.view().bytes())?;
+            format.extend(text.bytes())?;
         }
     }
     var out = PrintfText { bytes: Vector<u8>.create(), tooBig: false };
@@ -155,7 +155,7 @@ fn printfFunction(values: Slice<SqliteValue>) -> Result<SqliteValue, SqliteError
         // SQLite's text was never allocated, and an unallocated result is NULL.
         return Ok(SqliteValue.Null);
     }
-    return Ok(SqliteValue.Text(textFromBytesLossy(out.bytes.view())?));
+    return Ok(SqliteValue.Text(ByteString.fromBytes(out.bytes)));
 }
 
 /// sqlite3_str_vappendf with SQLITE_PRINTF_SQLFUNC: renders `fmt` into `out`.

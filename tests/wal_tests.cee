@@ -43,7 +43,7 @@ fn askSqliteKeepingLog(path: StringView, sql: StringView) -> Result<String, Test
     if (output.status != 0) {
         Check.fail("sqlite3 refused the query")?;
     }
-    let text = textFromBytesLossy(output.stdout.view())!;
+    let text = shownText(output.stdout.view());
     // The first line is the shell's report of the setting.
     let rest = match (text.view().splitOnce("\n")) {
         Some(halves) => halves.right,
@@ -286,8 +286,8 @@ fn sameWalSession(name: StringView, script: StringView, close: bool) -> Result<v
     var arguments = Vector<StringView>.create();
     arguments.push(theirPath.view())!;
     let output = Process.capture("sqlite3", borrow arguments, input.view().bytes())!;
-    let theirs = textFromBytesLossy(output.stdout.view())!;
-    let errors = textFromBytesLossy(output.stderr.view())!;
+    let theirs = shownText(output.stdout.view());
+    let errors = shownText(output.stderr.view());
     var errorLines = errors.view().split("\n");
     var theirErrors = String.create();
     while (errorLines.next() is Some(e)) {

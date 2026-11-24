@@ -129,7 +129,7 @@ fn writerWithRows(count: i64, pageSize: usize) -> DatabaseWriter {
     var writer = DatabaseWriter.create(options)!;
     let t = writer.addTable("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER, label TEXT)")!;
     for (i in 1i64..count + 1) {
-        writer.addRow(t, i, rowOf3(SqliteValue.Null, SqliteValue.Integer(i), SqliteValue.Text(numbered("row number ", i))))!;
+        writer.addRow(t, i, rowOf3(SqliteValue.Null, SqliteValue.Integer(i), SqliteValue.text(numbered("row number ", i).view())!))!;
     }
     writer.addIndex("CREATE INDEX t_n ON t(n)", null)!;
     return writer;

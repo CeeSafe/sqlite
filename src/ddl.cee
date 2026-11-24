@@ -71,7 +71,7 @@ fn removeSchemaRows(db: borrow mut Session, name: StringView, alsoOfTable: bool)
 }
 
 fn textOrEmptyRef(value: borrow SqliteValue) -> StringView => match (value) {
-    SqliteValue.Text(s) => s.view(),
+    SqliteValue.Text(s) => s.toUtf8() ?? "",
     _ => "",
 };
 

@@ -54,9 +54,9 @@ fn cellBytes(value: borrow SqliteValue) -> Result<Vector<u8>, AllocError> {
         }
         SqliteValue.Real(_) => {
             let text = value.toText()?;
-            out.extend(text.view().bytes())?;
+            out.extend(text.bytes())?;
         }
-        SqliteValue.Text(s) => { appendShown(mut out, s.view().bytes())?; }
+        SqliteValue.Text(s) => { appendShown(mut out, s.bytes())?; }
         SqliteValue.Blob(b) => { appendShown(mut out, b.view())?; }
     }
     return Ok(out);
@@ -176,7 +176,7 @@ fn printCsv(out: borrow mut Vector<u8>, result: borrow QueryResult, headers: boo
             }
             match (borrow row[c]) {
                 SqliteValue.Null => {}
-                SqliteValue.Text(s) => { appendCsvText(mut out, s.view().bytes())?; }
+                SqliteValue.Text(s) => { appendCsvText(mut out, s.bytes())?; }
                 _ => {
                     let cell = cellBytes(borrow row[c])?;
                     out.extend(cell.view())?;

@@ -75,26 +75,28 @@ fn numericValue(value: borrow SqliteValue) -> SqliteValue => match (value) {
     _ => textAsNumber(bytesOf(value)),
 };
 
-/// Appends a value as text: an integer in decimal, a real as SQLite writes it, a blob's bytes read as UTF-8.
-fn appendValueText(out: borrow mut String, value: borrow SqliteValue) -> Result<void, AllocError> {
+/// Appends a value as text: an integer in decimal, a real as SQLite writes it, a text's or a blob's bytes as they
+/// are (sqlite3_value_text keeps a blob's bytes, UTF-8 or not).
+fn appendValueText(out: borrow mut ByteString, value: borrow SqliteValue) -> Result<void, AllocError> {
     match (value) {
         SqliteValue.Null => { return Ok(); }
         SqliteValue.Integer(i) => { return out.appendNumber(i); }
-        SqliteValue.Real(r) => { return appendReal(out, r); }
-        SqliteValue.Text(s) => { return out.append(s.view()); }
-        SqliteValue.Blob(b) => {
-            let text = textFromBytesLossy(b.view())?;
+        SqliteValue.Real(r) => {
+            var text = String.create();
+            appendReal(mut text, r)?;
             return out.append(text.view());
         }
+        SqliteValue.Text(s) => { return out.appendBytes(s.bytes()); }
+        SqliteValue.Blob(b) => { return out.appendBytes(b.view()); }
     }
 }
 
 /// A value as text.
-fn valueText(value: borrow SqliteValue) -> Result<String, AllocError> {
+fn valueText(value: borrow SqliteValue) -> Result<ByteString, AllocError> {
     if (value is SqliteValue.Text(s)) {
         return s.clone();
     }
-    var out = String.create();
+    var out = ByteString.create();
     appendValueText(mut out, value)?;
     return Ok(out);
 }
@@ -258,7 +260,7 @@ fn concatenate(left: borrow SqliteValue, right: borrow SqliteValue) -> Result<Sq
     if (left.isNull() || right.isNull()) {
         return Ok(SqliteValue.Null);
     }
-    var out = String.create();
+    var out = ByteString.create();
     appendValueText(mut out, left)?;
     appendValueText(mut out, right)?;
     return Ok(SqliteValue.Text(out));

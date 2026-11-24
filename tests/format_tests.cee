@@ -79,11 +79,11 @@ fn recordRoundTrips() -> Result<void, TestFailure> {
         _ => { return Check.fail("expected a real"); }
     }
     match (borrow decoded[at + 2]) {
-        SqliteValue.Text(s) => { Check.equalText("héllo, wörld", s.view())?; }
+        SqliteValue.Text(s) => { Check.equalText("héllo, wörld", s.toUtf8() ?? "(not UTF-8)")?; }
         _ => { return Check.fail("expected text"); }
     }
     match (borrow decoded[at + 3]) {
-        SqliteValue.Text(s) => { Check.equalText("", s.view())?; }
+        SqliteValue.Text(s) => { Check.equalText("", s.toUtf8() ?? "(not UTF-8)")?; }
         _ => { return Check.fail("expected empty text"); }
     }
     match (borrow decoded[at + 4]) {
@@ -114,6 +114,6 @@ fn recordMaskSkipsColumns() -> Result<void, TestFailure> {
 fn utf16TextDecodes() -> Result<void, TestFailure> {
     let le = [0x68u8, 0x00, 0xE9, 0x00, 0x3D, 0xD8, 0x00, 0xDE];
     let text = decodeText(le[..], TextEncoding.Utf16LE)!;
-    Check.equalText("hé😀", text.view())?;
+    Check.equalText("hé😀", text.toUtf8() ?? "(not UTF-8)")?;
     return Ok();
 }

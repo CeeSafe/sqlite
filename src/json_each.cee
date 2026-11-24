@@ -185,7 +185,8 @@ fn jsonEachValueIsJson(frame: borrow Frame, slot: usize, column: usize) -> bool 
     let SqliteValue.Text(t) = borrow s.values[JSON_EACH_TYPE] else {
         return false;
     };
-    return s.values[JSON_EACH_VALUE] is SqliteValue.Text(_) && (t.view() == "array" || t.view() == "object");
+    return s.values[JSON_EACH_VALUE] is SqliteValue.Text(_) &&
+        (t.bytes() == "array".bytes() || t.bytes() == "object".bytes());
 }
 
 /// The rows of a json_each source, for the current values of its arguments.
@@ -284,7 +285,7 @@ struct JsonEachCursor {
                 return Ok(false);
             }
             let text = valueBytes(json)?;
-            this.input = SqliteValue.Text(textFromBytesLossy(beforeNul(text.view()))?);
+            this.input = SqliteValue.textOfBytes(beforeNul(text.view()))?;
             if (!this.parse.convertText(text.view())?) {
                 return Err(sqlError("malformed JSON"));
             }
@@ -475,9 +476,9 @@ struct JsonEachCursor {
                 return Ok(SqliteValue.Integer(truncate<i64>(x.bits)));
             }
             if (jsonAt(z, j + 1) == '"') {
-                return Ok(SqliteValue.Text(textFromBytesLossy(jsonBytes(z, j + 2, j + 2 + n.saturatingSub(3)))?));
+                return Ok(SqliteValue.textOfBytes(jsonBytes(z, j + 2, j + 2 + n.saturatingSub(3)))?);
             }
-            return Ok(SqliteValue.Text(textFromBytesLossy(jsonBytes(z, j + 1, j + n))?));
+            return Ok(SqliteValue.textOfBytes(jsonBytes(z, j + 1, j + n))?);
         }
         if (this.eType == JSONB_OBJECT) {
             return jsonReturnFromBlob(this.parse.blob.view(), this.i);
@@ -510,12 +511,12 @@ struct JsonEachCursor {
         if (this.parents.length != 0) {
             this.appendPathName()?;
         }
-        row.push(SqliteValue.Text(textFromBytesLossy(this.path.view())?))?;
+        row.push(SqliteValue.textOfBytes(this.path.view())?)?;
         this.path.truncate(base);
         let n = this.pathLength()?;
-        row.push(SqliteValue.Text(textFromBytesLossy(jsonBytes(this.path.view(), 0, n))?))?;
+        row.push(SqliteValue.textOfBytes(jsonBytes(this.path.view(), 0, n))?)?;
         row.push(this.input.clone()?)?;
-        row.push(SqliteValue.Text(textFromBytesLossy(jsonBytes(this.path.view(), 0, this.nRoot))?))?;
+        row.push(SqliteValue.textOfBytes(jsonBytes(this.path.view(), 0, this.nRoot))?)?;
         return Ok(row);
     }
 }

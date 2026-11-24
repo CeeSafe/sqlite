@@ -12,7 +12,7 @@ fn ourVerdict(path: StringView, sql: StringView) -> String {
             match (s.query(sql, none.view())) {
                 Ok(result) => {
                     for (r in 0..result.rows.length) {
-                        appendValueText(mut out, borrow result.rows[r][0])!;
+                        out.append(shownText(valueText(borrow result.rows[r][0])!.bytes()).view())!;
                         out.append("\n")!;
                     }
                 }
@@ -40,9 +40,9 @@ fn shellVerdict(path: StringView, sql: StringView) -> String {
     arguments.push(path)!;
     arguments.push(sql)!;
     let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
-    var out = textFromBytesLossy(output.stdout.view())!;
+    var out = shownText(output.stdout.view());
     if (output.status != 0) {
-        let errors = textFromBytesLossy(output.stderr.view())!;
+        let errors = shownText(output.stderr.view());
         if (out.length != 0 && errors.view().contains("database disk image is malformed")) {
             out.append("database disk image is malformed\n")!;
         } else {
@@ -95,7 +95,7 @@ fn sameTreeReport(path: StringView) -> Result<void, TestFailure> {
     let none = Vector<SqliteValue>.create();
     let result = session.query("PRAGMA integrity_check", none.view())!;
     var mine = String.create();
-    appendValueText(mut mine, borrow result.rows[0][0])!;
+    mine.append(shownText(valueText(borrow result.rows[0][0])!.bytes()).view())!;
     mine.append("\n")!;
     Check.isTrue(mine.view().startsWith("*** in database main ***"), "the b-tree check reports the damage")?;
     if (!theirs.view().startsWith(mine.view())) {
@@ -501,7 +501,7 @@ fn whatThisEngineWritesIsIntact() -> Result<void, TestFailure> {
     let inside = session.query("PRAGMA integrity_check", none.view())!;
     Check.isTrue(inside.rows.length == 1, "one row inside the transaction")?;
     var verdict = String.create();
-    appendValueText(mut verdict, borrow inside.rows[0][0])!;
+    verdict.append(shownText(valueText(borrow inside.rows[0][0])!.bytes()).view())!;
     Check.equalText("ok", verdict.view())?;
     session.query("COMMIT", none.view())!;
     sameVerdicts(path, "PRAGMA integrity_check")?;
@@ -514,7 +514,7 @@ fn databasesOtherTestsWroteAreJudgedAlike() -> Result<void, TestFailure> {
     var arguments = Vector<StringView>.create();
     arguments.push("out")!;
     let listing = Process.capture("ls", borrow arguments, "".bytes())!;
-    let names = textFromBytesLossy(listing.stdout.view())!;
+    let names = shownText(listing.stdout.view());
     var lines = names.view().split("\n");
     var checked: usize = 0;
     while (lines.next() is Some(name)) {

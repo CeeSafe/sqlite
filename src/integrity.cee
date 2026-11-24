@@ -1021,7 +1021,7 @@ fn decodeRawRow(row: borrow RawTableRow, encoding: TextEncoding) -> Result<Check
             // Of its type, for OP_IsType; its bytes are not there.
             let placeholder = if (serial.value >= 12 && serial.value % 2 == 0) SqliteValue.Blob(Vector<u8>.create())
                 else if (serial.value >= 12) SqliteValue.Text(
-                    String.create(),
+                    ByteString.create(),
                 ) else if (serial.value == 7) SqliteValue.Real(
                     0.0,
                 ) else if (serial.value == 0) SqliteValue.Null else SqliteValue.Integer(0);
