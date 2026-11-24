@@ -39,7 +39,10 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 39 | fixed in 0.95.5: `s.intoBytes()`, `String.fromUtf8(v)`, `ByteString.fromString(s)`, `b.intoString()`, and `ceesafec doc NAME` for a lib/core name, ADR 0236; workaround removed: text built in a `String` becomes TEXT without a copy (`SqliteValue.sqlTextFrom`: CURRENT_TIMESTAMP, ALTER TABLE's edited SQL, ANALYZE's statistics; a real's text in `valueText`), and ASCII case changes give their bytes to a `String` (`asciiLower`, `asciiUpper`) |
 | 42, 43, 44 | open: found while adopting 0.95.5 (below) |
 | 41 | open: found while making SQL text bytes (below) |
+| 45, 46 | fixed for 0.95.8 (ADR 0245, CeeSafe branch `fix/windows-processes`; checked on windows-2022 and on a Windows 11 laptop with MSVC and gcc), not yet released; the `tests/capture.py` workaround stays until then |
+| 47 | open: found making CI pass on Windows (below) |
 | 48 | open: found while porting os_win.c's locks (below) |
+| 49, 50 | open: found testing on a Windows 11 laptop (below) |
 | 40 | misreported: `cfg("target.windows")` (ADR 0179, guide/unsafe-and-c.md "Code for one system") names the system a build is for, in any code; `onWindows()` uses it, and the environment-variable check is gone |
 
 ## Gaps
@@ -484,3 +487,30 @@ portable program be checked on any host.
 Workaround: the Windows scheme was run on macOS by forcing `onWindows()` (not committed), which checks its logic
 but not those two rules; the code keeps the ranges it holds (`WritablePager.held`) and wal.c's `ckptLock` rule so
 that no lock is taken twice, and CI's windows-2022 runner is the check.
+
+### 49. MSVC refuses the C for a zeroed optional of a deeply nested type
+
+Found testing on a Windows 11 laptop (ceesafec 0.95.6, cl 19.44). The engine's test program does not compile with
+MSVC: `main.c(35841): fatal error C1054: compiler limit: initializers nested too deeply`, at
+`v_over_29 = ((ceeO_S10OverClause){ .tag = 0 });`, the null of an `OverClause?` (`src/compile.cee`, a window's OVER
+clause). The compound literal names only `.tag`, but the optional's C type holds `OverClause` by value, and its
+members (the frame, its bounds, expressions, vectors of them) nest structs and unions deeper than MSVC lets an
+initializer reach. gcc and clang accept it. CI's windows-2022 job did not see it: gcc is on that runner's PATH too,
+and ceesafec takes it when `CC` is not set. A null optional (or any zeroed value) of a deep type could be written
+without a nested initializer, e.g. from a zeroed static or with `memset`.
+
+Workaround: none; on Windows the package is built with gcc (MinGW), and CI says so (`CC`).
+
+### 50. Float results depend on the C toolchain on Windows
+
+Found testing on a Windows 11 laptop. ADR 0218's float methods call the platform's libm. Built with gcc (WinLibs
+MinGW-w64 16.2, UCRT), the engine's math functions differ from sqlite.org's `sqlite3.exe` (built with MSVC, the
+UCRT's libm) in the last bit or two for some arguments of `asin`, `acos`, `cosh`, `tanh` and `exp` (9 of 400 rows
+and 3 of 27 in `mathFunctionsAgreeWithTheShellOnManyArguments` and `mathFunctionsOverTableRows`). MinGW's `pow` also
+rounds a tie the wrong way: `pow(2, -1075)`, exactly half the smallest subnormal, is 4.94e-324 instead of 0.0
+(`mathFunctionsOnSpecialValues`). On macOS and Linux the engine and sqlite3 share the system's libm, so they agree.
+Correctly rounded functions (CORE-MATH, or LLVM libc's), or calling the UCRT's own functions from a MinGW build,
+would make results the same on every toolchain.
+
+Workaround: none in the engine; the three math tests fail when it is built with MinGW on Windows. CI's windows-2022
+job passes them with its gcc (a different MinGW build); results there are not guaranteed.
