@@ -72,7 +72,8 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   U+FFFD as soon as they were read. SQLite keeps a text's bytes, and so does this: `SqliteValue.Text` holds a
   `ByteString`. The functions read the bytes by SQLite's rules rather than a strict decoder's: unicode(), LIKE,
   GLOB and unhex() by READ_UTF8 (a byte below 0xC0 is a character of its own, a byte from 0xC0 takes every
-  continuation byte after it, and an overlong form, a surrogate, U+FFFE or U+FFFF reads as U+FFFD); length()
+  continuation byte after it, and an overlong form or a surrogate reads as U+FFFD, while U+FFFE and U+FFFF are
+  characters, as in SQLite 3.54.1, where Apple's sqlite3 3.54.0 reads them as U+FFFD too); length()
   and substr() by 3.54's tag-20260418-01 (a stray continuation byte takes the ones after it); instr() by its own
   stepping; trim() by matching each character of its set as bytes; upper(), lower(), replace(), quote(), `||`,
   group_concat(), printf() and strftime() keep the other bytes as they are; char() writes a surrogate as ED A0 80;
@@ -99,8 +100,8 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   into its records as UTF-8 (so sqlite3 then read `wörld` as `썷状摬`), kept its indexes in UTF-8 order, and showed
   UTF-8 wherever text met bytes. SQLite holds text in the database's encoding, and that shows; here text is held as
   UTF-8 and translated where SQLite would see the encoding (`src/textenc.cee`):
-  - records hold text in UTF-16, translated as sqlite3VdbeMemTranslate does (READ_UTF8: bytes that are not UTF-8,
-    overlong forms, U+FFFE and U+FFFF become U+FFFD), sqlite_schema's names and SQL included;
+  - records hold text in UTF-16, translated as sqlite3VdbeMemTranslate does (READ_UTF8: bytes that are not UTF-8
+    and overlong forms become U+FFFD, U+FFFE and U+FFFF stay), sqlite_schema's names and SQL included;
   - BINARY compares the encoding's bytes: in UTF-16LE `'Ā' < 'a'` (00 01 against 61 00), and in UTF-16BE a
     character above U+FFFF sorts before U+E000..U+FFFF; so do indexes (seeks in sqlite3's, entries written here),
     ORDER BY, GROUP BY, comparisons, min() and max(), window orders and compound ORDER BY. NOCASE and RTRIM exist
@@ -278,7 +279,9 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   renderer's version of the whole statement and left views and triggers naming the old names.
 - **Date and time values.** The C# read time values through .NET's `DateTime`: no year 0 or earlier, no
   `+HH:MM`/`Z` zones, at most three fraction digits, no time without a date, and a bare number was always a Julian
-  day. The port of SQLite's date.c reads them all as SQLite does, numbers included (`dateTimeValues`).
+  day. The port of SQLite's date.c reads them all as SQLite does, numbers included (`dateTimeValues`). A time of
+  24:00:00 is the next day's midnight before any modifier sees it, and hour 24 with other minutes or seconds is no
+  time, as in SQLite 3.54.1 (Apple's sqlite3 3.54.0 keeps 24:00:00 as it is and takes 24:30).
 - **Modifiers.** The C# applied 'unixepoch' and 'auto' wherever they stood, made 'floor' re-run month arithmetic,
   treated 'utc' and 'localtime' as nothing, and lacked 'julianday', '±HH:MM', '±YYYY-MM-DD', and 'subsec' outside
   datetime(). Here they apply in order with SQLite's rules (only right after the value for 'unixepoch', 'julianday',
@@ -305,7 +308,8 @@ The port fixes what was wrong in the source instead of copying it. Each item has
     `%n`; an unknown conversion threw, where SQLite ends the output there; a lone `%` at the end was dropped;
   - `%s` precision counted UTF-16 units instead of bytes (or characters with `!`); `%c` of `''` or NULL threw
     instead of giving a NUL; `%q` and `%w` of NULL gave `''` instead of `(NULL)`;
-  - `printf(NULL)`, `printf()` and an empty result were `''`; in SQLite they are NULL.
+  - `printf(NULL)` and `printf()` were `''`; in SQLite they are NULL. An empty result is `''` in SQLite 3.54.1
+    (Apple's 3.54.0 gives NULL), and here (`printfFlagsAndParsing`).
 
   Bytes that are not UTF-8 (a `%.Ns` precision that cuts a character in two, a text or blob argument that is not
   UTF-8) are kept as SQLite keeps them (`textFormatsKeepBytes`). Where this still differs from the stock library:
@@ -404,7 +408,8 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   afresh for each row (no inverse step yet), so a sliding frame costs its width per row.
 - **RIGHT and FULL joins** run in the nested loops: each right source's rows that matched nothing come out after
   the loops, with the earlier sources NULL; a column USING or NATURAL shares is `coalesce(left, right)` in
-  unqualified names, `*` and the left table's `t.*`, as in SQLite (`rightAndFullJoinsMatchSqlite`). The C# refused
+  unqualified names and `*`, while `t.*` and `t.column` are the table's own, as in SQLite 3.54.1 (Apple's 3.54.0
+  coalesces in the left table's `t.*` too; `rightAndFullJoinsMatchSqlite`). The C# refused
   them.
 - **Result column names** are SQLite's (`resultColumnNamesMatchSqlite`): an expression's text as written, comments
   and spacing kept; a column's name as its table declares it, whatever case the query uses; the INTEGER PRIMARY
@@ -538,7 +543,8 @@ The port fixes what was wrong in the source instead of copying it. Each item has
 - **VACUUM** (`vacuumPacksTheFile`) builds every b-tree again into packed pages within one transaction, records
   as they are stored, header settings kept, freelist empty; the file comes out the size sqlite3's VACUUM gives.
   VACUUM INTO writes the packed image to a new file
-  (`vacuumIntoWritesACopy`), refusing an existing file and a non-text name as SQLite does. Refused: VACUUM inside
+  (`vacuumIntoWritesACopy`), refusing an existing file that is not empty and a non-text name as SQLite 3.54.1 does (Apple's 3.54.0
+  refuses an empty one too). Refused: VACUUM inside
   a transaction (as in SQLite), UTF-16 databases and pages with reserved
   bytes. The C# refused VACUUM.
 - **OR FAIL and OR ROLLBACK** (`failAndRollbackActions`), from a statement, a constraint's ON CONFLICT or a
@@ -661,15 +667,21 @@ out/sqlite_shell -csv -header app.db < script.sql    # or statements and dot-com
 out/sqlite_shell app.db                              # at a terminal: a banner, then prompts
 ```
 
-It behaves as the `sqlite3` shell (3.54) for what it has: options `-header`, `-noheader`, `-list`, `-csv`,
-`-line`, `-column`, `-bail`; dot-commands `.headers`, `.mode list|csv|line|column`, `.tables`, `.schema`, `.read`,
-`.bail`, `.quit`, `.exit N`, `.help`; output byte for byte as sqlite3 prints it, errors as sqlite3 words them, and
-exit status 1 after an error. When standard input is a terminal (`Console.isTerminal`) and no argument gives SQL,
+It behaves as sqlite.org's `sqlite3` shell 3.54.1 for what it has: options `-header`, `-noheader`, `-list`,
+`-csv`, `-line`, `-column`, `-bail`; dot-commands `.headers on|off|always`, `.mode list|csv|line|column`,
+`.tables`, `.schema`, `.read`, `.bail`, `.quit`, `.exit N`, `.help`; output byte for byte as sqlite3 prints it,
+errors as sqlite3 words them, and exit status 1 after an error. As in 3.54.1, an error leaves the rest of its
+argument or line, whether the statement failed as it was prepared or as it ran, and `.schema` writes a view's `;`
+before the comment that names its columns; Apple's sqlite3 3.54.0 differs in these and in `.headers`' usage, and
+the tests compare with sqlite.org's output there when they run against it (`APPLE_DIFFERS` in
+`cli/tests/shell_tests.cee`). When standard input is a terminal (`Console.isTerminal`) and no argument gives SQL,
 it is interactive as sqlite3 is: it prints the banner, prompts with `sqlite> ` and, while a statement is unfinished,
 `   ...> `, goes on after errors even under `.bail`, and ends the line at Ctrl+D; otherwise it reads standard input
 as a script. The tests run the same arguments and input through both shells on copies of one database and compare
 everything printed, then check the file with `PRAGMA integrity_check`; `tests/terminal.py` does the same for
-sessions typed into both at a pseudo-terminal. Differences:
+sessions typed into both at a pseudo-terminal, with sqlite.org's line editor off (`-cmdline-edit off`: it asks
+the terminal where its cursor is and redraws lines, where Apple's sqlite3 and this shell read the terminal's lines).
+Differences:
 
 - no caret line under a statement's error ("^--- error here"): the engine does not report where in the text an
   error is; and the engine does not say whether a statement failed when it was prepared or when it ran, so "Parse

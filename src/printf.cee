@@ -131,7 +131,7 @@ struct PrintfSpec {
     precision: i64;
 }
 
-/// printf(FORMAT, ...) and format(FORMAT, ...): NULL when there is no format or it is NULL.
+/// printf(FORMAT, ...) and format(FORMAT, ...): NULL when there is no format or it is NULL, else text, '' included.
 fn printfFunction(values: Slice<SqliteValue>) -> Result<SqliteValue, SqliteError> {
     if (values.length == 0 || values[0].isNull()) {
         return Ok(SqliteValue.Null);
@@ -151,10 +151,7 @@ fn printfFunction(values: Slice<SqliteValue>) -> Result<SqliteValue, SqliteError
     if (out.tooBig) {
         return Err(sqlError("string or blob too big"));
     }
-    if (out.bytes.length == 0) {
-        // SQLite's text was never allocated, and an unallocated result is NULL.
-        return Ok(SqliteValue.Null);
-    }
+    // An empty result is empty text (SQLite 3.54.1; Apple's 3.54.0 gives NULL, its text never having been allocated).
     return Ok(SqliteValue.Text(ByteString.fromBytes(out.bytes)));
 }
 

@@ -1258,10 +1258,9 @@ fn compileCoreBody(
                         if (col.hidden) {
                             continue;
                         }
-                        var compiled = Compiler.columnOf(source, k);
-                        if (!Compiler.isMerged(source, col.name.view())) {
-                            compiled = Compiler.withMergedSides(scope, s, col.name.view(), compiled)?;
-                        }
+                        // The table's own columns, as `t.column` is: a column a RIGHT or FULL join merges is not
+                        // coalesced here (SQLite 3.54.1; Apple's 3.54.0 coalesces it, as `*` does).
+                        let compiled = Compiler.columnOf(source, k);
                         outputExprsIn.push(compiled.expr)?;
                         outputs.push(
                             OutputColumn {

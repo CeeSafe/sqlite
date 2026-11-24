@@ -220,6 +220,10 @@ fn parseHhMmSs(z: Slice<u8>, p: borrow mut DateTime) -> bool {
             }
         }
     }
+    // Hour 24 is midnight at the end of the day, 24:00:00 only (SQLite 3.54.1; Apple's 3.54.0 took any time in it).
+    if (h == 24 && (m != 0 || s != 0 || ms != 0.0)) {
+        return true;
+    }
     p.validJD = false;
     p.rawS = false;
     p.validHMS = true;
@@ -356,10 +360,8 @@ fn setRawDateNumber(p: borrow mut DateTime, r: f64) {
 
 /// parseDateOrTime: a date and time, a time, 'now', a number or 'subsec'. True on an error.
 fn parseDateOrTime(z: Slice<u8>, p: borrow mut DateTime, nowMillis: i64) -> bool {
-    if (!parseYyyyMmDd(z, p)) {
-        return false;
-    }
-    if (!parseHhMmSs(z, p)) {
+    if (!parseYyyyMmDd(z, p) || !parseHhMmSs(z, p)) {
+        endOfDayIsNextMidnight(p);
         return false;
     }
     if (sameWord(z, "now")) {
@@ -374,6 +376,16 @@ fn parseDateOrTime(z: Slice<u8>, p: borrow mut DateTime, nowMillis: i64) -> bool
         return setToNow(p, nowMillis);
     }
     return true;
+}
+
+/// A time value at 24:00:00 is the next day's 00:00:00 before any modifier sees it: `time('24:00')` is 00:00:00,
+/// `datetime('2024-12-31 24:00', 'start of day')` 2025-01-01 00:00:00 (SQLite 3.54.1).
+fn endOfDayIsNextMidnight(p: borrow mut DateTime) {
+    if (p.validHMS && p.hour == 24) {
+        computeJD(p);
+        p.validYMD = false;
+        p.validHMS = false;
+    }
 }
 
 fn validJulianDay(jd: i64) -> bool => jd >= 0 && jd <= MAX_JD_MS;

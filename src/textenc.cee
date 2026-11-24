@@ -10,8 +10,8 @@
 // - a blob becomes text by being read in the encoding: CAST(blob AS TEXT), `||`, and the functions that read
 //   text (upper(), trim(), unicode(), LIKE, printf('%s'), …).
 //
-// UTF-8 becomes UTF-16 as sqlite3VdbeMemTranslate makes it, by READ_UTF8 (bytes that are not UTF-8, overlong
-// forms, U+FFFE and U+FFFF become U+FFFD; a code point past U+10FFFF is written as WRITE_UTF16 writes it), with
+// UTF-8 becomes UTF-16 as sqlite3VdbeMemTranslate makes it, by READ_UTF8 (bytes that are not UTF-8 and overlong
+// forms become U+FFFD, U+FFFE and U+FFFF stay; a code point past U+10FFFF is written as WRITE_UTF16 writes it), with
 // one exception: a surrogate written in three bytes (ED A0 80..ED BF BF) becomes that unit again. Those bytes
 // are how record.cee keeps a lone surrogate read from a UTF-16 record, so text read from the file goes back
 // unchanged; SQLite, which never translated it, does the same. Text made in UTF-8 with such bytes (char(0xd800))
@@ -57,7 +57,7 @@ struct Utf16Units<region r> {
                 code = (code << 6) | ((this.bytes[this.at] & 0x3F) as u32);
                 this.at += 1;
             }
-            if (code < 0x80 || (code & 0xFFFF_F800) == 0xD800 || (code & 0xFFFF_FFFE) == 0xFFFE) {
+            if (code < 0x80 || (code & 0xFFFF_F800) == 0xD800) {
                 code = 0xFFFD;
             }
         }

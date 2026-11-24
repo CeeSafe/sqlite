@@ -399,8 +399,9 @@ fn windowFunctionNamed(name: StringView, argc: usize, star: bool) -> WindowFunct
 
 /// The characters of text, as SQLite reads them (READ_UTF8, sqlite3Utf8Read): a byte below 0xC0 is a character
 /// of its own, even a stray continuation byte; a byte from 0xC0 takes every continuation byte after it, and the
-/// result is U+FFFD when it is overlong, a surrogate, or U+FFFE or U+FFFF (as the sqlite3 shell this package
-/// is tested against reads them; SQLite's own 3.54.0 sources no longer replace those two). A NUL ends the text.
+/// result is U+FFFD when it is overlong or a surrogate. U+FFFE and U+FFFF are characters like any other, as in
+/// SQLite 3.54's sources and sqlite.org's builds (Apple's sqlite3 3.54.0 still makes them U+FFFD). A NUL ends the
+/// text.
 struct Utf8Chars<region r> {
     bytes: Slice<r, u8>;
     at: usize;
@@ -429,7 +430,7 @@ struct Utf8Chars<region r> {
             code = (code << 6) | ((this.bytes[this.at] & 0x3F) as u32);
             this.at += 1;
         }
-        if (code < 0x80 || (code & 0xFFFF_F800) == 0xD800 || (code & 0xFFFF_FFFE) == 0xFFFE) {
+        if (code < 0x80 || (code & 0xFFFF_F800) == 0xD800) {
             return 0xFFFD;
         }
         return code;

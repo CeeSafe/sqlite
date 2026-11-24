@@ -24,7 +24,8 @@ fn executeVacuum(into: borrow Expr?, params: Slice<SqliteValue>, db: borrow mut 
             return Err(sqlError("non-text filename"));
         };
         let path = fileNameOf(name.clone()?)?;
-        if (fileLength(path.view())?.isSome()) {
+        // The file must not exist or be empty (SQLite 3.54.1; Apple's 3.54.0 refuses an empty one too).
+        if ((fileLength(path.view())? ?? 0) > 0) {
             return Err(sqlError("output file already exists"));
         }
         target = path;
