@@ -448,16 +448,23 @@ fn executePragma(stmt: borrow PragmaStmt, db: borrow mut Session) -> Result<Quer
             rows.push(textRow(if (db.pager.inWalMode()) "wal" else "delete")?)?;
         }
         "wal_checkpoint" => {
-            // PASSIVE, FULL and RESTART copy every committed frame, there being no other connection to wait
-            // for; TRUNCATE also empties the log. Outside WAL mode there is no log: -1 frames.
-            if (db.inTransaction && db.pager.hasChanges()) {
+            // PASSIVE copies what readers allow; FULL also waits for the writer's lock and the readers, RESTART
+            // then waits for readers to leave the log, and TRUNCATE empties it (walindex.cee). Outside WAL mode
+            // there is no log: -1 frames. As in SQLite, a transaction that has read or written refuses it.
+            if (db.inTransaction && (db.pager.hasChanges() || db.pager.readBeforeStatement)) {
                 return Err(sqlError("database table is locked"));
             }
-            let truncate = setText.equalsIgnoreAsciiCase("truncate");
-            let done = db.pager.checkpoint(truncate)?;
+            let mode = if (setText.equalsIgnoreAsciiCase(
+                "full",
+            )) CheckpointMode.Full else if (setText.equalsIgnoreAsciiCase(
+                "restart",
+            )) CheckpointMode.Restart else if (setText.equalsIgnoreAsciiCase(
+                "truncate",
+            )) CheckpointMode.Truncate else CheckpointMode.Passive;
+            let done = db.pager.checkpoint(mode)?;
             columns = namesOf(["busy", "log", "checkpointed"][..])?;
             var row = Vector<SqliteValue>.create();
-            row.push(SqliteValue.Integer(0))?;
+            row.push(SqliteValue.Integer(if (done.busy) 1 else 0))?;
             row.push(SqliteValue.Integer(done.logFrames))?;
             row.push(SqliteValue.Integer(done.checkpointed))?;
             rows.push(row)?;

@@ -315,6 +315,7 @@ public struct Session {
         for (i in 0..this.databaseCount()) {
             let pager = this.pagerOf(i);
             pager.busyTimeout = timeout;
+            pager.readBeforeStatement = pager.lockLevel() != LOCK_NONE;
             idle.push(pager.lockLevel() == LOCK_NONE)?;
         }
         if (stmt is Stmt.Begin(kind)) {

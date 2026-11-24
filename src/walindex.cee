@@ -1,0 +1,1183 @@
+// The wal-index: `<database>-shm`, memory every connection to a database in WAL mode maps and shares, as SQLite's
+// wal.c keeps it, with os_unix.c's locks on its bytes. https://www.sqlite.org/walformat.html
+//
+// The file is read and written through 32 KiB shared mappings (CeeSafe's SharedMapping, ADR 0232), one for each
+// block of the index, in the host's byte order (little-endian on every host CeeSafe builds for):
+// - bytes 0 to 95: two copies of the 48-byte index header (format version, a change counter, an "initialized" byte,
+//   the log's checksum byte order, the page size, the last committed frame (mxFrame), the database's size in
+//   pages, the running checksum after the last commit, the log's salts, and a checksum of the 40 bytes before it).
+//   A writer writes the second copy, then the first; a reader reads the first, then the second, and takes the
+//   header only when they agree and the checksum holds;
+// - bytes 96 to 135: the checkpoint information: the frames copied into the database file (nBackfill), five read
+//   marks, eight bytes whose locks are the index's locks (below), and the frames a checkpoint last tried to copy;
+// - then, in each block, an array of the page numbers of 4096 frames (4062 in the first block, which holds the
+//   header) and a hash table of 8192 16-bit slots, each the index (from 1) of a frame in the array, by page number.
+//
+// Locks, on bytes of the `-shm` file (fcntl's, which sqlite3 takes too): 120 is the writer's, 121 the
+// checkpointer's, 122 recovery's, 123 to 127 the five read marks', and 128 the "dead man switch" (DMS): every
+// connection holds it shared while it has the index open; one that finds nobody holding it is the first, and empties
+// the file, so that the index is rebuilt from the log (recovery).
+//
+// A reader picks a read mark no larger than the last commit, and reads each page from the latest frame up to the
+// mark, else from the database file; a checkpoint copies no frame past a mark some reader holds, and a writer starts
+// the log again only when no reader is in it. Nothing read from the `-shm` is trusted: a header that fails its
+// checks, or names frames the log does not hold, is rebuilt from the log; a frame the hash tables name is read with
+// its header, whose page number and salts must be the page's and the log's, else the database is `Corrupt`; every
+// loop over the tables is bounded.
+
+const SHM_SUFFIX: StringView = "-shm";
+const WALINDEX_VERSION: u32 = 3007000;
+/// The size of a block of the index, as SQLite maps it.
+const WALINDEX_BLOCK: usize = 32768;
+/// The two header copies and the checkpoint information, at the start of the first block.
+const WALINDEX_HEADER_BYTES: usize = 136;
+const WALINDEX_HEADER_COPY: usize = 48;
+/// Frames a block indexes, and the first block's fewer.
+const HASH_FRAMES: u32 = 4096;
+const HASH_FRAMES_FIRST: u32 = 4062;
+const HASH_SLOTS: usize = 8192;
+/// Where a block's hash table begins, after its 4096 page numbers.
+const HASH_TABLE_AT: usize = 16384;
+const SHM_BACKFILL_AT: usize = 96;
+const SHM_READ_MARKS_AT: usize = 100;
+const SHM_BACKFILL_ATTEMPTED_AT: usize = 128;
+/// The lock bytes (os_unix.c's UNIX_SHM_BASE and UNIX_SHM_DMS), and the locks by number from the first.
+const SHM_LOCKS_AT: u64 = 120;
+const SHM_DMS: u64 = 128;
+const SHM_WRITE_LOCK: u64 = 0;
+const SHM_CHECKPOINT_LOCK: u64 = 1;
+const SHM_RECOVER_LOCK: u64 = 2;
+const SHM_READ_LOCK0: u64 = 3;
+const SHM_READERS: usize = 5;
+const READ_MARK_UNUSED: u32 = 0xFFFF_FFFF;
+/// walTryBeginRead's limit on retries, after which SQLite reports SQLITE_PROTOCOL.
+const WAL_RETRY_LIMIT: u32 = 100;
+
+/// PRAGMA wal_checkpoint's modes.
+enum CheckpointMode {
+    Passive,
+    Full,
+    Restart,
+    Truncate,
+}
+
+/// What `PRAGMA wal_checkpoint` answers: whether it was stopped by another connection, the frames in the log, and
+/// how many of them the database file now holds (-1 and -1 when it could not start).
+struct WalCheckpoint {
+    busy: bool;
+    logFrames: i64;
+    checkpointed: i64;
+}
+
+/// The block of the index that holds frame `frame` (walFramePage).
+fn walIndexBlockOf(frame: u32) -> usize =>
+    (((frame as u64) + (HASH_FRAMES as u64) - (HASH_FRAMES_FIRST as u64) - 1) / (HASH_FRAMES as u64)) as usize;
+
+/// One less than the first frame block `block` indexes (iZero).
+fn walIndexBlockZero(block: usize) -> u64 =>
+    if (block == 0) 0 else (HASH_FRAMES_FIRST as u64) + ((block - 1) as u64) * (HASH_FRAMES as u64);
+
+/// Where block `block`'s page numbers begin.
+fn walIndexPagesAt(block: usize) -> usize => if (block == 0) WALINDEX_HEADER_BYTES else 0;
+
+/// walHash: the first hash slot for page `page`.
+fn walIndexHash(page: u32) -> usize => (page.wrappingMul(383) as usize) & (HASH_SLOTS - 1);
+
+/// The page size a header field holds: 65536 is stored as 1.
+fn pageSizeFromField(field: u16) -> usize => ((field & 0xFE00) as usize) + (((field & 1) as usize) << 16);
+
+fn pageSizeField(pageSize: usize) -> u16 => truncate<u16>((pageSize & 0xFF00) | (pageSize >> 16));
+
+/// The wal-index header (WalIndexHdr), as one connection last read or wrote it.
+struct WalIndexHeader {
+    version: u32;
+    unused: u32;
+    change: u32;
+    initialized: u8;
+    bigEndian: u8;
+    pageSizeField: u16;
+    /// The last committed frame (mxFrame), and the database's size in pages after it.
+    frames: u32;
+    pages: u32;
+    /// The log's running checksum after frame `frames` (after its header when there is none).
+    frameSum: WalSum;
+    /// The log's salts, as its header holds them.
+    salt1: u32;
+    salt2: u32;
+    sum: WalSum;
+
+    fn zero() -> WalIndexHeader => WalIndexHeader {
+        version: 0,
+        unused: 0,
+        change: 0,
+        initialized: 0,
+        bigEndian: 0,
+        pageSizeField: 0,
+        frames: 0,
+        pages: 0,
+        frameSum: WalSum { first: 0, second: 0 },
+        salt1: 0,
+        salt2: 0,
+        sum: WalSum { first: 0, second: 0 },
+    };
+
+    fn decode(bytes: Slice<u8>) -> WalIndexHeader => WalIndexHeader {
+        version: bytes.readLE<u32>(0),
+        unused: bytes.readLE<u32>(4),
+        change: bytes.readLE<u32>(8),
+        initialized: bytes[12],
+        bigEndian: bytes[13],
+        pageSizeField: bytes.readLE<u16>(14),
+        frames: bytes.readLE<u32>(16),
+        pages: bytes.readLE<u32>(20),
+        frameSum: WalSum { first: bytes.readLE<u32>(24), second: bytes.readLE<u32>(28) },
+        salt1: bytes.readBE<u32>(32),
+        salt2: bytes.readBE<u32>(36),
+        sum: WalSum { first: bytes.readLE<u32>(40), second: bytes.readLE<u32>(44) },
+    };
+
+    fn encode(borrow this) -> [u8; 48] {
+        var bytes = [0u8; 48];
+        bytes[..].writeLE(0, this.version);
+        bytes[..].writeLE(4, this.unused);
+        bytes[..].writeLE(8, this.change);
+        bytes[12] = this.initialized;
+        bytes[13] = this.bigEndian;
+        bytes[..].writeLE(14, this.pageSizeField);
+        bytes[..].writeLE(16, this.frames);
+        bytes[..].writeLE(20, this.pages);
+        bytes[..].writeLE(24, this.frameSum.first);
+        bytes[..].writeLE(28, this.frameSum.second);
+        bytes[..].writeBE(32, this.salt1);
+        bytes[..].writeBE(36, this.salt2);
+        bytes[..].writeLE(40, this.sum.first);
+        bytes[..].writeLE(44, this.sum.second);
+        return bytes;
+    }
+
+    /// The checksum of the 40 bytes before it, in the host's byte order.
+    fn checksum(borrow this) -> WalSum {
+        let bytes = this.encode();
+        return walChecksum(WalSum { first: 0, second: 0 }, bytes[0..40], false);
+    }
+
+    fn pageSize(borrow this) -> usize => pageSizeFromField(this.pageSizeField);
+
+    fn sameAs(borrow this, other: borrow WalIndexHeader) -> bool {
+        let a = this.encode();
+        let b = other.encode();
+        return a[..] == b[..];
+    }
+}
+
+/// One try at a read transaction (walTryBeginRead).
+enum ReadTry {
+    Done,
+    Retry,
+    Busy,
+}
+
+/// A connection's handle on a database's write-ahead log and its wal-index: wal.c's Wal.
+struct SharedWal {
+    private shm: File;
+    private shmPath: String;
+    private logPath: String;
+    private log: File;
+    /// The index's blocks mapped so far, from the first.
+    private regions: Vector<SharedMapping>;
+    /// The header of this connection's snapshot (wal.c's pWal->hdr).
+    hdr: WalIndexHeader;
+    /// The read mark held (0 to 4), or -1; whether the writer's lock is held.
+    private readLock: i32;
+    private writeLock: bool;
+    /// The first frame this snapshot reads from the log; those before it are in the database file.
+    private minFrame: u32;
+    // A commit being written: its frames' pages, its next frame and its running checksum.
+    private pending: Vector<u32>;
+    private nextFrame: u32;
+    private pendingSum: WalSum;
+    // A block of the index being changed, and what it held before, so that only changed words are written.
+    private block: Vector<u8>;
+    private before: Vector<u8>;
+    private frame: Vector<u8>;
+
+    /// Opens the log and the wal-index of the database at `path`, creating them when missing, and takes the DMS
+    /// lock (unixLockSharedMemory): the first connection empties the index, which is then rebuilt. Null when
+    /// another connection is doing that now.
+    fn open(path: StringView) -> Result<SharedWal?, SqliteError> {
+        let shmPath = withSuffix(path, SHM_SUFFIX)?;
+        let logPath = withSuffix(path, WAL_SUFFIX)?;
+        var shm = File.openOrCreate(shmPath.view())?;
+        // os_unix.c asks with F_GETLK whether anyone holds the DMS byte; without a test of another's lock
+        // (CEESAFE_FINDINGS.md, finding 36) the exclusive lock is tried: it is granted only when nobody holds it.
+        if (shm.tryLock(FileLock.Exclusive, SHM_DMS, 1)?) {
+            shm.setLength(3)?;
+            // The handle's own lock becomes a shared one (fcntl converts it in place).
+            if (!shm.tryLock(FileLock.Shared, SHM_DMS, 1)?) {
+                return Ok(null);
+            }
+        } else if (!shm.tryLock(FileLock.Shared, SHM_DMS, 1)?) {
+            return Ok(null);
+        }
+        let log = File.openOrCreate(logPath.view())?;
+        var block = Vector<u8>.create();
+        block.resize(WALINDEX_BLOCK, 0)?;
+        var before = Vector<u8>.create();
+        before.resize(WALINDEX_BLOCK, 0)?;
+        return Ok(SharedWal {
+            shm: shm,
+            shmPath: shmPath,
+            logPath: logPath,
+            log: log,
+            regions: Vector<SharedMapping>.create(),
+            hdr: WalIndexHeader.zero(),
+            readLock: -1,
+            writeLock: false,
+            minFrame: 1,
+            pending: Vector<u32>.create(),
+            nextFrame: 0,
+            pendingSum: WalSum { first: 0, second: 0 },
+            block: block,
+            before: before,
+            frame: Vector<u8>.create(),
+        });
+    }
+
+    // ── locks ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    private fn tryShm(borrow this, kind: FileLock, lock: u64, count: u64) -> Result<bool, SqliteError> =>
+        Ok(this.shm.tryLock(kind, SHM_LOCKS_AT + lock, count)?);
+
+    private fn unlockShm(borrow this, lock: u64, count: u64) {
+        // An unlock fails only for a handle that is not open; closing it releases every lock.
+        let _ = this.shm.unlock(SHM_LOCKS_AT + lock, count);
+    }
+
+    /// An exclusive lock, waiting as the busy handler does when `waits` (walBusyLock).
+    private fn exclusiveWaiting(
+        borrow this,
+        lock: u64,
+        count: u64,
+        waits: bool,
+        timeout: i64,
+    ) -> Result<bool, SqliteError> {
+        var attempt: usize = 0;
+        loop {
+            if (this.tryShm(FileLock.Exclusive, lock, count)?) {
+                return Ok(true);
+            }
+            if (!waits || !busyWait(attempt, timeout)) {
+                return Ok(false);
+            }
+            attempt += 1;
+        }
+    }
+
+    /// Whether a read transaction is open, and on which read mark (-1 for none).
+    fn readMark(borrow this) -> i32 => this.readLock;
+
+    fn holdsWriteLock(borrow this) -> bool => this.writeLock;
+
+    // ── the shared memory ─────────────────────────────────────────────────────────────────────────────────────
+
+    /// Maps the index's blocks up to `block`; a mapping grows a shorter file with zeros.
+    private fn mapThrough(borrow mut this, block: usize) -> Result<void, SqliteError> {
+        while (this.regions.length <= block) {
+            let at = (this.regions.length as u64) * (WALINDEX_BLOCK as u64);
+            let mapped = this.shm.mapShared(at, WALINDEX_BLOCK)?;
+            this.regions.push(mapped)?;
+        }
+        return Ok();
+    }
+
+    private fn load(borrow this, at: usize) -> u32 => this.regions[0].load32(at, LoadOrdering.Acquire);
+
+    private fn store(borrow this, at: usize, value: u32) {
+        this.regions[0].store32(at, value, StoreOrdering.Release);
+    }
+
+    private fn readMarkAt(i: usize) -> usize => SHM_READ_MARKS_AT + 4 * i;
+
+    /// The first copy of the header as the index holds it now.
+    private fn liveHeader(borrow this) -> [u8; 48] {
+        var bytes = [0u8; 48];
+        this.regions[0].readAt(0, mut bytes[..]);
+        return bytes;
+    }
+
+    /// Whether the index's header is still this connection's.
+    private fn headerUnchanged(borrow this) -> bool {
+        SharedMapping.fence();
+        let live = this.liveHeader();
+        let mine = this.hdr.encode();
+        return live[..] == mine[..];
+    }
+
+    /// Writes this connection's header into both copies, the second first (walIndexWriteHdr).
+    private fn writeHeader(borrow mut this) {
+        this.hdr.initialized = 1;
+        this.hdr.version = WALINDEX_VERSION;
+        this.hdr.sum = this.hdr.checksum();
+        let bytes = this.hdr.encode();
+        this.regions[0].writeAt(WALINDEX_HEADER_COPY, bytes[..]);
+        SharedMapping.fence();
+        this.regions[0].writeAt(0, bytes[..]);
+    }
+
+    /// Where the log's frame `frame` (from 1) begins, for pages of `pageSize` bytes.
+    private fn frameOffset(frame: u32, pageSize: usize) -> u64 =>
+        WAL_HEADER_SIZE + ((frame - 1) as u64) * ((WAL_FRAME_HEADER_SIZE + pageSize) as u64);
+
+    /// walIndexTryHdr: true when the header could not be read (the copies differ, it is not initialized, or its
+    /// checksum fails), else takes it as this connection's and says in `changed` whether it moved. Beyond SQLite, a
+    /// header with an impossible page size, or naming frames the log does not hold, is taken as unreadable too, and
+    /// the index is rebuilt.
+    private fn tryHeader(borrow mut this, changed: borrow mut bool) -> Result<bool, SqliteError> {
+        this.mapThrough(0)?;
+        var first = [0u8; 48];
+        var second = [0u8; 48];
+        this.regions[0].readAt(0, mut first[..]);
+        SharedMapping.fence();
+        this.regions[0].readAt(WALINDEX_HEADER_COPY, mut second[..]);
+        if (first[..] != second[..]) {
+            return Ok(true);
+        }
+        let header = WalIndexHeader.decode(first[..]);
+        if (header.initialized == 0) {
+            return Ok(true);
+        }
+        let sum = header.checksum();
+        if (sum.first != header.sum.first || sum.second != header.sum.second) {
+            return Ok(true);
+        }
+        if (header.version != WALINDEX_VERSION) {
+            return Err(unsupported("the wal-index has a format version this engine does not know"));
+        }
+        if (header.frames != 0) {
+            let pageSize = header.pageSize();
+            if (!isPowerOfTwoBetween(pageSize, 512, 65536) || header.frames >= 0xFFFF_FFFE) {
+                return Ok(true);
+            }
+            let end = SharedWal.frameOffset(header.frames + 1, pageSize);
+            if (this.log.length()? < end) {
+                return Ok(true);
+            }
+        }
+        if (!this.hdr.sameAs(borrow header)) {
+            *changed = true;
+            this.hdr = header;
+        }
+        return Ok(false);
+    }
+
+    /// walIndexReadHdr: reads the header, rebuilding the index from the log when it cannot be read. Null when
+    /// that needs the writer's lock, or recovery's, and another connection holds it.
+    private fn readHeader(borrow mut this) -> Result<bool?, SqliteError> {
+        var changed = false;
+        if (!this.tryHeader(mut changed)?) {
+            return Ok(changed);
+        }
+        let held = this.writeLock;
+        if (!held) {
+            if (!this.tryShm(FileLock.Exclusive, SHM_WRITE_LOCK, 1)?) {
+                return Ok(null);
+            }
+            this.writeLock = true;
+        }
+        var result: Result<bool?, SqliteError> = Ok(true);
+        match (this.tryHeader(mut changed)) {
+            Ok(false) => { result = Ok(changed); }
+            Ok(true) => {
+                result = match (this.recover()) {
+                    Ok(true) => Ok(true),
+                    Ok(false) => Ok(null),
+                    Err(e) => Err(e),
+                };
+            }
+            Err(e) => { result = Err(e); }
+        }
+        if (!held) {
+            this.writeLock = false;
+            this.unlockShm(SHM_WRITE_LOCK, 1);
+        }
+        return result;
+    }
+
+    /// walIndexRecover: rebuilds the index from the log, holding the writer's lock; false when the checkpoint or
+    /// recovery lock is held by another connection.
+    private fn recover(borrow mut this) -> Result<bool, SqliteError> {
+        if (!this.tryShm(FileLock.Exclusive, SHM_CHECKPOINT_LOCK, 2)?) {
+            return Ok(false);
+        }
+        let result = this.rebuild();
+        this.unlockShm(SHM_CHECKPOINT_LOCK, 2);
+        result?;
+        return Ok(true);
+    }
+
+    private fn rebuild(borrow mut this) -> Result<void, SqliteError> {
+        this.hdr = WalIndexHeader.zero();
+        var commitSum = WalSum { first: 0, second: 0 };
+        let size = this.log.length()?;
+        var header = [0u8; 32];
+        if (size > WAL_HEADER_SIZE && readFully(mut this.log, mut header[..], 0)?) {
+            let magic = header[..].readBE<u32>(0);
+            let pageSize = header[..].readBE<u32>(8) as usize;
+            if ((magic & 0xFFFF_FFFE) == WAL_MAGIC && isPowerOfTwoBetween(pageSize, 512, 65536)) {
+                let bigEndian = (magic & 1) == 1;
+                let headerSum = walChecksum(WalSum { first: 0, second: 0 }, header[0..24], bigEndian);
+                if (headerSum.first == header[..].readBE<u32>(24) && headerSum.second == header[..].readBE<u32>(28)) {
+                    if (header[..].readBE<u32>(4) != WAL_VERSION) {
+                        return Err(unsupported("the write-ahead log has a format version this engine does not know"));
+                    }
+                    this.hdr.bigEndian = if (bigEndian) 1 else 0;
+                    this.hdr.salt1 = header[..].readBE<u32>(16);
+                    this.hdr.salt2 = header[..].readBE<u32>(20);
+                    commitSum = this.indexFrames(size, pageSize, headerSum)?;
+                }
+            }
+        }
+        this.hdr.frameSum = commitSum;
+        this.writeHeader();
+        this.store(SHM_BACKFILL_AT, 0);
+        this.store(SHM_BACKFILL_ATTEMPTED_AT, this.hdr.frames);
+        this.store(SharedWal.readMarkAt(0), 0);
+        for (i in 1..SHM_READERS) {
+            if (this.tryShm(FileLock.Exclusive, SHM_READ_LOCK0 + (i as u64), 1)?) {
+                let mark = if (i == 1 && this.hdr.frames != 0) this.hdr.frames else READ_MARK_UNUSED;
+                this.store(SharedWal.readMarkAt(i), mark);
+                this.unlockShm(SHM_READ_LOCK0 + (i as u64), 1);
+            }
+        }
+        return Ok();
+    }
+
+    /// Recovery's reading of the frames: each valid one is indexed, block by block, and each commit frame moves
+    /// the header's last frame. Gives the checksum after the last commit frame.
+    private fn indexFrames(
+        borrow mut this,
+        size: u64,
+        pageSize: usize,
+        headerSum: WalSum,
+    ) -> Result<WalSum, SqliteError> {
+        let frameSize = (WAL_FRAME_HEADER_SIZE + pageSize) as u64;
+        let available = (size - WAL_HEADER_SIZE) / frameSize;
+        let lastFrame: u32 = if (available >= 0xFFFF_FFFE) 0xFFFF_FFFD else truncate<u32>(available);
+        this.frame.resize(WAL_FRAME_HEADER_SIZE + pageSize, 0)?;
+        let bigEndian = this.hdr.bigEndian == 1;
+        var running = headerSum;
+        var commitSum = WalSum { first: 0, second: 0 };
+        var frame: u32 = 1;
+        var valid = true;
+        while (valid && frame <= lastFrame) {
+            let block = walIndexBlockOf(frame);
+            this.loadBlock(block)?;
+            let zero = walIndexBlockZero(block);
+            while (frame <= lastFrame && walIndexBlockOf(frame) == block) {
+                if (!readFully(mut this.log, this.frame.viewMut(), SharedWal.frameOffset(frame, pageSize))?) {
+                    valid = false;
+                    break;
+                }
+                let bytes = this.frame.view();
+                let page = bytes.readBE<u32>(0);
+                if (page == 0 || bytes.readBE<u32>(8) != this.hdr.salt1 || bytes.readBE<u32>(12) != this.hdr.salt2) {
+                    valid = false;
+                    break;
+                }
+                let sum = walChecksum(
+                    walChecksum(running, bytes[0..8], bigEndian),
+                    bytes[WAL_FRAME_HEADER_SIZE..],
+                    bigEndian,
+                );
+                if (sum.first != bytes.readBE<u32>(16) || sum.second != bytes.readBE<u32>(20)) {
+                    valid = false;
+                    break;
+                }
+                running = sum;
+                let commitSize = bytes.readBE<u32>(4);
+                let index = truncate<u32>((frame as u64) - zero);
+                appendToBlock(this.block.viewMut(), block, index, page, this.hdr.frames)?;
+                if (commitSize != 0) {
+                    this.hdr.frames = frame;
+                    this.hdr.pages = commitSize;
+                    this.hdr.pageSizeField = pageSizeField(pageSize);
+                    commitSum = sum;
+                }
+                frame += 1;
+            }
+            this.writeBlock(block);
+        }
+        return Ok(commitSum);
+    }
+
+    /// Copies block `block` of the index into `block` and `before`.
+    private fn loadBlock(borrow mut this, block: usize) -> Result<void, SqliteError> {
+        this.mapThrough(block)?;
+        this.regions[block].readAt(0, this.block.viewMut());
+        this.before.viewMut().copyFrom(this.block.view());
+        return Ok();
+    }
+
+    /// Writes the words of `block` that changed since `loadBlock` back into the index, each atomically, leaving
+    /// the first block's header alone.
+    private fn writeBlock(borrow this, block: usize) {
+        var at = walIndexPagesAt(block);
+        let changed = this.block.view();
+        let old = this.before.view();
+        while (at < WALINDEX_BLOCK) {
+            let word = changed.readLE<u32>(at);
+            if (word != old.readLE<u32>(at)) {
+                this.regions[block].store32(at, word, StoreOrdering.Release);
+            }
+            at += 4;
+        }
+    }
+
+    // ── readers ──────────────────────────────────────────────────────────────────────────────────────────────
+
+    /// Starts a read transaction (walBeginReadTransaction): true when the header changed since this connection's
+    /// last, so that pages it holds must be read again; null when another connection's lock is in the way, for
+    /// the caller's busy handler.
+    fn beginRead(borrow mut this) -> Result<bool?, SqliteError> {
+        assert(this.readLock < 0, "one read transaction at a time");
+        var changed = false;
+        var count: u32 = 0;
+        loop {
+            count += 1;
+            if (count > 5) {
+                if (count > WAL_RETRY_LIMIT) {
+                    return Err(SqliteError.Busy(ownedMessage("locking protocol")));
+                }
+                // SQLite's pauses, in microseconds: 1, then (count - 9)² × 39 from the tenth try.
+                let micros: u64 = if (count >= 10) ((count - 9) as u64) * ((count - 9) as u64) * 39 else 1;
+                Thread.sleep((micros + 999) / 1000);
+            }
+            match (this.tryBeginRead(mut changed, false)?) {
+                ReadTry.Done => { return Ok(changed); }
+                ReadTry.Retry => {}
+                ReadTry.Busy => { return Ok(null); }
+            }
+        }
+    }
+
+    /// walTryBeginRead. With `useWal` the header is not read again, and read mark 0 is not taken.
+    private fn tryBeginRead(borrow mut this, changed: borrow mut bool, useWal: bool) -> Result<ReadTry, SqliteError> {
+        if (!useWal) {
+            match (this.readHeader()?) {
+                Some(moved) => {
+                    if (moved) {
+                        *changed = true;
+                    }
+                }
+                null => {
+                    // Another connection holds the writer's lock while the header is unreadable: if it is
+                    // rebuilding the index (the recovery lock), wait for it; otherwise try again.
+                    if (this.tryShm(FileLock.Shared, SHM_RECOVER_LOCK, 1)?) {
+                        this.unlockShm(SHM_RECOVER_LOCK, 1);
+                        return Ok(ReadTry.Retry);
+                    }
+                    return Ok(ReadTry.Busy);
+                }
+            }
+        }
+        let frames = this.hdr.frames;
+        if (!useWal && this.load(SHM_BACKFILL_AT) == frames) {
+            // Every frame is in the database file: read it alone, under read mark 0.
+            if (this.tryShm(FileLock.Shared, SHM_READ_LOCK0, 1)?) {
+                if (!this.headerUnchanged()) {
+                    this.unlockShm(SHM_READ_LOCK0, 1);
+                    return Ok(ReadTry.Retry);
+                }
+                this.readLock = 0;
+                return Ok(ReadTry.Done);
+            }
+        }
+        // The largest read mark not past the last frame; failing that, a mark set to it.
+        var best: u32 = 0;
+        var chosen: usize = 0;
+        for (i in 1..SHM_READERS) {
+            let mark = this.load(SharedWal.readMarkAt(i));
+            if (best <= mark && mark <= frames) {
+                best = mark;
+                chosen = i;
+            }
+        }
+        if (best < frames || chosen == 0) {
+            for (i in 1..SHM_READERS) {
+                if (this.tryShm(FileLock.Exclusive, SHM_READ_LOCK0 + (i as u64), 1)?) {
+                    this.store(SharedWal.readMarkAt(i), frames);
+                    best = frames;
+                    chosen = i;
+                    this.unlockShm(SHM_READ_LOCK0 + (i as u64), 1);
+                    break;
+                }
+            }
+        }
+        if (chosen == 0) {
+            return Ok(ReadTry.Retry);
+        }
+        if (!this.tryShm(FileLock.Shared, SHM_READ_LOCK0 + (chosen as u64), 1)?) {
+            return Ok(ReadTry.Retry);
+        }
+        this.minFrame = this.load(SHM_BACKFILL_AT).saturatingAdd(1);
+        if (this.load(SharedWal.readMarkAt(chosen)) != best || !this.headerUnchanged()) {
+            this.unlockShm(SHM_READ_LOCK0 + (chosen as u64), 1);
+            return Ok(ReadTry.Retry);
+        }
+        this.readLock = truncate<i32>(chosen);
+        return Ok(ReadTry.Done);
+    }
+
+    /// Ends the read transaction (and a write transaction in it).
+    fn endRead(borrow mut this) {
+        this.endWrite();
+        if (this.readLock >= 0) {
+            this.unlockShm(SHM_READ_LOCK0 + truncate<u64>(this.readLock), 1);
+            this.readLock = -1;
+        }
+    }
+
+    /// walFindFrame: the latest frame of page `page` in this snapshot, or 0 when the page is read from the
+    /// database file.
+    private fn findFrame(borrow mut this, page: u32) -> Result<u32, SqliteError> {
+        let last = this.hdr.frames;
+        if (last == 0 || this.readLock <= 0 || this.minFrame > last) {
+            return Ok(0);
+        }
+        let lowest = walIndexBlockOf(this.minFrame);
+        var block = walIndexBlockOf(last);
+        this.mapThrough(block)?;
+        loop {
+            let found = this.findInBlock(block, page, last)?;
+            if (found != 0) {
+                return Ok(found);
+            }
+            if (block <= lowest) {
+                return Ok(0);
+            }
+            block -= 1;
+        }
+    }
+
+    private fn findInBlock(borrow this, block: usize, page: u32, last: u32) -> Result<u32, SqliteError> {
+        let region = borrow this.regions[block];
+        let zero = walIndexBlockZero(block);
+        let pagesAt = walIndexPagesAt(block);
+        var key = walIndexHash(page);
+        var found: u32 = 0;
+        var collisions: usize = 0;
+        loop {
+            let word = region.load32(HASH_TABLE_AT + (key / 2) * 4, LoadOrdering.Acquire);
+            let slot = if (key % 2 == 0) word & 0xFFFF else word >> 16;
+            if (slot == 0) {
+                return Ok(found);
+            }
+            let frame = zero + (slot as u64);
+            if (frame <= (last as u64) && frame >= (this.minFrame as u64)) {
+                let at = pagesAt + 4 * (((slot - 1) & (HASH_FRAMES - 1)) as usize);
+                if (region.load32(at, LoadOrdering.Relaxed) == page) {
+                    found = truncate<u32>(frame);
+                }
+            }
+            collisions += 1;
+            if (collisions > HASH_SLOTS) {
+                return Err(corrupt("the wal-index's hash table has no free slot"));
+            }
+            key = (key + 1) & (HASH_SLOTS - 1);
+        }
+    }
+
+    /// Reads page `number` from its latest frame in this snapshot into `into`; false when it is read from the
+    /// database file. The frame's header must name the page and carry the log's salts.
+    fn readPage(borrow mut this, number: u32, into: SliceMut<u8>) -> Result<bool, SqliteError> {
+        let frame = this.findFrame(number)?;
+        if (frame == 0) {
+            return Ok(false);
+        }
+        let pageSize = this.hdr.pageSize();
+        if (into.length != pageSize) {
+            return Err(corrupt("the write-ahead log's page size is not the database's"));
+        }
+        let offset = SharedWal.frameOffset(frame, pageSize);
+        var header = [0u8; 24];
+        if (!readFully(mut this.log, mut header[..], offset)? ||
+            !readFully(mut this.log, into, offset + (WAL_FRAME_HEADER_SIZE as u64))?) {
+            return Err(corrupt("the write-ahead log ends inside a frame"));
+        }
+        if (header[..].readBE<u32>(0) != number || header[..].readBE<u32>(8) != this.hdr.salt1 ||
+            header[..].readBE<u32>(12) != this.hdr.salt2) {
+            return Err(corrupt("the wal-index names a frame of another page"));
+        }
+        return Ok(true);
+    }
+
+    /// The database's size in pages in this snapshot; 0 when the index does not say, and the file's size counts.
+    fn databasePages(borrow this) -> u32 => this.hdr.pages;
+
+    // ── the writer ───────────────────────────────────────────────────────────────────────────────────────────
+
+    /// sqlite3WalBeginWriteTransaction: the writer's lock, inside a read transaction. False when another
+    /// connection holds it, or has committed since this snapshot was taken (SQLITE_BUSY_SNAPSHOT).
+    fn beginWrite(borrow mut this) -> Result<bool, SqliteError> {
+        if (this.writeLock) {
+            return Ok(true);
+        }
+        assert(this.readLock >= 0, "a write transaction is inside a read transaction");
+        if (!this.tryShm(FileLock.Exclusive, SHM_WRITE_LOCK, 1)?) {
+            return Ok(false);
+        }
+        this.writeLock = true;
+        if (!this.headerUnchanged()) {
+            this.endWrite();
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+
+    fn endWrite(borrow mut this) {
+        if (this.writeLock) {
+            this.writeLock = false;
+            this.unlockShm(SHM_WRITE_LOCK, 1);
+        }
+    }
+
+    /// walRestartLog: a writer reading the database file alone (read mark 0) starts the log again from its first
+    /// frame when every frame is in the database file and no reader is in the log, then takes a read mark.
+    private fn restartLog(borrow mut this) -> Result<void, SqliteError> {
+        if (this.readLock != 0) {
+            return Ok();
+        }
+        if (this.load(SHM_BACKFILL_AT) > 0) {
+            if (this.tryShm(FileLock.Exclusive, SHM_READ_LOCK0 + 1, (SHM_READERS - 1) as u64)?) {
+                this.restartHeader()?;
+                this.unlockShm(SHM_READ_LOCK0 + 1, (SHM_READERS - 1) as u64);
+            }
+        }
+        this.unlockShm(SHM_READ_LOCK0, 1);
+        this.readLock = -1;
+        var unused = false;
+        for (attempt in 0..WAL_RETRY_LIMIT) {
+            match (this.tryBeginRead(mut unused, true)?) {
+                ReadTry.Done => { return Ok(); }
+                _ => {}
+            }
+        }
+        return Err(SqliteError.Busy(ownedMessage("locking protocol")));
+    }
+
+    /// walRestartHdr: the index says the log is empty, with the next salt-1 and a new salt-2, and no reader in it.
+    private fn restartHeader(borrow mut this) -> Result<void, SqliteError> {
+        this.hdr.frames = 0;
+        this.hdr.salt1 = this.hdr.salt1.wrappingAdd(1);
+        this.hdr.salt2 = randomU32()?;
+        this.writeHeader();
+        this.store(SHM_BACKFILL_AT, 0);
+        this.store(SHM_BACKFILL_ATTEMPTED_AT, 0);
+        this.store(SharedWal.readMarkAt(1), 0);
+        for (i in 2..SHM_READERS) {
+            this.store(SharedWal.readMarkAt(i), READ_MARK_UNUSED);
+        }
+        return Ok();
+    }
+
+    /// Starts a commit of pages of `pageSize` bytes, holding the writer's lock (the start of walFrames): the log
+    /// starts again when it can, and an empty log gets a new header.
+    fn beginCommit(borrow mut this, pageSize: usize) -> Result<void, SqliteError> {
+        assert(this.writeLock, "only the writer commits");
+        this.restartLog()?;
+        if (this.hdr.frames == 0) {
+            this.writeLogHeader(pageSize)?;
+        }
+        if (this.hdr.pageSize() != pageSize) {
+            return Err(corrupt("the write-ahead log's page size is not the database's"));
+        }
+        this.pending.clear();
+        this.nextFrame = this.hdr.frames;
+        this.pendingSum = this.hdr.frameSum;
+        return Ok();
+    }
+
+    /// A new log header. Its salts differ from those of the header the file has, if any: salt-1 one more, salt-2
+    /// new, so that no frame left in the file can pass for one of the new log's.
+    private fn writeLogHeader(borrow mut this, pageSize: usize) -> Result<void, SqliteError> {
+        var old = [0u8; 32];
+        var sequence: u32 = 0;
+        var salt1 = randomU32()?;
+        if (this.log.length()? >= WAL_HEADER_SIZE && readFully(mut this.log, mut old[..], 0)?) {
+            let magic = old[..].readBE<u32>(0);
+            let sum = walChecksum(WalSum { first: 0, second: 0 }, old[0..24], (magic & 1) == 1);
+            if ((magic & 0xFFFF_FFFE) == WAL_MAGIC && sum.first == old[..].readBE<u32>(24) &&
+                sum.second == old[..].readBE<u32>(28)) {
+                sequence = old[..].readBE<u32>(12).wrappingAdd(1);
+                salt1 = old[..].readBE<u32>(16).wrappingAdd(1);
+            }
+        }
+        let salt2 = randomU32()?;
+        var header = [0u8; 32];
+        header[..].writeBE(0, WAL_MAGIC);
+        header[..].writeBE(4, WAL_VERSION);
+        header[..].writeBE(8, truncate<u32>(pageSize));
+        header[..].writeBE(12, sequence);
+        header[..].writeBE(16, salt1);
+        header[..].writeBE(20, salt2);
+        let sum = walChecksum(WalSum { first: 0, second: 0 }, header[0..24], false);
+        header[..].writeBE(24, sum.first);
+        header[..].writeBE(28, sum.second);
+        this.log.writeAt(header[..], 0)?;
+        this.log.syncAll()?;
+        this.hdr.salt1 = salt1;
+        this.hdr.salt2 = salt2;
+        this.hdr.bigEndian = 0;
+        this.hdr.pageSizeField = pageSizeField(pageSize);
+        this.hdr.frameSum = sum;
+        return Ok();
+    }
+
+    /// Appends page `number`'s new content as a frame of the commit; `commitSize` is the database's size in pages
+    /// on the commit's last frame, and 0 on the others.
+    fn addFrame(borrow mut this, number: u32, page: Slice<u8>, commitSize: u32) -> Result<void, SqliteError> {
+        if (this.nextFrame >= 0xFFFF_FFFD) {
+            return Err(unsupported("the write-ahead log has as many frames as it can hold"));
+        }
+        let bigEndian = this.hdr.bigEndian == 1;
+        var header = [0u8; 24];
+        header[..].writeBE(0, number);
+        header[..].writeBE(4, commitSize);
+        header[..].writeBE(8, this.hdr.salt1);
+        header[..].writeBE(12, this.hdr.salt2);
+        let sum = walChecksum(walChecksum(this.pendingSum, header[0..8], bigEndian), page, bigEndian);
+        header[..].writeBE(16, sum.first);
+        header[..].writeBE(20, sum.second);
+        let offset = SharedWal.frameOffset(this.nextFrame + 1, page.length);
+        this.log.writeAt(header[..], offset)?;
+        this.log.writeAt(page, offset + (WAL_FRAME_HEADER_SIZE as u64))?;
+        this.nextFrame += 1;
+        this.pending.push(number)?;
+        this.pendingSum = sum;
+        return Ok();
+    }
+
+    /// Makes the commit durable, indexes its frames, then publishes the new header (the end of walFrames).
+    fn finishCommit(borrow mut this, databasePages: u32) -> Result<void, SqliteError> {
+        this.log.syncAll()?;
+        var loaded: usize = 0;
+        var any = false;
+        for (k in 0..this.pending.length) {
+            let frame = this.hdr.frames + 1 + truncate<u32>(k);
+            let block = walIndexBlockOf(frame);
+            if (!any || block != loaded) {
+                if (any) {
+                    this.writeBlock(loaded);
+                }
+                this.loadBlock(block)?;
+                loaded = block;
+                any = true;
+            }
+            let index = truncate<u32>((frame as u64) - walIndexBlockZero(block));
+            appendToBlock(this.block.viewMut(), block, index, this.pending[k], this.hdr.frames)?;
+        }
+        if (any) {
+            this.writeBlock(loaded);
+        }
+        this.pending.clear();
+        this.hdr.frames = this.nextFrame;
+        this.hdr.pages = databasePages;
+        this.hdr.change = this.hdr.change.wrappingAdd(1);
+        this.hdr.frameSum = this.pendingSum;
+        this.writeHeader();
+        return Ok();
+    }
+
+    // ── checkpoints ──────────────────────────────────────────────────────────────────────────────────────────
+
+    /// sqlite3WalCheckpoint: copies the frames no reader still needs into the database file `db` (pages of
+    /// `pageSize` bytes). FULL, RESTART and TRUNCATE wait (up to `timeout` milliseconds) for the writer's lock
+    /// and for readers; RESTART and TRUNCATE then wait for readers to leave the log, and TRUNCATE empties it.
+    /// `changed` is set when the header had moved since this connection's last transaction. No read transaction
+    /// may be open.
+    fn checkpoint(
+        borrow mut this,
+        db: borrow mut File,
+        pageSize: usize,
+        mode: CheckpointMode,
+        timeout: i64,
+        changed: borrow mut bool,
+    ) -> Result<WalCheckpoint, SqliteError> {
+        assert(this.readLock < 0, "a checkpoint is made outside a read transaction");
+        var outcome = WalCheckpoint { busy: true, logFrames: -1, checkpointed: -1 };
+        if (!this.tryShm(FileLock.Exclusive, SHM_CHECKPOINT_LOCK, 1)?) {
+            return Ok(outcome);
+        }
+        var effective = mode;
+        var tookWrite = false;
+        if (mode != CheckpointMode.Passive && !this.writeLock) {
+            if (this.exclusiveWaiting(SHM_WRITE_LOCK, 1, true, timeout)?) {
+                this.writeLock = true;
+                tookWrite = true;
+            } else {
+                effective = CheckpointMode.Passive;
+            }
+        }
+        let result = this.checkpointLocked(db, pageSize, effective, timeout, changed);
+        if (tookWrite) {
+            this.endWrite();
+        }
+        this.unlockShm(SHM_CHECKPOINT_LOCK, 1);
+        match (result?) {
+            Some(done) => {
+                outcome = done;
+                if (effective != mode) {
+                    outcome.busy = true;
+                }
+            }
+            null => {}
+        }
+        return Ok(outcome);
+    }
+
+    /// The checkpoint, holding its lock (and the writer's for the modes that wait): null when the header could
+    /// not be read for another connection's lock.
+    private fn checkpointLocked(
+        borrow mut this,
+        db: borrow mut File,
+        pageSize: usize,
+        mode: CheckpointMode,
+        timeout: i64,
+        changed: borrow mut bool,
+    ) -> Result<WalCheckpoint?, SqliteError> {
+        let Some(moved) = this.readHeader()? else {
+            return Ok(null);
+        };
+        if (moved) {
+            *changed = true;
+        }
+        if (this.hdr.frames != 0 && this.hdr.pageSize() != pageSize) {
+            return Err(corrupt("the write-ahead log's page size is not the database's"));
+        }
+        let waits = mode != CheckpointMode.Passive;
+        let busy = this.backfill(db, pageSize, waits, mode, timeout)?;
+        let result = WalCheckpoint {
+            busy: busy,
+            logFrames: this.hdr.frames as i64,
+            checkpointed: this.load(SHM_BACKFILL_AT) as i64,
+        };
+        if (moved) {
+            // As SQLite forgets its header then: the next transaction reads it again, and finds it changed.
+            this.hdr = WalIndexHeader.zero();
+        }
+        return Ok(result);
+    }
+
+    /// walCheckpoint: true when readers or the writer kept it from doing all `mode` asks.
+    private fn backfill(
+        borrow mut this,
+        db: borrow mut File,
+        pageSize: usize,
+        startWaiting: bool,
+        mode: CheckpointMode,
+        timeout: i64,
+    ) -> Result<bool, SqliteError> {
+        var waits = startWaiting;
+        let done = this.load(SHM_BACKFILL_AT);
+        if (done < this.hdr.frames) {
+            // The last frame no reader still needs: readers on a smaller mark keep the frames after it.
+            var safe = this.hdr.frames;
+            for (i in 1..SHM_READERS) {
+                let mark = this.load(SharedWal.readMarkAt(i));
+                if (safe > mark) {
+                    let lock = SHM_READ_LOCK0 + (i as u64);
+                    if (this.exclusiveWaiting(lock, 1, waits, timeout)?) {
+                        this.store(SharedWal.readMarkAt(i), if (i == 1) safe else READ_MARK_UNUSED);
+                        this.unlockShm(lock, 1);
+                    } else {
+                        safe = mark;
+                        waits = false;
+                    }
+                }
+            }
+            if (done < safe && this.exclusiveWaiting(SHM_READ_LOCK0, 1, waits, timeout)?) {
+                let copied = this.copyFrames(db, pageSize, done, safe);
+                this.unlockShm(SHM_READ_LOCK0, 1);
+                copied?;
+            }
+        }
+        if (mode == CheckpointMode.Passive) {
+            return Ok(false);
+        }
+        if (this.load(SHM_BACKFILL_AT) < this.hdr.frames) {
+            return Ok(true);
+        }
+        if (mode == CheckpointMode.Full) {
+            return Ok(false);
+        }
+        let readers = (SHM_READERS - 1) as u64;
+        if (!this.exclusiveWaiting(SHM_READ_LOCK0 + 1, readers, waits, timeout)?) {
+            return Ok(true);
+        }
+        var result: Result<void, SqliteError> = Ok();
+        if (mode == CheckpointMode.Truncate) {
+            result = this.restartHeader();
+            if (result.isOk()) {
+                match (this.log.setLength(0)) {
+                    Ok() => {}
+                    Err(e) => { result = Err(SqliteError.Io(e)); }
+                }
+            }
+        }
+        this.unlockShm(SHM_READ_LOCK0 + 1, readers);
+        result?;
+        return Ok(false);
+    }
+
+    /// Copies each page's latest frame after `done` and not after `safe` into the database file, holding read
+    /// mark 0's lock; records that the file holds the frames up to `safe`.
+    private fn copyFrames(
+        borrow mut this,
+        db: borrow mut File,
+        pageSize: usize,
+        done: u32,
+        safe: u32,
+    ) -> Result<void, SqliteError> {
+        // A connection that started the log again since this header was read has nothing left to copy.
+        let live = WalIndexHeader.decode(this.liveHeader()[..]);
+        if (live.salt1 != this.hdr.salt1 || live.salt2 != this.hdr.salt2) {
+            return Ok();
+        }
+        this.store(SHM_BACKFILL_ATTEMPTED_AT, safe);
+        this.log.syncAll()?;
+        let maxPage = this.hdr.pages;
+        let wanted = (maxPage as u64) * (pageSize as u64);
+        // As in SQLite: a database larger than the file, the log's frames and the lock-byte page together is a
+        // damaged commit frame, not a size to give the file.
+        if (wanted > db.length()? + 65536 + (this.hdr.frames as u64) * (pageSize as u64)) {
+            return Err(corrupt("the write-ahead log's commit frame gives an impossible database size"));
+        }
+        // Each page's latest frame up to the last commit (walIteratorInit), in page order.
+        var latest = HashMap<u32, u32>.create();
+        var frame = done + 1;
+        while (frame <= this.hdr.frames) {
+            let block = walIndexBlockOf(frame);
+            this.mapThrough(block)?;
+            let index = ((frame as u64) - walIndexBlockZero(block) - 1) as usize;
+            let page = this.regions[block].load32(walIndexPagesAt(block) + 4 * index, LoadOrdering.Acquire);
+            let _ = latest.put(page, frame)?;
+            frame += 1;
+        }
+        var pages = Vector<u32>.withCapacity(latest.length())?;
+        for (i in 0..latest.length()) {
+            pages.push(*latest.keyAt(i))?;
+        }
+        pages.sortBy((a, b) => if (*a < *b) -1 else if (*a > *b) 1 else 0);
+        var buffer = Vector<u8>.create();
+        buffer.resize(pageSize, 0)?;
+        for (k in 0..pages.length) {
+            let page = pages[k];
+            let at = *latest.get(borrow page)!;
+            if (at > safe || page > maxPage || page == 0) {
+                continue;
+            }
+            let offset = SharedWal.frameOffset(at, pageSize);
+            var header = [0u8; 24];
+            if (!readFully(mut this.log, mut header[..], offset)? ||
+                !readFully(mut this.log, buffer.viewMut(), offset + (WAL_FRAME_HEADER_SIZE as u64))?) {
+                return Err(corrupt("the write-ahead log ends inside a frame"));
+            }
+            if (header[..].readBE<u32>(0) != page || header[..].readBE<u32>(8) != this.hdr.salt1 ||
+                header[..].readBE<u32>(12) != this.hdr.salt2) {
+                return Err(corrupt("the wal-index names a frame of another page"));
+            }
+            db.writeAt(buffer.view(), ((page - 1) as u64) * (pageSize as u64))?;
+        }
+        let liveFrames = WalIndexHeader.decode(this.liveHeader()[..]).frames;
+        if (safe == liveFrames) {
+            db.setLength(wanted)?;
+            db.syncAll()?;
+        } else {
+            db.syncAll()?;
+        }
+        this.store(SHM_BACKFILL_AT, safe);
+        return Ok();
+    }
+
+    /// Whether every committed frame is in the database file.
+    fn fullyCheckpointed(borrow this) -> bool =>
+        this.regions.length != 0 && this.load(SHM_BACKFILL_AT) >= this.hdr.frames;
+
+    /// Closes the log and the index, removing both files: the last connection's close, which holds the database
+    /// file's EXCLUSIVE lock.
+    fn closeAndRemove(this) -> Result<void, SqliteError> {
+        let shmPath = this.shmPath.clone()?;
+        let logPath = this.logPath.clone()?;
+        // Dropping the value unmaps the index and closes both files, which releases their locks.
+        {
+            let _closed = this;
+        }
+        removeIfThere(shmPath.view())?;
+        removeIfThere(logPath.view())?;
+        Directory.sync(directoryOf(logPath.view()))?;
+        return Ok();
+    }
+}
+
+fn removeIfThere(path: StringView) -> Result<void, SqliteError> {
+    match (File.remove(path)) {
+        Ok() => {}
+        Err(IoError.NotFound) => {}
+        Err(e) => { return Err(SqliteError.Io(e)); }
+    }
+    return Ok();
+}
+
+/// walIndexAppend, on a copy of block `block` of the index: frame `index` of the block (from 1) holds page
+/// `page`. The first frame of a block empties it; a page number already in the frame's place is what a writer
+/// that died left, and the entries past `lastFrame` (the header's last frame) are removed first (walCleanupHash).
+fn appendToBlock(
+    block: SliceMut<u8>,
+    number: usize,
+    index: u32,
+    page: u32,
+    lastFrame: u32,
+) -> Result<void, SqliteError> {
+    let pagesAt = walIndexPagesAt(number);
+    if (index == 1) {
+        block[pagesAt..].fill(0);
+    }
+    let place = pagesAt + 4 * (((index - 1) & (HASH_FRAMES - 1)) as usize);
+    if (block.readLE<u32>(place) != 0) {
+        cleanupBlock(block, number, lastFrame);
+    }
+    var key = walIndexHash(page);
+    var collisions: u32 = 0;
+    while (block.readLE<u16>(HASH_TABLE_AT + 2 * key) != 0) {
+        if (collisions >= index) {
+            return Err(corrupt("the wal-index's hash table is full"));
+        }
+        collisions += 1;
+        key = (key + 1) & (HASH_SLOTS - 1);
+    }
+    block.writeLE(place, page);
+    block.writeLE(HASH_TABLE_AT + 2 * key, truncate<u16>(index));
+    return Ok();
+}
+
+/// walCleanupHash on a copy of block `number`: forgets the frames after `lastFrame`.
+fn cleanupBlock(block: SliceMut<u8>, number: usize, lastFrame: u32) {
+    let zero = walIndexBlockZero(number);
+    if (lastFrame == 0 || (lastFrame as u64) <= zero) {
+        // The last frame is in an earlier block: this one holds nothing committed.
+        block[walIndexPagesAt(number)..].fill(0);
+        return;
+    }
+    let limit = (lastFrame as u64) - zero;
+    for (slot in 0..HASH_SLOTS) {
+        if ((block.readLE<u16>(HASH_TABLE_AT + 2 * slot) as u64) > limit) {
+            block.writeLE(HASH_TABLE_AT + 2 * slot, 0u16);
+        }
+    }
+    let from = walIndexPagesAt(
+        number,
+    ) + 4 * (if (limit > (HASH_FRAMES as u64)) HASH_FRAMES as usize else limit as usize);
+    if (from < HASH_TABLE_AT) {
+        block[from..HASH_TABLE_AT].fill(0);
+    }
+}
