@@ -669,3 +669,21 @@ fn rowValuesInInMatchSqlite() -> Result<void, TestFailure> {
         SELECT c FROM t WHERE (a, c) IN (VALUES (1, 10), (2, 20)) ORDER BY c
         """);
 }
+
+@test
+fn tiesKeepTheirOrderInEverySort() -> Result<void, TestFailure> {
+    // SQLite's sorter is stable: rows that ORDER BY finds equal keep the order they came in (sortStableBy).
+    let path = "out/ties.db";
+    makeDatabase(path, """
+        CREATE TABLE a(k, v);
+        WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 300)
+        INSERT INTO a SELECT (i * 37) % 5, i FROM c;
+        """)?;
+    return sameAnswers(path, """
+        SELECT k, v FROM a ORDER BY k
+        SELECT k, v FROM a ORDER BY k DESC LIMIT 40 OFFSET 7
+        SELECT k, group_concat(v, ' ' ORDER BY k % 2) FROM a GROUP BY k
+        SELECT v, row_number() OVER (ORDER BY k % 3) FROM a ORDER BY v
+        SELECT k, v FROM a WHERE v < 50 UNION ALL SELECT k, v + 1000 FROM a WHERE v > 250 ORDER BY k
+        """);
+}

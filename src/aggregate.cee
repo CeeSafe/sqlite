@@ -275,10 +275,7 @@ struct Accumulator {
             order.push(i)?;
         }
         let terms = spec.orderBy.view();
-        order.sortBy((a, b) => {
-            let c = compareKeys(kept[a].keys.view(), kept[b].keys.view(), terms);
-            return if (c != 0) c else if (a < b) -1 else if (a > b) 1 else 0;
-        });
+        order.sortStableBy((a, b) => compareKeys(kept[a].keys.view(), kept[b].keys.view(), terms));
         var args = Vector<XExpr>.withCapacity(spec.args.length)?;
         for (k in 0..spec.args.length) {
             args.push(XExpr.Column(spec.replaySlot, k))?;

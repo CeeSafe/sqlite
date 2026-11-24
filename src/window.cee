@@ -157,10 +157,7 @@ fn computeWindow(
     for (r in 0..rows.length) {
         order.push(r)?;
     }
-    order.sortBy((a, b) => {
-        let c = compareWindowRows(spec, borrow rows[a].inputs[w], borrow rows[b].inputs[w]);
-        return if (c != 0) c else if (a < b) -1 else if (a > b) 1 else 0;
-    });
+    order.sortStableBy((a, b) => compareWindowRows(spec, borrow rows[a].inputs[w], borrow rows[b].inputs[w]));
     let offsets = frameOffsets(spec, frame, db)?;
     var collations = Vector<Collation>.withCapacity(spec.orderBy.length)?;
     for (k in 0..spec.orderBy.length) {

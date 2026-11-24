@@ -621,14 +621,14 @@ fn runCore(
             order.push(g)?;
         }
         let collations = core.groupCollations.view();
-        order.sortBy((a, b) => {
+        order.sortStableBy((a, b) => {
             for (k in 0..collations.length) {
                 let c = compareForOrder(borrow groups[a].key[k], borrow groups[b].key[k], collations[k], false, true);
                 if (c != 0) {
                     return c;
                 }
             }
-            return if (a < b) -1 else if (a > b) 1 else 0;
+            return 0;
         });
         var sorted = Vector<GroupState>.withCapacity(groups.length)?;
         for (i in 0..order.length) {
@@ -686,15 +686,6 @@ fn compareKeys(a: Slice<SqliteValue>, b: Slice<SqliteValue>, terms: Slice<XOrder
     return 0;
 }
 
-/// Compares two rows' sort keys, then their places (the key after the terms').
-fn compareKeysThenPlace(a: Slice<SqliteValue>, b: Slice<SqliteValue>, terms: Slice<XOrderTerm>) -> i32 {
-    let c = compareKeys(a, b, terms);
-    if (c != 0 || a.length <= terms.length || b.length <= terms.length) {
-        return c;
-    }
-    return compareValues(borrow a[terms.length], borrow b[terms.length], Collation.Binary);
-}
-
 /// One ORDER BY term's comparison: NULLs first or last as asked, then the order, reversed for DESC.
 fn compareForOrder(
     a: borrow SqliteValue,
@@ -730,17 +721,16 @@ fn runSelect(
         var rows = runCore(core, frame, db, stopAfter)?;
         if (core.sortKeys.length != 0) {
             let terms = core.sortKeys.view();
-            // Stable, as SQLite's sorter is: rows with equal keys stay in the order they came, their place a last key.
-            for (i in 0..rows.length) {
-                rows[i].keys.push(SqliteValue.Integer(truncate<i64>(i)))?;
-            }
-            rows.sortBy((x, y) => compareKeysThenPlace(x.keys.view(), y.keys.view(), terms));
+            // Stable, as SQLite's sorter is: rows with equal keys stay in the order they came.
+            rows.sortStableBy((x, y) => compareKeys(x.keys.view(), y.keys.view(), terms));
         }
         var out = Vector<Vector<SqliteValue>>.withCapacity(rows.length)?;
-        for (index in 0..rows.length) {
+        var index: usize = 0;
+        for (row in rows.drain()) {
             if (index >= offset && (limit.isNull() || out.length < limit!)) {
-                out.push(replace(mut rows[index].values, Vector<SqliteValue>.create()))?;
+                out.push(row.values)?;
             }
+            index += 1;
         }
         return Ok(out);
     }
@@ -764,7 +754,8 @@ fn runSelect(
     }
     if (plan.compoundOrder.length != 0) {
         let order = plan.compoundOrder.view();
-        result.sortBy((x, y) => compareByColumns(x.view(), y.view(), order));
+        // Stable, as SQLite's sorter is: rows equal on the ORDER BY columns keep the compound's order.
+        result.sortStableBy((x, y) => compareByColumns(x.view(), y.view(), order));
     }
     var out = Vector<Vector<SqliteValue>>.create();
     for (index in 0..result.length) {
