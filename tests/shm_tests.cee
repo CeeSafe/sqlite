@@ -1,0 +1,381 @@
+// WAL mode shared through the wal-index (`-shm`): readers run beside a writer, in this engine and in a sqlite3
+// process running at the same time, in both directions. A sqlite3 process run on a thread of the test says where it
+// is by making a marker file (`.shell touch`), and waits for the test's signal, a file the test makes, before it
+// goes on (`shellWaitFor`): the order of events comes from the locks and these waits, not from timing.
+
+/// A shell command that waits (up to ten seconds) for the file at `path`: the test's signal to go on.
+fn shellWaitFor(path: StringView) -> String {
+    var text = String.from(".shell for i in $(seq 1 1000); do [ -f ")!;
+    text.append(path)!;
+    text.append(" ] && break; sleep 0.01; done")!;
+    return text;
+}
+
+fn touchFile(path: StringView) {
+    let _ = File.create(path)!;
+}
+
+/// The shell command that makes the marker file at `path`.
+fn shellTouch(path: StringView) -> String {
+    var text = String.from(".shell touch ")!;
+    text.append(path)!;
+    return text;
+}
+
+/// Runs sqlite3 on `path` with `script` on its standard input, on a thread of its own; the thread's value is what
+/// it printed.
+fn sqliteOutputInBackground(path: StringView, script: StringView) -> Thread<String> {
+    let owned = String.from(path)!;
+    let input = String.from(script)!;
+    return Thread.spawn(move () => {
+        var arguments = Vector<StringView>.create();
+        if (arguments.push(owned.view()).isErr()) {
+            return String.create();
+        }
+        return match (Process.capture("sqlite3", borrow arguments, input.view().bytes())) {
+            Ok(output) => match (textFromBytesLossy(output.stdout.view())) {
+                Ok(text) => text,
+                Err(_) => String.create(),
+            },
+            Err(_) => String.create(),
+        };
+    })!;
+}
+
+/// A fixture of one table `t(v)` holding 1, in WAL mode, with no file beside it; the signal file is removed.
+fn shmFixture(path: StringView, marker: StringView, go: StringView) -> Result<void, TestFailure> {
+    let _ = File.remove(go);
+    lockFixture(path, marker)?;
+    let _ = askSqlite(path, "PRAGMA journal_mode = WAL")?;
+    return Ok();
+}
+
+fn scalarOf(connection: borrow mut Connection, sql: StringView) -> Result<SqliteValue?, SqliteError> {
+    let none = Params.create();
+    return connection.scalar(sql, borrow none);
+}
+
+fn executes(connection: borrow mut Connection, sql: StringView) -> Result<void, SqliteError> {
+    let none = Params.create();
+    let _ = connection.execute(sql, borrow none)?;
+    return Ok();
+}
+
+fn fileThere(path: StringView) -> bool => fileLength(path)!.isSome();
+
+/// While sqlite3 holds the writer's lock (BEGIN IMMEDIATE, with a row written), this engine reads beside it, with
+/// no busy timeout, and sees sqlite3's last commit, read through the `-shm` sqlite3 wrote: it could not rebuild
+/// the index, which needs the writer's lock. It cannot write; once sqlite3 commits, its next transaction sees it.
+@test
+fn shmThisEngineReadsBesideSqlitesWriter() -> Result<void, TestFailure> {
+    let path = "out/shm-their-writer.db";
+    let marker = "out/shm-their-writer.marker";
+    let go = "out/shm-their-writer.go";
+    shmFixture(path, marker, go)?;
+    let touch = shellTouch(marker);
+    let wait = shellWaitFor(go);
+    let shell = sqliteInBackground(
+        path,
+        ["INSERT INTO t VALUES (2)", "BEGIN IMMEDIATE", "INSERT INTO t VALUES (3)", touch.view(), wait.view(), "COMMIT"][..],
+    );
+    waitForFile(marker)?;
+    var connection = Connection.open(path)!;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(2)), "sqlite3's last commit, beside its writer")?;
+    Check.isTrue(isLocked(borrow scalarOf(mut connection, "INSERT INTO t VALUES (4) RETURNING 0")), "one writer")?;
+    connection.begin()!;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(2)), "a read transaction")?;
+    touchFile(go);
+    Check.isTrue(shell.join() == 0, "the shell committed")?;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(2)), "the snapshot holds")?;
+    connection.commit()!;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(3)), "the next transaction sees the commit")?;
+    executes(mut connection, "INSERT INTO t VALUES (4)")!;
+    connection.close()!;
+    Check.isTrue(!fileThere(withSuffix(path, "-wal")!.view()), "the last connection removes the log")?;
+    Check.isTrue(!fileThere(withSuffix(path, "-shm")!.view()), "and the wal-index")?;
+    Check.equalText("4\n", theirAnswer(path, "SELECT count(*) FROM t").view())?;
+    return expectIntact(path);
+}
+
+/// The reverse: while this engine holds the writer's lock, sqlite3 reads beside it, through the `-shm` this
+/// engine wrote, which it takes as it is (rebuilding it would need the writer's lock: "database is locked"). It
+/// cannot write; after the commit it sees the rows.
+@test
+fn shmSqliteReadsBesideThisEnginesWriter() -> Result<void, TestFailure> {
+    let path = "out/shm-our-writer.db";
+    shmFixture(path, "out/shm-our-writer.marker", "out/shm-our-writer.go")?;
+    var connection = Connection.open(path)!;
+    executes(mut connection, "INSERT INTO t VALUES (2)")!;
+    executes(mut connection, "UPDATE t SET v = v * 10")!;
+    connection.executeScript("BEGIN IMMEDIATE; INSERT INTO t VALUES (3)")!;
+    Check.equalText("10|20\n", theirAnswer(path, "SELECT min(v), max(v) FROM t").view())?;
+    Check.isTrue(sqliteSaysLocked(theirAnswer(path, "INSERT INTO t VALUES (9)").view()), "sqlite3 cannot write")?;
+    connection.commit()!;
+    Check.equalText("3|33\n", theirAnswer(path, "SELECT count(*), sum(v) FROM t").view())?;
+    Check.equalText("ok\n", theirAnswer(path, "PRAGMA integrity_check").view())?;
+    // sqlite3's commits beside this connection, read at its next transaction.
+    Check.equalText("", theirAnswer(path, "INSERT INTO t VALUES (100)").view())?;
+    Check.isTrue(scalarOf(mut connection, "SELECT sum(v) FROM t")! is Some(SqliteValue.Integer(133)), "seen")?;
+    connection.close()!;
+    return expectIntact(path);
+}
+
+/// A sqlite3 read transaction keeps its snapshot while this engine commits beside it, and keeps a TRUNCATE
+/// checkpoint from emptying the log (busy); once it ends, the checkpoint goes through.
+@test
+fn shmSqliteKeepsItsSnapshotWhileThisEngineCommits() -> Result<void, TestFailure> {
+    let path = "out/shm-their-reader.db";
+    let marker = "out/shm-their-reader.marker";
+    let go = "out/shm-their-reader.go";
+    shmFixture(path, marker, go)?;
+    var connection = Connection.open(path)!;
+    executes(mut connection, "INSERT INTO t VALUES (2)")!;
+    var script = String.from("BEGIN;\nSELECT count(*) FROM t;\n")!;
+    script.append(shellTouch(marker).view())!;
+    script.append("\n")!;
+    script.append(shellWaitFor(go).view())!;
+    script.append("\nSELECT count(*) FROM t;\nCOMMIT;\nSELECT count(*) FROM t;\n")!;
+    let shell = sqliteOutputInBackground(path, script.view());
+    waitForFile(marker)?;
+    executes(mut connection, "INSERT INTO t VALUES (3)")!;
+    executes(mut connection, "INSERT INTO t VALUES (4)")!;
+    let busy = scalarOf(mut connection, "PRAGMA wal_checkpoint(TRUNCATE)")!;
+    Check.isTrue(busy is Some(SqliteValue.Integer(1)), "the reader keeps the log")?;
+    touchFile(go);
+    Check.equalText("2\n2\n4\n", shell.join().view())?;
+    Check.isTrue(scalarOf(mut connection, "PRAGMA wal_checkpoint(TRUNCATE)")! is Some(SqliteValue.Integer(0)), "done")?;
+    Check.isTrue(fileLength(withSuffix(path, "-wal")!.view())! == Some(0u64), "the log is emptied")?;
+    connection.close()!;
+    return expectIntact(path);
+}
+
+/// This engine's read transaction keeps its snapshot while sqlite3 commits beside it, without waiting; PRAGMA
+/// data_version moves when it next looks, and its next transaction sees the commits.
+@test
+fn shmThisEngineKeepsItsSnapshotWhileSqliteCommits() -> Result<void, TestFailure> {
+    let path = "out/shm-our-reader.db";
+    shmFixture(path, "out/shm-our-reader.marker", "out/shm-our-reader.go")?;
+    var connection = Connection.open(path)!;
+    connection.begin()!;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(1)), "the fixture's row")?;
+    let version = dataVersionOf(mut connection);
+    Check.equalText("", theirAnswer(path, "INSERT INTO t VALUES (2); INSERT INTO t VALUES (3)").view())?;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(1)), "the snapshot holds")?;
+    // This reader's mark keeps sqlite3's TRUNCATE checkpoint from emptying the log.
+    Check.isTrue(theirAnswer(path, "PRAGMA wal_checkpoint(TRUNCATE)").view().startsWith("1|"), "busy")?;
+    Check.equalI64(version, dataVersionOf(mut connection))?;
+    connection.commit()!;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(3)), "the next transaction sees them")?;
+    Check.equalI64(version + 1, dataVersionOf(mut connection))?;
+    Check.equalText("0|0|0\n", theirAnswer(path, "PRAGMA wal_checkpoint(TRUNCATE)").view())?;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(3)), "after the log is emptied")?;
+    connection.close()!;
+    return expectIntact(path);
+}
+
+/// Two sessions of this engine in one process: a reader beside the writer, a checkpoint stopped at the reader's
+/// mark, and the last close removing the files.
+@test
+fn shmTwoSessionsReadBesideAWriter() -> Result<void, TestFailure> {
+    let path = "out/shm-sessions.db";
+    shmFixture(path, "out/shm-sessions.marker", "out/shm-sessions.go")?;
+    var writer = Connection.open(path)!;
+    var reader = Connection.open(path)!;
+    executes(mut writer, "PRAGMA wal_autocheckpoint = 0")!;
+    reader.begin()!;
+    Check.isTrue(rowsOfT(mut reader)! is Some(SqliteValue.Integer(1)), "the reader's snapshot")?;
+    writer.executeScript("BEGIN IMMEDIATE; INSERT INTO t VALUES (2); COMMIT")!;
+    executes(mut writer, "INSERT INTO t VALUES (3)")!;
+    Check.isTrue(rowsOfT(mut writer)! is Some(SqliteValue.Integer(3)), "the writer's commits")?;
+    Check.isTrue(rowsOfT(mut reader)! is Some(SqliteValue.Integer(1)), "the reader's snapshot holds")?;
+    Check.isTrue(isLocked(borrow scalarOf(mut reader, "INSERT INTO t VALUES (9) RETURNING 0")), "a stale snapshot")?;
+    // A checkpoint copies nothing the reader may still need, and says the log is not all copied.
+    Check.isTrue(scalarOf(mut writer, "PRAGMA wal_checkpoint(FULL)")! is Some(SqliteValue.Integer(1)), "busy")?;
+    reader.rollback()!;
+    Check.isTrue(rowsOfT(mut reader)! is Some(SqliteValue.Integer(3)), "the reader's next transaction")?;
+    Check.isTrue(scalarOf(mut writer, "PRAGMA wal_checkpoint(RESTART)")! is Some(SqliteValue.Integer(0)), "done")?;
+    // The log starts again with the next commit, which the reader sees.
+    executes(mut writer, "INSERT INTO t VALUES (4)")!;
+    Check.isTrue(rowsOfT(mut reader)! is Some(SqliteValue.Integer(4)), "after the restart")?;
+    writer.close()!;
+    Check.isTrue(fileThere(withSuffix(path, "-wal")!.view()), "another connection keeps the log")?;
+    Check.isTrue(rowsOfT(mut reader)! is Some(SqliteValue.Integer(4)), "and reads on")?;
+    reader.close()!;
+    Check.isTrue(!fileThere(withSuffix(path, "-wal")!.view()), "the last close removes the log")?;
+    Check.isTrue(!fileThere(withSuffix(path, "-shm")!.view()), "and the wal-index")?;
+    return expectIntact(path);
+}
+
+const BIG_ROWS_SQL: StringView = """
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 5000)
+    INSERT INTO big SELECT i, randomblob(2500) FROM c
+    """;
+
+/// More than one block of the index (4062 frames in the first, 4096 in the others): a commit of some 5000 pages
+/// and one after it, written by this engine and read by sqlite3 beside this engine's writer (so through this
+/// engine's hash tables, as it cannot rebuild them), and the reverse.
+@test
+fn shmIndexBlocksAreSharedBothWays() -> Result<void, TestFailure> {
+    let path = "out/shm-blocks.db";
+    let marker = "out/shm-blocks.marker";
+    let go = "out/shm-blocks.go";
+    shmFixture(path, marker, go)?;
+    var connection = Connection.open(path)!;
+    executes(mut connection, "PRAGMA wal_autocheckpoint = 0")!;
+    executes(mut connection, "CREATE TABLE big(id INTEGER PRIMARY KEY, b BLOB)")!;
+    connection.executeScript(BIG_ROWS_SQL)!;
+    executes(mut connection, "UPDATE big SET b = zeroblob(10) WHERE id IN (1, 2500, 5000)")!;
+    connection.executeScript("BEGIN IMMEDIATE")!;
+    Check.equalText(
+        "ok\n5000|12492530\n",
+        theirAnswer(path, "PRAGMA integrity_check; SELECT count(*), sum(length(b)) FROM big").view(),
+    )?;
+    connection.rollback()!;
+    connection.close()!;
+    // sqlite3 writes as many frames, and holds the writer's lock while this engine reads them.
+    let touch = shellTouch(marker);
+    let wait = shellWaitFor(go);
+    let shell = sqliteInBackground(
+        path,
+        [
+            "PRAGMA wal_autocheckpoint = 0",
+            "CREATE TABLE big2(id INTEGER PRIMARY KEY, b BLOB)",
+            "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 5000) INSERT INTO big2 SELECT i, randomblob(2500) FROM c",
+            "UPDATE big2 SET b = zeroblob(7) WHERE id % 1000 = 0",
+            "BEGIN IMMEDIATE",
+            touch.view(),
+            wait.view(),
+            "COMMIT",
+        ][..],
+    );
+    waitForFile(marker)?;
+    var reader = Connection.open(path)!;
+    Check.isTrue(scalarOf(mut reader, "SELECT count(*) FROM big2")! is Some(SqliteValue.Integer(5000)), "rows")?;
+    Check.isTrue(
+        scalarOf(mut reader, "SELECT sum(length(b)) FROM big2")! is Some(SqliteValue.Integer(12487535)),
+        "every page from its latest frame",
+    )?;
+    Check.isTrue(scalarOf(mut reader, "SELECT count(*) FROM big")! is Some(SqliteValue.Integer(5000)), "the old")?;
+    touchFile(go);
+    Check.isTrue(shell.join() == 0, "the shell ran")?;
+    reader.close()!;
+    return expectIntact(path);
+}
+
+/// This engine and sqlite3 each add one to a counter 150 times in WAL mode, each in a transaction of its own that
+/// reads before it writes, at the same time: a writer whose snapshot is stale waits and starts again, as SQLite's
+/// does, so no update is lost.
+@test
+fn shmConcurrentWritersNeverLoseACommit() -> Result<void, TestFailure> {
+    let path = "out/shm-writers.db";
+    shmFixture(path, "out/shm-writers.marker", "out/shm-writers.go")?;
+    let _ = askSqlite(path, "CREATE TABLE counter(n); INSERT INTO counter VALUES (0)")?;
+    var script = String.from(".timeout 20000\n")!;
+    for (i in 0..150) {
+        script.append("UPDATE counter SET n = n + 1;\nINSERT INTO t SELECT n FROM counter;\n")!;
+    }
+    let noArguments = Vector<StringView>.create();
+    let shell = sqliteInBackgroundWith(path, noArguments.view(), script.view());
+    var connection = Connection.open(path)!;
+    connection.setBusyTimeout(20000);
+    for (i in 0..150) {
+        let sql = if (i % 2 == 0) "BEGIN IMMEDIATE; UPDATE counter SET n = n + 1; INSERT INTO t SELECT -n FROM counter; COMMIT" else "UPDATE counter SET n = n + 1";
+        executes(mut connection, sql)!;
+    }
+    Check.isTrue(shell.join() == 0, "the shell's updates all ran")?;
+    Check.isTrue(scalarOf(mut connection, "SELECT n FROM counter")! is Some(SqliteValue.Integer(300)), "every one")?;
+    Check.equalText(
+        "300|226|75\n",
+        theirAnswer(path, "SELECT n, (SELECT count(*) FROM t), (SELECT count(DISTINCT v) FROM t WHERE v < 0) FROM counter").view(),
+    )?;
+    connection.close()!;
+    return expectIntact(path);
+}
+
+/// Writes `bytes` into the `-shm` of the database at `path`, at `offset`.
+fn scribbleOnIndex(path: StringView, offset: u64, bytes: Slice<u8>) {
+    var shm = File.openReadWrite(withSuffix(path, "-shm")!.view())!;
+    shm.writeAt(bytes, offset)!;
+}
+
+/// Writes `header` into both copies of the `-shm`'s header, with its checksum.
+fn forgeIndexHeader(path: StringView, header: borrow mut WalIndexHeader) {
+    header.sum = header.checksum();
+    let bytes = header.encode();
+    scribbleOnIndex(path, 0, bytes[..]);
+    scribbleOnIndex(path, 48, bytes[..]);
+}
+
+/// The `-shm` header as the file has it.
+fn indexHeaderOf(path: StringView) -> WalIndexHeader {
+    let bytes = wholeFile(withSuffix(path, "-shm")!.view());
+    return WalIndexHeader.decode(bytes.view()[0..48]);
+}
+
+/// Whether reading the database at `path` (its schema, then table u) fails with `Corrupt`.
+fn corruptWhenRead(path: StringView) -> bool {
+    match (Connection.open(path)) {
+        Ok(opened) => {
+            var connection = opened;
+            return scalarOf(mut connection, "SELECT sum(x) FROM u") is Err(SqliteError.Corrupt(_));
+        }
+        Err(e) => { return e is SqliteError.Corrupt(_); }
+    }
+}
+
+/// Nothing in the `-shm` is trusted. With another connection holding the index open (so it is not emptied), a
+/// header that is torn, or names frames the log does not hold, is rebuilt from the log; hash tables with no free
+/// slot are `Corrupt`, not a hang; a frame named for the wrong page is `Corrupt`.
+@test
+fn shmDamagedIndexIsRebuiltOrCorrupt() -> Result<void, TestFailure> {
+    let path = "out/shm-damaged.db";
+    shmFixture(path, "out/shm-damaged.marker", "out/shm-damaged.go")?;
+    var holder = Connection.open(path)!;
+    executes(mut holder, "PRAGMA wal_autocheckpoint = 0")!;
+    executes(mut holder, "CREATE TABLE u(x)")!;
+    executes(mut holder, "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 300) INSERT INTO u SELECT i FROM c")!;
+    executes(mut holder, "UPDATE t SET v = 7")!;
+    Check.isTrue(scalarOf(mut holder, "SELECT sum(x) FROM u")! is Some(SqliteValue.Integer(45150)), "u")?;
+    // A torn header: the copies differ.
+    scribbleOnIndex(path, 50, [0x5Au8][..]);
+    {
+        var reader = Connection.open(path)!;
+        Check.isTrue(scalarOf(mut reader, "SELECT sum(x) + max(v) FROM u, t")! is Some(SqliteValue.Integer(45157)), "rebuilt")?;
+    }
+    // A header with a good checksum naming frames past the end of the log.
+    var header = indexHeaderOf(path);
+    let frames = header.frames;
+    Check.isTrue(frames > 2, "the commits are in the log")?;
+    header.frames = 1_000_000;
+    forgeIndexHeader(path, mut header);
+    {
+        var reader = Connection.open(path)!;
+        Check.isTrue(scalarOf(mut reader, "SELECT sum(x) + max(v) FROM u, t")! is Some(SqliteValue.Integer(45157)), "rebuilt")?;
+    }
+    Check.equalU64(frames as u64, indexHeaderOf(path).frames as u64)?;
+    // Every hash slot of the first block taken: a lookup that finds no free slot ends.
+    var full = Vector<u8>.create();
+    full.resize(16384, 0)!;
+    var slot: usize = 0;
+    while (slot < 8192) {
+        full.writeLE(2 * slot, 1u16);
+        slot += 1;
+    }
+    scribbleOnIndex(path, 16384, full.view());
+    Check.isTrue(corruptWhenRead(path), "a full hash table is Corrupt")?;
+    // Every frame of the first block named as page 1: page 1 is read from a frame of another page.
+    var ones = Vector<u8>.create();
+    ones.resize(4 * (frames as usize), 0)!;
+    for (k in 0..(frames as usize)) {
+        ones.writeLE(4 * k, 1u32);
+    }
+    var slots = Vector<u8>.create();
+    slots.resize(16384, 0)!;
+    for (k in 0..(frames as usize)) {
+        slots.writeLE(2 * ((383 + k) % 8192), truncate<u16>(k + 1));
+    }
+    scribbleOnIndex(path, 136, ones.view());
+    scribbleOnIndex(path, 16384, slots.view());
+    Check.isTrue(corruptWhenRead(path), "a frame of another page is Corrupt")?;
+    return Ok();
+}

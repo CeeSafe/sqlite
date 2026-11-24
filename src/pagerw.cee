@@ -30,12 +30,12 @@
 // It also compares the files with what they were when it last held a lock, and forgets every page it holds when
 // another connection committed since (SQLite's change-counter check).
 //
-// WAL mode: SQLite's readers and writers lock bytes of the `-shm` file, which this engine cannot map
-// (CEESAFE_FINDINGS.md, finding 26). So each transaction on a database in WAL mode, a read too, holds the
-// database file's EXCLUSIVE lock, as SQLite does with locking_mode=EXCLUSIVE; the log is read afresh when it
-// changed. A sqlite3 that has the database open in WAL mode holds SHARED for as long as it is open, so this engine
-// waits for it to close (and sqlite3 for this engine's transaction to end): neither ever reads the other's
-// half-written state.
+// WAL mode (wal.c's, through the wal-index of walindex.cee): a connection holds SHARED on the database file for as
+// long as it has the database open in WAL mode, as SQLite's does, so that no connection leaves WAL mode or removes
+// the log under it. Its transactions take the locks of the `-shm` file instead: a read transaction a read mark, a
+// write transaction the writer's lock as well. Readers run beside the writer, each on the last commit it saw. The
+// connection that closes last, the only one that can take EXCLUSIVE, checkpoints the log and removes it and the
+// `-shm`. The locking is POSIX-only: on Windows (os_win.c's scheme) WAL mode is refused.
 
 /// SQLite's default for PRAGMA wal_autocheckpoint, in frames.
 const WAL_DEFAULT_AUTOCHECKPOINT: u32 = 1000;
@@ -107,13 +107,15 @@ struct WritablePager {
     private committedHere: bool;
     /// PRAGMA data_version: goes up each time a transaction finds another connection's commit.
     dataVersion: i64;
-    /// The write-ahead log; commits go to it in WAL mode.
-    private wal: WalLog;
+    /// The write-ahead log and its wal-index, while the database is open in WAL mode; commits go to the log.
+    private shared: SharedWal?;
     private walMode: bool;
-    /// The number of pages in the database file itself, which in WAL mode may be fewer than the database has.
-    private filePages: u32;
     /// A commit that leaves this many frames or more in the log checkpoints it; 0 never does.
     autoCheckpoint: u32;
+    /// Whether the last commit left enough frames for the automatic checkpoint, made when the transaction ends.
+    private checkpointDue: bool;
+    /// Whether a transaction was open on this database before the running statement began (the session says).
+    readBeforeStatement: bool;
     private path: String;
     pageSize: usize;
     usable: usize;
@@ -152,10 +154,11 @@ struct WritablePager {
             seen: null,
             committedHere: false,
             dataVersion: 1,
-            wal: WalLog.closed(path)?,
+            shared: null,
             walMode: false,
-            filePages: 0,
             autoCheckpoint: WAL_DEFAULT_AUTOCHECKPOINT,
+            checkpointDue: false,
+            readBeforeStatement: false,
             path: String.from(path)?,
             pageSize: 4096,
             usable: 4096,
@@ -179,8 +182,17 @@ struct WritablePager {
 
     // ── locks ────────────────────────────────────────────────────────────────────────────────────────────────
 
-    /// The lock held now (LOCK_NONE … LOCK_EXCLUSIVE).
-    fn lockLevel(borrow this) -> u8 => this.lock;
+    /// The transaction's lock (LOCK_NONE … LOCK_EXCLUSIVE). In WAL mode, where SHARED on the file is held between
+    /// transactions, it is the transaction's: SHARED for a read mark, RESERVED for the writer's lock as well.
+    fn lockLevel(borrow this) -> u8 {
+        if (borrow this.shared is Some(wal)) {
+            if (wal.holdsWriteLock()) {
+                return LOCK_RESERVED;
+            }
+            return if (wal.readMark() >= 0) LOCK_SHARED else LOCK_NONE;
+        }
+        return this.lock;
+    }
 
     /// SHARED, from no lock (unixLock): a read lock on PENDING_BYTE while the SHARED range is read-locked, then
     /// released. False when a writer holds PENDING or EXCLUSIVE.
@@ -252,8 +264,15 @@ struct WritablePager {
         return Ok();
     }
 
-    /// Releases every lock: PENDING_BYTE, RESERVED_BYTE and the SHARED range, 512 bytes in a row.
+    /// Releases every lock: PENDING_BYTE, RESERVED_BYTE and the SHARED range, 512 bytes in a row. In WAL mode the
+    /// log and the wal-index are closed too (and their locks go): without SHARED the database may leave WAL mode,
+    /// so the next transaction looks at the files afresh.
     private fn unlockAll(borrow mut this) {
+        if (this.shared.isSome()) {
+            this.shared = null;
+            this.walMode = false;
+            this.seen = null;
+        }
         if (this.lock == LOCK_NONE) {
             return;
         }
@@ -263,15 +282,34 @@ struct WritablePager {
         this.lock = LOCK_NONE;
     }
 
-    /// Starts a read transaction, from no lock: SHARED (EXCLUSIVE in WAL mode), with a hot journal rolled back
+    /// Starts a read transaction, from no lock: SHARED (in WAL mode a read mark too), with a hot journal rolled back
     /// and the pages forgotten if another connection committed since this one's last transaction. Waits up to
     /// the busy timeout, then fails with "database is locked". True when the schema cookie moved (or the file
     /// was read for the first time), so the schema must be read again.
     fn startRead(borrow mut this) -> Result<bool, SqliteError> {
-        if (this.lock != LOCK_NONE) {
+        if (this.lockLevel() != LOCK_NONE) {
             return Ok(false);
         }
         return this.startFromNone(false);
+    }
+
+    /// The writer's lock: RESERVED on the file, or in WAL mode the `-shm` writer's lock, which a transaction
+    /// whose snapshot is no longer the last commit cannot have. False when another connection is writing.
+    private fn tryWriter(borrow mut this) -> Result<bool, SqliteError> {
+        if (borrow mut this.shared is Some(wal)) {
+            return wal.beginWrite();
+        }
+        return this.tryReserved();
+    }
+
+    /// What a try that failed took is released before the next: in WAL mode the transaction's `-shm` locks (SHARED
+    /// on the file stays), else every lock.
+    private fn releaseForRetry(borrow mut this) {
+        if (borrow mut this.shared is Some(wal)) {
+            wal.endRead();
+            return;
+        }
+        this.unlockAll();
     }
 
     /// Makes this transaction a write transaction: RESERVED. From no lock it waits as `startRead` does. Holding
@@ -279,17 +317,17 @@ struct WritablePager {
     /// given up between tries, as sqlite3BtreeBeginTrans does); otherwise a reader that waited could deadlock
     /// with the writer waiting for it to leave, so it fails at once, as SQLite does. True as for `startRead`.
     fn startWrite(borrow mut this, mayRestart: bool) -> Result<bool, SqliteError> {
-        if (this.lock >= LOCK_RESERVED) {
+        if (this.lockLevel() >= LOCK_RESERVED) {
             return Ok(false);
         }
-        if (this.lock == LOCK_SHARED) {
-            if (this.tryReserved()?) {
+        if (this.lockLevel() == LOCK_SHARED) {
+            if (this.tryWriter()?) {
                 return Ok(false);
             }
             if (!mayRestart) {
                 return Err(busyError());
             }
-            this.unlockAll();
+            this.releaseForRetry();
             if (!busyWait(0, this.busyTimeout)) {
                 return Err(busyError());
             }
@@ -305,22 +343,22 @@ struct WritablePager {
             match (this.tryStart()) {
                 Ok(Some(c)) => {
                     changed = changed || c;
-                    match (if (write) this.tryReserved() else Ok(true)) {
+                    match (if (write) this.tryWriter() else Ok(true)) {
                         Ok(true) => { return Ok(changed); }
                         Ok(false) => {}
                         Err(e) => {
-                            this.unlockAll();
+                            this.releaseForRetry();
                             return Err(e);
                         }
                     }
                 }
                 Ok(null) => {}
                 Err(e) => {
-                    this.unlockAll();
+                    this.releaseForRetry();
                     return Err(e);
                 }
             }
-            this.unlockAll();
+            this.releaseForRetry();
             if (!busyWait(attempt, this.busyTimeout)) {
                 return Err(busyError());
             }
@@ -333,6 +371,9 @@ struct WritablePager {
     private fn tryStart(borrow mut this) -> Result<bool?, SqliteError> {
         if (!this.tryShared()?) {
             return Ok(null);
+        }
+        if (this.walMode) {
+            return this.startWal();
         }
         // A hot journal: one that exists while no writer holds RESERVED (a writer's own journal is not hot). The
         // RESERVED byte is tested by taking it for a moment, as no fcntl test of another's lock is offered.
@@ -350,20 +391,26 @@ struct WritablePager {
             }
         }
         var now = this.filesNow()?;
-        // An empty file is an empty database: page 1 is written now, under EXCLUSIVE. A database in WAL mode, or
-        // with a log beside it, is used only under EXCLUSIVE (see the top of this file), and the files are looked
-        // at again once it is held: a sqlite3 in WAL mode writes its log holding only SHARED.
-        let isWal = now.header.length == 100 && (now.header[18] == 2 || now.header[19] == 2);
-        if (now.length == 0 || isWal || now.walLength > 0) {
+        // An empty file is an empty database: page 1 is written now, under EXCLUSIVE.
+        if (now.length == 0) {
             if (!this.tryReserved()? || !this.tryExclusive()?) {
                 return Ok(null);
             }
             if (this.file.length()? == 0) {
-                // A journal beside an empty file is not hot, and is removed (as hasHotJournal does).
+                // A journal beside an empty file is not hot, and is removed (as hasHotJournal does); so is a log,
+                // as pagerOpenWalIfPresent removes it.
                 Journal.remove(this.path.view())?;
+                removeIfThere(withSuffix(this.path.view(), WAL_SUFFIX)?.view())?;
+                removeIfThere(withSuffix(this.path.view(), SHM_SUFFIX)?.view())?;
                 this.writeEmptyDatabase()?;
             }
+            this.downgradeToShared()?;
             now = this.filesNow()?;
+        }
+        // A database whose header says WAL, or with a log beside it, is opened in WAL mode, as SQLite opens it.
+        let isWal = now.header.length == 100 && (now.header[18] == 2 || now.header[19] == 2);
+        if (isWal || now.walLength > 0) {
+            return this.startWal();
         }
         if (borrow this.seen is Some(seen)) {
             if (seen.same(borrow now)) {
@@ -379,6 +426,57 @@ struct WritablePager {
         this.loadState()?;
         this.seen = now;
         return Ok(schemaMoved);
+    }
+
+    /// One try at a read transaction in WAL mode, holding SHARED on the file: the log and the wal-index are opened
+    /// the first time, then a read mark is taken (walBeginReadTransaction). The pages held are forgotten when the
+    /// index's header moved since this connection's last transaction. Null as for `tryStart`.
+    private fn startWal(borrow mut this) -> Result<bool?, SqliteError> {
+        if (this.shared.isNull()) {
+            if (onWindows()) {
+                return Err(
+                    unsupported("WAL mode needs POSIX file locks on the -shm file; it is not supported on Windows yet"),
+                );
+            }
+            match (SharedWal.open(this.path.view())?) {
+                Some(wal) => { this.shared = wal; }
+                null => { return Ok(null); }
+            }
+            this.walMode = true;
+            this.seen = null;
+        }
+        let moved = match (borrow mut this.shared) {
+            Some(wal) => wal.beginRead()?,
+            null => { return Ok(null); },
+        };
+        let Some(changed) = moved else {
+            return Ok(null);
+        };
+        if (!changed && this.seen.isSome()) {
+            return Ok(false);
+        }
+        let previousCookie = match (borrow this.seen) {
+            Some(seen) => Some(seen.schemaCookie()),
+            null => null,
+        };
+        // As pager_reset does when the header moved, the first read too.
+        this.dataVersion += 1;
+        this.loadState()?;
+        let now = this.walSeen()?;
+        let cookie = now.schemaCookie();
+        this.seen = now;
+        return Ok(match (previousCookie) {
+            Some(previous) => previous != cookie,
+            null => true,
+        });
+    }
+
+    /// What `seen` holds in WAL mode: the database header as this transaction reads it, for its schema cookie.
+    /// Whether the pages held are current is the wal-index header's to say.
+    private fn walSeen(borrow mut this) -> Result<FilesSeen, SqliteError> {
+        var header = Vector<u8>.create();
+        header.extend(this.read(1)?[0..100])?;
+        return Ok(FilesSeen { header: header, length: 0, walLength: 0, walHeader: Vector<u8>.create() });
     }
 
     /// Writes page 1 of an empty database into the empty file, as the first commit to it.
@@ -422,6 +520,10 @@ struct WritablePager {
     /// Takes EXCLUSIVE for a commit, waiting up to the busy timeout for readers to leave (pager_wait_on_lock).
     /// Without it the transaction is left as it was, holding PENDING, and fails with "database is locked".
     fn lockForCommit(borrow mut this) -> Result<void, SqliteError> {
+        if (this.walMode) {
+            // In WAL mode readers stay while the writer commits: the writer's lock is all it needs.
+            return this.reserve();
+        }
         if (this.lock == LOCK_EXCLUSIVE) {
             return Ok();
         }
@@ -439,13 +541,13 @@ struct WritablePager {
     /// RESERVED for a change, without waiting: a statement that writes took it when it began (`startWrite`), so
     /// this is only for a change the session did not foresee.
     private fn reserve(borrow mut this) -> Result<void, SqliteError> {
-        if (this.lock >= LOCK_RESERVED) {
+        if (this.lockLevel() >= LOCK_RESERVED) {
             return Ok();
         }
-        if (this.lock == LOCK_NONE) {
+        if (this.lockLevel() == LOCK_NONE) {
             return Err(unsupported("a page is changed outside a transaction"));
         }
-        if (!this.tryReserved()?) {
+        if (!this.tryWriter()?) {
             return Err(busyError());
         }
         return Ok();
@@ -455,6 +557,9 @@ struct WritablePager {
     fn endTransaction(borrow mut this) -> Result<void, SqliteError> {
         if (this.dirty.length() != 0) {
             this.rollback();
+        }
+        if (this.walMode) {
+            return this.endWalTransaction();
         }
         if (this.lock == LOCK_NONE) {
             return Ok();
@@ -476,10 +581,39 @@ struct WritablePager {
         return result;
     }
 
-    /// Reads the header and the log afresh, forgetting every page held: the state at the last commit, whoever
-    /// made it. The caller holds SHARED (EXCLUSIVE in WAL mode).
+    /// The end of a transaction in WAL mode: its `-shm` locks go (SHARED on the file stays), and the automatic
+    /// checkpoint a commit called for is made, as SQLite's wal hook makes it once the transaction is over.
+    private fn endWalTransaction(borrow mut this) -> Result<void, SqliteError> {
+        var result: Result<void, SqliteError> = Ok();
+        if (this.committedHere) {
+            // What this connection wrote is what its pages hold; the schema cookie is the one it wrote.
+            match (this.walSeen()) {
+                Ok(seen) => { this.seen = seen; }
+                Err(e) => {
+                    this.seen = null;
+                    result = Err(e);
+                }
+            }
+            this.committedHere = false;
+        }
+        if (borrow mut this.shared is Some(wal)) {
+            wal.endRead();
+        }
+        if (this.checkpointDue) {
+            this.checkpointDue = false;
+            if (result.isOk()) {
+                result = match (this.checkpoint(CheckpointMode.Passive)) {
+                    Ok(_) => Ok(),
+                    Err(e) => Err(e),
+                };
+            }
+        }
+        return result;
+    }
+
+    /// Reads the header afresh, forgetting every page held: the state at the last commit, whoever made it (in WAL
+    /// mode, the commit of this transaction's snapshot). The caller holds SHARED, or a read mark in WAL mode.
     private fn loadState(borrow mut this) -> Result<void, SqliteError> {
-        let path = this.path.clone()?;
         var bytes = Vector<u8>.create();
         bytes.resize(100, 0)?;
         if (!readFully(mut this.file, bytes.viewMut(), 0)?) {
@@ -490,19 +624,17 @@ struct WritablePager {
         let filePages = checkedTruncate<u32>(pages) ?? {
             return Err(corrupt("database file has more pages than the format allows"));
         };
-        // A log with commits in it is part of the database, whatever mode the file's header names, as in SQLite.
-        var wal = WalLog.open(path.view(), true)?;
         var pageCount = filePages;
-        if (wal.hasFrames()) {
-            if (wal.pageSize != fileHeader.pageSize) {
-                return Err(corrupt("the write-ahead log's page size is not the database's"));
-            }
+        if (borrow mut this.shared is Some(wal)) {
+            // Page 1 and the size as the snapshot has them: the log's when it holds them.
             var page = Vector<u8>.create();
-            page.resize(wal.pageSize, 0)?;
+            page.resize(fileHeader.pageSize, 0)?;
             if (wal.readPage(1, page.viewMut())?) {
                 bytes.viewMut().copyFrom(page.view()[0..100]);
             }
-            pageCount = wal.databasePages;
+            if (wal.databasePages() != 0) {
+                pageCount = wal.databasePages();
+            }
         }
         let header = DatabaseHeader.parse(bytes.view())?;
         if (header.pageSize != fileHeader.pageSize) {
@@ -511,16 +643,12 @@ struct WritablePager {
         if (bytes[18] > 2 || bytes[19] > 2) {
             return Err(unsupported("the database's file format is newer than this engine"));
         }
-        let walMode = bytes[18] == 2 || bytes[19] == 2 || wal.hasFrames();
         if (bytes.view().readBE<u32>(52) != 0) {
             return Err(unsupported("databases with auto-vacuum or incremental vacuum cannot be written"));
         }
         if (header.schemaFormat > 4) {
             return Err(unsupported("the database's schema format is newer than this engine"));
         }
-        this.wal = wal;
-        this.walMode = walMode;
-        this.filePages = filePages;
         this.pageSize = header.pageSize;
         this.usable = header.usableSize();
         this.textEncoding = header.textEncoding;
@@ -559,8 +687,9 @@ struct WritablePager {
     private fn pendingPage(borrow this) -> u32 => truncate<u32>(PENDING_BYTE / (this.pageSize as u64)) + 1;
 
     private fn load(borrow mut this, number: u32) -> Result<void, SqliteError> {
-        if (this.lock == LOCK_NONE) {
-            // Pages are read only inside a transaction, which holds a lock that keeps writers out.
+        if (this.lockLevel() == LOCK_NONE) {
+            // Pages are read only inside a transaction, which holds a lock that keeps writers out (in WAL mode,
+            // a read mark that keeps checkpoints from overwriting its pages).
             return Err(unsupported("a page is read outside a transaction"));
         }
         if (number < 1 || number > this.pageCount) {
@@ -572,15 +701,15 @@ struct WritablePager {
         var bytes = Vector<u8>.create();
         bytes.resize(this.pageSize, 0)?;
         if (number <= this.committedPageCount) {
-            if (this.walMode && this.wal.readPage(number, bytes.viewMut())?) {
-                // The log's latest committed frame of the page.
-            } else if (this.walMode && number > this.filePages) {
-                // Past the end of the file and in no frame: zeros, as SQLite reads it.
-            } else {
-                let offset = ((number - 1) as u64) * (this.pageSize as u64);
-                if (!readFully(mut this.file, bytes.viewMut(), offset)?) {
-                    return Err(corrupt("database file ends inside a page"));
+            let offset = ((number - 1) as u64) * (this.pageSize as u64);
+            if (borrow mut this.shared is Some(wal)) {
+                // The snapshot's latest frame of the page; else the file, where a page past its end (in no
+                // frame) reads as zeros, as SQLite reads it.
+                if (!wal.readPage(number, bytes.viewMut())? && !readFully(mut this.file, bytes.viewMut(), offset)?) {
+                    bytes.viewMut().fill(0);
                 }
+            } else if (!readFully(mut this.file, bytes.viewMut(), offset)?) {
+                return Err(corrupt("database file ends inside a page"));
             }
         }
         let slot = this.pages.length;
@@ -891,7 +1020,7 @@ struct WritablePager {
         if (this.dirty.length() == 0) {
             return Ok();
         }
-        // Readers must leave before the file changes (in WAL mode the transaction holds EXCLUSIVE already).
+        // Readers must leave before the file changes (in WAL mode they stay: the writer's lock is enough).
         this.lockForCommit()?;
         this.committedHere = true;
         let pageCount = this.pageCount;
@@ -932,7 +1061,6 @@ struct WritablePager {
             this.file.setLength((pageCount as u64) * (this.pageSize as u64))?;
             this.file.syncAll()?;
             Journal.remove(this.path.view())?;
-            this.filePages = pageCount;
         }
 
         this.changeCounter = counter;
@@ -941,9 +1069,10 @@ struct WritablePager {
         this.committedFreeCount = freeCount;
         this.preImages.clear();
         this.dirty.clear();
-        // SQLite's automatic checkpoint: a passive one once the log holds wal_autocheckpoint frames.
-        if (this.walMode && this.autoCheckpoint != 0 && this.wal.frames >= this.autoCheckpoint) {
-            let _ = this.checkpoint(false)?;
+        // SQLite's automatic checkpoint: a passive one once the log holds wal_autocheckpoint frames, made when the
+        // transaction has ended (`endWalTransaction`).
+        if (borrow this.shared is Some(wal)) {
+            this.checkpointDue = this.autoCheckpoint != 0 && wal.hdr.frames >= this.autoCheckpoint;
         }
         return Ok();
     }
@@ -955,65 +1084,83 @@ struct WritablePager {
             numbers.push(*this.dirty.keyAt(i))?;
         }
         numbers.sortBy((a, b) => if (*a < *b) -1 else if (*a > *b) 1 else 0);
-        this.wal.beginCommit(this.pageSize)?;
+        let pageSize = this.pageSize;
+        let Some(wal) = borrow mut this.shared else {
+            return Err(unsupported("the write-ahead log is not open"));
+        };
+        wal.beginCommit(pageSize)?;
         for (k in 0..numbers.length) {
             let number = numbers[k];
             let commitSize = if (k + 1 == numbers.length) pageCount else 0;
-            let slot = this.slotOf(number);
-            this.wal.addFrame(number, this.pages[slot].get().view(), commitSize)?;
+            let slot = *this.slots.get(borrow number)!;
+            wal.addFrame(number, this.pages[slot].get().view(), commitSize)?;
         }
-        this.wal.finishCommit(pageCount)?;
+        wal.finishCommit(pageCount)?;
         return Ok();
     }
 
     /// Whether the database is in WAL mode: commits go to its write-ahead log.
     fn inWalMode(borrow this) -> bool => this.walMode;
 
-    /// Copies the log's committed pages into the database file (SQLite's checkpoint), and with `truncate` empties
-    /// the log. The transaction must have no changes.
-    fn checkpoint(borrow mut this, truncate: bool) -> Result<WalCheckpoint, SqliteError> {
+    /// PRAGMA wal_checkpoint (sqlite3WalCheckpoint): copies the log's committed pages into the database file as
+    /// far as readers allow, waiting for them as `mode` says. As SQLite's, it runs outside a read transaction:
+    /// the running statement's own ends first. The transaction must have no changes.
+    fn checkpoint(borrow mut this, mode: CheckpointMode) -> Result<WalCheckpoint, SqliteError> {
         assert(this.dirty.length() == 0, "a checkpoint is made between transactions");
-        if (!this.walMode) {
-            return Ok(WalCheckpoint { logFrames: -1, checkpointed: -1 });
-        }
-        if (this.lock != LOCK_EXCLUSIVE) {
-            return Err(unsupported("a checkpoint is made holding the database's EXCLUSIVE lock"));
-        }
-        this.committedHere = true;
-        this.wal.checkpoint(mut this.file)?;
-        if (this.wal.hasFrames()) {
-            this.filePages = this.wal.databasePages;
-        }
-        let result = WalCheckpoint { logFrames: this.wal.frames as i64, checkpointed: this.wal.backfilled as i64 };
-        if (truncate) {
-            this.wal.truncate()?;
-            return Ok(WalCheckpoint { logFrames: 0, checkpointed: 0 });
-        }
-        return Ok(result);
+        let pageSize = this.pageSize;
+        let timeout = this.busyTimeout;
+        let Some(wal) = borrow mut this.shared else {
+            return Ok(WalCheckpoint { busy: false, logFrames: -1, checkpointed: -1 });
+        };
+        wal.endRead();
+        var changed = false;
+        return wal.checkpoint(mut this.file, pageSize, mode, timeout, mut changed);
     }
 
-    /// Puts the database in WAL mode: the header's format numbers become 2, in a commit of their own.
+    /// Puts the database in WAL mode: the header's format numbers become 2, in a commit of its own (through the
+    /// rollback journal, under EXCLUSIVE); then the connection holds SHARED, opens the log and the wal-index, and
+    /// goes on in a read transaction on them.
     fn enterWalMode(borrow mut this) -> Result<void, SqliteError> {
         if (this.walMode) {
             return Ok();
+        }
+        if (onWindows()) {
+            return Err(
+                unsupported("WAL mode needs POSIX file locks on the -shm file; it is not supported on Windows yet"),
+            );
         }
         let header = this.write(1)?;
         header[18] = 2;
         header[19] = 2;
         this.commit()?;
-        this.walMode = true;
+        this.committedHere = false;
+        this.downgradeToShared()?;
+        this.seen = null;
+        let started = this.startWal()?;
+        if (started.isNull()) {
+            return Err(busyError());
+        }
         return Ok();
     }
 
-    /// Leaves WAL mode for a rollback journal: the log is checkpointed and removed, and the header's format
-    /// numbers become 1.
+    /// Leaves WAL mode for a rollback journal (sqlite3PagerCloseWal): only with EXCLUSIVE on the file, which no
+    /// other connection with the database open in WAL mode lets this one have; the log is checkpointed and
+    /// removed with the wal-index, and the header's format numbers become 1.
     fn leaveWalMode(borrow mut this) -> Result<void, SqliteError> {
         if (!this.walMode) {
             return Ok();
         }
-        let _ = this.checkpoint(false)?;
-        this.wal.remove()?;
-        this.walMode = false;
+        if (borrow mut this.shared is Some(wal)) {
+            wal.endRead();
+        }
+        if (!this.tryReserved()? || !this.tryExclusive()?) {
+            this.downgradeToShared()?;
+            let _ = this.startWal()?;
+            return Err(busyError());
+        }
+        if (!this.checkpointAndRemoveLog()?) {
+            return Err(busyError());
+        }
         let header = this.write(1)?;
         header[18] = 1;
         header[19] = 1;
@@ -1029,27 +1176,32 @@ struct WritablePager {
     }
 
     /// What closing does, the pager staying usable: forgets a transaction in progress, and in WAL mode copies the
-    /// log into the file and removes it, as SQLite's last connection does: only when the EXCLUSIVE lock can be
-    /// had at once, which means no other connection (a sqlite3 holding the database open in WAL mode among them)
-    /// is using it. Otherwise the log stays for the others. Every lock goes.
+    /// log into the file and removes it and the wal-index, as SQLite's last connection does: only when the
+    /// EXCLUSIVE lock can be had at once, which means no other connection (a sqlite3 holding the database open in
+    /// WAL mode among them) is using it. Otherwise the log stays for the others. Every lock goes.
     fn closeLog(borrow mut this) -> Result<void, SqliteError> {
         this.rollback();
+        this.checkpointDue = false;
         var result: Result<void, SqliteError> = Ok();
-        var held = this.lock != LOCK_NONE;
-        if (!held) {
-            // One try, without waiting: the pages are read afresh if another connection changed the log.
+        if (!this.walMode && this.lock == LOCK_NONE) {
+            // One try, without waiting: a database in WAL mode is opened in it, so that its log is removed.
             match (this.tryStart()) {
-                Ok(Some(_)) => { held = true; }
-                Ok(null) => {}
+                Ok(_) => {}
                 Err(e) => { result = Err(e); }
             }
         }
-        if (held && this.walMode && result.isOk()) {
+        if (this.walMode && result.isOk()) {
+            if (borrow mut this.shared is Some(wal)) {
+                wal.endRead();
+            }
             match (this.tryReserved()) {
                 Ok(true) => {
                     match (this.tryExclusive()) {
                         Ok(true) => {
-                            result = this.checkpointAndRemoveLog();
+                            match (this.checkpointAndRemoveLog()) {
+                                Ok(_) => {}
+                                Err(e) => { result = Err(e); }
+                            }
                         }
                         Ok(false) => {}
                         Err(e) => { result = Err(e); }
@@ -1061,17 +1213,37 @@ struct WritablePager {
         }
         this.committedHere = false;
         // The files changed; the next transaction reads them afresh.
-        this.seen = null;
         this.unlockAll();
+        this.seen = null;
         return result;
     }
 
-    private fn checkpointAndRemoveLog(borrow mut this) -> Result<void, SqliteError> {
-        let _ = this.checkpoint(false)?;
-        this.wal.remove()?;
-        return Ok();
+    /// Holding EXCLUSIVE on the file: copies every frame into it and removes the log and the wal-index, leaving
+    /// WAL mode. False when a frame could not be copied.
+    private fn checkpointAndRemoveLog(borrow mut this) -> Result<bool, SqliteError> {
+        let done = this.checkpoint(CheckpointMode.Passive)?;
+        let complete = match (borrow this.shared) {
+            Some(wal) => !done.busy && wal.fullyCheckpointed(),
+            null => true,
+        };
+        if (!complete) {
+            return Ok(false);
+        }
+        let Some(wal) = replace(mut this.shared, null) else {
+            return Ok(true);
+        };
+        this.walMode = false;
+        wal.closeAndRemove()?;
+        return Ok(true);
     }
 }
+
+/// Whether the program runs on Windows, whose locks (os_win.c's scheme) the WAL code does not follow yet. CeeSafe
+/// does not say which system it runs on (CEESAFE_FINDINGS.md, finding 40); Windows sets OS to Windows_NT.
+fn onWindows() -> bool => match (Environment.variable("OS")) {
+    Some(name) => name == "Windows_NT",
+    null => false,
+};
 
 impl PageSource for WritablePager {
     fn readPage(borrow mut this, number: u32) -> Result<Page, SqliteError> {

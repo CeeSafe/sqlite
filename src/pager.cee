@@ -64,7 +64,7 @@ struct Pager {
             return Err(corrupt("database file has more pages than the format allows"));
         };
         // Commits in the write-ahead log are part of the database: its pages are read through the log.
-        var wal = WalLog.open(path, false)?;
+        var wal = WalLog.open(path)?;
         var pageCount = filePages;
         var current = header;
         if (wal.hasFrames()) {

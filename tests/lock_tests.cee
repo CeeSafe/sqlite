@@ -320,34 +320,3 @@ fn locksDataVersionCountsOtherConnectionsCommits() -> Result<void, TestFailure> 
     Check.equalText("2\n", theirAnswer(path, "PRAGMA data_version").view())?;
     return Ok();
 }
-
-/// In WAL mode every transaction holds the database file's EXCLUSIVE lock, as SQLite's exclusive locking mode
-/// does: while sqlite3 has the database open in WAL mode (it holds SHARED for as long) this engine waits, and
-/// while this engine's transaction is open sqlite3 does. Each reads the other's commits from the log.
-@test
-fn locksWalModeConnectionsTakeTurns() -> Result<void, TestFailure> {
-    let path = "out/lock-wal.db";
-    let marker = "out/lock-wal.marker";
-    lockFixture(path, marker)?;
-    let _ = askSqlite(path, "PRAGMA journal_mode = WAL")?;
-    var connection = Connection.open(path)!;
-    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(1)), "the fixture's row")?;
-    let shell = sqliteInBackground(
-        path,
-        [".dbconfig no_ckpt_on_close on", "INSERT INTO t VALUES (2)", ".shell touch out/lock-wal.marker", ".shell sleep 1"][..],
-    );
-    waitForFile(marker)?;
-    Check.isTrue(isLocked(borrow rowsOfT(mut connection)), "sqlite3 has the database open")?;
-    connection.setBusyTimeout(10000);
-    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(2)), "its commit, read from the log")?;
-    Check.isTrue(shell.join() == 0, "the shell's insert ran")?;
-    connection.begin()!;
-    connection.executeScript("INSERT INTO t VALUES (3)")!;
-    Check.isTrue(sqliteSaysLocked(theirAnswer(path, "SELECT count(*) FROM t").view()), "sqlite3 waits for us")?;
-    connection.commit()!;
-    Check.equalText("3\n", askSqliteKeepingLog(path, "INSERT INTO t VALUES (4); SELECT count(*) - 1 FROM t")?.view())?;
-    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(4)), "sqlite3's commit to the log is read")?;
-    connection.close()!;
-    Check.equalText("4\n", theirAnswer(path, "SELECT count(*) FROM t").view())?;
-    return expectIntact(path);
-}
