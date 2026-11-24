@@ -2,7 +2,7 @@
 name = "sqlite"
 version = "0.1.0"
 kind = "library"
-ceesafec = ">=0.93.7"
+ceesafec = ">=0.95.0"
 tests = ["tests"]
 
 [dependencies]
