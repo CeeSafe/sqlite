@@ -58,20 +58,16 @@ fn runProgram(program: StringView, arguments: borrow Vector<StringView>) -> Resu
     return Ok(captureProgram(program, arguments, "".bytes())?.status);
 }
 
-/// The sqlite3 shell run with `arguments` and `input`. On Windows the shell ends its lines with "\r\n" unless told
-/// otherwise: `.crlf off`, run before the arguments, has it write what it writes elsewhere, and the "\r" of its
-/// messages, which `.crlf` does not cover, are dropped.
+/// The sqlite3 shell run with `arguments` and `input`. On Windows the shell writes "\r\n" for each "\n" (the C
+/// runtime's text mode); each "\r\n" becomes "\n" again, which undoes exactly that (a "\r\n" in a value was written
+/// "\r\r\n"). `.crlf off` would do it in the shell, but it says so on standard error and, given as `-cmd`, changes
+/// the arguments' numbers in messages.
 fn captureSqlite(arguments: borrow Vector<StringView>, input: Slice<u8>) -> Result<ProcessOutput, IoError> {
     if (!onWindowsHost()) {
         return Process.capture("sqlite3", arguments, input);
     }
-    var all = Vector<StringView>.create();
-    all.push("-cmd")!;
-    all.push(".crlf off")!;
-    for (argument in arguments) {
-        all.push(argument)!;
-    }
-    var output = captureProgram("sqlite3", borrow all, input)?;
+    var output = captureProgram("sqlite3", arguments, input)?;
+    output.stdout = withoutCarriageReturns(output.stdout.view());
     output.stderr = withoutCarriageReturns(output.stderr.view());
     return Ok(output);
 }

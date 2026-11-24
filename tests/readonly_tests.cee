@@ -271,7 +271,12 @@ fn readOnlyHotJournalIsRefused() -> Result<void, TestFailure> {
         },
         "the journal cannot be played back",
     )?;
-    Check.isTrue(theirReadOnlyAnswer(path, "SELECT 1").view().contains("attempt to write a readonly database"), "sqlite3 too")?;
+    let theirs = theirReadOnlyAnswer(path, "SELECT 1");
+    if (!theirs.view().contains("attempt to write a readonly database")) {
+        var message = String.from("sqlite3 too, but it answered: ")!;
+        message.append(theirs.view())!;
+        return Check.fail(message.view());
+    }
     Check.isTrue(Journal.exists(path)!, "the journal stays")?;
     let _ = File.remove(withSuffix(path, "-journal")!.view());
     return Ok();
