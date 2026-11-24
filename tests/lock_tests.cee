@@ -1,0 +1,353 @@
+// SQLite's file locks: this engine and the sqlite3 shell on one file at the same time, and two sessions of this
+// engine in one process. A lock is held by a sqlite3 process run on a thread of the test, which says it holds it
+// by making a marker file (`.shell touch`), and keeps it while it sleeps (`.shell sleep`).
+
+/// Runs sqlite3 on `path` with `commands` (each an argument: SQL or a dot-command, run in one connection) on a
+/// thread of its own; the thread's value is the shell's exit status.
+fn sqliteInBackground(path: StringView, commands: Slice<StringView>) -> Thread<i32> =>
+    sqliteInBackgroundWith(path, commands, "");
+
+/// The same, with `input` on the shell's standard input (a script, after the arguments' commands).
+fn sqliteInBackgroundWith(path: StringView, commands: Slice<StringView>, input: StringView) -> Thread<i32> {
+    var owned = Vector<String>.create();
+    owned.push(String.from(path)!)!;
+    for (i in 0..commands.length) {
+        owned.push(String.from(commands[i])!)!;
+    }
+    let script = String.from(input)!;
+    return Thread.spawn(move () => {
+        var arguments = Vector<StringView>.create();
+        for (i in 0..owned.length) {
+            if (arguments.push(owned[i].view()).isErr()) {
+                return -1;
+            }
+        }
+        return match (Process.capture("sqlite3", borrow arguments, script.view().bytes())) {
+            Ok(output) => output.status,
+            Err(_) => -1,
+        };
+    })!;
+}
+
+/// What sqlite3 prints for `commands` (each an argument) on `path`: its output, or "error: " and its first line
+/// of errors.
+fn theirAnswerTo(path: StringView, commands: Slice<StringView>) -> String {
+    var arguments = Vector<StringView>.create();
+    arguments.push(path)!;
+    for (i in 0..commands.length) {
+        arguments.push(commands[i])!;
+    }
+    let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
+    if (output.status == 0) {
+        return textFromBytesLossy(output.stdout.view())!;
+    }
+    let errors = textFromBytesLossy(output.stderr.view())!;
+    var text = String.from("error: ")!;
+    text.append((errors.view().splitOnce("\n") ?? TextHalves { left: errors.view(), right: "" }).left)!;
+    return text;
+}
+
+/// Whether sqlite3's answer is SQLITE_BUSY's "database is locked", which the shell words by where it met it.
+fn sqliteSaysLocked(answer: StringView) -> bool => answer.startsWith("error: ") && answer.contains("database is locked");
+
+/// Waits (up to ten seconds) for the file at `path` to exist.
+fn waitForFile(path: StringView) -> Result<void, TestFailure> {
+    for (i in 0..1000) {
+        if (fileLength(path)!.isSome()) {
+            return Ok();
+        }
+        Thread.sleep(10);
+    }
+    return Check.fail("the sqlite3 shell did not take its lock");
+}
+
+/// A fixture of one table `t(v)` holding 1, with no marker file beside it.
+fn lockFixture(path: StringView, marker: StringView) -> Result<void, TestFailure> {
+    let _ = File.remove(marker);
+    let _ = File.remove(withSuffix(path, "-journal")!.view());
+    let _ = File.remove(withSuffix(path, "-wal")!.view());
+    let _ = File.remove(withSuffix(path, "-shm")!.view());
+    return makeDatabase(path, "CREATE TABLE t(v); INSERT INTO t VALUES (1)");
+}
+
+fn rowsOfT(connection: borrow mut Connection) -> Result<SqliteValue?, SqliteError> {
+    let none = Params.create();
+    return connection.scalar("SELECT count(*) FROM t", borrow none);
+}
+
+fn dataVersionOf(connection: borrow mut Connection) -> i64 {
+    let none = Params.create();
+    return match (connection.scalar("PRAGMA data_version", borrow none)) {
+        Ok(Some(SqliteValue.Integer(n))) => n,
+        _ => -1,
+    };
+}
+
+fn isLocked(result: borrow Result<SqliteValue?, SqliteError>) -> bool => match (result) {
+    Err(SqliteError.Busy(m)) => m.view() == "database is locked",
+    _ => false,
+};
+
+/// While sqlite3 holds BEGIN EXCLUSIVE this engine cannot read: at once with no busy timeout, after the timeout
+/// with one, and as soon as sqlite3 commits with a timeout long enough. It then sees sqlite3's commit.
+@test
+fn locksSqliteHoldingExclusiveMakesThisEngineWait() -> Result<void, TestFailure> {
+    let path = "out/lock-their-exclusive.db";
+    let marker = "out/lock-their-exclusive.marker";
+    lockFixture(path, marker)?;
+    var connection = Connection.open(path)!;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(1)), "the fixture's row")?;
+    let shell = sqliteInBackground(
+        path,
+        ["BEGIN EXCLUSIVE", "INSERT INTO t VALUES (2)", ".shell touch out/lock-their-exclusive.marker", ".shell sleep 1.5", "COMMIT"][..],
+    );
+    waitForFile(marker)?;
+    Check.isTrue(isLocked(borrow rowsOfT(mut connection)), "no timeout: database is locked at once")?;
+    connection.setBusyTimeout(200);
+    let start = Timer.now();
+    Check.isTrue(isLocked(borrow rowsOfT(mut connection)), "a short timeout runs out")?;
+    let waited = Timer.now() - start;
+    Check.isTrue(waited >= 190 && waited < 1400, "the wait is the busy timeout")?;
+    connection.setBusyTimeout(10000);
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(2)), "a long timeout outlasts the lock")?;
+    Check.isTrue(shell.join() == 0, "the shell committed")?;
+    return expectIntact(path);
+}
+
+/// The reverse: while this engine's transaction has written (RESERVED), sqlite3 reads the last commit and cannot
+/// write; while it holds BEGIN EXCLUSIVE sqlite3 cannot read either; after COMMIT sqlite3 sees the rows.
+@test
+fn locksThisEngineHoldingLocksMakesSqliteWait() -> Result<void, TestFailure> {
+    let path = "out/lock-our-locks.db";
+    lockFixture(path, "out/lock-our-locks.marker")?;
+    var connection = Connection.open(path)!;
+    connection.begin()!;
+    connection.executeScript("INSERT INTO t VALUES (2)")!;
+    Check.equalText("1\n", theirAnswer(path, "SELECT count(*) FROM t").view())?;
+    Check.isTrue(sqliteSaysLocked(theirAnswer(path, "INSERT INTO t VALUES (3)").view()), "sqlite3 cannot write")?;
+    connection.commit()!;
+    Check.equalText("2\n", theirAnswer(path, "SELECT count(*) FROM t").view())?;
+    connection.executeScript("BEGIN EXCLUSIVE")!;
+    Check.isTrue(sqliteSaysLocked(theirAnswer(path, "SELECT count(*) FROM t").view()), "sqlite3 cannot read")?;
+    connection.executeScript("INSERT INTO t VALUES (3); COMMIT")!;
+    // BEGIN IMMEDIATE takes RESERVED before anything is written.
+    connection.executeScript("BEGIN IMMEDIATE")!;
+    Check.equalText("3\n", theirAnswer(path, "SELECT count(*) FROM t").view())?;
+    Check.isTrue(sqliteSaysLocked(theirAnswer(path, "DELETE FROM t").view()), "sqlite3 cannot write")?;
+    connection.rollback()!;
+    Check.equalText("2\n", theirAnswer(path, "DELETE FROM t WHERE v = 3; SELECT count(*) FROM t").view())?;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(2)), "sqlite3's delete is seen")?;
+    return expectIntact(path);
+}
+
+/// A reader inside a transaction holds SHARED, so a writer cannot commit under it: the reader's answers do not
+/// change until its transaction ends, and sqlite3's commit waits for it (here past its timeout).
+@test
+fn locksAReaderInATransactionSeesAStableSnapshot() -> Result<void, TestFailure> {
+    let path = "out/lock-snapshot.db";
+    lockFixture(path, "out/lock-snapshot.marker")?;
+    var connection = Connection.open(path)!;
+    connection.begin()!;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(1)), "the fixture's row")?;
+    let start = Timer.now();
+    let answer = theirAnswerTo(path, [".timeout 300", "INSERT INTO t VALUES (2)"][..]);
+    Check.isTrue(sqliteSaysLocked(answer.view()), "sqlite3 cannot commit under a reader")?;
+    Check.isTrue(Timer.now() - start >= 290, "after its busy timeout")?;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(1)), "the same answer")?;
+    connection.commit()!;
+    Check.equalText("", theirAnswer(path, "INSERT INTO t VALUES (2)").view())?;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(2)), "the next transaction sees the commit")?;
+    return expectIntact(path);
+}
+
+/// This engine and sqlite3 each add one to a counter 150 times, each in a transaction of its own that reads
+/// before it writes, at the same time: with the locks no update is lost, and the file stays sound.
+@test
+fn locksConcurrentWritersNeverLoseACommit() -> Result<void, TestFailure> {
+    let path = "out/lock-writers.db";
+    lockFixture(path, "out/lock-writers.marker")?;
+    let _ = askSqlite(path, "CREATE TABLE counter(n); INSERT INTO counter VALUES (0)")?;
+    var script = String.from(".timeout 20000\n")!;
+    for (i in 0..150) {
+        script.append("UPDATE counter SET n = n + 1;\nINSERT INTO t SELECT n FROM counter;\n")!;
+    }
+    let noArguments = Vector<StringView>.create();
+    // The shell's statements and these run at once; each side's busy timeout outlasts the other's commits.
+    let shell = sqliteInBackgroundWith(path, noArguments.view(), script.view());
+    var connection = Connection.open(path)!;
+    connection.setBusyTimeout(20000);
+    let none = Params.create();
+    for (i in 0..150) {
+        // Half in a transaction of several statements, half as a statement of its own (which waits for
+        // RESERVED as it begins, as SQLite's does).
+        let sql = if (i % 2 == 0) "BEGIN IMMEDIATE; UPDATE counter SET n = n + 1; INSERT INTO t SELECT -n FROM counter; COMMIT" else "UPDATE counter SET n = n + 1";
+        let _ = connection.execute(sql, borrow none)!;
+    }
+    Check.isTrue(shell.join() == 0, "the shell's updates all ran")?;
+    Check.isTrue(
+        connection.scalar("SELECT n FROM counter", borrow none)! is Some(SqliteValue.Integer(300)),
+        "every update counted",
+    )?;
+    Check.equalText(
+        "300|226|75\n",
+        theirAnswer(path, "SELECT n, (SELECT count(*) FROM t), (SELECT count(DISTINCT v) FROM t WHERE v < 0) FROM counter").view(),
+    )?;
+    return expectIntact(path);
+}
+
+/// A commit sqlite3 was killed in the middle of leaves a hot journal, which this engine rolls back, under
+/// EXCLUSIVE, before it reads. A journal whose writer still holds RESERVED is not hot: it is left alone.
+@test
+fn locksHotJournalsAreRolledBackAndLiveOnesLeftAlone() -> Result<void, TestFailure> {
+    let path = "out/lock-hot.db";
+    let marker = "out/lock-hot.marker";
+    lockFixture(path, marker)?;
+    // A live journal: sqlite3 has written (RESERVED, its changes in its cache) and sleeps before committing.
+    let shell = sqliteInBackground(
+        path,
+        ["BEGIN", "INSERT INTO t VALUES (2)", ".shell touch out/lock-hot.marker", ".shell sleep 1", "COMMIT"][..],
+    );
+    waitForFile(marker)?;
+    Check.isTrue(Journal.exists(path)!, "the shell's journal exists")?;
+    var connection = Connection.open(path)!;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(1)), "the last commit is read")?;
+    Check.isTrue(Journal.exists(path)!, "a journal whose writer holds RESERVED is not played back")?;
+    Check.isTrue(shell.join() == 0, "the shell committed")?;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(2)), "and its commit is seen")?;
+    // A hot journal: the shell's rows grow, it spills changed pages into the file (having synced the journal),
+    // and it is killed before it commits.
+    Check.equalText(
+        "",
+        theirAnswer(path, "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 5000) INSERT INTO t SELECT 'row ' || i FROM c").view(),
+    )?;
+    var arguments = Vector<StringView>.create();
+    arguments.push(path)!;
+    arguments.push("PRAGMA cache_size = 1; PRAGMA cache_spill = 1; BEGIN; UPDATE t SET v = v || ' changed';")!;
+    arguments.push(".shell kill -9 $PPID")!;
+    let _ = Process.run("sqlite3", borrow arguments);
+    Check.isTrue(Journal.mayBeHot(path)!, "the killed shell left a journal it had synced")?;
+    let none = Params.create();
+    let changed = connection.scalar("SELECT count(*) FROM t WHERE v LIKE '% changed'", borrow none)!;
+    Check.isTrue(changed is Some(SqliteValue.Integer(0)), "the journal is played back first")?;
+    Check.isTrue(!Journal.exists(path)!, "and removed")?;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(5002)), "every row is there")?;
+    return expectIntact(path);
+}
+
+/// A journal that looks hot while a writer holds RESERVED belongs to that writer: a reader leaves it alone. Here
+/// the journal is a header (synced, so its magic is written) that would cut the file to one page if played back.
+@test
+fn locksAJournalWhoseWriterHoldsReservedIsNotHot() -> Result<void, TestFailure> {
+    let path = "out/lock-live-journal.db";
+    lockFixture(path, "out/lock-live-journal.marker")?;
+    var writer = Connection.open(path)!;
+    var reader = Connection.open(path)!;
+    writer.executeScript("BEGIN IMMEDIATE")!;
+    {
+        var header = Vector<u8>.create();
+        header.resize(512, 0)!;
+        header.viewMut()[0..8].copyFrom(JOURNAL_MAGIC[..]);
+        header.writeBE(8, 0xFFFF_FFFFu32);
+        header.writeBE(12, 7u32);
+        header.writeBE(16, 1u32);
+        header.writeBE(20, 512u32);
+        header.writeBE(24, 4096u32);
+        var journal = File.create(withSuffix(path, "-journal")!.view())!;
+        journal.write(header.view())!;
+    }
+    Check.isTrue(Journal.mayBeHot(path)!, "the journal looks hot")?;
+    Check.isTrue(rowsOfT(mut reader)! is Some(SqliteValue.Integer(1)), "the reader reads the file as it is")?;
+    Check.isTrue(Journal.exists(path)!, "and leaves the writer's journal")?;
+    writer.executeScript("INSERT INTO t VALUES (2); COMMIT")!;
+    Check.isTrue(!Journal.exists(path)!, "the writer's commit ends with no journal")?;
+    Check.isTrue(rowsOfT(mut reader)! is Some(SqliteValue.Integer(2)), "and its row is read")?;
+    return expectIntact(path);
+}
+
+/// Two sessions of this engine on one file, in one process, are kept apart by the same locks: a reader sees the
+/// last commit, a second writer is refused, a writer's commit waits for readers, and a reader in a transaction
+/// that then writes while another writes fails at once rather than deadlock, as in SQLite.
+@test
+fn locksTwoSessionsInOneProcessAreKeptApart() -> Result<void, TestFailure> {
+    let path = "out/lock-sessions.db";
+    lockFixture(path, "out/lock-sessions.marker")?;
+    var first = Connection.open(path)!;
+    var second = Connection.open(path)!;
+    first.begin()!;
+    first.executeScript("INSERT INTO t VALUES (2)")!;
+    Check.isTrue(rowsOfT(mut second)! is Some(SqliteValue.Integer(1)), "the second reads the last commit")?;
+    let none = Params.create();
+    Check.isTrue(second.execute("INSERT INTO t VALUES (3)", borrow none) is Err(SqliteError.Busy(_)), "one writer")?;
+    // A reader in a transaction keeps the first's commit out until it ends.
+    second.begin()!;
+    Check.isTrue(rowsOfT(mut second)! is Some(SqliteValue.Integer(1)), "the second's snapshot")?;
+    Check.isTrue(first.execute("COMMIT", borrow none) is Err(SqliteError.Busy(_)), "the commit waits for the reader")?;
+    Check.isTrue(first.inTransaction(), "a commit that failed leaves the transaction open, as in SQLite")?;
+    // The second, a reader, now wants to write while the first holds RESERVED: it fails at once, even with a
+    // timeout, since waiting would deadlock with the first waiting for it.
+    second.setBusyTimeout(5000);
+    let start = Timer.now();
+    Check.isTrue(second.execute("INSERT INTO t VALUES (4)", borrow none) is Err(SqliteError.Busy(_)), "no deadlock")?;
+    Check.isTrue(Timer.now() - start < 1000, "the upgrade did not wait")?;
+    second.rollback()!;
+    first.commit()!;
+    Check.isTrue(rowsOfT(mut second)! is Some(SqliteValue.Integer(2)), "the commit is seen")?;
+    // A writer that began with no lock waits for another's commit, within its busy timeout.
+    first.executeScript("BEGIN IMMEDIATE; INSERT INTO t VALUES (5)")!;
+    Check.isTrue(second.execute("INSERT INTO t VALUES (6)", borrow none) is Err(SqliteError.Busy(_)), "the writer waits")?;
+    first.commit()!;
+    let _ = second.execute("INSERT INTO t VALUES (6)", borrow none)!;
+    Check.isTrue(rowsOfT(mut first)! is Some(SqliteValue.Integer(4)), "both commits are there")?;
+    // PRAGMA data_version moves when another connection commits, as in SQLite, and not for one's own.
+    let version = dataVersionOf(mut first);
+    let _ = first.execute("INSERT INTO t VALUES (7)", borrow none)!;
+    Check.equalI64(version, dataVersionOf(mut first))?;
+    let _ = second.execute("INSERT INTO t VALUES (8)", borrow none)!;
+    Check.equalI64(version + 1, dataVersionOf(mut first))?;
+    return expectIntact(path);
+}
+
+/// PRAGMA data_version as sqlite3 gives it: 2 before any other connection commits, one more for each that does.
+@test
+fn locksDataVersionCountsOtherConnectionsCommits() -> Result<void, TestFailure> {
+    let path = "out/lock-data-version.db";
+    lockFixture(path, "out/lock-data-version.marker")?;
+    var connection = Connection.open(path)!;
+    let none = Params.create();
+    Check.isTrue(connection.scalar("PRAGMA data_version", borrow none)! is Some(SqliteValue.Integer(2)), "first")?;
+    let _ = theirAnswer(path, "INSERT INTO t VALUES (2)");
+    Check.isTrue(connection.scalar("PRAGMA data_version", borrow none)! is Some(SqliteValue.Integer(3)), "next")?;
+    Check.equalText("2\n", theirAnswer(path, "PRAGMA data_version").view())?;
+    return Ok();
+}
+
+/// In WAL mode every transaction holds the database file's EXCLUSIVE lock, as SQLite's exclusive locking mode
+/// does: while sqlite3 has the database open in WAL mode (it holds SHARED for as long) this engine waits, and
+/// while this engine's transaction is open sqlite3 does. Each reads the other's commits from the log.
+@test
+fn locksWalModeConnectionsTakeTurns() -> Result<void, TestFailure> {
+    let path = "out/lock-wal.db";
+    let marker = "out/lock-wal.marker";
+    lockFixture(path, marker)?;
+    let _ = askSqlite(path, "PRAGMA journal_mode = WAL")?;
+    var connection = Connection.open(path)!;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(1)), "the fixture's row")?;
+    let shell = sqliteInBackground(
+        path,
+        [".dbconfig no_ckpt_on_close on", "INSERT INTO t VALUES (2)", ".shell touch out/lock-wal.marker", ".shell sleep 1"][..],
+    );
+    waitForFile(marker)?;
+    Check.isTrue(isLocked(borrow rowsOfT(mut connection)), "sqlite3 has the database open")?;
+    connection.setBusyTimeout(10000);
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(2)), "its commit, read from the log")?;
+    Check.isTrue(shell.join() == 0, "the shell's insert ran")?;
+    connection.begin()!;
+    connection.executeScript("INSERT INTO t VALUES (3)")!;
+    Check.isTrue(sqliteSaysLocked(theirAnswer(path, "SELECT count(*) FROM t").view()), "sqlite3 waits for us")?;
+    connection.commit()!;
+    Check.equalText("3\n", askSqliteKeepingLog(path, "INSERT INTO t VALUES (4); SELECT count(*) - 1 FROM t")?.view())?;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(4)), "sqlite3's commit to the log is read")?;
+    connection.close()!;
+    Check.equalText("4\n", theirAnswer(path, "SELECT count(*) FROM t").view())?;
+    return expectIntact(path);
+}

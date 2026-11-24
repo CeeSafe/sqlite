@@ -11,7 +11,8 @@
 //
 // What the C# got wrong, fixed here (README.md, "Differences from the C# engine"): parameters follow SQLite's
 // binding rules; a transaction left open when a connection closes is rolled back, not written to the file; and
-// connections that share a file see each other's commits and never each other's uncommitted changes.
+// connections that share a file, in this process or others, take SQLite's file locks, see each other's commits
+// and never each other's uncommitted changes.
 
 /// A value for a parameter given by its number.
 struct NumberedValue {
@@ -143,102 +144,30 @@ public struct Params {
 fn hasParameterPrefix(name: StringView) -> bool =>
     name.length != 0 && (name[0] == ':' || name[0] == '@' || name[0] == '$' || name[0] == '?');
 
-/// Takes a value from `channel`, waiting up to `milliseconds` for one. CeeSafe has no timed wait on a channel, nor
-/// a sleep outside async code (CEESAFE_FINDINGS.md, finding 23), so the wait polls.
-fn takeFrom<T: Send>(channel: borrow Channel<T>, milliseconds: i64) -> T? {
-    var value = channel.tryRecv();
-    if (value.isNull() && milliseconds > 0) {
-        let deadline = Timer.now() + (checkedTruncate<u64>(milliseconds) ?? 0);
-        while (value.isNull() && Timer.now() < deadline) {
-            value = channel.tryRecv();
-        }
-    }
-    return value;
-}
-
-fn takeGate(gate: borrow Channel<GateToken>, milliseconds: i64) -> GateToken? => takeFrom(gate, milliseconds);
-
-/// The right to use a database file, which the connections that share it pass between them (see `Connection`).
-struct GateToken {}
-
 /// A connection to a database file.
 ///
 /// Outside BEGIN … COMMIT each statement is a transaction of its own; inside, a failed statement undoes only
 /// itself, as in SQLite. A connection that is closed or dropped with a transaction open rolls it back.
 ///
-/// Connections made by one `ConnectionPool` share a gate: a connection takes it when a transaction starts (the
-/// first statement outside a transaction, or BEGIN) and gives it back when the transaction ends, so the pool's
-/// transactions run one at a time and none sees another's uncommitted changes. A connection that cannot take the
-/// gate waits up to its busy timeout (`PRAGMA busy_timeout`, `setBusyTimeout`) and then fails with
-/// `SqliteError.Busy`, "database is locked". When it takes the gate it checks the file's change counter, and if
-/// another connection committed since its last transaction it reads the file afresh.
-///
-/// A connection opened on its own has a gate of its own. Two such connections on one file, or another process
-/// writing the file, are not kept apart: this engine takes no file locks (CEESAFE_FINDINGS.md, finding 3). They
-/// still see each other's commits from their next transaction, by the change counter.
+/// Connections are kept apart by SQLite's own locks on the file (see `WritablePager`), which other processes, the
+/// `sqlite3` shell among them, take too: readers share the file, one writer at a time prepares a commit while
+/// they read, and its commit waits for them to leave. A connection that meets another's lock waits up to its
+/// busy timeout (`PRAGMA busy_timeout`, `setBusyTimeout`; 0 by default, as in SQLite) and then fails with
+/// `SqliteError.Busy`, "database is locked". When a transaction starts it reads the file afresh if another
+/// connection committed since its last one.
 public struct Connection {
     session: Session;
-    /// A read-only handle on the file, for its change counter.
-    header: File;
-    gate: Channel<GateToken>;
-    /// The gate, while this connection has a transaction open.
-    token: GateToken?;
-    /// The file's change counter when this connection last ended a transaction.
-    seenCounter: u32;
-
-    drop {
-        // The session's uncommitted pages go with it; the gate goes back for the others.
-        if (replace(mut this.token, null) is Some(token)) {
-            let _ = this.gate.trySend(token);
-        }
-    }
 
     /// Opens the database file at `path`, making an empty database if there is none. `:memory:` and the empty
     /// name give a private database, as in SQLite: here a file of its own, removed when the connection closes.
-    public fn open(path: StringView) -> Result<Connection, SqliteError> {
-        let gate = Channel<GateToken>.create(1)?;
-        let _ = gate.trySend(GateToken {});
-        return Connection.openWithGate(path, gate, 0);
-    }
+    public fn open(path: StringView) -> Result<Connection, SqliteError> => Connection.openWaiting(path, 0);
 
-    /// Opens a connection that takes the gate `gate` for its transactions, waiting up to `waitMilliseconds` for
-    /// it to open the file.
-    fn openWithGate(
-        path: StringView,
-        gate: Channel<GateToken>,
-        waitMilliseconds: i64,
-    ) -> Result<Connection, SqliteError> {
+    /// Opens a connection whose busy timeout is `busyTimeout` milliseconds, which opening waits for too.
+    fn openWaiting(path: StringView, busyTimeout: i64) -> Result<Connection, SqliteError> {
         if (path.startsWith("file:")) {
             return Err(unsupported("URI file names are not supported; give a file's path"));
         }
-        // Making the file is a change to it: it is done holding the gate.
-        let token = takeGate(borrow gate, waitMilliseconds) ?? {
-            return Err(SqliteError.Busy(String.from("database is locked")?));
-        };
-        let session = match (Session.open(path)) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = gate.trySend(token);
-                return Err(e);
-            }
-        };
-        // The file itself (a private one for `:memory:`), whose change counter tells of other connections' commits.
-        let header = match (File.open(session.pager.filePath())) {
-            Ok(f) => f,
-            Err(e) => {
-                let _ = gate.trySend(token);
-                return Err(SqliteError.Io(e));
-            }
-        };
-        var connection = Connection {
-            session: session,
-            header: header,
-            gate: gate,
-            token: token,
-            seenCounter: 0,
-        };
-        connection.endTransaction()?;
-        return Ok(connection);
+        return Ok(Connection { session: Session.openWaiting(path, busyTimeout.max(0))? });
     }
 
     /// Closes the connection, rolling back a transaction it left open.
@@ -330,8 +259,7 @@ public struct Connection {
     /// The rowid of the last row inserted, as sqlite3_last_insert_rowid gives it.
     public fn lastInsertRowid(borrow this) -> i64 => this.session.lastInsertRowid;
 
-    /// How long, in milliseconds, to wait for another connection of the pool to end its transaction
-    /// (PRAGMA busy_timeout).
+    /// How long, in milliseconds, to wait for another connection's lock on the file (PRAGMA busy_timeout).
     public fn setBusyTimeout(borrow mut this, milliseconds: i64) {
         this.session.busyTimeout = milliseconds.max(0);
     }
@@ -371,57 +299,7 @@ public struct Connection {
         return Ok(last);
     }
 
-    /// Runs one statement, holding the gate for as long as its transaction lasts.
-    fn runOne(borrow mut this, sql: StringView, values: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> {
-        this.startTransaction()?;
-        let result = this.session.query(sql, values);
-        this.endTransaction()?;
-        return result;
-    }
-
-    /// Takes the gate if this connection does not hold it, and reads the file afresh if it changed since.
-    fn startTransaction(borrow mut this) -> Result<void, SqliteError> {
-        if (this.token.isSome()) {
-            return Ok();
-        }
-        this.token = takeGate(borrow this.gate, this.session.busyTimeout) ?? {
-            return Err(SqliteError.Busy(String.from("database is locked")?));
-        };
-        if (this.changeCounter()? != this.seenCounter) {
-            match (this.session.reopen()) {
-                Ok() => {}
-                Err(e) => {
-                    this.giveBackGate();
-                    return Err(e);
-                }
-            }
-        }
-        return Ok();
-    }
-
-    /// Gives the gate back once no transaction is open, noting the change counter the file has then.
-    fn endTransaction(borrow mut this) -> Result<void, SqliteError> {
-        if (this.session.inTransaction || this.token.isNull()) {
-            return Ok();
-        }
-        let counter = this.changeCounter();
-        this.giveBackGate();
-        this.seenCounter = counter?;
-        return Ok();
-    }
-
-    fn giveBackGate(borrow mut this) {
-        if (replace(mut this.token, null) is Some(token)) {
-            let _ = this.gate.trySend(token);
-        }
-    }
-
-    /// The file change counter in the database header (offset 24), which every commit changes.
-    fn changeCounter(borrow mut this) -> Result<u32, SqliteError> {
-        var bytes = [0u8; 4];
-        if (!readFully(mut this.header, mut bytes[..], 24)?) {
-            return Ok(0);
-        }
-        return Ok(bytes[..].readBE<u32>(0));
-    }
+    /// Runs one statement; the session takes and releases the file's locks.
+    fn runOne(borrow mut this, sql: StringView, values: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> =>
+        this.session.query(sql, values);
 }

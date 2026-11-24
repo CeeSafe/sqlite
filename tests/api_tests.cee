@@ -422,15 +422,18 @@ fn poolConnectionsComeBackRolledBack() -> Result<void, TestFailure> {
         let count = c.get().scalar("SELECT count(*) FROM t", borrow none)!;
         Check.isTrue(count is Some(SqliteValue.Integer(0)), "api_tests.cee line 400")?;
     }
-    // Two out at once: the second cannot use the file while the first's transaction is open, and sees its rows
-    // once it commits.
+    // Two out at once, kept apart by the file's locks as SQLite keeps them: while the first's transaction has
+    // written and not committed, the second reads what was committed and cannot write; it sees the first's rows
+    // once they are committed.
     var a = pool.checkout()!;
     var b = pool.checkout()!;
     Check.isTrue(pool.openConnections() == 2, "api_tests.cee line 406")?;
     a.get().begin()!;
     a.get().executeScript("INSERT INTO t VALUES (2)")!;
-    let blocked = b.get().query("SELECT count(*) FROM t", borrow none);
-    Check.isTrue(blocked is Err(SqliteError.Busy(_)), "api_tests.cee line 410")?;
+    let before = b.get().scalar("SELECT count(*) FROM t", borrow none)!;
+    Check.isTrue(before is Some(SqliteValue.Integer(0)), "a reader sees only what was committed")?;
+    let blocked = b.get().execute("INSERT INTO t VALUES (3)", borrow none);
+    Check.isTrue(blocked is Err(SqliteError.Busy(_)), "a second writer is refused")?;
     // A full pool does not wait past its timeout.
     Check.isTrue(pool.checkout() is Err(SqliteError.Busy(_)), "api_tests.cee line 412")?;
     a.get().commit()!;
