@@ -772,16 +772,15 @@ Collations other than BINARY, NOCASE and RTRIM are refused.
   expressions and generated columns, as SQLite refuses them.
 
 - **Sharing a file.** In rollback-journal mode the engine takes SQLite's locks as os_unix.c does, so it shares a
-  database with sqlite3 and other processes (and its own connections) as SQLite connections share one. What
-  differs: the RESERVED byte is tested for a hot journal by taking it for a moment (CeeSafe offers no `F_GETLK`),
-  so another connection's RESERVED attempt in that instant fails once and goes to its busy handler; locks are
-  converted in place (shared to exclusive on the SHARED range), which POSIX allows and Windows' `LockFileEx` does
+  database with sqlite3 and other processes (and its own connections) as SQLite connections share one; the RESERVED
+  byte is tested for a hot journal without taking it (`File.testLock`, F_GETLK), so no other connection's lock
+  attempt is turned away by the test (`locksTheHotJournalCheckTakesNoLock`). What differs: locks are converted in
+  place (shared to exclusive on the SHARED range, atomically), which POSIX allows and Windows' `LockFileEx` does
   not, so on Windows the engine does not yet follow os_win.c's scheme; a file system without byte-range locks (some
   network mounts) is not detected.
 - **WAL mode.** The wal-index is shared as wal.c and os_unix.c share it (walindex.cee), with fcntl locks on the
-  `-shm`'s bytes, so readers run beside a writer, this engine's and sqlite3's alike (`shm*` tests). What differs:
-  the DMS byte is tested by trying its exclusive lock rather than with `F_GETLK` (CEESAFE_FINDINGS.md finding 36),
-  as the hot-journal test is; the index is mapped read-write only, so a database whose `-shm` cannot be written
+  `-shm`'s bytes, so readers run beside a writer, this engine's and sqlite3's alike (`shm*` tests); the DMS byte is
+  tested with `F_GETLK` as unixLockSharedMemory tests it. What differs: the index is mapped read-write only, so a database whose `-shm` cannot be written
   is refused where SQLite would fall back to `readonly_shm` or heap memory (finding 37); a new log's salts are
   always the old header's salt-1 plus one and a new salt-2 (or random), where SQLite reuses the index's salts after
   a restart (either way no old frame can pass for a new one); the index is in the host's byte order, as SQLite's,

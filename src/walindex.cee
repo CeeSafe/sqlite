@@ -208,15 +208,21 @@ struct SharedWal {
         let shmPath = withSuffix(path, SHM_SUFFIX)?;
         let logPath = withSuffix(path, WAL_SUFFIX)?;
         var shm = File.openOrCreate(shmPath.view())?;
-        // os_unix.c asks with F_GETLK whether anyone holds the DMS byte; without a test of another's lock
-        // (CEESAFE_FINDINGS.md, finding 36) the exclusive lock is tried: it is granted only when nobody holds it.
-        if (shm.tryLock(FileLock.Exclusive, SHM_DMS, 1)?) {
-            shm.setLength(3)?;
-            // The handle's own lock becomes a shared one (fcntl converts it in place).
-            if (!shm.tryLock(FileLock.Shared, SHM_DMS, 1)?) {
-                return Ok(null);
+        // unixLockSharedMemory: F_GETLK on the DMS byte, which takes nothing. Nobody holding it: this connection
+        // is the first, takes it exclusively and empties the file. A shared holder: others have the index open. An
+        // exclusive holder is emptying it now: busy.
+        match (shm.testLock(FileLock.Exclusive, SHM_DMS, 1)?) {
+            null => {
+                if (!shm.tryLock(FileLock.Exclusive, SHM_DMS, 1)?) {
+                    return Ok(null);
+                }
+                shm.setLength(3)?;
             }
-        } else if (!shm.tryLock(FileLock.Shared, SHM_DMS, 1)?) {
+            Some(FileLock.Exclusive) => { return Ok(null); }
+            Some(FileLock.Shared) => {}
+        }
+        // The exclusive lock, if taken, becomes a shared one in place (fcntl converts it atomically).
+        if (!shm.tryLock(FileLock.Shared, SHM_DMS, 1)?) {
             return Ok(null);
         }
         let log = File.openOrCreate(logPath.view())?;

@@ -25,8 +25,10 @@
 // - RESERVED, at a transaction's first write: a write lock on RESERVED_BYTE, which one connection at a time holds;
 // - PENDING, on the way to EXCLUSIVE: a write lock on PENDING_BYTE, which keeps new readers out;
 // - EXCLUSIVE, to commit: a write lock on the SHARED range, granted once every reader has left.
-// A transaction ends with no lock. Before reading, a connection that took SHARED looks for a hot journal (one
-// that exists while no writer holds RESERVED): it then takes EXCLUSIVE, plays the journal back, and goes on.
+// Locks are converted in place (SHARED to EXCLUSIVE on the SHARED range and back), atomically, as fcntl does and
+// ADR 0234 promises on POSIX hosts. A transaction ends with no lock. Before reading, a connection that took SHARED
+// looks for a hot journal (one that exists while no writer holds RESERVED, which it tests without taking it): it
+// then takes EXCLUSIVE, plays the journal back, and goes on.
 // It also compares the files with what they were when it last held a lock, and forgets every page it holds when
 // another connection committed since (SQLite's change-counter check).
 //
@@ -376,12 +378,10 @@ struct WritablePager {
             return this.startWal();
         }
         // A hot journal: one that exists while no writer holds RESERVED (a writer's own journal is not hot). The
-        // RESERVED byte is tested by taking it for a moment, as no fcntl test of another's lock is offered.
+        // RESERVED byte is tested without taking it (unixCheckReservedLock's F_GETLK), so that a writer taking it
+        // at that moment is not turned away.
         if (Journal.mayBeHot(this.path.view())?) {
-            let free = this.file.tryLock(FileLock.Exclusive, RESERVED_BYTE, 1)?;
-            if (free) {
-                this.file.unlock(RESERVED_BYTE, 1)?;
-            }
+            let free = this.file.testLock(FileLock.Exclusive, RESERVED_BYTE, 1)?.isNull();
             if (free && this.file.length()? > 0) {
                 if (!this.tryExclusive()?) {
                     return Ok(null);
