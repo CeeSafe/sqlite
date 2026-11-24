@@ -136,6 +136,20 @@ fn listModeAndHeaders() -> Result<void, TestFailure> {
 }
 
 @test
+fn aCommentBeforeTheSemicolonNamesTheColumn() -> Result<void, TestFailure> {
+    // A column's name runs up to the next token, a comment before the `;` included, as sqlite3_prepare's text.
+    return sameInput("comment-names", PEOPLE, """
+        .headers on
+        SELECT 2 -- to the end
+        ;
+        SELECT 3 /* c */ ; SELECT 4 /* d */, 5 -- x
+        , 6
+        ;
+        SELECT 7 -- at the end
+        """);
+}
+
+@test
 fn csvMode() -> Result<void, TestFailure> {
     return sameInput("csv", PEOPLE, """
         .mode csv

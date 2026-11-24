@@ -134,7 +134,13 @@ public fn splitScript(sql: StringView) -> Result<Vector<StatementSpan>, AllocErr
         }
         state = nextScriptState(state, token);
         match (token) {
-            ScriptToken.Space => {}
+            ScriptToken.Space => {
+                // A comment after a statement's tokens is part of its text, as in sqlite3_prepare's: a result
+                // column's name runs up to the next token (`SELECT 2 -- two` then `;` names it `2 -- two`).
+                if (first.isSome() && c != ';' && !isSqlSpace(c)) {
+                    last = i;
+                }
+            }
             ScriptToken.Semi => {
                 if (state == 1) {
                     if (first is Some(f)) {

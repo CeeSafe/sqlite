@@ -58,7 +58,7 @@ CASES = [
         "lines' as text;",
         "/* a comment",
         "*/ select 1 as one;",
-        "select 2 as two -- to the end",
+        "select 2 -- to the end",
         ";",
         ".mode line",
         "select name, score from people where id = 22;",
