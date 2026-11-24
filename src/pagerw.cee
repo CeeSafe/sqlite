@@ -29,6 +29,21 @@
 // ADR 0234 promises on POSIX hosts. A transaction ends with no lock. Before reading, a connection that took SHARED
 // looks for a hot journal (one that exists while no writer holds RESERVED, which it tests without taking it): it
 // then takes EXCLUSIVE, plays the journal back, and goes on.
+//
+// On Windows the locks are os_win.c's (winLock, winUnlock, winCheckReservedLock, the NT path), on the same bytes,
+// so that they exclude sqlite3.exe's. `LockFileEx` never converts a lock, and `UnlockFileEx` releases exactly a
+// range that was locked, so the pager keeps the ranges it holds (`held`):
+// - SHARED: a shared lock on PENDING_BYTE, then a shared lock on the SHARED range (winGetReadLock), then PENDING
+//   released;
+// - RESERVED: as above, an exclusive lock on RESERVED_BYTE;
+// - EXCLUSIVE: from RESERVED, an exclusive lock on PENDING_BYTE first, which stays (PENDING); then the read lock is
+//   released (winUnlockReadLock) and the whole range locked exclusively. When readers remain the read lock is taken
+//   back, and a later try goes on from PENDING. From SHARED (a hot journal) PENDING_BYTE is not taken, as in winLock;
+// - a test for RESERVED takes a shared lock on its byte and releases it at once, as winCheckReservedLock does
+//   (Windows has no F_GETLK);
+// - the PENDING_BYTE tries are made three times a millisecond apart, os_win.c's work-around for virus scanners.
+// Windows' locks are mandatory, so the lock bytes are never read or written: the page that holds them is never
+// allocated, written, or read (`allocatePage`).
 // It also compares the files with what they were when it last held a lock, and forgets every page it holds when
 // another connection committed since (SQLite's change-counter check).
 //
@@ -37,7 +52,7 @@
 // the log under it. Its transactions take the locks of the `-shm` file instead: a read transaction a read mark, a
 // write transaction the writer's lock as well. Readers run beside the writer, each on the last commit it saw. The
 // connection that closes last, the only one that can take EXCLUSIVE, checkpoints the log and removes it and the
-// `-shm`. The locking is POSIX-only: on Windows (os_win.c's scheme) WAL mode is refused.
+// `-shm`. On Windows the `-shm`'s locks are os_win.c's (walindex.cee).
 
 /// SQLite's default for PRAGMA wal_autocheckpoint, in frames.
 const WAL_DEFAULT_AUTOCHECKPOINT: u32 = 1000;
@@ -54,6 +69,15 @@ const LOCK_SHARED: u8 = 1;
 const LOCK_RESERVED: u8 = 2;
 const LOCK_PENDING: u8 = 3;
 const LOCK_EXCLUSIVE: u8 = 4;
+
+/// The ranges a pager's handle has locked on Windows (`WritablePager.held`): the SHARED range shared (the read
+/// lock), RESERVED_BYTE, PENDING_BYTE, and the SHARED range exclusively.
+const HELD_READ: u8 = 1;
+const HELD_RESERVED: u8 = 2;
+const HELD_PENDING: u8 = 4;
+const HELD_WRITE: u8 = 8;
+/// winLock's tries at PENDING_BYTE, a millisecond apart.
+const PENDING_TRIES: i32 = 3;
 
 /// sqliteDefaultBusyCallback's sleeps, in milliseconds, and their running totals.
 const BUSY_DELAYS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
@@ -104,6 +128,8 @@ struct WritablePager {
     readOnly: bool;
     /// The lock this pager's file handle holds (LOCK_NONE … LOCK_EXCLUSIVE).
     private lock: u8;
+    /// On Windows, the ranges the handle has locked (HELD_*), which are unlocked by name; 0 on POSIX hosts.
+    private held: u8;
     /// Milliseconds to wait for another connection's lock (PRAGMA busy_timeout), which the session sets.
     busyTimeout: i64;
     /// The files as they were when the pages held here were read; null before the first transaction.
@@ -173,6 +199,7 @@ struct WritablePager {
             file: file,
             readOnly: onlyReads,
             lock: LOCK_NONE,
+            held: 0,
             busyTimeout: busyTimeout,
             seen: null,
             committedHere: false,
@@ -223,6 +250,9 @@ struct WritablePager {
         if (this.lock >= LOCK_SHARED) {
             return Ok(true);
         }
+        if (onWindows()) {
+            return this.winShared();
+        }
         if (!this.file.tryLock(FileLock.Shared, PENDING_BYTE, 1)?) {
             return Ok(false);
         }
@@ -243,6 +273,9 @@ struct WritablePager {
         if (this.lock != LOCK_SHARED || !this.file.tryLock(FileLock.Exclusive, RESERVED_BYTE, 1)?) {
             return Ok(false);
         }
+        if (onWindows()) {
+            this.held = this.held | HELD_RESERVED;
+        }
         this.lock = LOCK_RESERVED;
         return Ok(true);
     }
@@ -256,6 +289,9 @@ struct WritablePager {
         }
         if (this.lock == LOCK_NONE) {
             return Ok(false);
+        }
+        if (onWindows()) {
+            return this.winExclusive();
         }
         if (this.lock < LOCK_PENDING) {
             if (!this.file.tryLock(FileLock.Exclusive, PENDING_BYTE, 1)?) {
@@ -277,6 +313,9 @@ struct WritablePager {
         if (this.lock <= LOCK_SHARED) {
             return Ok();
         }
+        if (onWindows()) {
+            return this.winDowngradeToShared();
+        }
         if (this.lock == LOCK_EXCLUSIVE && !this.file.tryLock(FileLock.Shared, SHARED_FIRST, SHARED_SIZE)?) {
             // A handle's own write lock always converts; anything else is a broken lock table.
             this.unlockAll();
@@ -291,10 +330,14 @@ struct WritablePager {
     /// log and the wal-index are closed too (and their locks go): without SHARED the database may leave WAL mode,
     /// so the next transaction looks at the files afresh.
     private fn unlockAll(borrow mut this) {
-        if (this.shared.isSome()) {
-            this.shared = null;
+        if (replace(mut this.shared, null) is Some(wal)) {
+            wal.close();
             this.walMode = false;
             this.seen = null;
+        }
+        if (onWindows()) {
+            this.winUnlockAll();
+            return;
         }
         if (this.lock == LOCK_NONE) {
             return;
@@ -303,6 +346,123 @@ struct WritablePager {
         // for a handle that is not open.
         let _ = this.file.unlock(PENDING_BYTE, 2 + SHARED_SIZE);
         this.lock = LOCK_NONE;
+    }
+
+    // ── os_win.c's locks ────────────────────────────────────────────────────────────────────────────────────────
+
+    /// winLock's tries at PENDING_BYTE: three, a millisecond apart. False when another connection holds it.
+    private fn winTryPending(borrow mut this, kind: FileLock) -> Result<bool, SqliteError> {
+        for (attempt in 0..PENDING_TRIES) {
+            if (this.file.tryLock(kind, PENDING_BYTE, 1)?) {
+                return Ok(true);
+            }
+            if (attempt + 1 < PENDING_TRIES) {
+                Thread.sleep(1);
+            }
+        }
+        return Ok(false);
+    }
+
+    /// SHARED, from no lock (winLock): PENDING_BYTE shared while the read lock is taken, a shared lock on the
+    /// SHARED range (winGetReadLock), then PENDING released. False when a writer holds PENDING or EXCLUSIVE.
+    private fn winShared(borrow mut this) -> Result<bool, SqliteError> {
+        if (!this.winTryPending(FileLock.Shared)?) {
+            return Ok(false);
+        }
+        let read = this.file.tryLock(FileLock.Shared, SHARED_FIRST, SHARED_SIZE);
+        if (read is Ok(true)) {
+            this.held = this.held | HELD_READ;
+            this.lock = LOCK_SHARED;
+        }
+        this.file.unlock(PENDING_BYTE, 1)?;
+        return Ok(read?);
+    }
+
+    /// EXCLUSIVE, from SHARED, RESERVED or PENDING (winLock): from RESERVED, PENDING_BYTE exclusively, which stays;
+    /// then the read lock is released and the SHARED range locked exclusively. When readers remain the read lock
+    /// is taken back and the lock stays PENDING, from which a later try goes on.
+    private fn winExclusive(borrow mut this) -> Result<bool, SqliteError> {
+        if (this.lock == LOCK_RESERVED) {
+            if (!this.winTryPending(FileLock.Exclusive)?) {
+                return Ok(false);
+            }
+            this.held = this.held | HELD_PENDING;
+        }
+        this.lock = LOCK_PENDING;
+        if ((this.held & HELD_READ) != 0) {
+            this.file.unlock(SHARED_FIRST, SHARED_SIZE)?;
+            this.held = this.held & ~HELD_READ;
+        }
+        if (this.file.tryLock(FileLock.Exclusive, SHARED_FIRST, SHARED_SIZE)?) {
+            this.held = this.held | HELD_WRITE;
+            this.lock = LOCK_EXCLUSIVE;
+            return Ok(true);
+        }
+        // The read lock back, as winLock takes it (and, like it, goes on without it if that fails: the next try or
+        // `winDowngradeToShared` takes it).
+        if (this.file.tryLock(FileLock.Shared, SHARED_FIRST, SHARED_SIZE)?) {
+            this.held = this.held | HELD_READ;
+        }
+        return Ok(false);
+    }
+
+    /// Back to SHARED (winUnlock): the exclusive lock on the SHARED range released and the read lock taken again,
+    /// then RESERVED_BYTE and PENDING_BYTE released.
+    private fn winDowngradeToShared(borrow mut this) -> Result<void, SqliteError> {
+        if ((this.held & HELD_WRITE) != 0) {
+            this.file.unlock(SHARED_FIRST, SHARED_SIZE)?;
+            this.held = this.held & ~HELD_WRITE;
+        }
+        if ((this.held & HELD_READ) == 0) {
+            if (!this.file.tryLock(FileLock.Shared, SHARED_FIRST, SHARED_SIZE)?) {
+                // Only a connection playing a hot journal back, which takes no PENDING_BYTE, could hold the range.
+                this.winUnlockAll();
+                return Err(busyError());
+            }
+            this.held = this.held | HELD_READ;
+        }
+        if ((this.held & HELD_RESERVED) != 0) {
+            this.file.unlock(RESERVED_BYTE, 1)?;
+            this.held = this.held & ~HELD_RESERVED;
+        }
+        if ((this.held & HELD_PENDING) != 0) {
+            this.file.unlock(PENDING_BYTE, 1)?;
+            this.held = this.held & ~HELD_PENDING;
+        }
+        this.lock = LOCK_SHARED;
+        return Ok();
+    }
+
+    /// Every lock released (winUnlock to NO_LOCK), each range as it was locked.
+    private fn winUnlockAll(borrow mut this) {
+        // An unlock fails only for a handle that is not open, whose locks went with it.
+        if ((this.held & HELD_WRITE) != 0) {
+            let _ = this.file.unlock(SHARED_FIRST, SHARED_SIZE);
+        }
+        if ((this.held & HELD_RESERVED) != 0) {
+            let _ = this.file.unlock(RESERVED_BYTE, 1);
+        }
+        if ((this.held & HELD_READ) != 0) {
+            let _ = this.file.unlock(SHARED_FIRST, SHARED_SIZE);
+        }
+        if ((this.held & HELD_PENDING) != 0) {
+            let _ = this.file.unlock(PENDING_BYTE, 1);
+        }
+        this.held = 0;
+        this.lock = LOCK_NONE;
+    }
+
+    /// Whether another connection holds RESERVED (winCheckReservedLock): Windows has no test that takes nothing, so
+    /// a shared lock on the byte is tried and, when taken, released at once.
+    private fn winReservedTaken(borrow mut this) -> Result<bool, SqliteError> {
+        if (this.lock >= LOCK_RESERVED) {
+            return Ok(true);
+        }
+        if (!this.file.tryLock(FileLock.Shared, RESERVED_BYTE, 1)?) {
+            return Ok(true);
+        }
+        this.file.unlock(RESERVED_BYTE, 1)?;
+        return Ok(false);
     }
 
     /// Starts a read transaction, from no lock: SHARED (in WAL mode a read mark too), with a hot journal rolled back
@@ -405,7 +565,11 @@ struct WritablePager {
         // RESERVED byte is tested without taking it (unixCheckReservedLock's F_GETLK), so that a writer taking it
         // at that moment is not turned away.
         if (Journal.mayBeHot(this.path.view())?) {
-            let free = this.file.testLock(FileLock.Exclusive, RESERVED_BYTE, 1)?.isNull();
+            let free = if (onWindows()) !this.winReservedTaken()? else this.file.testLock(
+                FileLock.Exclusive,
+                RESERVED_BYTE,
+                1,
+            )?.isNull();
             if (free && this.file.length()? > 0) {
                 if (this.readOnly) {
                     // SQLITE_READONLY_ROLLBACK: the journal must be played back, which needs writing.
@@ -465,11 +629,6 @@ struct WritablePager {
     /// index's header moved since this connection's last transaction. Null as for `tryStart`.
     private fn startWal(borrow mut this) -> Result<bool?, SqliteError> {
         if (this.shared.isNull()) {
-            if (onWindows()) {
-                return Err(
-                    unsupported("WAL mode needs POSIX file locks on the -shm file; it is not supported on Windows yet"),
-                );
-            }
             match (SharedWal.open(this.path.view())?) {
                 Some(wal) => { this.shared = wal; }
                 null => { return Ok(null); }
@@ -1174,11 +1333,6 @@ struct WritablePager {
         if (this.walMode) {
             return Ok();
         }
-        if (onWindows()) {
-            return Err(
-                unsupported("WAL mode needs POSIX file locks on the -shm file; it is not supported on Windows yet"),
-            );
-        }
         let header = this.write(1)?;
         header[18] = 2;
         header[19] = 2;
@@ -1301,7 +1455,7 @@ struct WritablePager {
     }
 }
 
-/// Whether the program is built for Windows, whose locks (os_win.c's scheme) the WAL code does not follow yet.
+/// Whether the program is built for Windows, where the locks are os_win.c's rather than os_unix.c's.
 fn onWindows() -> bool {
     if (cfg("target.windows")) {
         return true;

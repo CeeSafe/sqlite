@@ -16,7 +16,12 @@
 // Locks, on bytes of the `-shm` file (fcntl's, which sqlite3 takes too): 120 is the writer's, 121 the
 // checkpointer's, 122 recovery's, 123 to 127 the five read marks', and 128 the "dead man switch" (DMS): every
 // connection holds it shared while it has the index open; one that finds nobody holding it is the first, and empties
-// the file, so that the index is rebuilt from the log (recovery).
+// the file, so that the index is rebuilt from the log (recovery). On Windows the same bytes are locked with
+// `LockFileEx`, as os_win.c's winShmSystemLock locks them (its WIN_SHM_BASE and WIN_SHM_DMS are 120 and 128 too):
+// each connection has a handle of its own, every lock is taken on a byte or range this connection does not hold
+// and released as it was taken, and the DMS byte is taken as winLockSharedMemory takes it (`winLockSharedMemory`).
+// Those locks are mandatory, and the index is read and written only through its mappings, which they do not
+// cover; the one write through the file, winZeroSharedMemory's, is to bytes no lock covers.
 //
 // A reader picks a read mark no larger than the last commit, and reads each page from the latest frame up to the
 // mark, else from the database file; a checkpoint copies no frame past a mark some reader holds, and a writer starts
@@ -260,6 +265,8 @@ struct SharedWal {
     /// The read mark held (0 to 4), or -1; whether the writer's lock is held.
     private readLock: i32;
     private writeLock: bool;
+    /// Whether the checkpointer's lock is held (wal.c's ckptLock), which a recovery during a checkpoint keeps.
+    private checkpointLock: bool;
     /// The first frame this snapshot reads from the log; those before it are in the database file.
     private minFrame: u32;
     // A commit being written: its frames' pages, its next frame and its running checksum.
@@ -286,27 +293,17 @@ struct SharedWal {
                 File.open(shmPath.view())?
             }
         };
-        // unixLockSharedMemory: F_GETLK on the DMS byte, which takes nothing. Nobody holding it: this connection
-        // is the first, takes it exclusively and empties the file; one that cannot write the file cannot, and
-        // keeps an index of its own instead (SQLITE_READONLY_CANTINIT). A shared holder: others have the index
-        // open. An exclusive holder is emptying it now: busy.
         var unreliable = false;
-        match (shm.testLock(FileLock.Exclusive, SHM_DMS, 1)?) {
-            null => {
-                if (!shmWritable) {
-                    unreliable = true;
-                } else {
-                    if (!shm.tryLock(FileLock.Exclusive, SHM_DMS, 1)?) {
-                        return Ok(null);
-                    }
-                    shm.setLength(3)?;
-                }
-            }
-            Some(FileLock.Exclusive) => { return Ok(null); }
-            Some(FileLock.Shared) => {}
-        }
-        // The exclusive lock, if taken, becomes a shared one in place (fcntl converts it atomically).
-        if (!unreliable && !shm.tryLock(FileLock.Shared, SHM_DMS, 1)?) {
+        let locked = if (onWindows()) SharedWal.winLockSharedMemory(
+            mut shm,
+            shmWritable,
+            mut unreliable,
+        )? else SharedWal.unixLockSharedMemory(
+            mut shm,
+            shmWritable,
+            mut unreliable,
+        )?;
+        if (!locked) {
             return Ok(null);
         }
         var logWritable = true;
@@ -334,6 +331,7 @@ struct SharedWal {
             hdr: WalIndexHeader.zero(),
             readLock: -1,
             writeLock: false,
+            checkpointLock: false,
             minFrame: 1,
             pending: Vector<u32>.create(),
             nextFrame: 0,
@@ -345,6 +343,68 @@ struct SharedWal {
     }
 
     // ── locks ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    /// unixLockSharedMemory: the DMS byte held shared, false when another connection is emptying the index. It is
+    /// tested with F_GETLK, which takes nothing. Nobody holding it: this connection is the first, takes it
+    /// exclusively and empties the file; one that cannot write the file cannot, and keeps an index of its own
+    /// instead (SQLITE_READONLY_CANTINIT, `unreliable`). A shared holder: others have the index open. An exclusive
+    /// holder is emptying it now: busy.
+    private fn unixLockSharedMemory(
+        shm: borrow mut File,
+        writable: bool,
+        unreliable: borrow mut bool,
+    ) -> Result<bool, SqliteError> {
+        match (shm.testLock(FileLock.Exclusive, SHM_DMS, 1)?) {
+            null => {
+                if (!writable) {
+                    *unreliable = true;
+                } else {
+                    if (!shm.tryLock(FileLock.Exclusive, SHM_DMS, 1)?) {
+                        return Ok(false);
+                    }
+                    shm.setLength(3)?;
+                }
+            }
+            Some(FileLock.Exclusive) => { return Ok(false); }
+            Some(FileLock.Shared) => {}
+        }
+        // The exclusive lock, if taken, becomes a shared one in place (fcntl converts it atomically).
+        if (!*unreliable && !shm.tryLock(FileLock.Shared, SHM_DMS, 1)?) {
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+
+    /// winLockSharedMemory: the same on Windows, where a lock is neither tested without taking it nor converted.
+    /// The DMS byte is tried exclusively: taken, this connection is the first, empties the file (or, when another
+    /// process still maps it and the file cannot be shortened, zeroes its first eight bytes, which spoils the
+    /// header, as winZeroSharedMemory does) and releases it; one that cannot write the file keeps an index of its
+    /// own (SQLITE_READONLY_CANTINIT). Then, unless that, the byte is locked shared; false when that fails, as
+    /// another connection is emptying the index.
+    private fn winLockSharedMemory(
+        shm: borrow mut File,
+        writable: bool,
+        unreliable: borrow mut bool,
+    ) -> Result<bool, SqliteError> {
+        if (shm.tryLock(FileLock.Exclusive, SHM_DMS, 1)?) {
+            var emptied: Result<void, SqliteError> = Ok();
+            if (!writable) {
+                *unreliable = true;
+            } else if (shm.setLength(0).isErr()) {
+                let zeros = [0u8; 8];
+                emptied = match (shm.writeAt(zeros[..], 0)) {
+                    Ok(_) => Ok(),
+                    Err(e) => Err(SqliteError.Io(e)),
+                };
+            }
+            shm.unlock(SHM_DMS, 1)?;
+            emptied?;
+            if (*unreliable) {
+                return Ok(true);
+            }
+        }
+        return Ok(shm.tryLock(FileLock.Shared, SHM_DMS, 1)?);
+    }
 
     private fn tryShm(borrow this, kind: FileLock, lock: u64, count: u64) -> Result<bool, SqliteError> {
         if (this.heapLocks) {
@@ -543,16 +603,22 @@ struct SharedWal {
     /// walIndexRecover: rebuilds the index from the log, holding the writer's lock; false when the checkpoint or
     /// recovery lock is held by another connection.
     private fn recover(borrow mut this) -> Result<bool, SqliteError> {
-        if (!this.tryShm(FileLock.Exclusive, SHM_CHECKPOINT_LOCK, 2)?) {
+        // During a checkpoint, whose lock is held, only recovery's is taken, as wal.c locks from ckptLock on: a
+        // lock is never taken again where it is held (Windows' locks do not merge).
+        let first = if (this.checkpointLock) SHM_RECOVER_LOCK else SHM_CHECKPOINT_LOCK;
+        let count = SHM_READ_LOCK0 - first;
+        if (!this.tryShm(FileLock.Exclusive, first, count)?) {
             return Ok(false);
         }
         let result = this.rebuild();
-        this.unlockShm(SHM_CHECKPOINT_LOCK, 2);
+        this.unlockShm(first, count);
         result?;
         return Ok(true);
     }
 
     private fn rebuild(borrow mut this) -> Result<void, SqliteError> {
+        // The first block holds the header, even for a log with no frame to index.
+        this.mapThrough(0)?;
         this.hdr = WalIndexHeader.zero();
         var commitSum = WalSum { first: 0, second: 0 };
         let size = this.log.length()?;
@@ -1168,6 +1234,7 @@ struct SharedWal {
         if (!this.tryShm(FileLock.Exclusive, SHM_CHECKPOINT_LOCK, 1)?) {
             return Ok(outcome);
         }
+        this.checkpointLock = true;
         var effective = mode;
         var tookWrite = false;
         if (mode != CheckpointMode.Passive && !this.writeLock) {
@@ -1182,6 +1249,7 @@ struct SharedWal {
         if (tookWrite) {
             this.endWrite();
         }
+        this.checkpointLock = false;
         this.unlockShm(SHM_CHECKPOINT_LOCK, 1);
         match (result?) {
             Some(done) => {
@@ -1368,14 +1436,27 @@ struct SharedWal {
     fn closeAndRemove(this) -> Result<void, SqliteError> {
         let shmPath = this.shmPath.clone()?;
         let logPath = this.logPath.clone()?;
-        // Dropping the value unmaps the index and closes both files, which releases their locks.
-        {
-            let _closed = this;
-        }
+        // Closing unmaps the index and closes both files.
+        this.close();
         removeIfThere(shmPath.view())?;
         removeIfThere(logPath.view())?;
         Directory.sync(directoryOf(logPath.view()))?;
         return Ok();
+    }
+
+    /// Ends this connection's use of the log and the index: its `-shm` locks are released, the DMS byte last, and
+    /// the files closed. The locks go before the handle closes, as SQLite releases them, since Windows releases a
+    /// closed handle's locks only some time after.
+    fn close(this) {
+        var me = this;
+        me.endRead();
+        if (!me.unreliable) {
+            // An unlock fails only for a handle that is not open, whose locks went with it.
+            let _ = me.shm.unlock(SHM_DMS, 1);
+        }
+        {
+            let _closed = me;
+        }
     }
 }
 
