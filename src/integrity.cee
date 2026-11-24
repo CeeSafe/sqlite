@@ -639,7 +639,8 @@ struct HashBucket {
 }
 
 /// The order in which SQLite's Hash, given `names` one after another, lists them: hash.c's insertElement and
-/// rehash, with buckets of 16 bytes and SQLITE_MALLOC_SOFT_LIMIT of 1024.
+/// rehash, with buckets of 16 bytes and SQLITE_MALLOC_SOFT_LIMIT of 1024. rehash keeps as many buckets as the
+/// allocation holds (sqlite3MallocSize), which depends on the system's allocator.
 fn sqliteHashOrder(names: Slice<StringView>) -> Result<Vector<usize>, AllocError> {
     var hashes = Vector<u32>.withCapacity(names.length)?;
     for (n in names) {
@@ -653,11 +654,13 @@ fn sqliteHashOrder(names: Slice<StringView>) -> Result<Vector<usize>, AllocError
             var size = count * 3;
             if (size * 16 > 1024) {
                 size = 64;
-            } else {
-                // rehash keeps all the buckets the allocation holds: macOS's allocator gives 256 bytes for the
-                // 240 the first rehash (of 5 entries) asks for, so 16 buckets.
+            } else if (allocatorRoundsTo256()) {
+                // macOS's allocator gives 256 bytes for the 240 the first rehash (of 5 entries) asks for, so 16
+                // buckets.
                 size = (size * 16 + 255) / 256 * 16;
             }
+            // Elsewhere the size is what was asked for: glibc's malloc_usable_size adds 8 bytes to a multiple of
+            // 16, and SQLite's own size header (Windows) gives the size asked, so the buckets asked for.
             if (size != buckets.length) {
                 buckets.clear();
                 for (b in 0..size) {
@@ -678,6 +681,14 @@ fn sqliteHashOrder(names: Slice<StringView>) -> Result<Vector<usize>, AllocError
         }
     }
     return Ok(list);
+}
+
+/// Whether sqlite3MallocSize rounds a hash table's array up to 256 bytes, as macOS's allocator does.
+fn allocatorRoundsTo256() -> bool {
+    if (cfg("target.macos")) {
+        return true;
+    }
+    return false;
 }
 
 fn insertHashElement(
