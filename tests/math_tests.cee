@@ -50,7 +50,25 @@ fn trigonometryOfLargeArguments() -> Result<void, TestFailure> {
     return sameAnswers(path, """
         SELECT sin(1e22), cos(1e22), sin(1e300), cos(1e300), sin(1.7976931348623157e308), cos(-1.7976931348623157e308)
         SELECT sin(1e6), cos(1e6), tan(1e6), sin(123456789), cos(123456789), sin(2 * pi()), cos(pi()), sin(pi())
-        SELECT sin(3.14159265358979), cos(1.5707963267949), sin(6.28318530717959), sin(1e15), cos(1e17), sin(-1e19)
+        SELECT sin(3.14159265358979), cos(1.5707963267949), sin(6.28318530717959), sin(1e15), cos(1e17), sin(-1e19), tan(-1e19)
+        SELECT asin(0.5), atan(0.5), acos(0.3), tan(0.7), atanh(0.4), asinh(0.6), tan(1.2), acos(-0.9)
+        """);
+}
+
+@test
+fn mathFunctionsAgreeWithTheShellOnManyArguments() -> Result<void, TestFailure> {
+    // The engine calls the platform's libm, as sqlite3 does: every result the same, bit for bit (%!.17g).
+    let path = "out/math-sweep.db";
+    makeDatabase(path, """
+        CREATE TABLE a(x REAL);
+        WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 400)
+        INSERT INTO a SELECT (i * 7919 % 2003 - 1001) / 97.3 FROM c;
+        """)?;
+    return sameAnswers(path, """
+        SELECT printf('%!.17g %!.17g %!.17g %!.17g %!.17g', sin(x), cos(x), tan(x), atan(x), exp(x / 4)) FROM a
+        SELECT printf('%!.17g %!.17g %!.17g %!.17g', asin(x / 11), acos(x / 11), atanh(x / 11), asinh(x)) FROM a
+        SELECT printf('%!.17g %!.17g %!.17g %!.17g', ln(abs(x)), log10(abs(x)), log2(abs(x)), pow(abs(x), 0.37)) FROM a
+        SELECT printf('%!.17g %!.17g %!.17g %!.17g', sinh(x / 3), cosh(x / 3), tanh(x), atan2(x, 1.3)) FROM a
         """);
 }
 

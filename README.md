@@ -23,7 +23,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Numbers as text, text as numbers | `Exec/SqlValueOps` | `numeric.cee` | done: SQLite's own conversion routines, ported |
 | Value operations, comparison affinity | `Exec/SqlValueOps`, `ValueComparer` | `valueops.cee`, `compare.cee` | done |
 | Expressions: compiler and evaluator | `Exec/ExpressionEvaluator`, `Binding`, `ParameterBinder` | `expr.cee`, `compile.cee` | done |
-| Scalar functions, aggregates | `Exec/Functions`, `LikeMatcher` | `functions.cee`, `aggregate.cee`, `libm.cee` | done, with every math function (`libm.cee`: msun and double-double, a last-bit difference from macOS's libm on some arguments) |
+| Scalar functions, aggregates | `Exec/Functions`, `LikeMatcher` | `functions.cee`, `aggregate.cee` | done, with every math function (the platform's libm, as `sqlite3`) |
 | Date and time functions | `Exec/Functions` (date/time part) | `datetime.cee` | done: a port of SQLite's date.c; 'localtime' and 'utc' are an error where they need the time zone, which CeeSafe lacks |
 | printf() and format() | `Exec/Functions` (`Printf`) | `printf.cee` | done: a port of SQLite's `sqlite3_str_vappendf`, every conversion and flag of the SQL path |
 | JSON functions | `Exec/Json`, `Functions` (JSON1) | `json.cee`, `json_each.cee` | done: SQLite 3.53.4's JSON functions, `->`, `->>`, the aggregates, JSON5 input, JSONB blobs as input, the `jsonb_*` functions (their JSONB byte for byte as sqlite3's) and the table-valued `json_each`, `json_tree`, `jsonb_each` and `jsonb_tree` (every column, `id` as SQLite's JSONB offsets, arguments from earlier FROM items) |
@@ -466,29 +466,12 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   the wrong width is "sub-select returns N columns - expected M", an item of the wrong width "IN(...) element has
   N terms - expected M", as in SQLite.
 
-## Known differences from SQLite in the math functions
+## The math functions
 
-The `sqlite3` shell calls the platform's libm (macOS's here), and prints reals with 17 significant digits, so a
-difference in the last bit shows. CeeSafe has no math library and the package may not call C, so `libm.cee`
-computes them: `exp`, `ln`, `log`, `log10`, `log2`, `pow`, `sinh`, `cosh`, `tanh`, `asin`, `acos` and `atan2` in
-double-double arithmetic rounded once (correctly rounded but for arguments within ~2^-100 of a tie), the
-inverse hyperbolic functions by msun's formulas over those, and `sin`, `cos`, `tan` and `atan` as FreeBSD's msun
-(fdlibm) computes them, with its exact reduction of large arguments (`sin(1e22)` matches). macOS's libm is
-neither msun nor correctly rounded for the trigonometric functions, so on 3000 random arguments a call differs in
-the last bit (never more than 2 units) this often:
-
-| Function | Differs | Function | Differs |
-|---|---|---|---|
-| `exp`, `pow`, `ln`, `log10`, `log2` | 0–0.2% | `sin`, `cos` | 4–5% |
-| `sinh`, `cosh`, `tanh` | 0.2–0.3% | `asin` | 5% |
-| `atan2` | 1–2% | `acos` | 15% |
-| `acosh`, `asinh` of large arguments | 0–0.2% | `atan` | 5% |
-| `asinh` in (-1, 1) | 7% | `tan` | 40% |
-| `atanh` | 10% | `sqrt`, `degrees`, `radians`, `mod` | 0 |
-
-Where macOS is not correctly rounded, correct rounding would not match it either (its `tan` differs from the
-correctly rounded value on 42% of arguments, `asin(0.5)` and `atan(0.5)` are a unit off); matching it bit for bit
-would take Apple's algorithms, which are not published. The tests use arguments on which the two agree.
+The math functions call the platform's libm through CeeSafe's float methods (ceesafec 0.95.0, ADR 0218), as the
+`sqlite3` shell does, so their results are the shell's bit for bit (`mathFunctionsAgreeWithTheShellOnManyArguments`
+compares 1,600 calls printed with `%!.17g`). Before 0.95.0 the port carried `libm.cee`, a port of FreeBSD msun in
+double-double arithmetic, which differed from macOS's libm in the last bit on up to 40% of `tan`'s arguments.
 
 ## Known differences from SQLite in the JSON functions
 

@@ -863,7 +863,7 @@ fn mathFunction(function: ScalarFunction, v: Slice<SqliteValue>) -> SqliteValue 
         if (v.length == 2) {
             // log(B, X). As in logFunc, the base must be above 1 (a base in (0, 1] is NULL too), and X is read
             // with sqlite3_value_double, which takes the numeric prefix of text and 0 for NULL.
-            let base = libmLnAccurate(x);
+            let base = x.ln();
             if (base <= 0.0) {
                 return SqliteValue.Null;
             }
@@ -871,57 +871,36 @@ fn mathFunction(function: ScalarFunction, v: Slice<SqliteValue>) -> SqliteValue 
             if (y <= 0.0) {
                 return SqliteValue.Null;
             }
-            return realResult(libmLnAccurate(y) / base);
+            return realResult(y.ln() / base);
         }
         return realResult(match (function) {
-            ScalarFunction.Ln => libmLnAccurate(x),
-            ScalarFunction.Log2 => libmLog2Accurate(x),
+            ScalarFunction.Ln => x.ln(),
+            ScalarFunction.Log2 => x.log2(),
             // log(X) is the base-10 logarithm, as in SQLite.
-            _ => libmLog10Accurate(x),
+            _ => x.log10(),
         });
     }
     if (function == ScalarFunction.Atan2 || function == ScalarFunction.Pow) {
         let y = mathNumber(borrow v[1]) ?? { return SqliteValue.Null; };
-        return realResult(if (function == ScalarFunction.Pow) libmPow(x, y) else libmAtan2(x, y));
+        return realResult(if (function == ScalarFunction.Pow) x.pow(y) else x.atan2(y));
     }
     return realResult(match (function) {
-        ScalarFunction.Acos => libmAcosAccurate(x),
-        ScalarFunction.Acosh => libmAcosh(x),
-        ScalarFunction.Asin => libmAsinAccurate(x),
-        ScalarFunction.Asinh => libmAsinh(x),
-        ScalarFunction.Atan => libmAtan(x),
-        ScalarFunction.Atanh => libmAtanh(x),
-        ScalarFunction.Cos => libmCos(x),
-        ScalarFunction.Cosh => libmCoshAccurate(x),
+        ScalarFunction.Acos => x.acos(),
+        ScalarFunction.Acosh => x.acosh(),
+        ScalarFunction.Asin => x.asin(),
+        ScalarFunction.Asinh => x.asinh(),
+        ScalarFunction.Atan => x.atan(),
+        ScalarFunction.Atanh => x.atanh(),
+        ScalarFunction.Cos => x.cos(),
+        ScalarFunction.Cosh => x.cosh(),
         ScalarFunction.Degrees => x * (180.0 / 3.141592653589793),
-        ScalarFunction.Exp => libmExpAccurate(x),
+        ScalarFunction.Exp => x.exp(),
         ScalarFunction.Radians => x * (3.141592653589793 / 180.0),
-        ScalarFunction.Sin => libmSin(x),
-        ScalarFunction.Sinh => libmSinhAccurate(x),
-        ScalarFunction.Tan => libmTan(x),
-        _ => libmTanhAccurate(x),
+        ScalarFunction.Sin => x.sin(),
+        ScalarFunction.Sinh => x.sinh(),
+        ScalarFunction.Tan => x.tan(),
+        _ => x.tanh(),
     });
-}
-
-/// fmod(x, y), exactly: x - trunc(x / y) * y computed without rounding error.
-fn floatRemainder(x: f64, y: f64) -> f64 {
-    if (y == 0.0 || x != x || y != y || x > 1.7976931348623157e308 || x < -1.7976931348623157e308) {
-        return f64.fromBits(0x7FF8000000000000);
-    }
-    if (y > 1.7976931348623157e308 || y < -1.7976931348623157e308) {
-        return x;
-    }
-    var r = x.abs();
-    let m = y.abs();
-    // Long division by repeated subtraction of m scaled by powers of two: every step is exact.
-    while (r >= m) {
-        var scaled = m;
-        while (scaled * 2.0 <= r && scaled * 2.0 <= 1.7976931348623157e308) {
-            scaled = scaled * 2.0;
-        }
-        r = r - scaled;
-    }
-    return if (x < 0.0) 0.0 - r else r;
 }
 
 /// Calls a scalar function.
@@ -1177,7 +1156,7 @@ fn callFunction(
         ScalarFunction.Mod => {
             let x = mathNumber(borrow v[0]) ?? { return Ok(SqliteValue.Null); };
             let y = mathNumber(borrow v[1]) ?? { return Ok(SqliteValue.Null); };
-            return Ok(realResult(floatRemainder(x, y)));
+            return Ok(realResult(x.truncatingRemainder(y)));
         }
         ScalarFunction.NullIf => {
             if (!v[0].isNull() && !v[1].isNull() && compareValues(borrow v[0], borrow v[1], call.collation) == 0) {
