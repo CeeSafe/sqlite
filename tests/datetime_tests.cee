@@ -128,20 +128,24 @@ fn timediffAndErrors() -> Result<void, TestFailure> {
         SELECT datetime('2024-02-29', timediff('2025-06-30 10:00', '2024-02-29')), timediff('2024-01-01 10:00+02:00', '2024-01-01')
         SELECT timediff('2024-02-29'), date(), julianday(1, 2, 3)
         """)?;
-    // 'localtime' and 'utc' need a time zone, which CeeSafe cannot give: they are an error where SQLite needs one.
-    var session = Session.open(path.view())!;
-    let local = ours(mut session, "SELECT datetime('2024-02-29', 'localtime')");
-    if (!local.view().startsWith("error: local time unavailable")) {
-        return Check.fail(local.view());
-    }
-    let utc = ours(mut session, "SELECT datetime('2024-02-29', 'utc')");
-    if (!utc.view().startsWith("error: local time unavailable")) {
-        return Check.fail(utc.view());
-    }
-    // A time already known to be UTC needs no zone for 'utc'.
-    let known = ours(mut session, "SELECT datetime('2024-02-29 10:00Z', 'utc')");
-    if (known.view() != "2024-02-29 10:00:00\n") {
-        return Check.fail(known.view());
-    }
     return Ok();
 }
+
+@test
+fn localTimeAsTheShellHasIt() -> Result<void, TestFailure> {
+    // The process's time zone, which the sqlite3 shell inherits: run the suite under several TZ values (README.md)
+    // to cover daylight saving. Years outside 1970–2037 are looked up as an equivalent year, as in SQLite.
+    let path = dateFixture("localtime")?;
+    return allSameAnswers(path.view(), """
+        SELECT datetime('2024-02-29', 'localtime'), datetime('2024-02-29', 'utc'), datetime('2024-02-29 10:00Z', 'utc')
+        SELECT datetime('2024-03-10 06:30', 'localtime'), datetime('2024-03-31 01:30', 'localtime'), datetime('2024-11-03 05:30', 'localtime')
+        SELECT datetime('2024-03-10 02:30', 'utc'), datetime('2024-03-31 02:30', 'utc'), datetime('2024-11-03 01:30', 'utc'), datetime('2024-10-27 02:30', 'utc')
+        SELECT datetime('1969-07-20 20:17', 'localtime'), datetime('1900-03-01', 'localtime'), datetime('2100-02-28 23:30', 'localtime'), datetime('-0044-03-15', 'localtime')
+        SELECT datetime('2050-06-01 12:00', 'localtime', 'utc'), datetime('1960-01-01', 'utc', 'localtime'), datetime('9999-12-31 23:59:59', 'localtime')
+        SELECT datetime('2024-06-01 12:00:00.250', 'localtime', 'subsec'), strftime('%H:%M:%f', '2024-06-01 12:00:00.250', 'localtime')
+        SELECT datetime(1700000000, 'unixepoch', 'localtime'), datetime('2024-06-01', 'localtime', 'localtime'), datetime('2024-06-01', 'utc', 'utc')
+        SELECT datetime('2024-06-01', 'localtime', 'start of day', 'utc'), date('2024-12-31 23:30', 'localtime', '+1 day'), julianday('2024-06-01', 'localtime')
+        SELECT datetime('now', 'localtime') = datetime('now', 'localtime'), datetime('now', 'localtime', 'utc') = datetime('now')
+        """);
+}
+

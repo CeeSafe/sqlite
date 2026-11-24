@@ -24,7 +24,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Value operations, comparison affinity | `Exec/SqlValueOps`, `ValueComparer` | `valueops.cee`, `compare.cee` | done |
 | Expressions: compiler and evaluator | `Exec/ExpressionEvaluator`, `Binding`, `ParameterBinder` | `expr.cee`, `compile.cee` | done |
 | Scalar functions, aggregates | `Exec/Functions`, `LikeMatcher` | `functions.cee`, `aggregate.cee` | done, with every math function (the platform's libm, as `sqlite3`) |
-| Date and time functions | `Exec/Functions` (date/time part) | `datetime.cee` | done: a port of SQLite's date.c; 'localtime' and 'utc' are an error where they need the time zone, which CeeSafe lacks |
+| Date and time functions | `Exec/Functions` (date/time part) | `datetime.cee` | done: a port of SQLite's date.c, 'localtime' and 'utc' included |
 | printf() and format() | `Exec/Functions` (`Printf`) | `printf.cee` | done: a port of SQLite's `sqlite3_str_vappendf`, every conversion and flag of the SQL path |
 | JSON functions | `Exec/Json`, `Functions` (JSON1) | `json.cee`, `json_each.cee` | done: SQLite 3.53.4's JSON functions, `->`, `->>`, the aggregates, JSON5 input, JSONB blobs as input, the `jsonb_*` functions (their JSONB byte for byte as sqlite3's) and the table-valued `json_each`, `json_tree`, `jsonb_each` and `jsonb_tree` (every column, `id` as SQLite's JSONB offsets, arguments from earlier FROM items) |
 | SELECT: joins, subqueries, views, CTEs, grouping, compounds | `Exec/QueryExecutor` | `select.cee`, `run.cee` | done, with RIGHT and FULL joins, rowid and index seeks, and the table-valued functions (`pragma_*`, `json_each`, `json_tree`, `jsonb_each`, `jsonb_tree`) |
@@ -206,7 +206,8 @@ The port fixes what was wrong in the source instead of copying it. Each item has
 - **Modifiers.** The C# applied 'unixepoch' and 'auto' wherever they stood, made 'floor' re-run month arithmetic,
   treated 'utc' and 'localtime' as nothing, and lacked 'julianday', '±HH:MM', '±YYYY-MM-DD', and 'subsec' outside
   datetime(). Here they apply in order with SQLite's rules (only right after the value for 'unixepoch', 'julianday',
-  'auto'), and 'localtime'/'utc' are an error where they would need the time zone (`dateTimeModifiers`).
+  'auto'), and 'localtime'/'utc' read the system's time zone as SQLite's toLocaltime does, equivalent years
+  outside 1970–2037 included (`dateTimeModifiers`, `localTimeAsTheShellHasIt`, checked under eight TZ values).
 - **strftime().** An unknown specifier made the C# throw; SQLite and this give NULL. %J, %f, %s with 'subsec', %G,
   %g, %V, %u, %k, %l, %P and %e follow SQLite's printf (`strftimeSpecifiers`).
 - **'now'.** The C# read the clock at each call; here it is the statement's time, the same in every call.
@@ -647,9 +648,8 @@ Collations other than BINARY, NOCASE and RTRIM are refused.
   databases commits them one after the other, each atomically with its own journal but not all together: SQLite's
   super-journal is not written. VACUUM, ANALYZE and REINDEX work on main only.
 
-- **Local time.** 'localtime', and 'utc' on a value not known to be UTC, are an error ("local time unavailable"):
-  CeeSafe's library has no time zone (CEESAFE_FINDINGS.md). 'now' and date functions with it are also not refused
-  in CHECK constraints, index expressions and generated columns, as SQLite refuses them.
+- **Non-deterministic date functions.** 'now', 'localtime' and 'utc' are not refused in CHECK constraints, index
+  expressions and generated columns, as SQLite refuses them.
 
 - **One process at a time.** The engine does not take SQLite's file locks, which CeeSafe's library does not
   offer, so it must not have a database open while another process writes it. (The C# engine has the same

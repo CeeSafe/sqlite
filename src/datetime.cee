@@ -15,9 +15,9 @@
 //   and %f, %s with 'subsec', %G, %g, %V, %u, %k, %l, %P and %e are all supported;
 // - unixepoch() truncates toward zero and gives a real with 'subsec'; timediff() follows SQLite's month walk.
 //
-// 'localtime' and 'utc' need the system's time zone, which CeeSafe's library does not offer: where SQLite would
-// consult it they are an error here (CEESAFE_FINDINGS.md). Where SQLite skips it (a value already in UTC given 'utc')
-// they behave as in SQLite.
+// 'localtime' and 'utc' read the system's time zone through `Clock.localOffset`, as SQLite's toLocaltime reads
+// localtime_r: years outside 1970–2037 are mapped to an equivalent year for the lookup, and 'utc' inverts it in at
+// most four guesses, as in SQLite.
 
 /// SQLite's DateTime: a moment as a Julian day number in milliseconds, as calendar fields, or both.
 struct DateTime {
@@ -426,11 +426,71 @@ fn computeYMDHMS(p: borrow mut DateTime) {
     computeHMS(p);
 }
 
-/// What 'localtime' and 'utc' report when they need the system's time zone.
-fn localTimeUnavailable() -> SqliteError =>
-    unsupported(
-        "local time unavailable: 'localtime' and 'utc' need the system time zone, which CeeSafe's library does not provide",
-    );
+/// toLocaltime: the moment's calendar fields in the system's time zone. A year outside 1970–2037 is looked up as
+/// a year of 2000–2003 with the same remainder mod 4, and the difference is added back, as in SQLite.
+fn toLocaltime(p: borrow mut DateTime) {
+    computeJD(p);
+    var yearDiff: i64 = 0;
+    var t: i64 = 0;
+    if (p.jd < 210866760000000 || p.jd > 213014145600000) {
+        var x = DateTime.zero();
+        x.jd = p.jd;
+        x.validJD = true;
+        computeYMDHMS(mut x);
+        yearDiff = (2000 + x.year % 4) - x.year;
+        x.year += yearDiff;
+        x.validJD = false;
+        computeJD(mut x);
+        t = x.jd / 1000 - 210866760000;
+    } else {
+        t = p.jd / 1000 - 210866760000;
+    }
+    let offset = Clock.localOffset(UnixTime { seconds: t, nanoseconds: 0 }) as i64;
+    // localtime_r's broken-down time of t: whole seconds, so computed from a Julian day of whole seconds.
+    var local = DateTime.zero();
+    local.jd = (t + offset) * 1000 + UNIX_EPOCH_JD_MS;
+    local.validJD = true;
+    computeYMDHMS(mut local);
+    p.year = local.year - yearDiff;
+    p.month = local.month;
+    p.day = local.day;
+    p.hour = local.hour;
+    p.minute = local.minute;
+    p.second = local.second.floor() + toReal(p.jd % 1000) * 0.001;
+    p.validYMD = true;
+    p.validHMS = true;
+    p.validJD = false;
+    p.rawS = false;
+    p.tz = 0;
+    p.isError = false;
+}
+
+/// 'utc': the UTC moment whose local time is the value, found by up to four guesses, as in SQLite.
+fn toUtc(p: borrow mut DateTime) {
+    computeJD(p);
+    let origin = p.jd;
+    var guess = origin;
+    var error: i64 = 0;
+    var count = 0;
+    while (true) {
+        guess -= error;
+        var candidate = DateTime.zero();
+        candidate.jd = guess;
+        candidate.validJD = true;
+        toLocaltime(mut candidate);
+        computeJD(mut candidate);
+        error = candidate.jd - origin;
+        if (error == 0 || count >= 3) {
+            break;
+        }
+        count += 1;
+    }
+    p = DateTime.zero();
+    p.jd = guess;
+    p.validJD = true;
+    p.isUtc = true;
+    p.isLocal = false;
+}
 
 /// The units of '±NNN units': name, the limit on NNN (SQLite keeps it as a C float), and seconds in one.
 const UNIT_NAMES: [StringView; 6] = ["second", "minute", "hour", "day", "month", "year"];
@@ -602,8 +662,7 @@ fn numericModifier(z: Slice<u8>, p: borrow mut DateTime) -> bool {
     return applied;
 }
 
-/// parseModifier: applies one modifier. False when it is not one (the result is then NULL); an error when it
-/// needs local time.
+/// parseModifier: applies one modifier. False when it is not one (the result is then NULL).
 fn parseModifier(z: Slice<u8>, p: borrow mut DateTime, idx: usize) -> Result<bool, SqliteError> {
     let first = foldAscii(byteAt(z, 0));
     if (first == 'a') {
@@ -651,7 +710,7 @@ fn parseModifier(z: Slice<u8>, p: borrow mut DateTime, idx: usize) -> Result<boo
     if (first == 'l') {
         if (sameWord(z, "localtime")) {
             if (!p.isLocal) {
-                return Err(localTimeUnavailable());
+                toLocaltime(p);
             }
             p.isUtc = false;
             p.isLocal = true;
@@ -676,7 +735,7 @@ fn parseModifier(z: Slice<u8>, p: borrow mut DateTime, idx: usize) -> Result<boo
         }
         if (sameWord(z, "utc")) {
             if (!p.isUtc) {
-                return Err(localTimeUnavailable());
+                toUtc(p);
             }
             return Ok(true);
         }
