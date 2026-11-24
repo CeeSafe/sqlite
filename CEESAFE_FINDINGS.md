@@ -19,12 +19,12 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 14 | fixed in 0.55.0 (missed by the port): `Clock.localOffset(at)`, ADR 0153 |
 | 16 | fixed in 0.95.0: floats in constant arrays, ADR 0226 |
 | 17 | diagnostic in 0.95.0: N0245 shows the `static` table form (ADR 0226) |
-| 23, 30 | fixed in 0.95.0: `Thread.sleep`, `recvTimeout`, `t.isFinished()`, ADR 0222 |
+| 23, 30 | fixed in 0.95.0: `Thread.sleep`, `recvTimeout`, `t.isFinished()`, ADR 0222; 30's workaround removed (`pgwire` reaps its client threads, the daemon waits with `Thread.sleep`) |
 | 24 | fixed in 0.94.5: `Mutex.constant`, `OnceLock.constant`, `Vector.empty` in statics |
 | 25 | fixed by 0.94.5 |
-| 27, 29 | fixed in 0.95.0: `File.createReadWrite`, `IoError.BadDescriptor`, `Console.isTerminal`, ADR 0221 |
+| 27, 29 | fixed in 0.95.0: `File.createReadWrite`, `IoError.BadDescriptor`, `Console.isTerminal`, ADR 0221; 29's workaround removed (`cli` prompts at a terminal) |
 | 28, 33 | fixed in 0.95.0: `borrow` of a value lent to its statement; a field moved out of `e?.f`/`e!.f`, ADR 0227 |
-| 31 | diagnostic in 0.95.0: N0245 names a region parameter for a result holding a reference (ADR 0228) |
+| 31 | diagnostic in 0.95.0: N0245 names a region parameter for a result holding a reference (ADR 0228); workaround removed (`Cursor.skip` returns the slice) |
 | 32 | fixed in 0.95.0: `sortStableBy`, ADR 0225 |
 | 34 | fixed in 0.95.0 for an expected slice or number (ADR 0226); `let a = [1, 2];` stays `i32`, as `let x = 1;` does |
 | 9, 10, 12, 18, 21 | by design: closures are typed where a function type is expected; reserved words, now named as such in the error; references are not re-pointed; ranges are half-open (ADR 0085) |
@@ -262,6 +262,7 @@ person types at it, and reads a script silently when its input is a pipe or a fi
 cannot tell the two apart.
 
 Workaround: the shell always reads standard input as a script, without prompts (README.md, "Front ends").
+Removed with 0.95.0: at a terminal the shell prints sqlite3's banner and prompts.
 
 ### 30. A finished thread cannot be reaped
 
@@ -273,7 +274,9 @@ still freeing its session as the test ends.
 
 Workaround: `pgwire/src/server.cee` serves each client on a service thread and counts the clients in an
 `AtomicUSize`; the tests, and the daemon when it stops, poll the count down to zero (`PgServer.waitForClients`,
-spinning against `Timer.now()` for want of a sleep: finding 23).
+spinning against `Timer.now()` for want of a sleep: finding 23). Removed with 0.95.0: `serve` keeps its clients'
+threads in a `Vector<Thread<u64>>` (finding 35), joins the finished ones as clients come, and joins the rest when
+its listener is shut down; the daemon waits for `serve`'s thread with `isFinished` and `Thread.sleep`.
 
 ### 31. N0245's suggested fix does not fit a result that holds a slice
 
@@ -284,6 +287,7 @@ What works is a region parameter, `fn span<region r>(…, bytes: Slice<r, u8>, �
 which the message does not mention.
 
 Workaround: `Cursor.skip` in `pgwire/src/wire.cee` returns the index where the bytes start, and the caller slices.
+Removed with 0.95.0: it is `fn skip<region r>(…, bytes: Slice<r, u8>, …) -> Result<Slice<r, u8>, WireError>`.
 
 ### 32. No stable sort
 

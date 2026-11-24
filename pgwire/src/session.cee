@@ -698,8 +698,7 @@ struct Session {
                 values.push(SqliteValue.Null)?;
                 continue;
             }
-            let start = cursor.skip(bytes, truncate<usize>(length))?;
-            let data = bytes[start..start + (truncate<usize>(length))];
+            let data = cursor.skip(bytes, truncate<usize>(length))?;
             let oid = if (i < this.prepared[p].types.length) this.prepared[p].types[i] else 0;
             let value = if (formatAt(borrow formats, i) == 1) parseBinaryValue(
                 data,

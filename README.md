@@ -42,7 +42,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Connection, command, transaction | `SqliteConnection`, `SqliteCommand`, `SqliteTransaction`, `EngineGlue` | `api.cee`, `params.cee` | done: `Connection` with `execute`, `query`, `scalar`, `executeScript`, `begin`/`commit`/`rollback` and `transaction(work)`; `Params` bound by SQLite's rules; results materialised (see below) |
 | Connection pool | `SqliteConnectionPool`, `SharedStore` | `pool.cee` | done: shareable across threads (`Arc<ConnectionPool>`), transactions serialised, connections rolled back on return; no `:memory:` |
 | Scripts | `SqliteScript` | `script.cee` | done: `splitScript`/`splitStatements` end statements where sqlite3_complete does |
-| PostgreSQL wire front end, daemon, CLI | `CosmoNova.Engine.Sqlite.PgWire`, `CosmoSqliteD`, `.Cli` | `pgwire/`, `daemon/`, `cli/` (packages of their own) | done: a sqlite3-like shell (list, csv, line and column modes, `.headers`, `.tables`, `.schema`, `.read`, `.bail`, sqlite3's error messages and exit status), and a PostgreSQL protocol 3.0 server (simple and extended query, binary formats, portal suspension, cleartext password or trust) with a pool per database; see "Front ends" |
+| PostgreSQL wire front end, daemon, CLI | `CosmoNova.Engine.Sqlite.PgWire`, `CosmoSqliteD`, `.Cli` | `pgwire/`, `daemon/`, `cli/` (packages of their own) | done: a sqlite3-like shell (prompts at a terminal, list, csv, line and column modes, `.headers`, `.tables`, `.schema`, `.read`, `.bail`, sqlite3's error messages and exit status), and a PostgreSQL protocol 3.0 server (simple and extended query, binary formats, portal suspension, cleartext password or trust) with a pool per database; see "Front ends" |
 
 ## Differences from the C# engine
 
@@ -574,21 +574,30 @@ text SQLite gives a value, `src/frontend.cee`).
 cd cli && ceesafec build
 out/sqlite_shell app.db "SELECT * FROM t"            # each argument a text of SQL or a dot-command
 out/sqlite_shell -csv -header app.db < script.sql    # or statements and dot-commands from standard input
+out/sqlite_shell app.db                              # at a terminal: a banner, then prompts
 ```
 
 It behaves as the `sqlite3` shell (3.54) for what it has: options `-header`, `-noheader`, `-list`, `-csv`,
 `-line`, `-column`, `-bail`; dot-commands `.headers`, `.mode list|csv|line|column`, `.tables`, `.schema`, `.read`,
 `.bail`, `.quit`, `.exit N`, `.help`; output byte for byte as sqlite3 prints it, errors as sqlite3 words them, and
-exit status 1 after an error. The tests run the same arguments and input through both shells on copies of one
-database and compare everything printed, then check the file with `PRAGMA integrity_check`. Differences:
+exit status 1 after an error. When standard input is a terminal (`Console.isTerminal`) and no argument gives SQL,
+it is interactive as sqlite3 is: it prints the banner, prompts with `sqlite> ` and, while a statement is unfinished,
+`   ...> `, goes on after errors even under `.bail`, and ends the line at Ctrl+D; otherwise it reads standard input
+as a script. The tests run the same arguments and input through both shells on copies of one database and compare
+everything printed, then check the file with `PRAGMA integrity_check`; `tests/terminal.py` does the same for
+sessions typed into both at a pseudo-terminal. Differences:
 
 - no caret line under a statement's error ("^--- error here"): the engine does not report where in the text an
   error is; and the engine does not say whether a statement failed when it was prepared or when it ran, so "Parse
   error" or "Error" is chosen by the kind of error (`isPrepareError`);
 - without a file, sqlite3 opens an in-memory database; the engine has none, so the shell uses a temporary file,
   removed at the end;
-- no prompt or line editing (standard input is read as a script), and none of sqlite3's other dot-commands and
-  options (`.import`, `.dump`, `.separator`, box and table modes, …);
+- at a terminal: the prompts are the classic ones, which sqlite3 3.54 shows when `SQLITE_PS1` and `SQLITE_PS2`
+  say so (its own default is a coloured prompt naming the database; the tests set them); sqlite3 then defaults to
+  box mode, which this shell does not have, so it stays in list mode; the banner gives the engine's version
+  without a date, and without a file it does not suggest `.open`; there is no line editing or history;
+- none of sqlite3's other dot-commands and options (`.import`, `.dump`, `.open`, `.separator`, box and table
+  modes, …);
 - `.tables` with more names than fit on one line sets them in columns of sqlite3's widths but does not fold the
   line at 60 characters as sqlite3 3.54 does.
 
@@ -605,9 +614,13 @@ out/sqlited --trust                                   # no password: every clien
 answered 'N', NegotiateProtocolVersion for later minor versions, cleartext password authentication (or trust),
 the simple query protocol, the extended one (Parse, Bind, Describe, Execute with row limits, Close, Sync, Flush),
 text and binary formats, ErrorResponse with SQLSTATEs, and ReadyForQuery's transaction status. Each client has a
-thread and a connection from its database's `ConnectionPool` for its whole session. `daemon` is the C#'s
+thread and a connection from its database's `ConnectionPool` for its whole session; `serve` keeps the clients'
+threads and joins each that has finished when the next client comes (`isFinished`), so it holds only those of
+connected clients and counts them against the limit (`setLimits`), and once its listener is shut down it waits for
+the clients still connected, joins their threads and returns how many clients it served. `daemon` is the C#'s
 CosmoSqliteD: a bind address, a data directory with one directory a database (the C#'s layout), a password from
-`SQLITED_PASSWORD` (it refuses to start without one unless `--trust`), and a clean stop on Ctrl+C or SIGTERM.
+`SQLITED_PASSWORD` (it refuses to start without one unless `--trust`), and a clean stop on Ctrl+C or SIGTERM: it
+stops accepting, waits up to five seconds for `serve` to return, and exits.
 The tests drive the server over TCP with a raw client, and with `psql` when it is installed. Differences from
 PostgreSQL:
 
@@ -687,7 +700,8 @@ Collations other than BINARY, NOCASE and RTRIM are refused.
 
 `ceesafec test` needs the `sqlite3` shell on the path: fixtures are made with it, and answers are compared with
 what it prints. The front ends have their own: `ceesafec test` in `cli/`, `pgwire/` and `daemon/` (`pgwire`'s
-`psqlTalksToTheServer` runs `psql` when it is installed and is skipped otherwise).
+`psqlTalksToTheServer` runs `psql` when it is installed and is skipped otherwise; `cli`'s `atATerminalAsSqlite3`
+builds the shell and runs `tests/terminal.py` when `python3` is installed).
 
 The planner's timing probe (`tests/planner_probe_tests.cee`) times each kind of seek, covering read and index
 order against the same query with the index defeated (`+column`) on a 20,000-row table:

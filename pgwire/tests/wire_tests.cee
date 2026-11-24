@@ -5,11 +5,11 @@
 import sqlite;
 
 /// A server running on a thread of the test. Dropped (as when a check fails), it shuts the listener down, so that
-/// the thread it then joins ends.
+/// the thread it then joins ends once the clients have gone.
 struct Running {
     server: Arc<PgServer>;
     listener: Arc<TcpListener>;
-    thread: Thread<Result<void, IoError>>?;
+    thread: Thread<Result<u64, IoError>>?;
     port: u16;
 
     drop {
@@ -22,14 +22,19 @@ fn makeDirectory(path: StringView) {
 }
 
 /// Starts a server over `out/pg-tests`, with the database `database` made empty.
-fn startServer(database: StringView, password: StringView?) -> Running {
+fn startServer(database: StringView, password: StringView?) -> Running => startLimited(database, password, 100);
+
+/// The same, letting at most `maxClients` clients in at once.
+fn startLimited(database: StringView, password: StringView?, maxClients: usize) -> Running {
     makeDirectory("out");
     makeDirectory("out/pg-tests");
     var file = String.from("out/pg-tests/")!;
     file.append(database)!;
     file.append("/main.db")!;
     let _ = File.remove(file.view());
-    let server = Arc<PgServer>.create(PgServer.create("out/pg-tests", password)!)!;
+    var limited = PgServer.create("out/pg-tests", password)!;
+    limited.setLimits(maxClients, 16);
+    let server = Arc<PgServer>.create(limited)!;
     let listener = Arc<TcpListener>.create(TcpListener.bind("127.0.0.1", 0)!)!;
     let port = listener.get().port()!;
     let accepting = listener.clone();
@@ -39,13 +44,26 @@ fn startServer(database: StringView, password: StringView?) -> Running {
 }
 
 fn stopServer(running: Running) -> Result<void, TestFailure> {
+    let _ = stopCounting(running)?;
+    return Ok();
+}
+
+/// Stops the server; how many clients it served. `serve` returns once it has joined every client's thread, so
+/// nothing a session held is left allocated when the test ends.
+fn stopCounting(running: Running) -> Result<u64, TestFailure> {
     var r = running;
     r.listener.get().shutdown()!;
-    let thread = replace(mut r.thread, null) ?? { return Check.fail("the server was stopped twice"); };
-    let finished = thread.join();
-    Check.isTrue(finished.isOk(), "the server stops when its listener is shut down")?;
-    // The clients' threads end once their clients have gone: before the test ends, so nothing is left allocated.
-    return Check.isTrue(r.server.get().waitForClients(5000), "every client's session ends");
+    let thread = replace(mut r.thread, null) ?? {
+        Check.fail("the server was stopped twice")?;
+        return Ok(0);
+    };
+    match (thread.join()) {
+        Ok(served) => { return Ok(served); }
+        Err(_) => {
+            Check.fail("the server stops when its listener is shut down")?;
+            return Ok(0);
+        }
+    }
 }
 
 /// A raw protocol client.
@@ -183,8 +201,7 @@ fn describeMessage(m: borrow Message) -> String {
                 text.append("NULL")!;
                 continue;
             }
-            let start = cursor.skip(bytes, truncate<usize>(length))!;
-            let value = bytes[start..start + truncate<usize>(length)];
+            let value = cursor.skip(bytes, truncate<usize>(length))!;
             match (StringView.fromUtf8(value)) {
                 Some(v) => {
                     var printable = true;
@@ -752,4 +769,33 @@ fn psqlTalksToTheServer() -> Result<void, TestFailure> {
     let errors = StringView.fromUtf8(output.stderr.view()) ?? "not UTF-8";
     Check.isTrue(errors.contains("ERROR:  no such column: nope"), "psql shows the server's error")?;
     return stopped;
+}
+
+@test
+fn clientsPastTheLimitAreRefusedUntilOneLeaves() -> Result<void, TestFailure> {
+    let running = startLimited("limited", null, 1);
+    var first = Client.connect(running.port);
+    Check.equalText("R 0\nZ I\n", first.logIn("u", "limited", "").view())?;
+    var second = Client.connect(running.port);
+    Check.equalText("E FATAL 53300 sorry, too many clients already", second.next().view())?;
+    Check.equalText("EOF", second.next().view())?;
+    first.terminate();
+    Check.equalText("EOF", first.next().view())?;
+    // The first client's thread is joined when a client comes after it has finished freeing its session; until
+    // then, a client is still refused.
+    var tries = 0;
+    loop {
+        var third = Client.connect(running.port);
+        let replies = third.logIn("u", "limited", "");
+        if (replies.view() == "R 0\nZ I\n") {
+            third.terminate();
+            Check.equalText("EOF", third.next().view())?;
+            break;
+        }
+        tries += 1;
+        Check.isTrue(tries < 100, "a client is let in once the first has left")?;
+        Thread.sleep(20);
+    }
+    let served = stopCounting(running)?;
+    return Check.isTrue(served == 2, "the clients let in are counted, and the refused ones are not");
 }

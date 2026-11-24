@@ -19,7 +19,6 @@ public struct PgServer {
     /// (trust).
     password: String?;
     databases: Mutex<Vector<OpenDatabase>>;
-    clients: AtomicUSize;
     maxClients: usize;
     connectionsPerDatabase: usize;
 
@@ -33,7 +32,6 @@ public struct PgServer {
                 null => null,
             },
             databases: Mutex<Vector<OpenDatabase>>.create(Vector<OpenDatabase>.create())?,
-            clients: AtomicUSize.create(0),
             maxClients: 100,
             connectionsPerDatabase: 16,
         });
@@ -44,17 +42,6 @@ public struct PgServer {
     public fn setLimits(borrow mut this, maxClients: usize, connectionsPerDatabase: usize) {
         this.maxClients = maxClients.max(1);
         this.connectionsPerDatabase = connectionsPerDatabase.max(1);
-    }
-
-    /// How many clients are connected now.
-    public fn clientCount(borrow this) -> usize => this.clients.load();
-
-    /// Waits up to `milliseconds` for every client to leave; whether they did. CeeSafe has no sleep outside async
-    /// code (CEESAFE_FINDINGS.md, finding 23), so this polls.
-    public fn waitForClients(borrow this, milliseconds: u64) -> bool {
-        let deadline = Timer.now() + milliseconds;
-        while (this.clients.load() != 0 && Timer.now() < deadline) {}
-        return this.clients.load() == 0;
     }
 
     /// A connection to the database called `name`, from its pool, opening the pool (and making the database) on
@@ -117,36 +104,62 @@ public struct PgServer {
     }
 }
 
-/// Serves one client on this thread: counted against the server's limit, which a client past it is told.
-fn serveCounted(server: borrow PgServer, stream: TcpStream) {
-    let before = server.clients.fetchAdd(1);
-    if (before >= server.maxClients) {
-        var wire = Wire.over(stream);
-        let _ = sendFatal(mut wire, "53300", "sorry, too many clients already");
-    } else {
-        serveClient(server, stream);
+/// Joins the client threads in `clients` that have finished, adding to `served` the clients they served.
+fn reap(clients: borrow mut Vector<Thread<u64>>, served: borrow mut u64) {
+    var k: usize = 0;
+    while (k < clients.length) {
+        if (clients[k].isFinished()) {
+            served += clients.swapRemove(k).join();
+        } else {
+            k += 1;
+        }
     }
-    let _ = server.clients.fetchSub(1);
 }
 
 /// Accepts clients on `listener` until it is shut down (`listener.shutdown()`), serving each on a thread of its
-/// own.
-public fn serve(server: Arc<PgServer>, listener: Arc<TcpListener>) -> Result<void, IoError> {
+/// own; then waits for the clients still connected to leave, and gives how many clients were served. A client's
+/// thread is joined once it has finished, when the next client comes, so the threads kept are those of the
+/// clients connected. A client past the server's limit is told so and let go.
+public fn serve(server: Arc<PgServer>, listener: Arc<TcpListener>) -> Result<u64, IoError> {
+    var clients = Vector<Thread<u64>>.create();
+    var served: u64 = 0;
     loop {
         match (listener.get().accept()) {
             Ok(stream) => {
+                reap(mut clients, mut served);
+                if (clients.length >= server.get().maxClients) {
+                    var wire = Wire.over(stream);
+                    let _ = sendFatal(mut wire, "53300", "sorry, too many clients already");
+                    continue;
+                }
                 let mine = server.clone();
-                // A client's thread is not joined: it ends when its client goes, and the process may end first.
-                let _ = Thread.service("pgwire client", move () => {
-                    serveCounted(mine.get(), stream);
-                });
+                match (Thread.spawn(move () => {
+                    serveClient(mine.get(), stream);
+                    return 1u64;
+                })) {
+                    Ok(thread) => {
+                        // Out of memory for the list: dropping the thread joins it, so this waits for the client.
+                        let _ = clients.push(thread);
+                    }
+                    Err(_) => {}
+                }
             }
-            Err(IoError.ConnectionAborted) => { return Ok(); }
+            Err(IoError.ConnectionAborted) => { break; }
             Err(IoError.TooManyOpenFiles) => {
                 // Out of descriptors: the client waits in the backlog until one is freed.
-                continue;
+                reap(mut clients, mut served);
+                Thread.sleep(10);
             }
-            Err(e) => { return Err(e); }
+            Err(e) => {
+                for (thread in clients.drain()) {
+                    served += thread.join();
+                }
+                return Err(e);
+            }
         }
     }
+    for (thread in clients.drain()) {
+        served += thread.join();
+    }
+    return Ok(served);
 }
