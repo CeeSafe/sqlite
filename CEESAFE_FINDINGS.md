@@ -39,6 +39,7 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 39 | fixed in 0.95.5: `s.intoBytes()`, `String.fromUtf8(v)`, `ByteString.fromString(s)`, `b.intoString()`, and `ceesafec doc NAME` for a lib/core name, ADR 0236; workaround removed: text built in a `String` becomes TEXT without a copy (`SqliteValue.sqlTextFrom`: CURRENT_TIMESTAMP, ALTER TABLE's edited SQL, ANALYZE's statistics; a real's text in `valueText`), and ASCII case changes give their bytes to a `String` (`asciiLower`, `asciiUpper`) |
 | 42, 43, 44 | open: found while adopting 0.95.5 (below) |
 | 41 | open: found while making SQL text bytes (below) |
+| 48 | open: found while porting os_win.c's locks (below) |
 | 40 | misreported: `cfg("target.windows")` (ADR 0179, guide/unsafe-and-c.md "Code for one system") names the system a build is for, in any code; `onWindows()` uses it, and the environment-variable check is gone |
 
 ## Gaps
@@ -466,3 +467,20 @@ type of bytes (`ByteStringView` on POSIX, UTF-16 on Windows) would let it follow
 
 Workaround: `fileNamesThatAreNotUtf8AreRefused` compares with sqlite3 on macOS only, and elsewhere checks the
 engine's refusal.
+
+### 48. Windows' lock rules cannot be checked off Windows
+
+Found porting os_win.c's locks (`WritablePager.win*`, `SharedWal.winLockSharedMemory`). On Windows a `File` must
+never lock a range it holds (`LockFileEx` neither converts nor merges) and must unlock exactly the ranges it locked
+(ADR 0220 §2.2). On POSIX hosts both are allowed, and the interpreter models POSIX's rules, so code meant for
+Windows that breaks them (a recovery that locks the checkpointer's byte again during a checkpoint, an unlock of
+PENDING_BYTE and RESERVED_BYTE as one range) passes every test on macOS and Linux and fails only on a Windows
+machine. The hosts also differ the other way: an exclusive `tryLock` on a `File` opened for reading is `EBADF`
+(an `IoError`) on POSIX and is granted on Windows, so os_win.c's exclusive try of a read-only `-shm`'s DMS byte
+cannot even be run elsewhere. A lock model for the interpreter that follows Windows' rules (an option, or a
+`--check-leaks`-like checker that reports a lock taken twice or an unlock that names no locked range) would let a
+portable program be checked on any host.
+
+Workaround: the Windows scheme was run on macOS by forcing `onWindows()` (not committed), which checks its logic
+but not those two rules; the code keeps the ranges it holds (`WritablePager.held`) and wal.c's `ckptLock` rule so
+that no lock is taken twice, and CI's windows-2022 runner is the check.
