@@ -8,7 +8,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 
 | Part | C# source | Here | State |
 |---|---|---|---|
-| Varints, records, values | `Engine/Format` | `varint.cee`, `record.cee`, `value.cee` | done |
+| Varints, records, values | `Engine/Format` | `varint.cee`, `record.cee`, `value.cee` | done: TEXT keeps any bytes (`ByteString`), as SQLite's does |
 | Database header, pager, freelist count | `Storage/DatabaseHeader`, `Pager`, `FreelistReader` | `header.cee`, `pager.cee` | done, reading through a write-ahead log |
 | Table b-tree reader | `Btree/BTreeReader` | `btree.cee` | done |
 | Index b-tree reader | `Btree/IndexBTreeReader` | `index.cee` | done, except the integer batch-count fast paths, which belong with the executor |
@@ -67,6 +67,20 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   (`valuesCompareAsSqliteOrdersThem`).
 - **Text order.** The C# orders text by UTF-16 code units; SQLite's BINARY collation orders by UTF-8 bytes, which
   differs for characters above U+FFFF. This compares bytes.
+- **Text of any bytes.** The C# holds TEXT as a .NET string, so bytes that are not UTF-8 (`CAST(x'ff' AS TEXT)`,
+  a record another program wrote, JSON's `"\ud800"`, which SQLite decodes to ED A0 80, `char(0xd800)`) became
+  U+FFFD as soon as they were read. SQLite keeps a text's bytes, and so does this: `SqliteValue.Text` holds a
+  `ByteString`. The functions read the bytes by SQLite's rules rather than a strict decoder's: unicode(), LIKE,
+  GLOB and unhex() by READ_UTF8 (a byte below 0xC0 is a character of its own, a byte from 0xC0 takes every
+  continuation byte after it, and an overlong form, a surrogate, U+FFFE or U+FFFF reads as U+FFFD); length()
+  and substr() by 3.54's tag-20260418-01 (a stray continuation byte takes the ones after it); instr() by its own
+  stepping; trim() by matching each character of its set as bytes; upper(), lower(), replace(), quote(), `||`,
+  group_concat(), printf() and strftime() keep the other bytes as they are; char() writes a surrogate as ED A0 80;
+  text in a UTF-16 database is translated as sqlite3VdbeMemTranslate does (a lone surrogate kept as three bytes).
+  The tests compare answers byte for byte (`textKeepsItsBytes`, `textFunctionsReadBytesAsSqliteDoes`,
+  `textFormatsKeepBytes`, `jsonKeepsSqlitesBytes`, `textFromRecordsIsKept`, `utf16TextIsTranslatedAsSqliteDoes`).
+  What stays UTF-8 here: SQL text, error messages (a RAISE message or a bad JSON path that is not UTF-8 gets
+  U+FFFD), names and SQL read from `sqlite_schema`, file names (ATTACH, VACUUM INTO) and pragma arguments.
 - **Names.** The C# matches table and index names with .NET's ordinal-ignore-case, which folds non-ASCII letters;
   SQLite folds ASCII only, and so does this.
 - **Seeks in DESC and NOCASE indexes.** The C# equality seek compared with BINARY and assumed ascending order, so
@@ -231,9 +245,9 @@ The port fixes what was wrong in the source instead of copying it. Each item has
     instead of giving a NUL; `%q` and `%w` of NULL gave `''` instead of `(NULL)`;
   - `printf(NULL)`, `printf()` and an empty result were `''`; in SQLite they are NULL.
 
-  Where this still differs from the stock library: text here is UTF-8, so where SQLite's result would not be (a
-  `%.Ns` or `%.Nq` precision that cuts a character in two, a blob argument that is not UTF-8) each stray byte
-  becomes U+FFFD. Results longer than SQLite's default limit of 10^9 bytes are "string or blob too big"; the macOS
+  Bytes that are not UTF-8 (a `%.Ns` precision that cuts a character in two, a text or blob argument that is not
+  UTF-8) are kept as SQLite keeps them (`textFormatsKeepBytes`). Where this still differs from the stock library:
+  results longer than SQLite's default limit of 10^9 bytes are "string or blob too big"; the macOS
   `sqlite3` shell the tests use is built with a limit of 2^31 - 1, so the tests stay at sizes where both agree.
 
 - **Automatic index names of WITHOUT ROWID tables.** The primary key keeps its number in `sqlite_autoindex_T_N`
@@ -500,8 +514,6 @@ double-double arithmetic, which differed from macOS's libm in the last bit on up
   `evaluateWithSubtype` (`json.cee`), which sees through CASE, coalesce, ifnull, iif, nullif, likely, unlikely,
   the scalar min and max, unary `+`, CAST, COLLATE, `->`, the JSON aggregates and json_each's `value`, but not
   into a subquery (`SELECT json_array(x.value) FROM (SELECT value FROM json_each('[[1]]')) x` quotes it).
-- **Unpaired surrogates.** SQLite decodes `"\ud800"` to the bytes ED A0 80, which are not UTF-8. Text values here
-  are valid UTF-8, so each such byte becomes U+FFFD.
 - **Window functions.** json_group_array() and json_group_object() run as window functions, but their arguments
   lose the JSON subtype on the way through the window, so a JSON argument is quoted as text.
 - **json_each() and json_tree() compute every column of a row.** SQLite reads only the columns a query uses, so
@@ -544,6 +556,9 @@ Choices where the C# concept does not fit CeeSafe:
   outlive its scope or be forgotten open.
 - **No async methods.** The engine is in-process and synchronous; the C#'s async methods ran synchronously too.
   Tasks can use a pool from a worker thread.
+- **Text** is `SqliteValue.Text(ByteString)`: SQLite's TEXT may hold any bytes, and they are kept as they are.
+  `SqliteValue.text(view)` and `SqliteValue.textOfBytes(bytes)` make one; `value.textView()` gives a TEXT value
+  as a `StringView` when it is UTF-8 (null otherwise), and `toText()` any value's text as SQLite gives it.
 - **Parameters** are a `Params` value passed with each call, not a command object's mutable collection, and there
   is no `SqliteCommand`: a command was only text, parameters and a connection.
 - **Results are materialised.** `query` returns every row. The executor's SELECT (`runSelect`) builds its rows as
@@ -567,7 +582,8 @@ Choices where the C# concept does not fit CeeSafe:
 
 Three packages beside the library, each depending on it by path, each built and tested in its own directory
 (`ceesafec build`, `ceesafec test`). The library gained one public method for them, `SqliteValue.toText()` (the
-text SQLite gives a value, `src/frontend.cee`).
+text SQLite gives a value, as a `ByteString` of any bytes, `src/frontend.cee`). The shell prints a text's bytes as
+they are, as sqlite3 does; the wire server sends UTF-8 (see below).
 
 ### The shell (`cli/`)
 
@@ -631,6 +647,10 @@ PostgreSQL:
 - PostgreSQL's `START TRANSACTION`, `BEGIN ISOLATION LEVEL …`, `COMMIT AND CHAIN`, `ABORT` become SQLite's
   BEGIN, COMMIT and ROLLBACK, and `SET`, `RESET` and `DISCARD` succeed and do nothing; there is no `pg_catalog`,
   so `psql`'s `\d` and drivers' metadata queries fail;
+- text is sent as UTF-8, as client_encoding UTF8 promises: a TEXT value whose bytes are not UTF-8 (SQLite allows
+  them) is sent with U+FFFD for each maximal ill-formed subpart, where PostgreSQL could not have stored it at
+  all; `CAST(x AS BLOB)` sends the exact bytes as bytea. Parameters that are not UTF-8 are refused with 22021,
+  as PostgreSQL refuses them;
 - result types are bigint, double precision, bytea or text, decided from a column's values (SQLite's columns have
   no fixed type); a column of a prepared statement described before it runs is text; a parameter of no stated
   type is text, and SQLite's affinity converts it;

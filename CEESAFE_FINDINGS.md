@@ -30,12 +30,13 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 9, 10, 12, 18, 21 | by design: closures are typed where a function type is expected; reserved words, now named as such in the error; references are not re-pointed; ranges are half-open (ADR 0085) |
 | 6 | fixed in 0.95.2: methods of one name from several interfaces, and `I.m(x, …)` to name one (N0267 when a call on the type is ambiguous), ADR 0229; workaround removed (`PageSink.usableSize` again, beside `PageSource.usableSize`) |
 | 15 | fixed in 0.95.2: a file's `private` items have a scope of their own, so two files may each have a private item of one name, ADR 0230; workaround removed (`datetime.cee` and `printf.cee` each have a private `appendInteger` and `appendFloat`) |
-| 19 | fixed in 0.95.2: `ByteString`/`ByteStringView` in lib/core, any bytes kept as they are, with `toUtf8`, `toUtf8Lossy` and `chunks`, ADR 0231; the workaround (`textFromBytesLossy`, U+FFFD for invalid bytes) stays until this package moves to 0.95.2 |
+| 19 | fixed in 0.95.2: `ByteString`/`ByteStringView` in lib/core, any bytes kept as they are, with `toUtf8`, `toUtf8Lossy` and `chunks`, ADR 0231; workaround removed: `SqliteValue.Text` holds a `ByteString`, `textFromBytesLossy` is gone, and the text functions read bytes by SQLite's rules (README's "Text of any bytes") |
 | 26 | fixed in 0.95.2: `SharedMapping`, `f.mapShared(offset, length)`, with `readAt`/`writeAt` and 32- and 64-bit atomics, checked against a live sqlite3 `-shm`, ADR 0232; WAL mode still takes turns until this package writes a shared `-shm` (what is still missing for that: finding 37) |
 | 35 | fixed in 0.95.2: a `Thread<void>` in a generic signature is checked as a return type, no longer N0226; workaround removed (`pgwire`'s client threads are `Thread<void>`) |
 | 36 | open: found while removing the workarounds for 3, 23, 24 and 27 (below) |
 | 37 | open: found with 26's fix (below) |
 | 38 | open: found with 19's fix (below) |
+| 39 | open: found while removing 19's workaround (below) |
 
 ## Gaps
 
@@ -359,3 +360,15 @@ Found with finding 19's fix. `m.get(k) == Some(x)`, where `get` gives a `borrow 
 `match (m.get(k)) { Some(v) => …, null => … }`.
 
 Workaround: `match`, or `m.get(k).isSome()` and a separate comparison.
+
+### 39. A `String` cannot become a `ByteString` without a copy
+
+Found while removing finding 19's workaround. `ByteString.fromBytes(v)` takes a `Vector<u8>` without copying, but
+a `String` has no `intoBytes()` and `ByteString` no `fromString(s)`, so text built in a `String` (a number written
+by `appendReal`, an ALTER TABLE's edited SQL, CURRENT_TIMESTAMP) is copied again to become a TEXT value:
+`ByteString.fromText(s.view())`. A `String` is valid UTF-8, so the move cannot break anything. Nor does
+`ceesafec doc` take a type's name (`ceesafec doc ByteString` is "not a .cee or .c file"), so the members of a
+lib/core type are found in its source or through the MCP server.
+
+Workaround: the copy (`SqliteValue.text(s.view())`), or building the bytes in a `ByteString` or `Vector<u8>` from
+the start where the text is a function's result (`concat`, `group_concat`, `printf`, `hex`, `upper`).
