@@ -42,7 +42,8 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 45, 46 | fixed for 0.95.8 (ADR 0245, CeeSafe branch `fix/windows-processes`; checked on windows-2022 and on a Windows 11 laptop with MSVC and gcc), not yet released; the `tests/capture.py` workaround stays until then |
 | 47 | open: found making CI pass on Windows (below) |
 | 48 | open: found while porting os_win.c's locks (below) |
-| 49, 50 | open: found testing on a Windows 11 laptop (below) |
+| 49 | fixed for 0.95.7 (ADR 0247: initializers MSVC can nest; the sqlite package builds and passes with cl on the laptop) |
+| 50 | to be fixed in 0.95.9 (ADR 0248, the system's ucrtbase.dll on every Windows toolchain); the cause was the Windows version, not MinGW (below) |
 | 40 | misreported: `cfg("target.windows")` (ADR 0179, guide/unsafe-and-c.md "Code for one system") names the system a build is for, in any code; `onWindows()` uses it, and the environment-variable check is gone |
 
 ## Gaps
@@ -501,16 +502,22 @@ without a nested initializer, e.g. from a zeroed static or with `memset`.
 
 Workaround: none; on Windows the package is built with gcc (MinGW), and CI says so (`CC`).
 
-### 50. Float results depend on the C toolchain on Windows
+### 50. Float results on Windows depend on which UCRT a program uses
 
-Found testing on a Windows 11 laptop. ADR 0218's float methods call the platform's libm. Built with gcc (WinLibs
-MinGW-w64 16.2, UCRT), the engine's math functions differ from sqlite.org's `sqlite3.exe` (built with MSVC, the
-UCRT's libm) in the last bit or two for some arguments of `asin`, `acos`, `cosh`, `tanh` and `exp` (9 of 400 rows
-and 3 of 27 in `mathFunctionsAgreeWithTheShellOnManyArguments` and `mathFunctionsOverTableRows`). MinGW's `pow` also
-rounds a tie the wrong way: `pow(2, -1075)`, exactly half the smallest subnormal, is 4.94e-324 instead of 0.0
-(`mathFunctionsOnSpecialValues`). On macOS and Linux the engine and sqlite3 share the system's libm, so they agree.
-Correctly rounded functions (CORE-MATH, or LLVM libc's), or calling the UCRT's own functions from a MinGW build,
-would make results the same on every toolchain.
+Found testing on a Windows 11 laptop (22H2, build 22621); first put down to MinGW's libm, which was wrong. ADR 0218's
+float methods call the C library's functions, and on Windows that can be either of two UCRTs: the system's
+`ucrtbase.dll`, or the static copy of the Windows SDK's that `cl` links by default (`/MT`). sqlite.org's `sqlite3.exe`
+is built `/MT` with SDK 10.0.26100 and imports only KERNEL32.dll. A CeeSafe program built with gcc (WinLibs, UCRT)
+already called `ucrtbase.dll`, and build 22621's DLL differs from SDK 26100's static copy in the last bit or two for
+about 0.6% of arguments (`asin`, `acos`, `cosh`, `tanh`, `exp`, ...) and rounds the tie `pow(2, -1075)` to the
+smallest subnormal instead of 0.0. On Windows build 26100 (GitHub's windows-2025) the DLL and the static copy agree on
+every result. So the engine's three math tests (`mathFunctionsAgreeWithTheShellOnManyArguments`,
+`mathFunctionsOnSpecialValues`, `mathFunctionsOverTableRows`) fail on older Windows with any compiler, while a `cl`
+build of the same program used the static copy and so depended on the compiler.
 
-Workaround: none in the engine; the three math tests fail when it is built with MinGW on Windows. CI's windows-2022
-job passes them with its gcc (a different MinGW build); results there are not guaranteed.
+The owner chose "the same as the platform": ADR 0248 (CeeSafe branch `fix/windows-libm`, for 0.95.9) makes every
+Windows build call System32's `ucrtbase.dll`, whatever the compiler, so results follow the installed Windows, as
+Python's `math` does. Not yet released.
+
+Workaround: none yet; after 0.95.9 the three tests are to say, on Windows older than build 26100, that the shell's
+static UCRT differs from the system's, rather than compare those last bits.
