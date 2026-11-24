@@ -10,7 +10,7 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 1, 20 | fixed in 0.95.0: float math methods (`exp`, `ln`, `pow`, trigonometry, `fma`, `copySign`, `scaleB`, `roundEven`, …), ADR 0218; hexadecimal float literals and `frexp` not added; workaround removed (`src/libm.cee` deleted: the math functions call the platform's libm, and match sqlite3 bit for bit) |
 | 2 | fixed in 0.95.0: `wrappingShl`/`wrappingShr` on signed integers (arithmetic shift), ADR 0223; workaround removed (`pwr10to2`/`pwr2to10` shift; `floorDivide` stays for divisions by 27, 1000, 146097) |
 | 3 | fixed in 0.95.0: byte-range advisory locks `lock`/`tryLock`/`unlock`, interoperating with sqlite3's, ADR 0220; workaround removed: the writable pager takes os_unix.c's locks (`src/pagerw.cee`), README.md's "one process at a time" limit is gone (WAL mode takes turns, finding 26) |
-| 4 | fixed in 0.95.0: `Arc.getMut()`, ADR 0224 |
+| 4 | fixed in 0.95.0: `Arc.getMut()`, ADR 0224; workaround removed (the writable pager keeps `Arc` pages: a read shares the page, a write copies it only while a reader still has it) |
 | 5 | already there: `appendChar`/`appendUtf8` are documented; now used (`appendAscii` is `appendUtf8` checked) |
 | 7 | diagnostic in 0.95.0: float patterns say to use a guard or `==` (ADR 0228); not added as patterns, by choice |
 | 8 | diagnostic in 0.95.0: `*b` on a box says `let inner: T = b;` (ADR 0228) |

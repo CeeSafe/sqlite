@@ -129,7 +129,8 @@ struct WritablePager {
     private freeCount: u32;
     // The pages the transaction has looked at: `slots` says where in `pages` each one is.
     private slots: HashMap<u32, usize>;
-    private pages: Vector<Vector<u8>>;
+    /// Shared with the readers given them (`readPage`); a write copies a page only while a reader still has it.
+    private pages: Vector<Arc<Vector<u8>>>;
     private preImages: HashMap<u32, Vector<u8>>;
     private dirty: HashMap<u32, bool>;
     /// Savepoints in progress, innermost last (a statement's own is the top one): each holds the content pages had
@@ -167,7 +168,7 @@ struct WritablePager {
             freeTrunk: 0,
             freeCount: 0,
             slots: HashMap<u32, usize>.create(),
-            pages: Vector<Vector<u8>>.create(),
+            pages: Vector<Arc<Vector<u8>>>.create(),
             preImages: HashMap<u32, Vector<u8>>.create(),
             dirty: HashMap<u32, bool>.create(),
             levels: Vector<StatementUndo>.create(),
@@ -583,7 +584,7 @@ struct WritablePager {
             }
         }
         let slot = this.pages.length;
-        this.pages.push(bytes)?;
+        this.pages.push(Arc<Vector<u8>>.create(bytes)?)?;
         let _ = this.slots.put(number, slot)?;
         return Ok();
     }
@@ -594,13 +595,13 @@ struct WritablePager {
     /// Page `number` as the transaction sees it.
     fn read(borrow mut this, number: u32) -> Result<Slice<u8>, SqliteError> {
         this.load(number)?;
-        return Ok(this.pages[this.slotOf(number)].view());
+        return Ok(this.pages[this.slotOf(number)].get().view());
     }
 
     /// A copy of page `number`, for code that reads other pages while it looks at this one.
     fn copy(borrow mut this, number: u32) -> Result<Vector<u8>, SqliteError> {
         this.load(number)?;
-        return Ok(this.pages[this.slotOf(number)].clone()?);
+        return Ok(this.pages[this.slotOf(number)].get().clone()?);
     }
 
     /// Page `number`, to change. Its old image is kept for the journal.
@@ -611,18 +612,23 @@ struct WritablePager {
             let top = this.levels.length - 1;
             let undo = borrow mut this.levels[top];
             if (!undo.saved.contains(borrow number)) {
-                let image = this.pages[*this.slots.get(borrow number)!].clone()?;
+                let image = this.pages[*this.slots.get(borrow number)!].get().clone()?;
                 let wasDirty = this.dirty.contains(borrow number);
                 let _ = undo.saved.put(number, SavedPage { image: image, wasDirty: wasDirty })?;
             }
         }
         if (number <= this.committedPageCount && !this.preImages.contains(borrow number)) {
-            let image = this.pages[this.slotOf(number)].clone()?;
+            let image = this.pages[this.slotOf(number)].get().clone()?;
             let _ = this.preImages.put(number, image)?;
         }
         let _ = this.dirty.put(number, true)?;
         let slot = this.slotOf(number);
-        return Ok(this.pages[slot].viewMut());
+        if (this.pages[slot].getMut().isNull()) {
+            // A reader still has this image: it keeps it, and the transaction changes a copy.
+            let fresh = this.pages[slot].get().clone()?;
+            this.pages[slot] = Arc<Vector<u8>>.create(fresh)?;
+        }
+        return Ok(this.pages[slot].getMut()!.viewMut());
     }
 
     /// The number of page numbers a freelist trunk page can hold. SQLite keeps six slots unused, for the sake
@@ -667,7 +673,7 @@ struct WritablePager {
             var bytes = Vector<u8>.create();
             bytes.resize(this.pageSize, 0)?;
             let slot = this.pages.length;
-            this.pages.push(bytes)?;
+            this.pages.push(Arc<Vector<u8>>.create(bytes)?)?;
             let _ = this.slots.put(number, slot)?;
             let _ = this.dirty.put(number, true)?;
             this.pageCount = number;
@@ -815,7 +821,7 @@ struct WritablePager {
             }
             let slot = *this.slots.get(borrow number)!;
             let page = saved.getMut(borrow number)!;
-            this.pages[slot] = replace(mut page.image, Vector<u8>.create());
+            this.pages[slot] = Arc<Vector<u8>>.create(replace(mut page.image, Vector<u8>.create()))?;
             if (!page.wasDirty) {
                 let _ = this.dirty.remove(borrow number);
             }
@@ -921,7 +927,7 @@ struct WritablePager {
                 let number = *this.dirty.keyAt(i);
                 let offset = ((number - 1) as u64) * (this.pageSize as u64);
                 let slot = this.slotOf(number);
-                this.file.writeAt(this.pages[slot].view(), offset)?;
+                this.file.writeAt(this.pages[slot].get().view(), offset)?;
             }
             this.file.setLength((pageCount as u64) * (this.pageSize as u64))?;
             this.file.syncAll()?;
@@ -954,7 +960,7 @@ struct WritablePager {
             let number = numbers[k];
             let commitSize = if (k + 1 == numbers.length) pageCount else 0;
             let slot = this.slotOf(number);
-            this.wal.addFrame(number, this.pages[slot].view(), commitSize)?;
+            this.wal.addFrame(number, this.pages[slot].get().view(), commitSize)?;
         }
         this.wal.finishCommit(pageCount)?;
         return Ok();
@@ -1069,8 +1075,8 @@ struct WritablePager {
 
 impl PageSource for WritablePager {
     fn readPage(borrow mut this, number: u32) -> Result<Page, SqliteError> {
-        let bytes = this.copy(number)?;
-        return Ok(Page { bytes: Arc<Vector<u8>>.create(bytes)? });
+        this.load(number)?;
+        return Ok(Page { bytes: this.pages[this.slotOf(number)].clone() });
     }
 
     fn usableSize(borrow this) -> usize => this.usable;
