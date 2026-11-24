@@ -7,7 +7,7 @@ fn answerOf(connection: borrow mut Connection, sql: StringView, params: borrow P
         Ok(result) => { return listText(borrow result); }
         Err(e) => {
             var text = String.from("error: ")!;
-            text.append(e.message())!;
+            text.append(shownText(e.message().bytes()).view())!;
             text.append("\n")!;
             return text;
         }
@@ -245,7 +245,7 @@ fn executeScalarAndCounts() -> Result<void, TestFailure> {
     Check.isTrue(count is Some(SqliteValue.Integer(3)), "api_tests.cee line 233")?;
     // A query's result is its last statement's.
     let last = connection.query("SELECT 1; SELECT 2 AS two", borrow none)!;
-    Check.equalText("two", last.columns[0].view())?;
+    Check.equalText("two", last.columns[0].toUtf8() ?? "")?;
     // `:memory:` is a database of the connection's own, gone when it closes.
     var memory = Connection.open(":memory:")!;
     let _ = memory.execute("CREATE TABLE m(x); INSERT INTO m VALUES (1), (2)", borrow none)!;

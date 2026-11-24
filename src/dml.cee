@@ -203,7 +203,7 @@ fn tableIndexes(
             continue;
         }
         let name = entry.name.view();
-        if (name.length <= prefix.length || !name[0..prefix.length].equalsIgnoreAsciiCase(prefix.view())) {
+        if (name.length <= prefix.length || !startsWithIgnoreAsciiCase(name, prefix.view())) {
             continue;
         }
         let n = name[prefix.length..].parseInt<usize>() ?? 0;
@@ -1058,13 +1058,13 @@ fn executeInsert(
                 message.append(table.name.view())?;
                 message.append(" has no column named ")?;
                 message.append(name)?;
-                return Err(SqliteError.Sql(message));
+                return Err(sqlError(message.view()));
             };
             if (found < table.columns.length && table.columns[found].generated.isSome()) {
                 var message = String.from("cannot INSERT into generated column \"")?;
                 message.append(name)?;
                 message.append("\"")?;
-                return Err(SqliteError.Sql(message));
+                return Err(sqlError(message.view()));
             }
             targets.push(found)?;
         }
@@ -1099,7 +1099,7 @@ fn executeInsert(
                 message.appendNumber(targets.length)?;
                 message.append(" columns")?;
             }
-            return Err(SqliteError.Sql(message));
+            return Err(sqlError(message.view()));
         }
         // The row: defaults, then the given values with the columns' affinities.
         var values = Vector<SqliteValue>.withCapacity(table.columns.length)?;
@@ -1244,7 +1244,9 @@ fn executeInsert(
     db.totalChanges += count;
     return Ok(
         QueryResult {
-            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
+            columns: columnNamesOf(
+                returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
+            )?,
             rows: output,
         },
     );
@@ -1444,7 +1446,9 @@ fn executeDelete(
     db.totalChanges += db.changes;
     return Ok(
         QueryResult {
-            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
+            columns: columnNamesOf(
+                returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
+            )?,
             rows: output,
         },
     );
@@ -1470,7 +1474,7 @@ fn assignmentTarget(name: StringView, table: borrow TableSchema) -> Result<usize
         var message = String.from("cannot UPDATE generated column \"")?;
         message.append(name)?;
         message.append("\"")?;
-        return Err(SqliteError.Sql(message));
+        return Err(sqlError(message.view()));
     }
     return Ok(found);
 }
@@ -1670,7 +1674,9 @@ fn executeUpdate(
     db.totalChanges += count;
     return Ok(
         QueryResult {
-            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
+            columns: columnNamesOf(
+                returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
+            )?,
             rows: output,
         },
     );
@@ -1949,7 +1955,9 @@ fn executeUpdateFrom(
     db.totalChanges += count;
     return Ok(
         QueryResult {
-            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
+            columns: columnNamesOf(
+                returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
+            )?,
             rows: output,
         },
     );
@@ -1960,7 +1968,7 @@ fn conflictError(db: borrow mut Session, action: ConflictAction, message: String
     if (action == ConflictAction.Fail || action == ConflictAction.Rollback) {
         db.conflictFailure = action;
     }
-    return SqliteError.Constraint(message);
+    return constraintError(message.view());
 }
 
 /// Rebuilds the indexes a statement left to rebuild when it ended early (OR FAIL keeps its changes).

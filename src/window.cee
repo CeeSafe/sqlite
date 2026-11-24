@@ -207,7 +207,7 @@ fn frameOffset(
         message.append(which)?;
         message.append(" offset must be a non-negative ")?;
         message.append(if (mode == FrameMode.Range) "number" else "integer")?;
-        return Err(SqliteError.Sql(message));
+        return Err(sqlError(message.view()));
     }
     return Ok(numeric);
 }

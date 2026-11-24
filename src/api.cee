@@ -65,8 +65,12 @@ public struct Params {
     }
 
     /// Gives the parameter called `name` `value`.
-    public fn bind(borrow mut this, name: StringView, value: SqliteValue) -> Result<void, AllocError> {
-        this.named.push(NamedValue { name: String.from(name)?, value: value })?;
+    public fn bind(borrow mut this, name: StringView, value: SqliteValue) -> Result<void, AllocError> =>
+        this.bindBytes(ByteStringView.fromText(name), value);
+
+    /// `bind`, for a name of any bytes, as a statement may write one.
+    public fn bindBytes(borrow mut this, name: ByteStringView, value: SqliteValue) -> Result<void, AllocError> {
+        this.named.push(NamedValue { name: sqlTextOf(name.bytes())?, value: value })?;
         return Ok();
     }
 
@@ -116,7 +120,7 @@ public struct Params {
             if (!used) {
                 var message = String.from("column index out of range: there is no parameter ")?;
                 message.appendNumber(n)?;
-                return Err(SqliteError.Sql(message));
+                return Err(sqlError(message.view()));
             }
         }
         for (i in 0..this.named.length) {
@@ -134,7 +138,7 @@ public struct Params {
             if (!used) {
                 var message = String.from("no such parameter: ")?;
                 message.append(name)?;
-                return Err(SqliteError.Sql(message));
+                return Err(sqlError(message.view()));
             }
         }
         return Ok();
@@ -183,22 +187,45 @@ public struct Connection {
     /// Runs the statements of `sql` in order, each with the values of `params` it has places for, and returns
     /// how many rows their INSERTs, UPDATEs and DELETEs changed. It stops at the first that fails; those before
     /// it keep their effect (inside BEGIN, until the transaction ends).
-    public fn execute(borrow mut this, sql: StringView, params: borrow Params) -> Result<i64, SqliteError> {
+    public fn execute(borrow mut this, sql: StringView, params: borrow Params) -> Result<i64, SqliteError> =>
+        this.executeBytes(ByteStringView.fromText(sql), params);
+
+    /// `execute`, for SQL text of any bytes, as SQLite takes it: a string literal keeps every byte it holds, and a
+    /// name may hold any byte above 0x7F.
+    public fn executeBytes(borrow mut this, sql: ByteStringView, params: borrow Params) -> Result<i64, SqliteError> {
+        let text = sqlTextOf(sql.bytes())?;
         var changed: i64 = 0;
-        let _ = this.runAll(sql, params, mut changed)?;
+        let _ = this.runAll(text.view(), params, mut changed)?;
         return Ok(changed);
     }
 
     /// Runs the statements of `sql` as `execute` does, and returns the last one's columns and rows.
-    public fn query(borrow mut this, sql: StringView, params: borrow Params) -> Result<QueryResult, SqliteError> {
+    public fn query(borrow mut this, sql: StringView, params: borrow Params) -> Result<QueryResult, SqliteError> =>
+        this.queryBytes(ByteStringView.fromText(sql), params);
+
+    /// `query`, for SQL text of any bytes.
+    public fn queryBytes(
+        borrow mut this,
+        sql: ByteStringView,
+        params: borrow Params,
+    ) -> Result<QueryResult, SqliteError> {
+        let text = sqlTextOf(sql.bytes())?;
         var changed: i64 = 0;
-        return this.runAll(sql, params, mut changed);
+        return this.runAll(text.view(), params, mut changed);
     }
 
     /// The first column of the first row of `query`'s result: null when there is no row, and `SqliteValue.Null`
     /// when there is one and its value is NULL.
-    public fn scalar(borrow mut this, sql: StringView, params: borrow Params) -> Result<SqliteValue?, SqliteError> {
-        var result = this.query(sql, params)?;
+    public fn scalar(borrow mut this, sql: StringView, params: borrow Params) -> Result<SqliteValue?, SqliteError> =>
+        this.scalarBytes(ByteStringView.fromText(sql), params);
+
+    /// `scalar`, for SQL text of any bytes.
+    public fn scalarBytes(
+        borrow mut this,
+        sql: ByteStringView,
+        params: borrow Params,
+    ) -> Result<SqliteValue?, SqliteError> {
+        var result = this.queryBytes(sql, params)?;
         if (result.rows.length == 0 || result.rows[0].length == 0) {
             return Ok(null);
         }
@@ -206,9 +233,13 @@ public struct Connection {
     }
 
     /// Runs a script of statements without parameters, as sqlite3_exec does.
-    public fn executeScript(borrow mut this, sql: StringView) -> Result<void, SqliteError> {
+    public fn executeScript(borrow mut this, sql: StringView) -> Result<void, SqliteError> =>
+        this.executeScriptBytes(ByteStringView.fromText(sql));
+
+    /// `executeScript`, for SQL text of any bytes.
+    public fn executeScriptBytes(borrow mut this, sql: ByteStringView) -> Result<void, SqliteError> {
         let none = Params.create();
-        let _ = this.execute(sql, borrow none)?;
+        let _ = this.executeBytes(sql, borrow none)?;
         return Ok();
     }
 
@@ -286,7 +317,7 @@ public struct Connection {
             }
             params.checkUsed(borrow numbered)?;
         }
-        var last = QueryResult { columns: Vector<String>.create(), rows: Vector<Vector<SqliteValue>>.create() };
+        var last = QueryResult { columns: Vector<ByteString>.create(), rows: Vector<Vector<SqliteValue>>.create() };
         for (i in 0..spans.length) {
             let text = sql[spans[i].start..spans[i].end];
             let values = if (params.isEmpty()) Vector<SqliteValue>.create() else params.valuesFor(borrow numbered[i])?;
@@ -301,5 +332,5 @@ public struct Connection {
 
     /// Runs one statement; the session takes and releases the file's locks.
     fn runOne(borrow mut this, sql: StringView, values: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> =>
-        this.session.query(sql, values);
+        this.session.queryText(sql, values);
 }

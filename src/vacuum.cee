@@ -23,8 +23,7 @@ fn executeVacuum(into: borrow Expr?, params: Slice<SqliteValue>, db: borrow mut 
         let SqliteValue.Text(name) = evaluate(borrow compiled, mut frame, db)? else {
             return Err(sqlError("non-text filename"));
         };
-        // A file name is UTF-8 here.
-        let path = name.toUtf8Lossy()?;
+        let path = fileNameOf(name.clone()?)?;
         if (fileLength(path.view())?.isSome()) {
             return Err(sqlError("output file already exists"));
         }
@@ -53,14 +52,8 @@ fn executeVacuum(into: borrow Expr?, params: Slice<SqliteValue>, db: borrow mut 
             let oldRoot = checkedTruncate<u32>(root) ?? {
                 return Err(corrupt("a root page number is out of range"));
             };
-            let kind = match (borrow values[0]) {
-                SqliteValue.Text(t) => t.toUtf8Lossy()?,
-                _ => String.create(),
-            };
-            let name = match (borrow values[1]) {
-                SqliteValue.Text(t) => t.toUtf8Lossy()?,
-                _ => String.create(),
-            };
+            let kind = textOrEmptyRef(borrow values[0])?;
+            let name = textOrEmptyRef(borrow values[1])?;
             var keyed = kind.view() == "index";
             if (kind.view() == "table") {
                 if (db.catalog.table(name.view())? is Some(table)) {

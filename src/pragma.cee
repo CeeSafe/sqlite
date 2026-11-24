@@ -19,7 +19,7 @@ fn intRow(n: i64) -> Result<Vector<SqliteValue>, AllocError> {
 
 fn textRow(text: StringView) -> Result<Vector<SqliteValue>, AllocError> {
     var row = Vector<SqliteValue>.create();
-    row.push(SqliteValue.text(text)?)?;
+    row.push(SqliteValue.sqlText(text)?)?;
     return Ok(row);
 }
 
@@ -139,11 +139,11 @@ fn pragmaRows(
             }
             var row = Vector<SqliteValue>.create();
             row.push(SqliteValue.Integer(if (extended) truncate<i64>(c) else cid))?;
-            row.push(SqliteValue.text(column.name.view())?)?;
-            row.push(SqliteValue.text(column.declaredType.view())?)?;
+            row.push(SqliteValue.sqlText(column.name.view())?)?;
+            row.push(SqliteValue.sqlText(column.declaredType.view())?)?;
             row.push(SqliteValue.Integer(if (column.notNull) 1 else 0))?;
             row.push(
-                if (borrow column.defaultValue is Some(d)) SqliteValue.text(d.text.view())? else SqliteValue.Null,
+                if (borrow column.defaultValue is Some(d)) SqliteValue.sqlText(d.text.view())? else SqliteValue.Null,
             )?;
             row.push(SqliteValue.Integer(pk))?;
             if (extended) {
@@ -199,9 +199,9 @@ fn pragmaRows(
             }
             var row = Vector<SqliteValue>.create();
             row.push(SqliteValue.Integer(seq))?;
-            row.push(SqliteValue.text(entry.name.view())?)?;
+            row.push(SqliteValue.sqlText(entry.name.view())?)?;
             row.push(SqliteValue.Integer(if (unique) 1 else 0))?;
-            row.push(SqliteValue.text(origin)?)?;
+            row.push(SqliteValue.sqlText(origin)?)?;
             row.push(SqliteValue.Integer(if (partial) 1 else 0))?;
             rows.push(row)?;
             seq += 1;
@@ -232,14 +232,14 @@ fn pragmaRows(
                 row.push(SqliteValue.Integer(truncate<i64>(c)))?;
                 if (index.columns[c].column is Some(at)) {
                     row.push(SqliteValue.Integer(truncate<i64>(at)))?;
-                    row.push(SqliteValue.text(table.columns[at].name.view())?)?;
+                    row.push(SqliteValue.sqlText(table.columns[at].name.view())?)?;
                 } else {
                     row.push(SqliteValue.Integer(-2))?;
                     row.push(SqliteValue.Null)?;
                 }
                 if (extended) {
                     row.push(SqliteValue.Integer(if (index.order.descending[c]) 1 else 0))?;
-                    row.push(SqliteValue.text(index.order.collations[c].name())?)?;
+                    row.push(SqliteValue.sqlText(index.order.collations[c].name())?)?;
                     row.push(SqliteValue.Integer(1))?;
                 }
                 rows.push(row)?;
@@ -251,7 +251,7 @@ fn pragmaRows(
                 row.push(SqliteValue.Integer(-1))?;
                 row.push(SqliteValue.Null)?;
                 row.push(SqliteValue.Integer(0))?;
-                row.push(SqliteValue.text("BINARY")?)?;
+                row.push(SqliteValue.sqlText("BINARY")?)?;
                 row.push(SqliteValue.Integer(0))?;
                 rows.push(row)?;
             }
@@ -272,14 +272,14 @@ fn pragmaRows(
                 var row = Vector<SqliteValue>.create();
                 row.push(SqliteValue.Integer(id))?;
                 row.push(SqliteValue.Integer(truncate<i64>(c)))?;
-                row.push(SqliteValue.text(key.refTable.view())?)?;
-                row.push(SqliteValue.text(key.columns[c].view())?)?;
+                row.push(SqliteValue.sqlText(key.refTable.view())?)?;
+                row.push(SqliteValue.sqlText(key.columns[c].view())?)?;
                 row.push(
-                    if (c < key.refColumns.length) SqliteValue.text(key.refColumns[c].view())? else SqliteValue.Null,
+                    if (c < key.refColumns.length) SqliteValue.sqlText(key.refColumns[c].view())? else SqliteValue.Null,
                 )?;
-                row.push(SqliteValue.text(actionName(key.onUpdate))?)?;
-                row.push(SqliteValue.text(actionName(key.onDelete))?)?;
-                row.push(SqliteValue.text("NONE")?)?;
+                row.push(SqliteValue.sqlText(actionName(key.onUpdate))?)?;
+                row.push(SqliteValue.sqlText(actionName(key.onDelete))?)?;
+                row.push(SqliteValue.sqlText("NONE")?)?;
                 rows.push(row)?;
             }
             id += 1;
@@ -305,8 +305,8 @@ fn pragmaRows(
             ) == db.tempIndex) 1 else truncate<i64>(k) + if (db.tempIndex.isSome()) 0 else 1;
             var row = Vector<SqliteValue>.create();
             row.push(SqliteValue.Integer(seq))?;
-            row.push(SqliteValue.text(db.databaseNames[i].view())?)?;
-            row.push(SqliteValue.text(db.databaseShownPaths[i].view())?)?;
+            row.push(SqliteValue.sqlText(db.databaseNames[i].view())?)?;
+            row.push(SqliteValue.sqlText(db.databaseShownPaths[i].view())?)?;
             rows.push(row)?;
         }
         return Ok(rows);
@@ -331,9 +331,9 @@ fn pragmaRows(
                 }
             }
             var row = Vector<SqliteValue>.create();
-            row.push(SqliteValue.text("main")?)?;
-            row.push(SqliteValue.text(entry.name.view())?)?;
-            row.push(SqliteValue.text(kind)?)?;
+            row.push(SqliteValue.sqlText("main")?)?;
+            row.push(SqliteValue.sqlText(entry.name.view())?)?;
+            row.push(SqliteValue.sqlText(kind)?)?;
             row.push(SqliteValue.Integer(columns))?;
             row.push(SqliteValue.Integer(if (withoutRowid) 1 else 0))?;
             row.push(SqliteValue.Integer(if (strict) 1 else 0))?;
@@ -341,9 +341,9 @@ fn pragmaRows(
         }
         for (pair in [["main", "sqlite_schema"], ["temp", "sqlite_temp_schema"]]) {
             var row = Vector<SqliteValue>.create();
-            row.push(SqliteValue.text(pair[0])?)?;
-            row.push(SqliteValue.text(pair[1])?)?;
-            row.push(SqliteValue.text("table")?)?;
+            row.push(SqliteValue.sqlText(pair[0])?)?;
+            row.push(SqliteValue.sqlText(pair[1])?)?;
+            row.push(SqliteValue.sqlText("table")?)?;
             row.push(SqliteValue.Integer(5))?;
             row.push(SqliteValue.Integer(0))?;
             row.push(SqliteValue.Integer(0))?;
@@ -356,7 +356,7 @@ fn pragmaRows(
         for (i in 0..names.length) {
             var row = Vector<SqliteValue>.create();
             row.push(SqliteValue.Integer(truncate<i64>(i)))?;
-            row.push(SqliteValue.text(names[i])?)?;
+            row.push(SqliteValue.sqlText(names[i])?)?;
             rows.push(row)?;
         }
         return Ok(rows);
@@ -377,7 +377,7 @@ fn executePragma(stmt: borrow PragmaStmt, db: borrow mut Session) -> Result<Quer
         if (borrow stmt.value is Some(v)) {
             argument = v.clone()?;
         }
-        return Ok(QueryResult { columns: namesOf(columns)?, rows: pragmaRows(name, argument, db)? });
+        return Ok(QueryResult { columns: columnNamesOf(namesOf(columns)?)?, rows: pragmaRows(name, argument, db)? });
     }
     var setTo: i64? = null;
     var setText: StringView = "";
@@ -536,5 +536,5 @@ fn executePragma(stmt: borrow PragmaStmt, db: borrow mut Session) -> Result<Quer
             return Ok(emptyResult());
         }
     }
-    return Ok(QueryResult { columns: columns, rows: rows });
+    return Ok(QueryResult { columns: columnNamesOf(columns)?, rows: rows });
 }

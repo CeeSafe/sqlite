@@ -77,7 +77,7 @@ public struct ConnectionPool {
             }
         }
         var connection = found ?? {
-            return Err(SqliteError.Busy(String.from("every connection of the pool is in use")?));
+            return Err(SqliteError.Busy(ownedMessage("every connection of the pool is in use")));
         };
         connection.setBusyTimeout(this.busyTimeout);
         return Ok(PooledConnection { connection: connection, home: this.idle.clone(), opened: this.opened.clone() });

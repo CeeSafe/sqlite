@@ -112,8 +112,8 @@ fn sourceRows(
             var text: String? = null;
             if (argument is Some(a)) {
                 let v = evaluate(a, frame, db)?;
-                // A pragma's argument is read as UTF-8.
-                text = valueText(borrow v)?.toUtf8Lossy()?;
+                // A pragma's argument keeps its bytes, in the engine's form for SQL text (sqltext.cee).
+                text = sqlTextOf(valueText(borrow v)?.bytes())?;
             }
             var rows = pragmaRows(name.view(), text, db)?;
             // The hidden argument column.

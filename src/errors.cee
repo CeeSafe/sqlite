@@ -7,39 +7,47 @@ public enum SqliteError {
     /// The file system refused an operation.
     @from Io(IoError),
     /// The database file does not follow the SQLite file format.
-    Corrupt(String),
+    ///
+    /// Each message is bytes, as SQLite's are: a name or a RAISE message in it keeps bytes that are not UTF-8.
+    Corrupt(ByteString),
     /// The file is not a SQLite database at all.
-    NotADatabase(String),
+    NotADatabase(ByteString),
     /// The SQL text could not be parsed, or names something that does not exist.
-    Sql(String),
+    Sql(ByteString),
     /// A constraint (NOT NULL, UNIQUE, CHECK, FOREIGN KEY, …) refused a change.
-    Constraint(String),
+    Constraint(ByteString),
     /// The engine does not support what was asked.
-    Unsupported(String),
+    Unsupported(ByteString),
     /// Another connection of the same pool holds the database (SQLITE_BUSY), and the busy timeout ran out.
-    Busy(String),
+    Busy(ByteString),
     /// RAISE(IGNORE) in a trigger: the row is skipped, and the statement goes on.
     RaiseIgnore,
 }
 
 impl SqliteError {
-    /// The error's message.
-    public fn message(borrow this) -> StringView => match (this) {
-        SqliteError.Alloc(_) => "out of memory",
-        SqliteError.Io(e) => e.message(),
+    /// The error's message, as SQLite gives it: bytes, UTF-8 unless a name, a value or the statement's text in
+    /// it held bytes that are not (`messageText` for a `String`).
+    public fn message(borrow this) -> ByteStringView => match (this) {
+        SqliteError.Alloc(_) => ByteStringView.fromText("out of memory"),
+        SqliteError.Io(e) => ByteStringView.fromText(e.message()),
         SqliteError.Corrupt(m) => m.view(),
         SqliteError.NotADatabase(m) => m.view(),
         SqliteError.Sql(m) => m.view(),
         SqliteError.Constraint(m) => m.view(),
         SqliteError.Unsupported(m) => m.view(),
         SqliteError.Busy(m) => m.view(),
-        SqliteError.RaiseIgnore => "RAISE(IGNORE)",
+        SqliteError.RaiseIgnore => ByteStringView.fromText("RAISE(IGNORE)"),
     };
+
+    /// The message as text, U+FFFD for each byte of it that is not UTF-8.
+    public fn messageText(borrow this) -> Result<String, AllocError> => this.message().toUtf8Lossy();
 }
 
-fn ownedMessage(message: StringView) -> String => match (String.from(message)) {
+/// A message made in the engine, whose names are SQL text in the engine's form (sqltext.cee), as the bytes it
+/// stands for.
+fn ownedMessage(message: StringView) -> ByteString => match (sqlBytes(message)) {
     Ok(s) => s,
-    Err(_) => String.create(),
+    Err(_) => ByteString.create(),
 };
 
 fn corrupt(message: StringView) -> SqliteError => SqliteError.Corrupt(ownedMessage(message));
@@ -49,3 +57,5 @@ fn notADatabase(message: StringView) -> SqliteError => SqliteError.NotADatabase(
 fn sqlError(message: StringView) -> SqliteError => SqliteError.Sql(ownedMessage(message));
 
 fn unsupported(message: StringView) -> SqliteError => SqliteError.Unsupported(ownedMessage(message));
+
+fn constraintError(message: StringView) -> SqliteError => SqliteError.Constraint(ownedMessage(message));

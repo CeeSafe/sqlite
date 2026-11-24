@@ -14,7 +14,7 @@ fn shape(text: StringView) -> String {
         Ok(_) => { return String.from("<not a select>")!; }
         Err(e) => {
             var message = String.from("error: ")!;
-            message.append(e.message())!;
+            message.append(shownText(e.message().bytes()).view())!;
             return message;
         }
     }
@@ -22,7 +22,7 @@ fn shape(text: StringView) -> String {
 
 fn parseError(sql: StringView) -> String => match (Parser.parseStatement(sql)) {
     Ok(_) => String.from("<parsed>")!,
-    Err(e) => String.from(e.message())!,
+    Err(e) => shownText(e.message().bytes()),
 };
 
 fn textOf(value: borrow String?) -> StringView => match (value) {

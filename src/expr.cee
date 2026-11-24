@@ -202,7 +202,8 @@ enum XExpr {
 }
 
 /// A RAISE() in a trigger, which stops its statement; carried as an error.
-fn raiseError(action: RaiseAction, message: String) -> SqliteError => match (action) {
+/// Its message keeps the value's bytes, as SQLite's does.
+fn raiseError(action: RaiseAction, message: ByteString) -> SqliteError => match (action) {
     RaiseAction.Ignore => SqliteError.RaiseIgnore,
     _ => SqliteError.Constraint(message),
 };
@@ -355,15 +356,13 @@ fn evaluate(expr: borrow XExpr, frame: borrow mut Frame, db: borrow mut Session)
                 let v = evaluate(m, frame, db)?;
                 appendValueText(mut bytes, borrow v)?;
             }
-            // An error's message is a String: bytes that are not UTF-8 become U+FFFD there.
-            let text = bytes.toUtf8Lossy()?;
             // RAISE(FAIL) keeps the statement's earlier changes; RAISE(ROLLBACK) ends the transaction.
             match (action) {
                 RaiseAction.Fail => { db.conflictFailure = ConflictAction.Fail; }
                 RaiseAction.Rollback => { db.conflictFailure = ConflictAction.Rollback; }
                 _ => {}
             }
-            return Err(raiseError(action, text));
+            return Err(raiseError(action, bytes));
         }
         XExpr.Now(kind) => { return nowText(kind, frame.nowMillis); }
         XExpr.RowValue(_) => { return Err(sqlError("row value misused")); }
@@ -721,7 +720,7 @@ struct ParamTable {
             let n = text[1..].parseInt<usize>() ?? 0;
             if (n == 0 || n > 32766) {
                 var message = String.from("variable number must be between ?1 and ?32766")?;
-                return Err(SqliteError.Sql(message));
+                return Err(sqlError(message.view()));
             }
             this.count = this.count.max(n);
             return Ok(n - 1);

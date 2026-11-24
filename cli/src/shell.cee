@@ -98,7 +98,7 @@ fn isComplete(sql: StringView) -> Result<bool, AllocError> {
 /// runs it ("Error"). The engine does not tell the two apart, so this goes by the kind of error and, for SQL
 /// errors, by the messages SQLite gives only as a statement runs.
 fn isPrepareError(e: borrow SqliteError) -> bool => match (e) {
-    SqliteError.Sql(m) => !isRuntimeMessage(m.view()),
+    SqliteError.Sql(m) => !isRuntimeMessage(m.toUtf8() ?? ""),
     SqliteError.Unsupported(_) => true,
     _ => false,
 };
@@ -299,7 +299,7 @@ struct Shell {
                 }
                 Err(e) => {
                     let prepare = isPrepareError(borrow e);
-                    this.reportSqlError(prepare, e.message(), place)?;
+                    this.reportSqlError(prepare, e.messageText()?.view(), place)?;
                     if (prepare || this.bail) {
                         this.flush();
                         return Ok(false);
@@ -317,7 +317,7 @@ struct Shell {
             Ok(result) => { return Ok(result); }
             Err(e) => {
                 var message = String.from("Error: ")?;
-                message.append(e.message())?;
+                message.append(e.messageText()?.view())?;
                 this.reportError(message.view())?;
                 return Ok(null);
             }
@@ -430,7 +430,7 @@ struct Shell {
                             this.out.push(',')?;
                         }
                         let column = columns.columns[c].view();
-                        if (isPlainName(column)) {
+                        if (isPlainName(column.toUtf8() ?? "\"")) {
                             this.out.extend(column.bytes())?;
                         } else {
                             this.out.push('"')?;
@@ -757,9 +757,9 @@ fn runShell(arguments: Slice<StringView>, input: Lines, live: bool) -> Result<Sh
             errors.append(file)?;
             errors.append("\": ")?;
             errors.append(match (e) {
-                SqliteError.Io(_) => "unable to open database file",
-                _ => e.message(),
-            })?;
+                SqliteError.Io(_) => String.from("unable to open database file")?,
+                _ => e.messageText()?,
+            }.view())?;
             errors.append("\n")?;
             if (live) {
                 Console.writeError(errors.view());
@@ -812,7 +812,7 @@ fn runShell(arguments: Slice<StringView>, input: Lines, live: bool) -> Result<Sh
         Ok() => {}
         Err(e) => {
             errors.append("Error: ")?;
-            errors.append(e.message())?;
+            errors.append(e.messageText()?.view())?;
             errors.append("\n")?;
         }
     }

@@ -38,7 +38,8 @@ fn sqlState(e: borrow SqliteError) -> StringView {
         SqliteError.Busy(_) => { return "55P03"; }
         SqliteError.RaiseIgnore => { return "XX000"; }
         SqliteError.Constraint(m) => {
-            let message = m.view();
+            let text = m.toUtf8Lossy().ok() ?? String.create();
+            let message = text.view();
             return if (message.startsWith("UNIQUE") || message.startsWith("PRIMARY KEY")) "23505"
                 else if (message.startsWith("NOT NULL")) "23502"
                 else if (message.startsWith("FOREIGN KEY")) "23503"
@@ -46,7 +47,8 @@ fn sqlState(e: borrow SqliteError) -> StringView {
                 else "23000";
         }
         SqliteError.Sql(m) => {
-            let message = m.view();
+            let text = m.toUtf8Lossy().ok() ?? String.create();
+            let message = text.view();
             return if (message.contains("syntax error") || message.startsWith("incomplete input") ||
                 message.startsWith("unrecognized token")) "42601"
                 else if (message.startsWith("no such table") || message.startsWith("no such view")) "42P01"
@@ -73,7 +75,7 @@ fn toPgError(failure: Failure) -> PgError => match (failure) {
     Failure.Alloc(_) => pgError("53200", "out of memory"),
     Failure.Pg(e) => e,
     Failure.Wire(_) => pgError("08P01", "invalid message"),
-    Failure.Sqlite(e) => pgError(sqlState(borrow e), e.message()),
+    Failure.Sqlite(e) => pgError(sqlState(borrow e), (e.messageText().ok() ?? String.create()).view()),
 };
 
 /// A statement made by Parse.
@@ -392,14 +394,15 @@ fn putParameterStatus(out: borrow mut Vector<u8>, name: StringView, value: Strin
 
 fn putRowDescription(
     out: borrow mut Vector<u8>,
-    columns: borrow Vector<String>,
+    columns: borrow Vector<ByteString>,
     types: borrow Vector<u32>,
     formats: borrow Vector<i16>,
 ) -> Result<void, AllocError> {
     let b = begin(mut out, 'T')?;
     putI16(mut out, truncate<i16>(columns.length))?;
     for (c in 0..columns.length) {
-        putText(mut out, columns[c].view())?;
+        // Names are sent as UTF-8, as client_encoding UTF8 promises (U+FFFD for bytes that are not).
+        putText(mut out, columns[c].toUtf8Lossy()?.view())?;
         putI32(mut out, 0)?; // no table
         putI16(mut out, 0)?; // no column of one
         let oid = if (c < types.length) types[c] else OID_TEXT;
@@ -469,7 +472,7 @@ struct Session {
     /// Runs one statement with the values of `values` for its `$n` parameters.
     fn run(borrow mut this, sql: StringView, values: borrow Vector<SqliteValue>) -> Result<Outcome, Failure> {
         let words = topWords(sql)?;
-        let empty = QueryResult { columns: Vector<String>.create(), rows: Vector<Vector<SqliteValue>>.create() };
+        let empty = QueryResult { columns: Vector<ByteString>.create(), rows: Vector<Vector<SqliteValue>>.create() };
         if (translate(borrow words)? is Some(t)) {
             match (borrow t.sql) {
                 Some(statement) => {
@@ -494,7 +497,7 @@ struct Session {
     /// The columns a statement would give, without its effects, for Describe of a prepared statement: a query's
     /// as a subquery with LIMIT 0, and those of a statement with RETURNING or a PRAGMA from running it in a
     /// transaction that is then rolled back. Null when it gives none, or they cannot be known before it runs.
-    fn probeColumns(borrow mut this, sql: StringView) -> Result<Vector<String>?, AllocError> {
+    fn probeColumns(borrow mut this, sql: StringView) -> Result<Vector<ByteString>?, AllocError> {
         let words = topWords(sql)?;
         if (words.length == 0) {
             return Ok(null);

@@ -2458,8 +2458,8 @@ fn jsonBadPathError(path: Slice<u8>, rc: usize) -> SqliteError {
         return sqlError("JSON path too deep");
     }
     var message = String.create();
-    // An error's message is a String: path bytes that are not UTF-8 become U+FFFD there.
-    let text = match (ByteStringView.fromBytes(path).toUtf8Lossy()) {
+    // The path keeps its bytes, in the engine's form for SQL text (sqltext.cee) until the message is made.
+    let text = match (sqlTextOf(path)) {
         Ok(t) => t,
         Err(e) => {
             return SqliteError.Alloc(e);
@@ -2470,7 +2470,7 @@ fn jsonBadPathError(path: Slice<u8>, rc: usize) -> SqliteError {
     if (!built) {
         return sqlError("out of memory");
     }
-    return SqliteError.Sql(message);
+    return sqlError(message.view());
 }
 
 /// A JSON argument parsed into JSONB (jsonParseFuncArg): NULL is `null`. Malformed JSON is an error, or, with
@@ -2959,7 +2959,7 @@ fn jsonEditFunction(args: Slice<JsonValue>, edit: u8, name: StringView, blob: bo
         var message = String.from("json_")?;
         message.append(name)?;
         message.append("() needs an odd number of arguments")?;
-        return Err(SqliteError.Sql(message));
+        return Err(sqlError(message.view()));
     }
     var p = jsonParseArgument(borrow args[0].value, false)? ?? {
         return Ok(jsonNull());
@@ -3057,7 +3057,7 @@ fn jsonTypeFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
             return Err(jsonBadPathError(z, i));
         }
     }
-    return Ok(jsonPlain(SqliteValue.text(jsonbTypeName(jsonAt(p.blob.view(), i) & 0x0F))?));
+    return Ok(jsonPlain(SqliteValue.sqlText(jsonbTypeName(jsonAt(p.blob.view(), i) & 0x0F))?));
 }
 
 /// json_pretty(J [, INDENT]).
@@ -3428,7 +3428,7 @@ fn jsonGroupResult(
 /// The final value of json_group_array() or json_group_object() (jsonArrayCompute, jsonObjectCompute).
 fn jsonGroupFinish(isObject: bool, group: borrow JsonOut, started: bool) -> Result<SqliteValue, SqliteError> {
     if (!started) {
-        return Ok(SqliteValue.text(if (isObject) "{}" else "[]")?);
+        return Ok(SqliteValue.sqlText(if (isObject) "{}" else "[]")?);
     }
     var out = JsonOut { buf: group.buf.clone()?, err: group.err, failure: group.failure };
     out.byte(if (isObject) '}' else ']')?;

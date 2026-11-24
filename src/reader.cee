@@ -58,9 +58,9 @@ fn readSchemaEntries<P: PageSource>(pager: borrow mut P) -> Result<Vector<Schema
         if (columns.length < 5) {
             return Err(corrupt("a row of sqlite_schema has too few columns"));
         }
-        // The schema's text is parsed as UTF-8: bytes that are not UTF-8 become U+FFFD here.
+        // The schema's text keeps its bytes, in the engine's form for SQL text (sqltext.cee).
         let sql: String? = match (columns.pop()!) {
-            SqliteValue.Text(s) => s.toUtf8Lossy()?,
+            SqliteValue.Text(s) => sqlTextOf(s.bytes())?,
             _ => null,
         };
         let rootPage: u32 = match (columns.pop()!) {
@@ -152,8 +152,9 @@ impl DatabaseReader {
     }
 }
 
-/// A name in sqlite_schema, as UTF-8 (U+FFFD for bytes that are not), or empty when it is not text.
+/// A name in sqlite_schema, in the engine's form for SQL text (its bytes, whatever they are), or empty when it is
+/// not text.
 fn textOrEmpty(value: SqliteValue) -> Result<String, AllocError> => match (value) {
-    SqliteValue.Text(s) => s.toUtf8Lossy(),
+    SqliteValue.Text(s) => sqlTextOf(s.bytes()),
     _ => Ok(String.create()),
 };

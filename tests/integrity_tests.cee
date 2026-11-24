@@ -18,14 +18,14 @@ fn ourVerdict(path: StringView, sql: StringView) -> String {
                 }
                 Err(e) => {
                     out.append("error: ")!;
-                    out.append(e.message())!;
+                    out.append(shownText(e.message().bytes()).view())!;
                     out.append("\n")!;
                 }
             }
         }
         Err(e) => {
             out.append("error: ")!;
-            out.append(e.message())!;
+            out.append(shownText(e.message().bytes()).view())!;
             out.append("\n")!;
         }
     }

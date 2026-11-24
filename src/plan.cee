@@ -736,16 +736,17 @@ fn loadStats(db: borrow mut Session) -> Result<PlanStats, SqliteError> {
         if (row.columns.length < 3) {
             continue;
         }
-        // Names and numbers are UTF-8; a row that is not is of no table here.
-        let Some(table) = row.columns[0].textView() else {
+        // Names keep their bytes (in the engine's form for SQL text); the numbers are UTF-8.
+        let SqliteValue.Text(tableBytes) = borrow row.columns[0] else {
             continue;
         };
+        let table = sqlTextOf(tableBytes.bytes())?;
         let Some(stat) = row.columns[2].textView() else {
             continue;
         };
         var index = String.create();
-        if (row.columns[1].textView() is Some(name)) {
-            index = String.from(name)?;
+        if (borrow row.columns[1] is SqliteValue.Text(name)) {
+            index = sqlTextOf(name.bytes())?;
         }
         var numbers = Vector<u64>.create();
         var parts = stat.split(" ");
@@ -756,7 +757,7 @@ fn loadStats(db: borrow mut Session) -> Result<PlanStats, SqliteError> {
             numbers.push(n)?;
         }
         if (numbers.length != 0) {
-            stats.rows.push(IndexStat { table: String.from(table)?, index: index, numbers: numbers })?;
+            stats.rows.push(IndexStat { table: table, index: index, numbers: numbers })?;
         }
     }
     return Ok(stats);

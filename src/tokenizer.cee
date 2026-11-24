@@ -69,7 +69,7 @@ struct Tokenizer<region r> {
         var text = String.from("unrecognized token: \"").ok() ?? String.create();
         let _ = text.append(this.text[start..stop]);
         let _ = text.append("\"");
-        return SqliteError.Sql(text);
+        return sqlError(text.view());
     }
 
     /// Where a token that runs into letters ends: the letters, digits and `$` after `start`.

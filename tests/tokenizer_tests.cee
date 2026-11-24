@@ -72,7 +72,7 @@ fn refusesMalformedTokens() -> Result<void, TestFailure> {
     Check.isTrue(refused("a ! b"), "a lone !")?;
     Check.isTrue(refused("a # b"), "a character SQL does not use")?;
     match (Tokenizer.tokenize("SELECT #")) {
-        Err(e) => { Check.equalText("unrecognized token: \"#\"", e.message())?; }
+        Err(e) => { Check.equalText("unrecognized token: \"#\"", e.messageText()!.view())?; }
         Ok(_) => { return Check.fail("expected an error"); }
     }
     return Ok();

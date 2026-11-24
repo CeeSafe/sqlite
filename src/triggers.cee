@@ -275,9 +275,9 @@ fn executeCreateTrigger(
                 return Ok();
             }
             var message = String.from("trigger ")?;
-            message.append(name)?;
+            message.append(writtenObjectName(sql, name).view())?;
             message.append(" already exists")?;
-            return Err(SqliteError.Sql(message));
+            return Err(sqlError(message.view()));
         }
     }
     let table = stmt.table.view();
@@ -303,7 +303,7 @@ fn executeCreateTrigger(
         message.append(if (stmt.timing == TriggerTiming.Before) "BEFORE" else "AFTER")?;
         message.append(" trigger on view: ")?;
         message.append(table)?;
-        return Err(SqliteError.Sql(message));
+        return Err(sqlError(message.view()));
     }
     if (!isView && stmt.timing == TriggerTiming.InsteadOf) {
         return Err(namedError("cannot create INSTEAD OF trigger on table: ", table));

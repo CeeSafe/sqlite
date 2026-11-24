@@ -101,9 +101,9 @@ fn ensureStatTable(db: borrow mut Session) -> Result<void, SqliteError> {
 fn analyzeTable(table: borrow TableSchema, only: StringView?, db: borrow mut Session) -> Result<void, SqliteError> {
     let quoted = quotedName(table.name.view())?;
     var params = Vector<SqliteValue>.create();
-    params.push(SqliteValue.text(table.name.view())?)?;
+    params.push(SqliteValue.sqlText(table.name.view())?)?;
     if (only is Some(index)) {
-        params.push(SqliteValue.text(index)?)?;
+        params.push(SqliteValue.sqlText(index)?)?;
         let _ = db.runInternal("DELETE FROM sqlite_stat1 WHERE tbl = ?1 AND idx = ?2", params.view())?;
     } else {
         let _ = db.runInternal("DELETE FROM sqlite_stat1 WHERE tbl = ?1", params.view())?;
@@ -120,10 +120,10 @@ fn analyzeTable(table: borrow TableSchema, only: StringView?, db: borrow mut Ses
         let rows = tableRows;
         if (rows > 0) {
             var insert = Vector<SqliteValue>.create();
-            insert.push(SqliteValue.text(table.name.view())?)?;
+            insert.push(SqliteValue.sqlText(table.name.view())?)?;
             var stat = String.create();
             stat.appendNumber(rows)?;
-            insert.push(SqliteValue.text(stat.view())?)?;
+            insert.push(SqliteValue.sqlText(stat.view())?)?;
             let _ = db.runInternal("INSERT INTO sqlite_stat1 VALUES (?1, NULL, ?2)", insert.view())?;
         }
         return Ok();
@@ -163,9 +163,9 @@ fn analyzeTable(table: borrow TableSchema, only: StringView?, db: borrow mut Ses
             stat.appendNumber(if (distinct == 0) 0 else (rows + distinct - 1) / distinct)?;
         }
         var insert = Vector<SqliteValue>.create();
-        insert.push(SqliteValue.text(table.name.view())?)?;
-        insert.push(SqliteValue.text(index.name.view())?)?;
-        insert.push(SqliteValue.text(stat.view())?)?;
+        insert.push(SqliteValue.sqlText(table.name.view())?)?;
+        insert.push(SqliteValue.sqlText(index.name.view())?)?;
+        insert.push(SqliteValue.sqlText(stat.view())?)?;
         let _ = db.runInternal("INSERT INTO sqlite_stat1 VALUES (?1, ?2, ?3)", insert.view())?;
     }
     return Ok();
@@ -199,7 +199,7 @@ fn executeAnalyze(target: borrow String?, db: borrow mut Session) -> Result<void
     if (tables.length == 0 && only.isNull()) {
         for (i in 0..db.catalog.tables.length) {
             let name = db.catalog.tables[i].name.view();
-            if (name.length >= 7 && name[0..7].equalsIgnoreAsciiCase("sqlite_")) {
+            if (startsWithIgnoreAsciiCase(name, "sqlite_")) {
                 continue;
             }
             tables.push(String.from(name)?)?;

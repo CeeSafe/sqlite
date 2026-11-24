@@ -57,7 +57,7 @@ fn literalValue(literal: borrow Literal) -> Result<SqliteValue, SqliteError> {
         LiteralKind.Null => { return Ok(SqliteValue.Null); }
         LiteralKind.True => { return Ok(SqliteValue.Integer(1)); }
         LiteralKind.False => { return Ok(SqliteValue.Integer(0)); }
-        LiteralKind.String => { return Ok(SqliteValue.text(text)?); }
+        LiteralKind.String => { return Ok(SqliteValue.sqlText(text)?); }
         LiteralKind.Float => { return Ok(SqliteValue.Real(RealParse.of(text.bytes()).value)); }
         LiteralKind.Integer => {
             if (text.length > 2 && (text[1] == 'x' || text[1] == 'X')) {
@@ -90,7 +90,7 @@ fn namedError(prefix: StringView, name: StringView) -> SqliteError {
     var text = String.create();
     let _ = text.append(prefix);
     let _ = text.append(name);
-    return SqliteError.Sql(text);
+    return sqlError(text.view());
 }
 
 fn columnNameError(column: borrow ColumnRef) -> SqliteError {
@@ -101,7 +101,7 @@ fn columnNameError(column: borrow ColumnRef) -> SqliteError {
         let _ = text.append(".");
     }
     let _ = text.append(column.name.view());
-    return SqliteError.Sql(text);
+    return sqlError(text.view());
 }
 
 fn functionNameError(prefix: StringView, name: StringView, suffix: StringView) -> SqliteError {
@@ -109,7 +109,7 @@ fn functionNameError(prefix: StringView, name: StringView, suffix: StringView) -
     let _ = text.append(prefix);
     let _ = text.append(name);
     let _ = text.append(suffix);
-    return SqliteError.Sql(text);
+    return sqlError(text.view());
 }
 
 /// A name found in a scope.
@@ -255,7 +255,7 @@ impl Compiler {
                     text.append(".")?;
                 }
                 text.append(name)?;
-                return Err(SqliteError.Sql(text));
+                return Err(sqlError(text.view()));
             }
             if (found is Some(compiled)) {
                 var result = compiled;
@@ -348,7 +348,7 @@ impl Compiler {
         }
         // SQLite's double-quoted string fallback.
         if (unqualified && column.doubleQuoted) {
-            return Ok(plain(XExpr.Value(SqliteValue.text(column.name.view())?)));
+            return Ok(plain(XExpr.Value(SqliteValue.sqlText(column.name.view())?)));
         }
         return Err(columnNameError(column));
     }
@@ -691,7 +691,7 @@ impl Compiler {
                         message.appendNumber(terms)?;
                         message.append(if (terms == 1) " term - expected " else " terms - expected ")?;
                         message.appendNumber(width)?;
-                        return Err(SqliteError.Sql(message));
+                        return Err(sqlError(message.view()));
                     }
                     items.push(this.compile(borrow list[i], db)?)?;
                 }
@@ -1045,5 +1045,5 @@ fn inColumnCount(found: usize, expected: usize) -> SqliteError {
     let _ = message.appendNumber(found);
     let _ = message.append(" columns - expected ");
     let _ = message.appendNumber(expected);
-    return SqliteError.Sql(message);
+    return sqlError(message.view());
 }

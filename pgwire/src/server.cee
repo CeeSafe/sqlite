@@ -70,14 +70,14 @@ public struct PgServer {
                 var message = owned("cannot open database \"");
                 let _ = message.append(base);
                 let _ = message.append("\": ");
-                let _ = message.append(e.message());
+                let _ = message.append((e.messageText().ok() ?? String.create()).view());
                 return Err(PgError { state: owned(sqlState(borrow e)), message: message });
             }
         };
         return match (pool.get().checkout()) {
             Ok(c) => Ok(c),
             Err(SqliteError.Busy(_)) => Err(pgError("53300", "too many connections for this database")),
-            Err(e) => Err(pgError(sqlState(borrow e), e.message())),
+            Err(e) => Err(pgError(sqlState(borrow e), (e.messageText().ok() ?? String.create()).view())),
         };
     }
 

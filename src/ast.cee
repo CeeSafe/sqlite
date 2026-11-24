@@ -478,7 +478,8 @@ enum AlterAction {
     AddColumn(ColumnDef),
     RenameTo(String),
     /// From, to.
-    RenameColumn(String, String),
+    /// The old name, the new, and whether the statement quoted the new name (renameEditSql's bQuote).
+    RenameColumn(String, String, bool),
     DropColumn(String),
 }
 

@@ -196,7 +196,7 @@ struct Parser {
             let _ = text.append(this.tokens[this.at].text.view());
             let _ = text.append("\": syntax error");
         }
-        return SqliteError.Sql(text);
+        return sqlError(text.view());
     }
 
     private fn expectWord(borrow mut this, keyword: StringView) -> Result<void, SqliteError> {
@@ -511,7 +511,7 @@ struct Parser {
             }
             message.append(op)?;
             message.append(" not before")?;
-            return Err(SqliteError.Sql(message));
+            return Err(sqlError(message.view()));
         }
         return Ok(stmt);
     }
@@ -925,7 +925,7 @@ struct Parser {
             );
         }
         // A pragma function may be written without parentheses.
-        if (name.schema.isNull() && name.name.length > 7 && name.name.view()[0..7].equalsIgnoreAsciiCase("pragma_")) {
+        if (name.schema.isNull() && name.name.length > 7 && startsWithIgnoreAsciiCase(name.name.view(), "pragma_")) {
             return Ok(
                 FromItem.TableFunction(
                     TableFunctionSource { name: name.name, args: Vector<Expr>.create(), alias: this.alias()? },
@@ -1433,7 +1433,8 @@ struct Parser {
             let _ = this.acceptWord("COLUMN");
             let from = this.name()?;
             this.expectWord("TO")?;
-            return Ok(AlterTableStmt { table: table, action: AlterAction.RenameColumn(from, this.name()?) });
+            let quoted = this.kind() == TokenKind.QuotedId || this.kind() == TokenKind.StringLit;
+            return Ok(AlterTableStmt { table: table, action: AlterAction.RenameColumn(from, this.name()?, quoted) });
         }
         if (this.acceptWord("DROP")) {
             let _ = this.acceptWord("COLUMN");

@@ -84,7 +84,7 @@ fn dataVersionOf(connection: borrow mut Connection) -> i64 {
 }
 
 fn isLocked(result: borrow Result<SqliteValue?, SqliteError>) -> bool => match (result) {
-    Err(SqliteError.Busy(m)) => m.view() == "database is locked",
+    Err(SqliteError.Busy(m)) => m.view().equals(ByteStringView.fromText("database is locked")),
     _ => false,
 };
 

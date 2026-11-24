@@ -165,7 +165,7 @@ fn termError(n: usize, clause: StringView, message: StringView, count: usize) ->
     if (count != 0) {
         let _ = s.appendNumber(count);
     }
-    return SqliteError.Sql(s);
+    return sqlError(s.view());
 }
 
 /// A literal positive integer term: an ordinal.
@@ -350,7 +350,7 @@ fn planScopeColumns(plan: borrow SelectPlan, names: borrow Vector<String>) -> Re
         message.append(" values for ")?;
         message.appendNumber(names.length)?;
         message.append(" columns")?;
-        return Err(SqliteError.Sql(message));
+        return Err(sqlError(message.view()));
     }
     var columns = Vector<ScopeColumn>.withCapacity(plan.columnNames.length)?;
     for (i in 0..plan.columnNames.length) {
@@ -708,7 +708,7 @@ fn compileCores(
                 CompoundOp.Except => "EXCEPT",
             })?;
             message.append(" do not have the same number of result columns")?;
-            return Err(SqliteError.Sql(message));
+            return Err(sqlError(message.view()));
         }
         if (c > from) {
             plan.ops.push(select.compoundOps[c - 1])?;
@@ -949,7 +949,7 @@ fn compileFromItem(
                 sources.push(compileJsonEach(compiler, f, kind, slot, scope, db)?)?;
                 return Ok();
             }
-            let isPragma = name.length > 7 && name[0..7].equalsIgnoreAsciiCase("pragma_");
+            let isPragma = name.length > 7 && startsWithIgnoreAsciiCase(name, "pragma_");
             let columnNames = (if (isPragma) pragmaColumns(name[7..]) else null) ?? {
                 return Err(namedError("no such table: ", name));
             };

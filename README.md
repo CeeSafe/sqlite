@@ -14,7 +14,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Index b-tree reader | `Btree/IndexBTreeReader` | `index.cee` | done, except the integer batch-count fast paths, which belong with the executor |
 | Value ordering, collations | `Exec/ValueComparer` | `compare.cee` | done |
 | Schema and tables by name | `SqliteDatabaseReader` | `reader.cee` | done |
-| Tokenizer, parser, AST | `Engine/Sql` | `tokenizer.cee`, `parser.cee`, `ast.cee` | done |
+| Tokenizer, parser, AST | `Engine/Sql` | `tokenizer.cee`, `parser.cee`, `ast.cee` | done: SQL text of any bytes (`sqltext.cee`), as SQLite takes it |
 | SQL writer | `Sql/SqlWriter` | `sqlwriter.cee` | expressions only, by design (see below) |
 | Schema catalog, affinity | `Engine/Schema`, `Exec/Affinity` | `schema.cee` | done |
 | Database writer, b-tree builder | `Storage/DatabaseWriter`, `BTreeBuilder`, `PageStore` | `writer.cee`, `builder.cee` | done: files pass `PRAGMA integrity_check` in `sqlite3` |
@@ -79,8 +79,30 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   text in a UTF-16 database is translated as sqlite3VdbeMemTranslate does (a lone surrogate kept as three bytes).
   The tests compare answers byte for byte (`textKeepsItsBytes`, `textFunctionsReadBytesAsSqliteDoes`,
   `textFormatsKeepBytes`, `jsonKeepsSqlitesBytes`, `textFromRecordsIsKept`, `utf16TextIsTranslatedAsSqliteDoes`).
-  What stays UTF-8 here: SQL text, error messages (a RAISE message or a bad JSON path that is not UTF-8 gets
-  U+FFFD), names and SQL read from `sqlite_schema`, file names (ATTACH, VACUUM INTO) and pragma arguments.
+- **SQL text of any bytes.** The C# took SQL as a .NET string, so a statement, the names and definitions in
+  `sqlite_schema` and every error message were UTF-16, and bytes that are not UTF-8 became U+FFFD. SQLite takes a
+  statement as bytes: a string literal keeps every byte (`SELECT hex('<ff>')` is `FF`), a name may hold any byte
+  above 0x7F, and names, definitions, result column names and messages carry them on. So does this: the API takes
+  `ByteStringView` (`Connection.executeBytes`, `queryBytes`, `scalarBytes`, `executeScriptBytes`,
+  `Params.bindBytes`, `Session.queryBytes`; the `StringView` forms are conveniences over them),
+  `QueryResult.columns` are `ByteString`s, and `SqliteError.message()` is a `ByteStringView` (`messageText()` for
+  a `String`, U+FFFD for bytes that are not UTF-8). Inside, SQL text stays a `String`, in which each byte of a
+  sequence that is not UTF-8 stands as one code point of U+10FF80..U+10FFFF (a real one of those is escaped the
+  same way, so the mapping is one to one; `src/sqltext.cee`). Names therefore compare as their bytes, folding
+  ASCII case only; a name or definition leaves as its bytes wherever it becomes a value (a literal, sqlite_schema's
+  columns, a pragma's rows, sqlite_stat1) or a message, and a RAISE message keeps its value's bytes
+  (`stringLiteralsKeepTheirBytes`, `namesKeepTheirBytes`, `schemasSqliteWroteWithBytesRoundTrip`,
+  `connectionsTakeSqlOfAnyBytes`). A file name for ATTACH or VACUUM INTO that is not UTF-8 is refused with
+  SQLite's "unable to open database: …", as macOS's file system makes sqlite3 refuse it
+  (`fileNamesThatAreNotUtf8AreRefused`); on Linux SQLite would make such a file.
+- **Names in messages and definitions.** A name the shell's tests met while checking the above: a CREATE TABLE,
+  VIEW or TRIGGER of a name in use says `table "t" already exists` with the name as written (SQLite's `%T`); a CHECK
+  constraint's failure names it by its CONSTRAINT name, else by its text dequoted as sqlite3Dequote does
+  (`CHECK ("b" <> 'x')` is `b`), where the C# always gave the whole text; RENAME COLUMN writes the new name in
+  double quotes everywhere when the statement quoted it, and wherever the old one was quoted, as renameEditSql does,
+  where the C# wrote it bare whenever it could (`renamedColumnsAreQuotedAsSqliteQuotesThem`). A name whose first
+  seven bytes end inside a character (`"abcdefé"`) no longer stops the engine with a panic when it is checked for
+  the `sqlite_` prefix.
 - **Names.** The C# matches table and index names with .NET's ordinal-ignore-case, which folds non-ASCII letters;
   SQLite folds ASCII only, and so does this.
 - **Seeks in DESC and NOCASE indexes.** The C# equality seek compared with BINARY and assumed ascending order, so
@@ -568,6 +590,10 @@ Choices where the C# concept does not fit CeeSafe:
   outlive its scope or be forgotten open.
 - **No async methods.** The engine is in-process and synchronous; the C#'s async methods ran synchronously too.
   Tasks can use a pool from a worker thread.
+- **SQL text and messages are bytes**, as SQLite's are: `executeBytes`, `queryBytes`, `scalarBytes` and
+  `executeScriptBytes` take a `ByteStringView`, and `execute`, `query`, `scalar` and `executeScript` a `StringView`;
+  `QueryResult.columns` are `ByteString`s, and `SqliteError.message()` is a `ByteStringView` (`messageText()` gives
+  a `String`).
 - **Text** is `SqliteValue.Text(ByteString)`: SQLite's TEXT may hold any bytes, and they are kept as they are.
   `SqliteValue.text(view)` and `SqliteValue.textOfBytes(bytes)` make one; `value.textView()` gives a TEXT value
   as a `StringView` when it is UTF-8 (null otherwise), and `toText()` any value's text as SQLite gives it.
@@ -629,6 +655,9 @@ sessions typed into both at a pseudo-terminal. Differences:
   modes, …);
 - `.tables` with more names than fit on one line sets them in columns of sqlite3's widths but does not fold the
   line at 60 characters as sqlite3 3.54 does.
+- input is read as UTF-8 text (`Console.readLine`), and error messages are written as UTF-8 (U+FFFD for a byte
+  of a name or RAISE message that is not), where sqlite3 reads and writes bytes; results are written as their
+  bytes, as sqlite3 writes them.
 
 ### The PostgreSQL wire server (`pgwire/`) and the daemon (`daemon/`)
 

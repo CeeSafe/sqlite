@@ -614,10 +614,19 @@ fn checkBtrees(
 
 // ── SQLite's schema hash table ───────────────────────────────────────────────────────────────────────────────
 
-/// strHash in hash.c.
+/// strHash in hash.c, over the bytes the name (SQL text in the engine's form, sqltext.cee) stands for.
 fn sqliteStrHash(name: StringView) -> u32 {
     var h: u32 = 0;
-    for (b in name.bytes()) {
+    let bytes = name.bytes();
+    var at: usize = 0;
+    while (at < bytes.length) {
+        var b = bytes[at];
+        if (isEscapeAt(bytes, at)) {
+            b = escapedByteAt(bytes, at);
+            at += 4;
+        } else {
+            at += 1;
+        }
         h = h.wrappingAdd((b & 0xdf) as u32);
         h = h.wrappingMul(0x9e3779b1);
     }
@@ -867,7 +876,7 @@ impl Verdict {
     /// integrityCheckResultRow: the message, then a halt when the budget is spent.
     fn emit(borrow mut this, text: StringView) -> Result<bool, AllocError> {
         var row = Vector<SqliteValue>.create();
-        row.push(SqliteValue.text(text)?)?;
+        row.push(SqliteValue.sqlText(text)?)?;
         this.rows.push(row)?;
         if (this.left > 0) {
             this.left -= 1;
@@ -1541,7 +1550,7 @@ fn integrityCheck(
             Err(SqliteError.Corrupt(_)) => {
                 // SQLite stops at a record it cannot read, with this as the last row.
                 var row = Vector<SqliteValue>.create();
-                row.push(SqliteValue.text("database disk image is malformed")?)?;
+                row.push(SqliteValue.sqlText("database disk image is malformed")?)?;
                 verdict.rows.push(row)?;
                 verdict.halted = true;
             }
@@ -1553,5 +1562,5 @@ fn integrityCheck(
     }
     var columns = Vector<String>.create();
     columns.push(String.from(name)?)?;
-    return Ok(QueryResult { columns: columns, rows: verdict.rows });
+    return Ok(QueryResult { columns: columnNamesOf(columns)?, rows: verdict.rows });
 }

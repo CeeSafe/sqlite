@@ -38,7 +38,7 @@ fn ours(session: borrow mut Session, sql: StringView) -> String {
         Ok(result) => { return listText(borrow result); }
         Err(e) => {
             var text = String.from("error: ")!;
-            text.append(e.message())!;
+            text.append(shownText(e.message().bytes()).view())!;
             text.append("\n")!;
             return text;
         }
@@ -331,10 +331,10 @@ fn ourNames(session: borrow mut Session, sql: StringView) -> String {
                 if (i != 0) {
                     text.append("|")!;
                 }
-                text.append(result.columns[i].view())!;
+                text.append(shownText(result.columns[i].bytes()).view())!;
             }
         }
-        Err(e) => { text.append(e.message())!; }
+        Err(e) => { text.append(shownText(e.message().bytes()).view())!; }
     }
     return text;
 }

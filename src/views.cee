@@ -132,7 +132,7 @@ fn insteadOfTriggers(
         var message = String.from("cannot modify ")?;
         message.append(name)?;
         message.append(" because it is a view")?;
-        return Err(SqliteError.Sql(message));
+        return Err(sqlError(message.view()));
     }
     return Ok(out);
 }
@@ -197,7 +197,7 @@ fn insertIntoView(
                 message.append(name)?;
                 message.append(" has no column named ")?;
                 message.append(stmt.columns[k].view())?;
-                return Err(SqliteError.Sql(message));
+                return Err(sqlError(message.view()));
             };
             targets.push(at)?;
         }
@@ -230,7 +230,7 @@ fn insertIntoView(
                 message.appendNumber(targets.length)?;
                 message.append(" columns")?;
             }
-            return Err(SqliteError.Sql(message));
+            return Err(sqlError(message.view()));
         }
         var values = Vector<SqliteValue>.withCapacity(table.columns.length)?;
         for (c in 0..table.columns.length) {
@@ -260,7 +260,7 @@ fn insertIntoView(
     db.changes = 0;
     return Ok(
         QueryResult {
-            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow table)?,
+            columns: columnNamesOf(returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow table)?)?,
             rows: output,
         },
     );
@@ -312,7 +312,7 @@ fn deleteFromView(
     db.changes = 0;
     return Ok(
         QueryResult {
-            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow table)?,
+            columns: columnNamesOf(returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow table)?)?,
             rows: output,
         },
     );
@@ -383,7 +383,7 @@ fn updateView(
     db.changes = 0;
     return Ok(
         QueryResult {
-            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow table)?,
+            columns: columnNamesOf(returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow table)?)?,
             rows: output,
         },
     );

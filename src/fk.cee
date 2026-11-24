@@ -26,7 +26,7 @@ fn parentColumns(key: borrow ForeignKeySchema, parent: borrow TableSchema) -> Re
         var message = String.from("foreign key mismatch - \"")?;
         message.append(key.refTable.view())?;
         message.append("\" referencing a table")?;
-        return Err(SqliteError.Sql(message));
+        return Err(sqlError(message.view()));
     }
     return Ok(out);
 }

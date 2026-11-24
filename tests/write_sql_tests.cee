@@ -285,6 +285,22 @@ fn alterTableRewritesDefinitions() -> Result<void, TestFailure> {
 }
 
 @test
+fn renamedColumnsAreQuotedAsSqliteQuotesThem() -> Result<void, TestFailure> {
+    // renameEditSql: the new name in double quotes everywhere when RENAME COLUMN quoted it, else in double quotes
+    // only where the old name was quoted. The C# port wrote it bare wherever it could stand bare.
+    return sameScript("alter-quotes", """
+        PRAGMA legacy_alter_table = ON
+        CREATE TABLE t(a INT, "b" TEXT, c, CHECK (a > 0 AND "b" <> ''))
+        CREATE INDEX t_ab ON t(a, b)
+        CREATE TABLE child(x REFERENCES t(a), y REFERENCES t("b"))
+        ALTER TABLE t RENAME COLUMN a TO "z"
+        ALTER TABLE t RENAME COLUMN b TO y
+        ALTER TABLE t RENAME COLUMN c TO [w]
+        SELECT name, sql FROM sqlite_schema ORDER BY name
+        """);
+}
+
+@test
 fn upsertsFollowSqlite() -> Result<void, TestFailure> {
     return sameScript("upsert", """
         CREATE TABLE kv(k TEXT PRIMARY KEY, v INT, hits INT DEFAULT 0)
@@ -815,7 +831,7 @@ fn vacuumIntoWritesACopy() -> Result<void, TestFailure> {
     Check.equalText("334|3|0\n", askSqlite(copy, "SELECT count(*), (SELECT user_version FROM pragma_user_version), (SELECT freelist_count FROM pragma_freelist_count) FROM t")?.view())?;
     Check.equalText(askSqlite("out/script-ours-vacuum-into.db", "SELECT sum(length(b)), sum(a) FROM t")?.view(), askSqlite(copy, "SELECT sum(length(b)), sum(a) FROM t")?.view())?;
     match (session.query("VACUUM INTO 'out/vacuum-into-copy.db'", none.view())) {
-        Err(e) => { Check.equalText("output file already exists", e.message())?; }
+        Err(e) => { Check.equalText("output file already exists", e.messageText()!.view())?; }
         Ok(_) => { return Check.fail("expected the existing file to be refused"); }
     }
     return Ok();

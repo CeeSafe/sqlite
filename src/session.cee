@@ -4,9 +4,10 @@
 // at commit. Here a statement's changes go to the pages they touch, held by the pager until the transaction
 // commits, and reads see them; a commit journals and writes those pages only.
 
-/// The result of a statement: its column names and its rows.
+/// The result of a statement: its column names and its rows. A name is bytes, as SQLite's are: it is the
+/// statement's own text, which may hold any bytes.
 public struct QueryResult {
-    public columns: Vector<String>;
+    public columns: Vector<ByteString>;
     public rows: Vector<Vector<SqliteValue>>;
 }
 
@@ -200,7 +201,7 @@ public struct Session {
             return Ok(null);
         }
         var params = Vector<SqliteValue>.create();
-        params.push(SqliteValue.text(name)?)?;
+        params.push(SqliteValue.sqlText(name)?)?;
         let result = this.runInternal("SELECT max(seq) FROM sqlite_sequence WHERE name = ?", params.view())?;
         if (result.rows.length != 0 && result.rows[0][0] is SqliteValue.Integer(n)) {
             return Ok(n);
@@ -212,7 +213,7 @@ public struct Session {
     fn updateSequence(borrow mut this, name: StringView, rowId: i64) -> Result<void, SqliteError> {
         let current = this.sequenceValue(name)?;
         var params = Vector<SqliteValue>.create();
-        params.push(SqliteValue.text(name)?)?;
+        params.push(SqliteValue.sqlText(name)?)?;
         params.push(SqliteValue.Integer(rowId))?;
         if (current is Some(seq)) {
             if (seq < rowId) {
@@ -227,13 +228,27 @@ public struct Session {
     /// Forgets the AUTOINCREMENT counter of a dropped table.
     fn removeSequence(borrow mut this, name: StringView) -> Result<void, SqliteError> {
         var params = Vector<SqliteValue>.create();
-        params.push(SqliteValue.text(name)?)?;
+        params.push(SqliteValue.sqlText(name)?)?;
         let _ = this.runInternal("DELETE FROM sqlite_sequence WHERE name = ?", params.view())?;
         return Ok();
     }
 
     /// Runs one SQL statement with positional parameters (?, ?N, :name in order of first use).
-    public fn query(borrow mut this, sql: StringView, params: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> {
+    public fn query(borrow mut this, sql: StringView, params: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> =>
+        this.queryBytes(ByteStringView.fromText(sql), params);
+
+    /// `query`, for SQL text of any bytes, as SQLite takes it.
+    public fn queryBytes(
+        borrow mut this,
+        sql: ByteStringView,
+        params: Slice<SqliteValue>,
+    ) -> Result<QueryResult, SqliteError> {
+        let text = sqlTextOf(sql.bytes())?;
+        return this.queryText(text.view(), params);
+    }
+
+    /// `query`, for SQL text in the engine's form (sqltext.cee).
+    fn queryText(borrow mut this, sql: StringView, params: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> {
         let result = this.queryLocked(sql, params);
         if (!this.inTransaction) {
             // The transaction ended (or was the statement's own): what it left uncommitted is forgotten, and every
@@ -498,7 +513,7 @@ public struct Session {
                 let plan = compileSelect(mut compiler, select, this)?;
                 var frame = newFrame(mut compiler, params, this)?;
                 let rows = runSelect(borrow plan, mut frame, this)?;
-                return Ok(QueryResult { columns: cloneStrings(borrow plan.columnNames)?, rows: rows });
+                return Ok(QueryResult { columns: columnNamesOf(cloneStrings(borrow plan.columnNames)?)?, rows: rows });
             }
             Stmt.Begin(_) => {
                 if (this.inTransaction) {
@@ -612,7 +627,7 @@ impl Session {
 }
 
 fn emptyResult() -> QueryResult =>
-    QueryResult { columns: Vector<String>.create(), rows: Vector<Vector<SqliteValue>>.create() };
+    QueryResult { columns: Vector<ByteString>.create(), rows: Vector<Vector<SqliteValue>>.create() };
 
 /// The frame a compiled statement runs in: its slots, parameters and CTEs, and its time.
 fn newFrame(
@@ -921,7 +936,7 @@ impl Session {
             var message = String.from("database ")?;
             message.append(name)?;
             message.append(" is already in use")?;
-            return Err(SqliteError.Sql(message));
+            return Err(sqlError(message.view()));
         }
         var attached: usize = 0;
         for (i in 1..this.databaseCount()) {
@@ -936,8 +951,9 @@ impl Session {
         let compiled = compiler.compile(target, this)?;
         var frame = newFrame(mut compiler, params, this)?;
         let value = evaluate(borrow compiled, mut frame, this)?;
-        // A file name is UTF-8 here.
-        let file = if (value.isNull()) String.create() else valueText(borrow value)?.toUtf8Lossy()?;
+        // A file name is UTF-8 here; the file system refuses one that is not (on macOS, as here, SQLite's open
+        // fails the same way).
+        let file = if (value.isNull()) String.create() else fileNameOf(valueText(borrow value)?)?;
         // An empty name (and :memory:) is a private database: a temporary file here, shown without a name.
         var path = file.clone()?;
         var shown = file.clone()?;
@@ -957,7 +973,7 @@ impl Session {
         if (name.equalsIgnoreAsciiCase("main") || name.equalsIgnoreAsciiCase("temp")) {
             var message = String.from("cannot detach database ")?;
             message.append(name)?;
-            return Err(SqliteError.Sql(message));
+            return Err(sqlError(message.view()));
         }
         let i = this.databaseIndex(name) ?? {
             return Err(namedError("no such database: ", name));
@@ -969,7 +985,7 @@ impl Session {
             var message = String.from("database ")?;
             message.append(name)?;
             message.append(" is locked")?;
-            return Err(SqliteError.Sql(message));
+            return Err(sqlError(message.view()));
         }
         let Some(state) = this.stash.remove(i) else {
             return Ok();
@@ -1058,4 +1074,15 @@ fn statementWrites(stmt: borrow Stmt) -> bool {
         }
         _ => { return false; }
     }
+}
+
+/// A file name given in SQL (ATTACH, VACUUM INTO): the file system's names are UTF-8 here, so one that is not
+/// cannot be opened, and is refused with SQLite's message.
+fn fileNameOf(name: ByteString) -> Result<String, SqliteError> {
+    if (name.toUtf8() is Some(text)) {
+        return Ok(String.from(text)?);
+    }
+    var message = ByteString.fromText("unable to open database: ")?;
+    message.appendBytes(name.bytes())?;
+    return Err(SqliteError.Sql(message));
 }

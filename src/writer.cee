@@ -59,11 +59,11 @@ struct WriterObject {
 /// The SQLITE_VERSION_NUMBER recorded in files this writes: the release whose format they follow.
 const WRITER_SQLITE_VERSION: u32 = 3051000;
 
-fn constraintError(message: StringView, name: StringView) -> SqliteError {
+fn namedConstraintError(message: StringView, name: StringView) -> SqliteError {
     var text = String.create();
     let _ = text.append(message);
     let _ = text.append(name);
-    return SqliteError.Constraint(text);
+    return constraintError(text.view());
 }
 
 struct DatabaseWriter {
@@ -93,7 +93,7 @@ struct DatabaseWriter {
         };
         let schema = buildTableSchema(stmt, stmt.name.name.view(), 0, sql)?;
         if (this.findTable(schema.name.view()).isSome()) {
-            return Err(constraintError("there is already a table named ", schema.name.view()));
+            return Err(namedConstraintError("there is already a table named ", schema.name.view()));
         }
         this.tables.push(WriterTable { schema: schema, sql: String.from(sql)?, rows: Vector<TableRow>.create() })?;
         return Ok(this.tables.length - 1);
@@ -249,7 +249,7 @@ struct DatabaseWriter {
                     }
                 }
                 if (!hasNull && order.comparePrefix(entries[i - 1].view(), key) == 0) {
-                    return Err(constraintError("UNIQUE constraint failed: ", name));
+                    return Err(namedConstraintError("UNIQUE constraint failed: ", name));
                 }
             }
             records.push(Record.encode(entries[i].view())?)?;
@@ -350,7 +350,9 @@ struct DatabaseWriter {
             for (s in 0..storage.length) {
                 let value = DatabaseWriter.columnValue(schema, borrow table.rows[r], storage[s])?;
                 if (s < keyPositions.length && value.isNull()) {
-                    return Err(constraintError("NOT NULL constraint failed: ", schema.columns[storage[s]].name.view()));
+                    return Err(
+                        namedConstraintError("NOT NULL constraint failed: ", schema.columns[storage[s]].name.view()),
+                    );
                 }
                 entry.push(value)?;
             }
@@ -389,12 +391,12 @@ struct DatabaseWriter {
         sql: StringView?,
     ) -> Result<void, SqliteError> {
         var values = Vector<SqliteValue>.create();
-        values.push(SqliteValue.text(kind)?)?;
-        values.push(SqliteValue.text(name)?)?;
-        values.push(SqliteValue.text(table)?)?;
+        values.push(SqliteValue.sqlText(kind)?)?;
+        values.push(SqliteValue.sqlText(name)?)?;
+        values.push(SqliteValue.sqlText(table)?)?;
         values.push(SqliteValue.Integer(rootPage as i64))?;
         if (sql is Some(text)) {
-            values.push(SqliteValue.text(text)?)?;
+            values.push(SqliteValue.sqlText(text)?)?;
         } else {
             values.push(SqliteValue.Null)?;
         }

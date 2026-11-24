@@ -123,7 +123,7 @@ fn compileJsonEach(
         message.append(if (kind.jsonb) "jsonb_" else "json_")?;
         message.append(if (kind.recursive) "tree" else "each")?;
         message.append("() - max 2")?;
-        return Err(SqliteError.Sql(message));
+        return Err(sqlError(message.view()));
     }
     var args = compileJsonEachArguments(compiler, f.args.view(), scope, db)?;
     let root = if (args.length == 2) args.pop() else null;
@@ -498,7 +498,7 @@ struct JsonEachCursor {
         } else {
             row.push(jsonReturnFromBlob(blob, i)?)?;
         }
-        row.push(SqliteValue.text(jsonbTypeName(t))?)?;
+        row.push(SqliteValue.sqlText(jsonbTypeName(t))?)?;
         row.push(if (t < JSONB_ARRAY) jsonReturnFromBlob(blob, i)? else SqliteValue.Null)?;
         row.push(SqliteValue.Integer(truncate<i64>(this.i)))?;
         let hasParent = this.recursive && this.parents.length > 0;

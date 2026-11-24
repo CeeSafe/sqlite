@@ -27,11 +27,11 @@ fn addSchemaRow(
     sql: StringView?,
 ) -> Result<void, SqliteError> {
     var values = Vector<SqliteValue>.create();
-    values.push(SqliteValue.text(kind)?)?;
-    values.push(SqliteValue.text(name)?)?;
-    values.push(SqliteValue.text(table)?)?;
+    values.push(SqliteValue.sqlText(kind)?)?;
+    values.push(SqliteValue.sqlText(name)?)?;
+    values.push(SqliteValue.sqlText(table)?)?;
     values.push(SqliteValue.Integer(root as i64))?;
-    values.push(if (sql is Some(s)) SqliteValue.text(s)? else SqliteValue.Null)?;
+    values.push(if (sql is Some(s)) SqliteValue.sqlText(s)? else SqliteValue.Null)?;
     let rowId = (lastRowid(mut db.pager, 1)? ?? 0) + 1;
     var op = Vector<TableOp>.create();
     op.push(TableOp { rowId: rowId, record: Record.encode(values.view())? })?;
@@ -48,9 +48,11 @@ fn removeSchemaRows(db: borrow mut Session, name: StringView, alsoOfTable: bool)
         if (row.columns.length < 5) {
             continue;
         }
-        let objectName = textOrEmptyRef(borrow row.columns[1]);
-        let tableName = textOrEmptyRef(borrow row.columns[2]);
-        let matches = objectName.equalsIgnoreAsciiCase(name) || (alsoOfTable && tableName.equalsIgnoreAsciiCase(name));
+        let objectName = textOrEmptyRef(borrow row.columns[1])?;
+        let tableName = textOrEmptyRef(borrow row.columns[2])?;
+        let matches = objectName.view().equalsIgnoreAsciiCase(
+            name,
+        ) || (alsoOfTable && tableName.view().equalsIgnoreAsciiCase(name));
         if (!matches) {
             continue;
         }
@@ -70,9 +72,10 @@ fn removeSchemaRows(db: borrow mut Session, name: StringView, alsoOfTable: bool)
     return Ok();
 }
 
-fn textOrEmptyRef(value: borrow SqliteValue) -> StringView => match (value) {
-    SqliteValue.Text(s) => s.toUtf8() ?? "",
-    _ => "",
+/// A name in sqlite_schema in the engine's form for SQL text, or empty when it is not text.
+fn textOrEmptyRef(value: borrow SqliteValue) -> Result<String, AllocError> => match (value) {
+    SqliteValue.Text(s) => sqlTextOf(s.bytes()),
+    _ => Ok(String.create()),
 };
 
 /// Gives every page of a b-tree (table or index, overflow pages included) back to the freelist.
@@ -137,16 +140,45 @@ fn objectExists(db: borrow Session, name: StringView) -> bool {
     return false;
 }
 
+/// The name a CREATE TABLE, VIEW or TRIGGER statement gives its object, as written (quotes and all), which
+/// SQLite's "… already exists" shows (`%T`); `name` when it cannot be found.
+fn writtenObjectName(sql: StringView, name: StringView) -> String {
+    let tokens = match (Tokenizer.tokenize(sql)) {
+        Ok(t) => t,
+        Err(_) => { return ownedName(name); }
+    };
+    for (i in 0..tokens.length) {
+        let t = borrow tokens[i];
+        if (!(t.isWord("TABLE") || t.isWord("VIEW") || t.isWord("TRIGGER"))) {
+            continue;
+        }
+        var at = i + 1;
+        if (at < tokens.length && tokens[at].isWord("IF")) {
+            at += 3;
+        }
+        if (at + 2 < tokens.length && tokens[at + 1].isOp(".")) {
+            at += 2;
+        }
+        if (at < tokens.length && tokens[at].offset <= tokens[at].end && tokens[at].end <= sql.length) {
+            return ownedName(sql[tokens[at].offset..tokens[at].end]);
+        }
+        break;
+    }
+    return ownedName(name);
+}
+
+fn ownedName(name: StringView) -> String => String.from(name).ok() ?? String.create();
+
 fn existsError(kind: StringView, name: StringView) -> SqliteError {
     var message = String.create();
     let _ = message.append(kind);
     let _ = message.append(" ");
     let _ = message.append(name);
     let _ = message.append(" already exists");
-    return SqliteError.Sql(message);
+    return sqlError(message.view());
 }
 
-fn isReservedName(name: StringView) -> bool => name.length >= 7 && name[0..7].equalsIgnoreAsciiCase("sqlite_");
+fn isReservedName(name: StringView) -> bool => startsWithIgnoreAsciiCase(name, "sqlite_");
 
 /// CREATE TABLE.
 fn executeCreateTable(
@@ -163,7 +195,7 @@ fn executeCreateTable(
         return Err(
             existsError(
                 if (db.viewSql(name)?.isSome()) "view" else if (db.catalog.table(name)?.isSome()) "table" else "index",
-                name,
+                writtenObjectName(sql, name).view(),
             ),
         );
     }
@@ -261,7 +293,7 @@ fn executeCreateIndex(
                 if (writer.conflictsIn(index, borrow entry, self.view(), db)?.length != 0) {
                     var message = String.from("UNIQUE constraint failed: ")?;
                     message.append(index.keyNames.view())?;
-                    return Err(SqliteError.Constraint(message));
+                    return Err(constraintError(message.view()));
                 }
             }
         }
@@ -281,7 +313,7 @@ fn executeCreateView(
         if (stmt.ifNotExists) {
             return Ok();
         }
-        return Err(existsError("view", name));
+        return Err(existsError("view", writtenObjectName(sql, name).view()));
     }
     var compiler = newCompiler(db)?;
     let plan = compileSelect(mut compiler, borrow stmt.select, db)?;
@@ -327,7 +359,7 @@ fn executeDrop(stmt: borrow DropStmt, db: borrow mut Session) -> Result<void, Sq
             message.append(kind)?;
             message.append(" ")?;
             message.append(name)?;
-            return Err(SqliteError.Sql(message));
+            return Err(sqlError(message.view()));
         }
         return Err(namedError(match (stmt.kind) {
             DropKind.Table => "no such table: ",
@@ -340,7 +372,7 @@ fn executeDrop(stmt: borrow DropStmt, db: borrow mut Session) -> Result<void, Sq
         var message = String.from("table ")?;
         message.append(name)?;
         message.append(" may not be dropped")?;
-        return Err(SqliteError.Sql(message));
+        return Err(sqlError(message.view()));
     }
     if (stmt.kind == DropKind.Index) {
         for (i in 0..db.entries.length) {
