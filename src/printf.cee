@@ -287,8 +287,8 @@ fn renderPrintf(
             }
         }
         match (c) {
-            'd' | 'i' | 'u' | 'r' | 'x' | 'X' | 'o' | 'p' => { printfInteger(out, args, c, spec)?; }
-            'f' | 'e' | 'E' | 'g' | 'G' => { printfFloat(out, args, c, spec)?; }
+            'd' | 'i' | 'u' | 'r' | 'x' | 'X' | 'o' | 'p' => { appendInteger(out, args, c, spec)?; }
+            'f' | 'e' | 'E' | 'g' | 'G' => { appendFloat(out, args, c, spec)?; }
             'n' => {}
             '%' => { out.field("%".bytes(), spec.width, spec.leftJustify)?; }
             'c' => { appendCharacter(out, args, spec)?; }
@@ -316,7 +316,7 @@ fn digitCharacter(d: u64, upper: bool) -> u8 {
 }
 
 /// %d %i %u %r %x %X %o %p.
-fn printfInteger(
+private fn appendInteger(
     out: borrow mut PrintfText,
     args: borrow mut PrintfArguments,
     conv: u8,
@@ -442,7 +442,7 @@ struct FpDecoded {
 }
 
 /// %f %e %E %g %G.
-fn printfFloat(
+private fn appendFloat(
     out: borrow mut PrintfText,
     args: borrow mut PrintfArguments,
     conv: u8,

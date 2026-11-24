@@ -10,7 +10,7 @@
 /// Where b-tree pages are built: pages in memory for a new file, or the pages of a database being changed.
 interface PageSink {
     /// The bytes of each page that b-trees use.
-    fn usableBytes(borrow this) -> usize;
+    fn usableSize(borrow this) -> usize;
 
     /// A zeroed page to build in, and its number.
     fn allocate(borrow mut this) -> Result<u32, SqliteError>;
@@ -45,7 +45,7 @@ struct PageStore {
 
 impl PageSink for PageStore {
     // A file written whole has no reserved space.
-    fn usableBytes(borrow this) -> usize => this.pageSize;
+    fn usableSize(borrow this) -> usize => this.pageSize;
 
     fn allocate(borrow mut this) -> Result<u32, SqliteError> => this.allocatePage();
 
@@ -66,14 +66,14 @@ struct EncodedRow {
 
 struct BTreeBuilder {
     // Sizes are of a page's usable part, which is all of a page the sink lends.
-    fn tableLeafMaxLocal<S: PageSink>(store: borrow S) -> usize => store.usableBytes() - 35;
+    fn tableLeafMaxLocal<S: PageSink>(store: borrow S) -> usize => store.usableSize() - 35;
 
-    fn indexMaxLocal<S: PageSink>(store: borrow S) -> usize => (store.usableBytes() - 12) * 64 / 255 - 23;
+    fn indexMaxLocal<S: PageSink>(store: borrow S) -> usize => (store.usableSize() - 12) * 64 / 255 - 23;
 
     /// The bytes of a payload of `length` kept in its cell when it spills to overflow pages.
     fn localSize<S: PageSink>(store: borrow S, length: usize, maxLocal: usize) -> usize {
-        let minLocal = (store.usableBytes() - 12) * 32 / 255 - 23;
-        let k = minLocal + (length - minLocal) % (store.usableBytes() - 4);
+        let minLocal = (store.usableSize() - 12) * 32 / 255 - 23;
+        let k = minLocal + (length - minLocal) % (store.usableSize() - 4);
         return if (k <= maxLocal) k else minLocal;
     }
 
@@ -94,7 +94,7 @@ struct BTreeBuilder {
         }
         let local = BTreeBuilder.localSize(store, record.length, maxLocal);
         cell.extend(record[0..local])?;
-        let chunkSize = store.usableBytes() - 4;
+        let chunkSize = store.usableSize() - 4;
         var position = local;
         var first: u32 = 0;
         var previous: u32 = 0;
@@ -197,7 +197,7 @@ struct BTreeBuilder {
                 return Err(SqliteError.Constraint(ownedMessage("two rows of a table have the same rowid")));
             }
             let cell = BTreeBuilder.tableLeafCell(store, rows[i].rowId, rows[i].record.view())?;
-            if (cells.length != 0 && footprint + cell.length + 2 > store.usableBytes()) {
+            if (cells.length != 0 && footprint + cell.length + 2 > store.usableSize()) {
                 let page = store.allocate()?;
                 BTreeBuilder.fillPage(store.pageMut(page)?, 0, PAGE_LEAF_TABLE, cells.view(), null);
                 leaves.push(TableNode { page: page, maxKey: lastKey })?;
@@ -232,7 +232,7 @@ struct BTreeBuilder {
         children: Slice<TableNode>,
     ) -> Result<Vector<TableNode>, SqliteError> {
         // A cell is at most a 4-byte child, a 9-byte key and its 2-byte pointer.
-        let maxChildren = ((store.usableBytes() - 12) / 15).max(2);
+        let maxChildren = ((store.usableSize() - 12) / 15).max(2);
         let groups = (children.length + maxChildren - 1) / maxChildren;
         let baseSize = children.length / groups;
         let remainder = children.length % groups;
@@ -261,7 +261,7 @@ struct BTreeBuilder {
         for (i in 0..cells.length) {
             footprint += cells[i].length + 2;
         }
-        if (footprint <= store.usableBytes()) {
+        if (footprint <= store.usableSize()) {
             BTreeBuilder.fillPage(store.pageMut(1)?, DATABASE_HEADER_SIZE, PAGE_LEAF_TABLE, cells, null);
             return Ok();
         }
@@ -270,11 +270,11 @@ struct BTreeBuilder {
         var used: usize = 8;
         // Cells that would fit one ordinary leaf are still put in two, so that the root has a cell: SQLite
         // leaves a root without cells only when a single cell is all there is.
-        let fitsOneLeaf = footprint - DATABASE_HEADER_SIZE <= store.usableBytes() && cells.length >= 2;
+        let fitsOneLeaf = footprint - DATABASE_HEADER_SIZE <= store.usableSize() && cells.length >= 2;
         let forcedSplit = if (fitsOneLeaf) (cells.length + 1) / 2 else cells.length + 1;
         for (i in 0..cells.length + 1) {
             if (i == cells.length ||
-                (i > start && (i == forcedSplit || used + cells[i].length + 2 > store.usableBytes()))) {
+                (i > start && (i == forcedSplit || used + cells[i].length + 2 > store.usableSize()))) {
                 let page = store.allocate()?;
                 BTreeBuilder.fillPage(store.pageMut(page)?, 0, PAGE_LEAF_TABLE, cells[start..i], null);
                 leaves.push(TableNode { page: page, maxKey: rowIds[i - 1] })?;
@@ -286,7 +286,7 @@ struct BTreeBuilder {
             }
         }
         // Page 1 has 100 bytes less room; build levels until the top one fits in it.
-        let maxRootChildren = ((store.usableBytes() - DATABASE_HEADER_SIZE - 12) / 15).max(2);
+        let maxRootChildren = ((store.usableSize() - DATABASE_HEADER_SIZE - 12) / 15).max(2);
         while (leaves.length > maxRootChildren) {
             leaves = BTreeBuilder.tableInteriorLevel(store, leaves.view())?;
         }
@@ -317,7 +317,7 @@ struct BTreeBuilder {
             var footprint: usize = 8;
             while (i < n) {
                 let size = BTreeBuilder.indexCellSize(store, records[i].length, false);
-                if (i > start && footprint + size > store.usableBytes()) {
+                if (i > start && footprint + size > store.usableSize()) {
                     break;
                 }
                 footprint += size;
@@ -354,7 +354,7 @@ struct BTreeBuilder {
             for (d in 0..dividers.length) {
                 maxCell = maxCell.max(BTreeBuilder.indexCellSize(store, records[dividers[d]].length, true));
             }
-            let maxChildren = (1 + (store.usableBytes() - 12) / maxCell).max(2);
+            let maxChildren = (1 + (store.usableSize() - 12) / maxCell).max(2);
             let groups = (children.length + maxChildren - 1) / maxChildren;
             let baseSize = children.length / groups;
             let remainder = children.length % groups;

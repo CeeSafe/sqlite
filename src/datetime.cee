@@ -840,7 +840,12 @@ fn isDate(args: Slice<SqliteValue>, p: borrow mut DateTime, nowMillis: i64) -> R
 // ── printf, as SQLite's does it for the few formats these functions use ─────────────────────────────────────
 
 /// `%d` with a width, padded with spaces or (with `zeroPad`) zeros after the sign.
-fn appendInteger(out: borrow mut Vector<u8>, value: i64, width: usize, zeroPad: bool) -> Result<void, AllocError> {
+private fn appendInteger(
+    out: borrow mut Vector<u8>,
+    value: i64,
+    width: usize,
+    zeroPad: bool,
+) -> Result<void, AllocError> {
     let negative = value < 0;
     var magnitude: u64 = if (negative) truncate<u64>(0 - (value + 1)) + 1 else truncate<u64>(value);
     var digits = [0u8; 20];
@@ -877,7 +882,7 @@ fn appendInteger(out: borrow mut Vector<u8>, value: i64, width: usize, zeroPad: 
 
 /// A real as `%[0][width].{precision}f` (`generic` false) or `%.{precision}g` (`generic` true), following
 /// SQLite's printf over sqlite3FpDecode. The value must be finite.
-fn appendFloat(
+private fn appendFloat(
     out: borrow mut Vector<u8>,
     value: f64,
     precisionIn: i32,

@@ -1087,7 +1087,7 @@ impl PageSource for WritablePager {
 }
 
 impl PageSink for WritablePager {
-    fn usableBytes(borrow this) -> usize => this.usable;
+    fn usableSize(borrow this) -> usize => this.usable;
 
     fn allocate(borrow mut this) -> Result<u32, SqliteError> => this.allocatePage();
 

@@ -3,7 +3,7 @@
 Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed in CeeSafe later. Compiler:
 `ceesafec 0.93.7`. Each entry says what was needed, what happened, and the workaround used in this package.
 
-## Status (ceesafec 0.95.0)
+## Status (ceesafec 0.95.2)
 
 | Finding | Status |
 |---|---|
@@ -28,11 +28,11 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 32 | fixed in 0.95.0: `sortStableBy`, ADR 0225; workaround removed (every ORDER BY sort, the compound one included, which was unstable) |
 | 34 | fixed in 0.95.0 for an expected slice or number (ADR 0226); `let a = [1, 2];` stays `i32`, as `let x = 1;` does; `logEst`'s tables are typed `[i64; N]` |
 | 9, 10, 12, 18, 21 | by design: closures are typed where a function type is expected; reserved words, now named as such in the error; references are not re-pointed; ranges are half-open (ADR 0085) |
-| 6 | fixed in 0.95.2: methods of one name from several interfaces, and `I.m(x, …)` to name one (N0267 when a call on the type is ambiguous), ADR 0229; the workaround (`usableBytes`) stays until this package moves to 0.95.2 |
-| 15 | fixed in 0.95.2: a file's `private` items have a scope of their own, so two files may each have a private item of one name, ADR 0230; the workaround (`printfInteger` and the other prefixed helpers) stays until this package moves to 0.95.2 |
+| 6 | fixed in 0.95.2: methods of one name from several interfaces, and `I.m(x, …)` to name one (N0267 when a call on the type is ambiguous), ADR 0229; workaround removed (`PageSink.usableSize` again, beside `PageSource.usableSize`) |
+| 15 | fixed in 0.95.2: a file's `private` items have a scope of their own, so two files may each have a private item of one name, ADR 0230; workaround removed (`datetime.cee` and `printf.cee` each have a private `appendInteger` and `appendFloat`) |
 | 19 | fixed in 0.95.2: `ByteString`/`ByteStringView` in lib/core, any bytes kept as they are, with `toUtf8`, `toUtf8Lossy` and `chunks`, ADR 0231; the workaround (`textFromBytesLossy`, U+FFFD for invalid bytes) stays until this package moves to 0.95.2 |
 | 26 | fixed in 0.95.2: `SharedMapping`, `f.mapShared(offset, length)`, with `readAt`/`writeAt` and 32- and 64-bit atomics, checked against a live sqlite3 `-shm`, ADR 0232; WAL mode still takes turns until this package writes a shared `-shm` (what is still missing for that: finding 37) |
-| 35 | fixed in 0.95.2: a `Thread<void>` in a generic signature is checked as a return type, no longer N0226 |
+| 35 | fixed in 0.95.2: a `Thread<void>` in a generic signature is checked as a return type, no longer N0226; workaround removed (`pgwire`'s client threads are `Thread<void>`) |
 | 36 | open: found while removing the workarounds for 3, 23, 24 and 27 (below) |
 | 37 | open: found with 26's fix (below) |
 | 38 | open: found with 19's fix (below) |

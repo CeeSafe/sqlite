@@ -105,11 +105,12 @@ public struct PgServer {
 }
 
 /// Joins the client threads in `clients` that have finished, adding to `served` the clients they served.
-fn reap(clients: borrow mut Vector<Thread<u64>>, served: borrow mut u64) {
+fn reap(clients: borrow mut Vector<Thread<void>>, served: borrow mut u64) {
     var k: usize = 0;
     while (k < clients.length) {
         if (clients[k].isFinished()) {
-            served += clients.swapRemove(k).join();
+            clients.swapRemove(k).join();
+            served += 1;
         } else {
             k += 1;
         }
@@ -121,7 +122,7 @@ fn reap(clients: borrow mut Vector<Thread<u64>>, served: borrow mut u64) {
 /// thread is joined once it has finished, when the next client comes, so the threads kept are those of the
 /// clients connected. A client past the server's limit is told so and let go.
 public fn serve(server: Arc<PgServer>, listener: Arc<TcpListener>) -> Result<u64, IoError> {
-    var clients = Vector<Thread<u64>>.create();
+    var clients = Vector<Thread<void>>.create();
     var served: u64 = 0;
     loop {
         match (listener.get().accept()) {
@@ -133,10 +134,7 @@ public fn serve(server: Arc<PgServer>, listener: Arc<TcpListener>) -> Result<u64
                     continue;
                 }
                 let mine = server.clone();
-                match (Thread.spawn(move () => {
-                    serveClient(mine.get(), stream);
-                    return 1u64;
-                })) {
+                match (Thread.spawn(move () => serveClient(mine.get(), stream))) {
                     Ok(thread) => {
                         // Out of memory for the list: dropping the thread joins it, so this waits for the client.
                         let _ = clients.push(thread);
@@ -152,14 +150,16 @@ public fn serve(server: Arc<PgServer>, listener: Arc<TcpListener>) -> Result<u64
             }
             Err(e) => {
                 for (thread in clients.drain()) {
-                    served += thread.join();
+                    thread.join();
+                    served += 1;
                 }
                 return Err(e);
             }
         }
     }
     for (thread in clients.drain()) {
-        served += thread.join();
+        thread.join();
+        served += 1;
     }
     return Ok(served);
 }
