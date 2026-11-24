@@ -48,6 +48,7 @@ fn dateTimeValues() -> Result<void, TestFailure> {
         SELECT datetime('2024-02-29 13:45'), datetime('2024-02-29 13:45:30'), datetime('2024-02-29 13:45:30.123456789')
         SELECT datetime('2024-02-29T13:45:30'), datetime('2024-02-29   13:45'), datetime('2024-02-29T  13:45')
         SELECT datetime('13:45'), datetime('13:45:30.5'), time('24:00'), datetime('24:00:00'), date('12:00')
+        SELECT date('2024-02-29 24:00'), datetime('2024-02-29 24:00:00.5'), datetime('2024-12-31 24:00', 'start of day'), datetime('2024-02-29 24:30'), time('24:59:59'), time('24:00:00.000'), datetime('2024-02-29 13:45:30', '+24:30')
         SELECT datetime('2024-02-29 13:45+02:30'), datetime('2024-02-29 13:45-11:15'), datetime('2024-02-29 13:45Z'), datetime('2024-02-29 13:45 z ')
         SELECT datetime('13:45+01:00'), datetime('2024-02-29 13:45 +00:00'), datetime('2024-02-29 13:45+14:59'), datetime('2024-02-29 13:45+15:00')
         SELECT datetime('2024-02-30'), date('2023-02-29'), date('2023-04-31'), date('2023-02-31'), date('2024-13-01'), date('2024-00-10'), date('2024-01-00'), date('2024-01-32')

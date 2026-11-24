@@ -22,7 +22,7 @@ fn makeWalDatabase(path: StringView, sql: StringView) -> Result<void, TestFailur
     arguments.push(".dbconfig no_ckpt_on_close on")!;
     arguments.push("PRAGMA journal_mode = WAL")!;
     arguments.push(sql)!;
-    match (Process.capture("sqlite3", borrow arguments, "".bytes())) {
+    match (captureSqlite(borrow arguments, "".bytes())) {
         Ok(output) => {
             if (output.status != 0) {
                 return Check.fail("sqlite3 refused the fixture's SQL");
@@ -39,7 +39,7 @@ fn askSqliteKeepingLog(path: StringView, sql: StringView) -> Result<String, Test
     arguments.push(path)!;
     arguments.push(".dbconfig no_ckpt_on_close on")!;
     arguments.push(sql)!;
-    let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
+    let output = captureSqlite(borrow arguments, "".bytes())!;
     if (output.status != 0) {
         Check.fail("sqlite3 refused the query")?;
     }
@@ -126,6 +126,9 @@ const WAL_QUERIES: StringView = """
 
 @test
 fn readsCommitsSqliteLeftInItsLog() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     let path = "out/wal-from-sqlite.sqlite";
     makeWalDatabase(path, WAL_FIXTURE_SQL)?;
     Check.isTrue(logLength(path) > 0, "the shell left its commits in the log")?;
@@ -163,6 +166,9 @@ fn rewriteBigEndian(path: StringView) {
 
 @test
 fn readsALogWithBigEndianChecksums() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     let path = "out/wal-big-endian.sqlite";
     makeWalDatabase(path, WAL_FIXTURE_SQL)?;
     let before = ourAnswers(path, WAL_QUERIES);
@@ -224,6 +230,9 @@ const PAGE_FRAME: usize = 4096 + 24;
 
 @test
 fn anUnfinishedTransactionHidesNoCommittedPage() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     // The log is cut inside the second transaction's commit frame: its first frame is whole and valid but not
     // committed, and names a page the first transaction also changed. The C# engine let it replace the first
     // transaction's frame in its map, then dropped the page, and read it as it was before both.
@@ -232,12 +241,18 @@ fn anUnfinishedTransactionHidesNoCommittedPage() -> Result<void, TestFailure> {
 
 @test
 fn aBadChecksumEndsTheLog() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     // A byte of the commit frame's page is changed: its checksum fails, and the transaction is not seen.
     return sameAfterDamage("out/wal-torn-checksum.sqlite", 50, 0x40, 0, "1|1000000\n2|2\n2999|2999\n3000|1000000\n");
 }
 
 @test
 fn aFrameWithOtherSaltsEndsTheLog() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     // The commit frame's salt-1 (8 bytes into its header) is changed.
     return sameAfterDamage(
         "out/wal-torn-salt.sqlite",
@@ -250,6 +265,9 @@ fn aFrameWithOtherSaltsEndsTheLog() -> Result<void, TestFailure> {
 
 @test
 fn framesAfterABadOneAreIgnored() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     // A byte of the first transaction's first frame is changed: neither transaction is seen, though the second's
     // frames are whole.
     return sameAfterDamage("out/wal-torn-early.sqlite", 4 * PAGE_FRAME - 200, 0x10, 0, "1|1\n2|2\n2999|2999\n3000|3000\n");
@@ -257,6 +275,9 @@ fn framesAfterABadOneAreIgnored() -> Result<void, TestFailure> {
 
 @test
 fn anUndamagedLogHasBothTransactions() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     return sameAfterDamage("out/wal-torn-none.sqlite", 0, 0, 0, "1|2000000\n2|2\n2999|2999\n3000|2000000\n");
 }
 
@@ -285,7 +306,7 @@ fn sameWalSession(name: StringView, script: StringView, close: bool) -> Result<v
     }
     var arguments = Vector<StringView>.create();
     arguments.push(theirPath.view())!;
-    let output = Process.capture("sqlite3", borrow arguments, input.view().bytes())!;
+    let output = captureSqlite(borrow arguments, input.view().bytes())!;
     let theirs = shownText(output.stdout.view());
     let errors = shownText(output.stderr.view());
     var errorLines = errors.view().split("\n");
@@ -320,6 +341,9 @@ fn sameWalSession(name: StringView, script: StringView, close: bool) -> Result<v
 
 @test
 fn walPragmasAnswerAsSqlites() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     return sameWalSession("pragmas", """
         PRAGMA journal_mode
         PRAGMA wal_checkpoint
@@ -379,6 +403,9 @@ fn walPragmasAnswerAsSqlites() -> Result<void, TestFailure> {
 
 @test
 fn closingCheckpointsAndRemovesTheLog() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     return sameWalSession("close", """
         PRAGMA journal_mode = WAL
         CREATE TABLE t(id INTEGER PRIMARY KEY, n INT, label TEXT)
@@ -397,6 +424,9 @@ fn formatVersions(path: StringView) -> u32 {
 
 @test
 fn sqliteReadsTheLogThisEngineWrites() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     let path = "out/wal-ours.sqlite";
     freshWalPath(path);
     var session = Session.open(path)!;
@@ -450,6 +480,9 @@ fn sqliteReadsTheLogThisEngineWrites() -> Result<void, TestFailure> {
 
 @test
 fn anUncommittedTransactionLeavesNothingInTheLog() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     let path = "out/wal-uncommitted.sqlite";
     makeWalDatabase(path, WAL_FIXTURE_SQL)?;
     let before = logLength(path);
@@ -468,6 +501,9 @@ fn anUncommittedTransactionLeavesNothingInTheLog() -> Result<void, TestFailure> 
 
 @test
 fn appendsToALogSqliteLeft() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     // This engine's commits follow sqlite3's frames in the same log, with its salts and checksums.
     let path = "out/wal-append.sqlite";
     makeWalDatabase(path, WAL_FIXTURE_SQL)?;

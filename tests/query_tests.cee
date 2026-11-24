@@ -45,12 +45,16 @@ fn ours(session: borrow mut Session, sql: StringView) -> String {
     }
 }
 
+/// What the sqlite3 shell answers, or "error: " and its message (sqlite.org's answer where Apple's shell differs,
+/// shell_runner_tests.cee).
+fn theirAnswer(path: StringView, sql: StringView) -> String => officialAnswer(path, sql, shellAnswer(path, sql));
+
 /// What the sqlite3 shell answers, or "error: " and its message.
-fn theirAnswer(path: StringView, sql: StringView) -> String {
+fn shellAnswer(path: StringView, sql: StringView) -> String {
     var arguments = Vector<StringView>.create();
     arguments.push(path)!;
     arguments.push(sql)!;
-    let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
+    let output = captureSqlite(borrow arguments, "".bytes())!;
     if (output.status == 0) {
         return shownText(output.stdout.view());
     }
@@ -316,7 +320,7 @@ fn theirNames(path: StringView, sql: StringView) -> String {
     arguments.push("-header")!;
     arguments.push(path)!;
     arguments.push(sql)!;
-    let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
+    let output = captureSqlite(borrow arguments, "".bytes())!;
     let text = shownText(output.stdout.view());
     let first = text.view().splitOnce("\n") ?? TextHalves { left: text.view(), right: "" };
     return String.from(first.left)!;

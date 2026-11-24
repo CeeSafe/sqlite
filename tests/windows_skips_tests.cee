@@ -1,0 +1,31 @@
+// The tests that do not run on Windows yet, and why. Each such test starts with
+// `if (skippedOnWindows(WindowsGap.…)) { return Ok(); }`; when a gap is closed, `skippedOnWindows` stops skipping
+// its tests here, and `grep -n "WindowsGap\.<name>" tests/*.cee` lists them.
+
+/// What a test needs that the engine or the tests do not have on Windows yet.
+enum WindowsGap {
+    /// WAL mode: the engine refuses it on Windows until os_win.c's locks (of the database and of the -shm file) are
+    /// ported, `src/pagerw.cee` and `src/walindex.cee`.
+    WalMode,
+    /// File locks as SQLite takes them on Windows (os_win.c): this engine takes POSIX's, so it cannot share a file
+    /// with sqlite3 or with another of its connections there.
+    FileLocks,
+    /// Killing the sqlite3 shell in the middle of a transaction, which the tests do with `.shell kill -9 $PPID`, a
+    /// POSIX shell's command.
+    KillingTheShell,
+}
+
+/// True, after saying so, when the test cannot run on Windows yet because of `gap`.
+fn skippedOnWindows(gap: WindowsGap) -> bool {
+    if (!onWindowsHost()) {
+        return false;
+    }
+    let reason = match (gap) {
+        WindowsGap.WalMode => "WAL mode is not supported on Windows yet (os_win.c's locks are not ported)",
+        WindowsGap.FileLocks => "SQLite's Windows file locks (os_win.c) are not ported yet",
+        WindowsGap.KillingTheShell => "killing the sqlite3 shell needs a POSIX shell's kill",
+    };
+    Console.write("skipped on Windows: ");
+    Console.writeLine(reason);
+    return true;
+}

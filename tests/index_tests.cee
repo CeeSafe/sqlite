@@ -5,7 +5,7 @@ fn askSqlite(path: StringView, sql: StringView) -> Result<String, TestFailure> {
     var arguments = Vector<StringView>.create();
     arguments.push(path)!;
     arguments.push(sql)!;
-    match (Process.capture("sqlite3", borrow arguments, "".bytes())) {
+    match (captureSqlite(borrow arguments, "".bytes())) {
         Ok(output) => {
             if (output.status != 0) {
                 Check.fail("sqlite3 refused the query")?;

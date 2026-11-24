@@ -1,0 +1,226 @@
+// Running the sqlite3 shell (and the few other programs the tests start) on every system. On macOS and Linux this
+// is lib/std's `Process.capture` and `Process.run`. On Windows neither can run the shell at ceesafec 0.95.5
+// (CEESAFE_FINDINGS.md 45 and 46): `Process.capture` keeps its input file open for writing while the runtime opens
+// it again to read, which Windows refuses, so it always fails; `Process.run` hands the arguments to `_wspawnvp`,
+// which joins them with spaces without quoting, so an argument of SQL arrives as many words. `Process.spawn`
+// quotes its arguments but cannot send a child's streams to files, and a package cannot call the runtime's
+// `ceesafe_host_spawn` itself (N0292). So on Windows `tests/capture.py`, started by `Process.spawn`, runs the
+// program with its streams in files.
+
+/// The setting under which the sqlite3 shell lets `PRAGMA writable_schema = ON` change sqlite_schema, which the
+/// tests do to make damaged databases: sqlite.org's shell runs in defensive mode, which forbids it, and Apple's
+/// does not. As an argument before the SQL; it prints the setting.
+const SCHEMA_WRITABLE: StringView = ".dbconfig defensive off";
+
+/// Whether the sqlite3 on the path is Apple's build (its source id ends in "aapl"). The engine follows sqlite.org's
+/// SQLite 3.54.1, which CI runs; Apple's sqlite3 3.54.0, from an earlier snapshot of SQLite, answers a few
+/// statements differently. Where a comparison meets one of them with Apple's shell, the engine is checked against
+/// sqlite.org's answer (`officialAnswerWhereAppleDiffers`) instead of Apple's; with sqlite.org's shell every
+/// answer is the shell's.
+fn sqliteIsApples() -> bool {
+    var arguments = Vector<StringView>.create();
+    arguments.push(":memory:")!;
+    arguments.push("SELECT sqlite_source_id()")!;
+    return match (captureSqlite(borrow arguments, "".bytes())) {
+        Ok(output) => withoutCarriageReturns(output.stdout.view()).view().endsWith("aapl\n".bytes()),
+        Err(_) => false,
+    };
+}
+
+/// sqlite.org's sqlite3 3.54.1's answer to `sql` on the database at `path`, as the tests show answers, where
+/// Apple's 3.54.0 gives another:
+/// - U+FFFE and U+FFFF are characters (Apple's reads them as U+FFFD);
+/// - an empty printf() result is '' (Apple's gives NULL);
+/// - a time of 24:00:00 is the next day's midnight, and 24 with other minutes or seconds is no time;
+/// - `t.*` in a RIGHT or FULL join is the table's own columns (Apple's coalesces those USING or NATURAL shares).
+fn officialAnswerWhereAppleDiffers(path: StringView, sql: StringView) -> String? {
+    var k: usize = 0;
+    while (k + 2 < APPLE_DIFFERS.length) {
+        if ((APPLE_DIFFERS[k].length == 0 || APPLE_DIFFERS[k] == path) && APPLE_DIFFERS[k + 1] == sql) {
+            return String.from(APPLE_DIFFERS[k + 2])!;
+        }
+        k += 3;
+    }
+    return null;
+}
+
+/// The statements of `officialAnswerWhereAppleDiffers`, three entries each: the database (any if empty), the
+/// statement and sqlite.org's answer.
+const APPLE_DIFFERS: [StringView; 36] = [
+    "",
+    "SELECT date('2024-02-29 24:00'), datetime('2024-02-29 24:00:00.5'), datetime('2024-12-31 24:00', 'start of day'), datetime('2024-02-29 24:30'), time('24:59:59'), time('24:00:00.000'), datetime('2024-02-29 13:45:30', '+24:30')",
+    "2024-03-01||2025-01-01 00:00:00|||00:00:00|\n",
+    "",
+    "SELECT typeof(printf('%s', '')), typeof(printf('%n')), typeof(printf('%y')), typeof(printf('%.0s', 'abc')), typeof(printf('%')), typeof(printf('%.0c', '')), typeof(printf(x''))",
+    "text|text|text|text|text|text|text\n",
+    "",
+    "SELECT id, x LIKE CAST(x'ff' AS TEXT), x LIKE '_', x LIKE '%', x GLOB '?', x GLOB '*' || CAST(x'ff' AS TEXT) FROM t ORDER BY id",
+    "1|1|1|1|1|1\n2|1|1|1|1|1\n3|1|1|1|1|1\n4|0|0|1|0|0\n5|0|0|1|0|0\n6|0|1|1|1|0\n7|0|0|1|0|0\n8|0|0|1|0|0\n9|0|0|1|0|0\n10|0|1|1|1|0\n11|0|0|1|0|0\n",
+    "",
+    "SELECT id, x LIKE 'a_bc', x GLOB 'a?bc', x LIKE '%' || CAST(x'ff' AS TEXT) || '%', x GLOB '[' || CAST(x'ff' AS TEXT) || ']' FROM t ORDER BY id",
+    "1|0|0|1|1\n2|0|0|1|1\n3|0|0|1|1\n4|1|1|0|0\n5|0|0|1|0\n6|0|0|0|0\n7|0|0|1|0\n8|0|0|1|0\n9|0|0|0|0\n10|0|0|0|0\n11|0|0|0|0\n",
+    "",
+    "SELECT unicode(CAST(x'80' AS TEXT)), unicode(CAST(x'bf41' AS TEXT)), unicode(CAST(x'c3' AS TEXT)), unicode(CAST(x'eda080' AS TEXT)), unicode(CAST(x'efbfbf' AS TEXT))",
+    "128|191|65533|65533|65535\n",
+    "",
+    "SELECT datetime('13:45'), datetime('13:45:30.5'), time('24:00'), datetime('24:00:00'), date('12:00')",
+    "2000-01-01 13:45:00|2000-01-01 13:45:30|00:00:00|2000-01-02 00:00:00|2000-01-01\n",
+    "",
+    "SELECT strftime('%I %l %p', '2024-02-29 00:30'), strftime('%I %l %p', '2024-02-29 12:30'), strftime('%I %l %P', '2024-02-29 23:30'), strftime('%k %H', '24:00')",
+    "12 12 AM|12 12 PM|11 11 pm| 0 00\n",
+    "",
+    "SELECT printf(NULL), printf(NULL, 1), typeof(printf()), printf(''), typeof(printf('')), format('%d-%s', 1, 'a'), FORMAT('%5.1f', 2.25)",
+    "||null||text|1-a|  2.3\n",
+    "",
+    "SELECT a.*, b.k FROM a NATURAL RIGHT JOIN b ORDER BY bv",
+    "|||2\n|||3\n|||5\n|||\n",
+    "",
+    "SELECT id, length(x), octet_length(x), unicode(x) FROM t ORDER BY id",
+    "1|1|1|65533\n2|1|1|65533\n3|1|3|65533\n4|4|4|97\n5|2|3|65533\n6|1|4|1114112\n7|5|5|65\n8|7|8|32\n9|5|6|104\n10|1|3|65534\n11|2|3|130\n",
+    "out/utf16-functions-le.db",
+    "SELECT group_concat(hex(CAST(column1 AS BLOB)), ' ') FROM (SELECT column1 FROM (VALUES ('a'), ('Ā'), ('😀'), ('￿'), ('b'), ('ab'), ('aĀ')) ORDER BY 1)",
+    "0001 3DD800DE 6100 61000001 61006200 6200 FFFF\n",
+    "out/utf16-functions-be.db",
+    "SELECT group_concat(hex(CAST(column1 AS BLOB)), ' ') FROM (SELECT column1 FROM (VALUES ('a'), ('Ā'), ('😀'), ('￿'), ('b'), ('ab'), ('aĀ')) ORDER BY 1)",
+    "0061 00610062 00610100 0062 0100 D83DDE00 FFFF\n",
+];
+
+/// What the shell answered to `sql` on `path`, or with Apple's shell, for a statement Apple's answers differently,
+/// sqlite.org's answer.
+fn officialAnswer(path: StringView, sql: StringView, theirs: String) -> String {
+    match (officialAnswerWhereAppleDiffers(path, sql)) {
+        Some(answer) => {
+            if (sqliteIsApples()) {
+                return answer;
+            }
+        }
+        null => {}
+    }
+    return theirs;
+}
+
+/// Where `tests/capture.py` is, from the package's directory.
+const CAPTURE_SCRIPT: StringView = "tests/capture.py";
+
+/// Whether the tests run on Windows.
+fn onWindowsHost() -> bool {
+    if (cfg("target.windows")) {
+        return true;
+    }
+    return false;
+}
+
+/// `program` run with `arguments` and `input` as its standard input: its exit status and what it wrote.
+fn captureProgram(program: StringView, arguments: borrow Vector<StringView>, input: Slice<u8>) -> Result<ProcessOutput, IoError> {
+    if (!onWindowsHost()) {
+        return Process.capture(program, arguments, input);
+    }
+    let directory = Directory.temporary()?;
+    let result = captureThroughPython(directory.view(), program, arguments, input);
+    for (name in ["in", "out", "err"]) {
+        let _ = File.remove(pathIn(directory.view(), name).view());
+    }
+    let _ = Directory.remove(directory.view());
+    return result;
+}
+
+/// `program` run with `arguments`: its exit status. What it writes is the test's output on macOS and Linux, and
+/// is dropped on Windows.
+fn runProgram(program: StringView, arguments: borrow Vector<StringView>) -> Result<i32, IoError> {
+    if (!onWindowsHost()) {
+        return Process.run(program, arguments);
+    }
+    return Ok(captureProgram(program, arguments, "".bytes())?.status);
+}
+
+/// The sqlite3 shell run with `arguments` and `input`. On Windows the shell ends its lines with "\r\n" unless told
+/// otherwise: `.crlf off`, run before the arguments, has it write what it writes elsewhere, and the "\r" of its
+/// messages, which `.crlf` does not cover, are dropped.
+fn captureSqlite(arguments: borrow Vector<StringView>, input: Slice<u8>) -> Result<ProcessOutput, IoError> {
+    if (!onWindowsHost()) {
+        return Process.capture("sqlite3", arguments, input);
+    }
+    var all = Vector<StringView>.create();
+    all.push("-cmd")!;
+    all.push(".crlf off")!;
+    for (argument in arguments) {
+        all.push(argument)!;
+    }
+    var output = captureProgram("sqlite3", borrow all, input)?;
+    output.stderr = withoutCarriageReturns(output.stderr.view());
+    return Ok(output);
+}
+
+/// The sqlite3 shell run with `arguments`: its exit status.
+fn runSqlite(arguments: borrow Vector<StringView>) -> Result<i32, IoError> {
+    if (!onWindowsHost()) {
+        return Process.run("sqlite3", arguments);
+    }
+    return Ok(captureSqlite(arguments, "".bytes())?.status);
+}
+
+/// `bytes` without the "\r" of each "\r\n".
+fn withoutCarriageReturns(bytes: Slice<u8>) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    for (i in 0..bytes.length) {
+        if (bytes[i] == '\r' && i + 1 < bytes.length && bytes[i + 1] == '\n') {
+            continue;
+        }
+        out.push(bytes[i])!;
+    }
+    return out;
+}
+
+/// `directory/name`.
+fn pathIn(directory: StringView, name: StringView) -> String {
+    var path = String.from(directory)!;
+    path.append("/")!;
+    path.append(name)!;
+    return path;
+}
+
+/// The whole file's bytes.
+fn wholeFileOf(path: StringView) -> Result<Vector<u8>, IoError> {
+    var file = File.open(path)?;
+    var bytes = Vector<u8>.create();
+    var buffer = [0u8; 65536];
+    loop {
+        let n = file.read(mut buffer[..])?;
+        if (n == 0) {
+            break;
+        }
+        for (i in 0..n) {
+            bytes.push(buffer[i])!;
+        }
+    }
+    return Ok(bytes);
+}
+
+/// `program` run by `tests/capture.py` with its streams in files of `directory`.
+fn captureThroughPython(directory: StringView, program: StringView, arguments: borrow Vector<StringView>, input: Slice<u8>) -> Result<ProcessOutput, IoError> {
+    let inPath = pathIn(directory, "in");
+    let outPath = pathIn(directory, "out");
+    let errPath = pathIn(directory, "err");
+    {
+        var file = File.create(inPath.view())?;
+        file.write(input)?;
+    }
+    var all = Vector<StringView>.create();
+    all.push(CAPTURE_SCRIPT)!;
+    all.push(inPath.view())!;
+    all.push(outPath.view())!;
+    all.push(errPath.view())!;
+    all.push(program)!;
+    for (argument in arguments) {
+        all.push(argument)!;
+    }
+    var child = Process.spawn("python", borrow all, ChildOptions.quiet())?;
+    let status = match (child.wait()?) {
+        ChildExit.Status(code) => code,
+        ChildExit.Signal(number) => 128 + number,
+    };
+    if (status == 127) {
+        return Err(IoError.NotFound);
+    }
+    return Ok(ProcessOutput { status: status, stdout: wholeFileOf(outPath.view())?, stderr: wholeFileOf(errPath.view())? });
+}

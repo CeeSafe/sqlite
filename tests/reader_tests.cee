@@ -1,12 +1,18 @@
 // Reading databases that the stock sqlite3 command-line shell wrote. Each test makes its own file under out/.
 
 /// Makes a fresh database at `path` by running `sql` through the sqlite3 shell.
-fn makeDatabase(path: StringView, sql: StringView) -> Result<void, TestFailure> {
+fn makeDatabase(path: StringView, sql: StringView) -> Result<void, TestFailure> => makeDatabaseWith(path, "", sql);
+
+/// The same, after the dot-command `setting` (none if empty).
+fn makeDatabaseWith(path: StringView, setting: StringView, sql: StringView) -> Result<void, TestFailure> {
     let _ = File.remove(path);
     var arguments = Vector<StringView>.create();
     arguments.push(path)!;
+    if (setting.length > 0) {
+        arguments.push(setting)!;
+    }
     arguments.push(sql)!;
-    match (Process.run("sqlite3", borrow arguments)) {
+    match (runSqlite(borrow arguments)) {
         Ok(0) => { return Ok(); }
         Ok(_) => { return Check.fail("sqlite3 refused the fixture's SQL"); }
         Err(_) => { return Check.fail("the sqlite3 shell is needed to make fixtures"); }

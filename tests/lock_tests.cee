@@ -22,7 +22,7 @@ fn sqliteInBackgroundWith(path: StringView, commands: Slice<StringView>, input: 
                 return -1;
             }
         }
-        return match (Process.capture("sqlite3", borrow arguments, script.view().bytes())) {
+        return match (captureSqlite(borrow arguments, script.view().bytes())) {
             Ok(output) => output.status,
             Err(_) => -1,
         };
@@ -37,7 +37,7 @@ fn theirAnswerTo(path: StringView, commands: Slice<StringView>) -> String {
     for (i in 0..commands.length) {
         arguments.push(commands[i])!;
     }
-    let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
+    let output = captureSqlite(borrow arguments, "".bytes())!;
     if (output.status == 0) {
         return shownText(output.stdout.view());
     }
@@ -92,6 +92,9 @@ fn isLocked(result: borrow Result<SqliteValue?, SqliteError>) -> bool => match (
 /// with one, and as soon as sqlite3 commits with a timeout long enough. It then sees sqlite3's commit.
 @test
 fn locksSqliteHoldingExclusiveMakesThisEngineWait() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.FileLocks)) {
+        return Ok();
+    }
     let path = "out/lock-their-exclusive.db";
     let marker = "out/lock-their-exclusive.marker";
     lockFixture(path, marker)?;
@@ -118,6 +121,9 @@ fn locksSqliteHoldingExclusiveMakesThisEngineWait() -> Result<void, TestFailure>
 /// write; while it holds BEGIN EXCLUSIVE sqlite3 cannot read either; after COMMIT sqlite3 sees the rows.
 @test
 fn locksThisEngineHoldingLocksMakesSqliteWait() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.FileLocks)) {
+        return Ok();
+    }
     let path = "out/lock-our-locks.db";
     lockFixture(path, "out/lock-our-locks.marker")?;
     var connection = Connection.open(path)!;
@@ -144,6 +150,9 @@ fn locksThisEngineHoldingLocksMakesSqliteWait() -> Result<void, TestFailure> {
 /// change until its transaction ends, and sqlite3's commit waits for it (here past its timeout).
 @test
 fn locksAReaderInATransactionSeesAStableSnapshot() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.FileLocks)) {
+        return Ok();
+    }
     let path = "out/lock-snapshot.db";
     lockFixture(path, "out/lock-snapshot.marker")?;
     var connection = Connection.open(path)!;
@@ -164,6 +173,9 @@ fn locksAReaderInATransactionSeesAStableSnapshot() -> Result<void, TestFailure> 
 /// before it writes, at the same time: with the locks no update is lost, and the file stays sound.
 @test
 fn locksConcurrentWritersNeverLoseACommit() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.FileLocks)) {
+        return Ok();
+    }
     let path = "out/lock-writers.db";
     lockFixture(path, "out/lock-writers.marker")?;
     let _ = askSqlite(path, "CREATE TABLE counter(n); INSERT INTO counter VALUES (0)")?;
@@ -199,6 +211,9 @@ fn locksConcurrentWritersNeverLoseACommit() -> Result<void, TestFailure> {
 /// EXCLUSIVE, before it reads. A journal whose writer still holds RESERVED is not hot: it is left alone.
 @test
 fn locksHotJournalsAreRolledBackAndLiveOnesLeftAlone() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.FileLocks)) {
+        return Ok();
+    }
     let path = "out/lock-hot.db";
     let marker = "out/lock-hot.marker";
     lockFixture(path, marker)?;
@@ -224,7 +239,7 @@ fn locksHotJournalsAreRolledBackAndLiveOnesLeftAlone() -> Result<void, TestFailu
     arguments.push(path)!;
     arguments.push("PRAGMA cache_size = 1; PRAGMA cache_spill = 1; BEGIN; UPDATE t SET v = v || ' changed';")!;
     arguments.push(".shell kill -9 $PPID")!;
-    let _ = Process.run("sqlite3", borrow arguments);
+    let _ = runSqlite(borrow arguments);
     Check.isTrue(Journal.mayBeHot(path)!, "the killed shell left a journal it had synced")?;
     let none = Params.create();
     let changed = connection.scalar("SELECT count(*) FROM t WHERE v LIKE '% changed'", borrow none)!;
@@ -238,6 +253,9 @@ fn locksHotJournalsAreRolledBackAndLiveOnesLeftAlone() -> Result<void, TestFailu
 /// the journal is a header (synced, so its magic is written) that would cut the file to one page if played back.
 @test
 fn locksAJournalWhoseWriterHoldsReservedIsNotHot() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.FileLocks)) {
+        return Ok();
+    }
     let path = "out/lock-live-journal.db";
     lockFixture(path, "out/lock-live-journal.marker")?;
     var writer = Connection.open(path)!;
@@ -269,6 +287,9 @@ fn locksAJournalWhoseWriterHoldsReservedIsNotHot() -> Result<void, TestFailure> 
 /// that then writes while another writes fails at once rather than deadlock, as in SQLite.
 @test
 fn locksTwoSessionsInOneProcessAreKeptApart() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.FileLocks)) {
+        return Ok();
+    }
     let path = "out/lock-sessions.db";
     lockFixture(path, "out/lock-sessions.marker")?;
     var first = Connection.open(path)!;
@@ -310,6 +331,9 @@ fn locksTwoSessionsInOneProcessAreKeptApart() -> Result<void, TestFailure> {
 /// PRAGMA data_version as sqlite3 gives it: 2 before any other connection commits, one more for each that does.
 @test
 fn locksDataVersionCountsOtherConnectionsCommits() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.FileLocks)) {
+        return Ok();
+    }
     let path = "out/lock-data-version.db";
     lockFixture(path, "out/lock-data-version.marker")?;
     var connection = Connection.open(path)!;

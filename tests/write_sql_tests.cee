@@ -167,7 +167,7 @@ fn sameSessionWith(name: StringView, scriptText: StringView, theirAux: StringVie
     }
     var arguments = Vector<StringView>.create();
     arguments.push(theirPath.view())!;
-    let output = Process.capture("sqlite3", borrow arguments, input.view().bytes())!;
+    let output = captureSqlite(borrow arguments, input.view().bytes())!;
     var theirs = shownText(output.stdout.view());
     // Errors, in order, as "error: message".
     let errors = shownText(output.stderr.view());
@@ -255,11 +255,23 @@ fn pragmasDescribeTheSchema() -> Result<void, TestFailure> {
         """);
 }
 
+/// `script` after `PRAGMA legacy_alter_table = ON` and after `= OFF`, each in one session of each engine: the
+/// shells' builds differ in the setting (Apple's sqlite3 has it on, sqlite.org's off, SQLite's default), so it is
+/// set where the shell keeps it.
+fn sameSessionWithLegacyAlterOnAndOff(name: StringView, script: StringView) -> Result<void, TestFailure> {
+    for (on in [true, false]) {
+        var named = String.from(name)!;
+        named.append(if (on) "-legacy" else "")!;
+        var text = String.from(if (on) "PRAGMA legacy_alter_table = ON\n" else "PRAGMA legacy_alter_table = OFF\n")!;
+        text.append(script)!;
+        sameSession(named.view(), text.view())?;
+    }
+    return Ok();
+}
+
 @test
 fn alterTableRewritesDefinitions() -> Result<void, TestFailure> {
-    // The macOS sqlite3 shell runs with legacy_alter_table on.
-    return sameScript("alter", """
-        PRAGMA legacy_alter_table = ON
+    return sameSessionWithLegacyAlterOnAndOff("alter", """
         CREATE TABLE t(a INT, b TEXT CHECK (b <> a), UNIQUE (a, b))
         CREATE INDEX t_b ON t(b) WHERE a > 0
         CREATE TABLE child(id INTEGER PRIMARY KEY, ref INT REFERENCES t(a))
@@ -288,8 +300,7 @@ fn alterTableRewritesDefinitions() -> Result<void, TestFailure> {
 fn renamedColumnsAreQuotedAsSqliteQuotesThem() -> Result<void, TestFailure> {
     // renameEditSql: the new name in double quotes everywhere when RENAME COLUMN quoted it, else in double quotes
     // only where the old name was quoted. The C# port wrote it bare wherever it could stand bare.
-    return sameScript("alter-quotes", """
-        PRAGMA legacy_alter_table = ON
+    return sameSessionWithLegacyAlterOnAndOff("alter-quotes", """
         CREATE TABLE t(a INT, "b" TEXT, c, CHECK (a > 0 AND "b" <> ''))
         CREATE INDEX t_ab ON t(a, b)
         CREATE TABLE child(x REFERENCES t(a), y REFERENCES t("b"))
@@ -497,7 +508,7 @@ fn createTableAsSelectLikeSqlite() -> Result<void, TestFailure> {
         CREATE TABLE s AS SELECT b, typeof(b) AS tb, e + 0 AS en FROM src ORDER BY a DESC
         SELECT type, name, sql FROM sqlite_schema ORDER BY name
         SELECT * FROM t
-        SELECT typeof(a), typeof("a+1"), typeof(e) FROM t
+        SELECT typeof(a), typeof("a + 1"), "a + 1", typeof(e) FROM t
         SELECT * FROM "q t"
         SELECT * FROM w
         SELECT * FROM k
@@ -810,8 +821,6 @@ fn failAndRollbackActions() -> Result<void, TestFailure> {
 fn vacuumIntoWritesACopy() -> Result<void, TestFailure> {
     let copy = "out/vacuum-into-copy.db";
     let _ = File.remove(copy);
-    let existing = "out/vacuum-into-existing.db";
-    let _ = File.create(existing)!;
     sameScript("vacuum-into", """
         PRAGMA user_version = 3
         CREATE TABLE t(id INTEGER PRIMARY KEY, a, b TEXT)
@@ -820,12 +829,24 @@ fn vacuumIntoWritesACopy() -> Result<void, TestFailure> {
         DELETE FROM t WHERE id % 3 = 0
         VACUUM INTO NULL
         VACUUM INTO 5
-        VACUUM INTO 'out/vacuum-into-existing.db'
         SELECT count(*) FROM t
         """)?;
+    // An existing file that is empty may be written, by each engine on a file of its own.
+    let theirEmpty = "out/vacuum-into-empty-theirs.db";
+    let ourEmpty = "out/vacuum-into-empty-ours.db";
+    let _ = File.create(theirEmpty)!;
+    let _ = File.create(ourEmpty)!;
+    if (!sqliteIsApples()) {
+        // Apple's sqlite3 3.54.0 refuses an empty file too.
+        Check.equalText("", askSqlite("out/script-theirs-vacuum-into.db", "VACUUM INTO 'out/vacuum-into-empty-theirs.db'")?.view())?;
+        Check.equalText("ok\n", askSqlite(theirEmpty, "PRAGMA integrity_check")?.view())?;
+    }
     // Ours writes a copy that sqlite3 reads, intact, with the same rows.
     var session = Session.open("out/script-ours-vacuum-into.db")!;
     let none = Vector<SqliteValue>.create();
+    let _ = session.query("VACUUM INTO 'out/vacuum-into-empty-ours.db'", none.view())!;
+    Check.equalText("ok\n", askSqlite(ourEmpty, "PRAGMA integrity_check")?.view())?;
+    Check.equalText("334\n", askSqlite(ourEmpty, "SELECT count(*) FROM t")?.view())?;
     let _ = session.query("VACUUM INTO 'out/vacuum-into-copy.db'", none.view())!;
     Check.equalText("ok\n", askSqlite(copy, "PRAGMA integrity_check")?.view())?;
     Check.equalText("334|3|0\n", askSqlite(copy, "SELECT count(*), (SELECT user_version FROM pragma_user_version), (SELECT freelist_count FROM pragma_freelist_count) FROM t")?.view())?;

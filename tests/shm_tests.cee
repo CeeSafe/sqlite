@@ -32,7 +32,7 @@ fn sqliteOutputInBackground(path: StringView, script: StringView) -> Thread<Stri
         if (arguments.push(owned.view()).isErr()) {
             return String.create();
         }
-        return match (Process.capture("sqlite3", borrow arguments, input.view().bytes())) {
+        return match (captureSqlite(borrow arguments, input.view().bytes())) {
             Ok(output) => match (ByteStringView.fromBytes(output.stdout.view()).toUtf8Lossy()) {
                 Ok(text) => text,
                 Err(_) => String.create(),
@@ -68,6 +68,9 @@ fn fileThere(path: StringView) -> bool => fileLength(path)!.isSome();
 /// the index, which needs the writer's lock. It cannot write; once sqlite3 commits, its next transaction sees it.
 @test
 fn shmThisEngineReadsBesideSqlitesWriter() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     let path = "out/shm-their-writer.db";
     let marker = "out/shm-their-writer.marker";
     let go = "out/shm-their-writer.go";
@@ -102,6 +105,9 @@ fn shmThisEngineReadsBesideSqlitesWriter() -> Result<void, TestFailure> {
 /// cannot write; after the commit it sees the rows.
 @test
 fn shmSqliteReadsBesideThisEnginesWriter() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     let path = "out/shm-our-writer.db";
     shmFixture(path, "out/shm-our-writer.marker", "out/shm-our-writer.go")?;
     var connection = Connection.open(path)!;
@@ -124,6 +130,9 @@ fn shmSqliteReadsBesideThisEnginesWriter() -> Result<void, TestFailure> {
 /// checkpoint from emptying the log (busy); once it ends, the checkpoint goes through.
 @test
 fn shmSqliteKeepsItsSnapshotWhileThisEngineCommits() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     let path = "out/shm-their-reader.db";
     let marker = "out/shm-their-reader.marker";
     let go = "out/shm-their-reader.go";
@@ -153,6 +162,9 @@ fn shmSqliteKeepsItsSnapshotWhileThisEngineCommits() -> Result<void, TestFailure
 /// data_version moves when it next looks, and its next transaction sees the commits.
 @test
 fn shmThisEngineKeepsItsSnapshotWhileSqliteCommits() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     let path = "out/shm-our-reader.db";
     shmFixture(path, "out/shm-our-reader.marker", "out/shm-our-reader.go")?;
     var connection = Connection.open(path)!;
@@ -177,6 +189,9 @@ fn shmThisEngineKeepsItsSnapshotWhileSqliteCommits() -> Result<void, TestFailure
 /// mark, and the last close removing the files.
 @test
 fn shmTwoSessionsReadBesideAWriter() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     let path = "out/shm-sessions.db";
     shmFixture(path, "out/shm-sessions.marker", "out/shm-sessions.go")?;
     var writer = Connection.open(path)!;
@@ -216,6 +231,9 @@ const BIG_ROWS_SQL: StringView = """
 /// engine's hash tables, as it cannot rebuild them), and the reverse.
 @test
 fn shmIndexBlocksAreSharedBothWays() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     let path = "out/shm-blocks.db";
     let marker = "out/shm-blocks.marker";
     let go = "out/shm-blocks.go";
@@ -267,6 +285,9 @@ fn shmIndexBlocksAreSharedBothWays() -> Result<void, TestFailure> {
 /// does, so no update is lost.
 @test
 fn shmConcurrentWritersNeverLoseACommit() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     let path = "out/shm-writers.db";
     shmFixture(path, "out/shm-writers.marker", "out/shm-writers.go")?;
     let _ = askSqlite(path, "CREATE TABLE counter(n); INSERT INTO counter VALUES (0)")?;
@@ -328,6 +349,9 @@ fn corruptWhenRead(path: StringView) -> bool {
 /// slot are `Corrupt`, not a hang; a frame named for the wrong page is `Corrupt`.
 @test
 fn shmDamagedIndexIsRebuiltOrCorrupt() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     let path = "out/shm-damaged.db";
     shmFixture(path, "out/shm-damaged.marker", "out/shm-damaged.go")?;
     var holder = Connection.open(path)!;

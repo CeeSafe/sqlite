@@ -39,7 +39,7 @@ fn shellVerdict(path: StringView, sql: StringView) -> String {
     var arguments = Vector<StringView>.create();
     arguments.push(path)!;
     arguments.push(sql)!;
-    let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
+    let output = captureSqlite(borrow arguments, "".bytes())!;
     var out = shownText(output.stdout.view());
     if (output.status != 0) {
         let errors = shownText(output.stderr.view());
@@ -192,8 +192,9 @@ fn redefine(path: StringView, setup: StringView, name: StringView, sql: StringVi
     script.append("';")!;
     var arguments = Vector<StringView>.create();
     arguments.push(path)!;
+    arguments.push(SCHEMA_WRITABLE)!;
     arguments.push(script.view())!;
-    let status = Process.run("sqlite3", borrow arguments)!;
+    let status = runSqlite(borrow arguments)!;
     return Check.isTrue(status == 0, "sqlite3 changes the schema");
 }
 
@@ -254,6 +255,7 @@ fn indexesThatDisagreeWithTheirTables() -> Result<void, TestFailure> {
     // Each index of t takes u's tree, and the other way round.
     var arguments = Vector<StringView>.create();
     arguments.push(path)!;
+    arguments.push(SCHEMA_WRITABLE)!;
     arguments.push("""
         PRAGMA writable_schema = ON;
         UPDATE sqlite_schema SET rootpage = CASE name
@@ -263,7 +265,7 @@ fn indexesThatDisagreeWithTheirTables() -> Result<void, TestFailure> {
             WHEN 'u_name' THEN (SELECT rootpage FROM sqlite_schema WHERE name = 't_name')
             ELSE rootpage END;
         """)!;
-    Check.isTrue(Process.run("sqlite3", borrow arguments)! == 0, "sqlite3 swaps the indexes")?;
+    Check.isTrue(runSqlite(borrow arguments)! == 0, "sqlite3 swaps the indexes")?;
     sameVerdicts(path, EVERY_FORM)?;
     sameVerdicts(path, "PRAGMA integrity_check(t)\nPRAGMA integrity_check(u)\nPRAGMA integrity_check(500)")?;
     // A UNIQUE index over duplicates.
@@ -422,7 +424,7 @@ fn tablesComeInSqlitesHashOrder() -> Result<void, TestFailure> {
     let path = "out/integrity-order.db";
     for (count in [3i64, 4, 5, 9, 11, 22, 40]) {
         let sql = manyTablesSql(count);
-        makeDatabase(path, sql.view())?;
+        makeDatabaseWith(path, SCHEMA_WRITABLE, sql.view())?;
         sameVerdicts(path, "PRAGMA integrity_check\nPRAGMA quick_check(7)")?;
     }
     return Ok();
@@ -511,13 +513,10 @@ fn whatThisEngineWritesIsIntact() -> Result<void, TestFailure> {
 /// The databases the other tests leave in out/, judged by both engines alike.
 @test
 fn databasesOtherTestsWroteAreJudgedAlike() -> Result<void, TestFailure> {
-    var arguments = Vector<StringView>.create();
-    arguments.push("out")!;
-    let listing = Process.capture("ls", borrow arguments, "".bytes())!;
-    let names = shownText(listing.stdout.view());
-    var lines = names.view().split("\n");
+    let names = Directory.list("out")!;
     var checked: usize = 0;
-    while (lines.next() is Some(name)) {
+    for (k in 0..names.length) {
+        let name = names[k].view();
         if (!name.endsWith(".db") || name.startsWith("integrity-")) {
             continue;
         }

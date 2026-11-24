@@ -61,7 +61,7 @@ fn makeDatabaseOfBytes(path: StringView, script: StringView) -> Result<void, Tes
     var arguments = Vector<StringView>.create();
     arguments.push(path)!;
     let input = unescaped(script);
-    let output = Process.capture("sqlite3", borrow arguments, input.bytes())!;
+    let output = captureSqlite(borrow arguments, input.bytes())!;
     if (output.status != 0) {
         return Check.fail(shownText(output.stderr.view()).view());
     }
@@ -99,7 +99,7 @@ fn sameByteSession(name: StringView, fixture: StringView, script: StringView) ->
     }
     var arguments = Vector<StringView>.create();
     arguments.push(theirPath.view())!;
-    let output = Process.capture("sqlite3", borrow arguments, input.bytes())!;
+    let output = captureSqlite(borrow arguments, input.bytes())!;
     let theirs = shownText(output.stdout.view());
     // Errors, in order, as "error: message"; the shell writes "… near line N: message", then for a parse error
     // the statement and a caret, on lines that start with spaces.
@@ -245,12 +245,36 @@ fn schemasSqliteWroteWithBytesRoundTrip() -> Result<void, TestFailure> {
 
 @test
 fn fileNamesThatAreNotUtf8AreRefused() -> Result<void, TestFailure> {
-    // The file system refuses such names here, and SQLite's open fails with them as this does.
-    return sameByteSession("files", "", """
+    let script = """
         ATTACH 'out/a\xffb.db' AS x
         CREATE TABLE t(a)
         VACUUM INTO 'out/v\xff.db'
-        """);
+        """;
+    if (cfg("target.macos")) {
+        // macOS's file system refuses such names, and SQLite's open fails with them as this does.
+        return sameByteSession("files", "", script);
+    }
+    // Linux's file system takes such a name, and so does sqlite3 on Windows (as U+FFFD): SQLite makes the file.
+    // This engine cannot name it (CeeSafe's file names are text, CEESAFE_FINDINGS.md 47) and refuses it as
+    // sqlite3 does on macOS (README.md, "Text of any bytes").
+    let path = "out/bytes-ours-files.db";
+    freshPath(path);
+    var session = Session.open(path)!;
+    let none = Vector<SqliteValue>.create();
+    var errors = String.create();
+    var lines = script.split("\n");
+    while (lines.next() is Some(line)) {
+        let sql = line.trim();
+        if (sql.length == 0) {
+            continue;
+        }
+        if (session.queryBytes(unescaped(sql).view(), none.view()) is Err(e)) {
+            errors.append(shownText(e.message().bytes()).view())!;
+            errors.append("\n")!;
+        }
+    }
+    Check.equalText("unable to open database: out/a\\xFFb.db\nunable to open database: out/v\\xFF.db\n", errors.view())?;
+    return expectIntact(path);
 }
 
 @test

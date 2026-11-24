@@ -76,6 +76,9 @@ fn sqliteUndoesThisEnginesInterruptedCommit() -> Result<void, TestFailure> {
 
 @test
 fn thisEngineUndoesSqlitesInterruptedCommit() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.KillingTheShell)) {
+        return Ok();
+    }
     let path = "out/journal-from-sqlite.db";
     makeDatabase(path, JOURNAL_FIXTURE_SQL)?;
     let original = wholeFile(path);
@@ -84,7 +87,7 @@ fn thisEngineUndoesSqlitesInterruptedCommit() -> Result<void, TestFailure> {
     arguments.push(path)!;
     arguments.push("PRAGMA cache_size = 1; PRAGMA cache_spill = 1; BEGIN; UPDATE t SET n = n + 1000000, label = label || ' changed';")!;
     arguments.push(".shell kill -9 $PPID")!;
-    let _ = Process.run("sqlite3", borrow arguments);
+    let _ = runSqlite(borrow arguments);
     Check.isTrue(Journal.exists(path)!, "the killed shell left its journal")?;
     Check.isTrue(wholeFile(path).view() != original.view(), "and a file with part of its transaction in it")?;
     Check.isTrue(Journal.recover(path)!, "the journal is played back")?;
