@@ -641,7 +641,7 @@ struct PlanStats {
 
 /// sqlite3LogEst: about 10 × log2(n).
 fn logEst(n: u64) -> i64 {
-    let a = [0, 2, 3, 5, 6, 7, 8, 9];
+    let a: [i64; 8] = [0, 2, 3, 5, 6, 7, 8, 9];
     var x = n;
     var y: i64 = 40;
     if (x < 8) {
@@ -662,12 +662,45 @@ fn logEst(n: u64) -> i64 {
             x = x >> 1;
         }
     }
-    return (a[truncate<usize>(x & 7)] as i64) + y - 10;
+    return a[truncate<usize>(x & 7)] + y - 10;
 }
 
 /// sqlite3LogEstAdd: the LogEst of the sum of two values given as LogEsts.
 fn logEstAdd(a: i64, b: i64) -> i64 {
-    let x = [10, 10, 9, 9, 8, 8, 7, 7, 7, 6, 6, 6, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2];
+    let x: [i64; 32] = [
+        10,
+        10,
+        9,
+        9,
+        8,
+        8,
+        7,
+        7,
+        7,
+        6,
+        6,
+        6,
+        5,
+        5,
+        5,
+        4,
+        4,
+        4,
+        4,
+        3,
+        3,
+        3,
+        3,
+        3,
+        3,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+    ];
     let high = if (a >= b) a else b;
     let low = if (a >= b) b else a;
     if (high > low + 49) {
@@ -676,7 +709,7 @@ fn logEstAdd(a: i64, b: i64) -> i64 {
     if (high > low + 31) {
         return high + 1;
     }
-    return high + (x[truncate<usize>(high - low)] as i64);
+    return high + x[truncate<usize>(high - low)];
 }
 
 /// estLog: the cost of one search among `n` (a LogEst) entries.

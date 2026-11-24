@@ -213,8 +213,7 @@ fn insertIntoView(
     var frame = newFrame(mut compiler, params, db)?;
     var rows = insertRows(borrow source, mut frame, db)?;
     var output = Vector<Vector<SqliteValue>>.create();
-    for (r in 0..rows.length) {
-        let given = takeRow(mut rows, r);
+    for (given in rows.drain()) {
         if (given.length != targets.length) {
             var message = String.create();
             if (stmt.columns.length == 0) {
@@ -291,8 +290,8 @@ fn deleteFromView(
     var frame = newFrame(mut compiler, params, db)?;
     var rows = runSelect(borrow plan, mut frame, db)?;
     var output = Vector<Vector<SqliteValue>>.create();
-    for (r in 0..rows.length) {
-        let oldRow: Slot? = viewRow(takeRow(mut rows, r));
+    for (taken in rows.drain()) {
+        let oldRow: Slot? = viewRow(taken);
         let noRow: Slot? = null;
         if (!fireTriggers(
             borrow triggers,
@@ -353,8 +352,8 @@ fn updateView(
     var rows = runSelect(borrow plan, mut frame, db)?;
     var output = Vector<Vector<SqliteValue>>.create();
     let n = table.columns.length;
-    for (r in 0..rows.length) {
-        var row = takeRow(mut rows, r);
+    for (taken in rows.drain()) {
+        var row = taken;
         var old = Vector<SqliteValue>.withCapacity(n)?;
         for (c in 0..n) {
             old.push(row[c].clone()?)?;

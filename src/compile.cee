@@ -25,7 +25,7 @@ fn pairCollation(left: borrow Compiled, right: borrow Compiled) -> Collation {
     return left.collation ?? right.collation ?? Collation.Binary;
 }
 
-/// What an operand passes up of its collation.
+/// What an operand passes up of its collation: a Copy snapshot, taken before its expression moves into the node.
 struct CollationInfo {
     collation: Collation?;
     explicit: bool;
@@ -34,23 +34,13 @@ struct CollationInfo {
 fn infoOf(c: borrow Compiled) -> CollationInfo => CollationInfo { collation: c.collation, explicit: c.explicit };
 
 /// The collation an expression passes up: an explicit one from its operands, left first (EP_Collate).
-fn passedCollation(parts: Slice<CollationInfo>) -> Compiled {
+fn passedCollation(parts: Slice<CollationInfo>) -> CollationInfo {
     for (i in 0..parts.length) {
         if (parts[i].explicit) {
-            return Compiled {
-                expr: XExpr.Value(SqliteValue.Null),
-                affinity: ExprAffinity.None,
-                collation: parts[i].collation,
-                explicit: true,
-            };
+            return parts[i];
         }
     }
-    return Compiled {
-        expr: XExpr.Value(SqliteValue.Null),
-        affinity: ExprAffinity.None,
-        collation: null,
-        explicit: false,
-    };
+    return CollationInfo { collation: null, explicit: false };
 }
 
 fn withPassed(expr: XExpr, parts: Slice<CollationInfo>) -> Compiled {

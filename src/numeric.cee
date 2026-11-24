@@ -56,16 +56,17 @@ struct Wide96 {
     low: u32;
 }
 
+/// value / divisor rounded toward negative infinity.
 fn floorDivide(value: i64, divisor: i64) -> i64 {
     let quotient = value / divisor;
     return if (value % divisor != 0 && value < 0) quotient - 1 else quotient;
 }
 
 /// floor(log2(10^p)).
-fn pwr10to2(p: i32) -> i32 => truncate<i32>(floorDivide((p as i64) * 108853, 32768));
+fn pwr10to2(p: i32) -> i32 => truncate<i32>(((p as i64) * 108853).wrappingShr(15));
 
 /// floor(log10(2^p)).
-fn pwr2to10(p: i32) -> i32 => truncate<i32>(floorDivide((p as i64) * 78913, 262144));
+fn pwr2to10(p: i32) -> i32 => truncate<i32>(((p as i64) * 78913).wrappingShr(18));
 
 /// The upper 96 bits of the 160-bit product of (a, aLow) × b: the top 64 and the 32 after them.
 fn multiply160(a: u64, aLow: u32, b: u64) -> Wide96 {
@@ -532,9 +533,12 @@ struct DecodedReal {
     }
 }
 
-/// Appends ASCII bytes to a string.
-fn appendAscii(out: borrow mut String, bytes: Slice<u8>) -> Result<void, AllocError> =>
-    out.append(StringView.fromUtf8(bytes)!);
+/// Appends ASCII bytes (digits, signs, a point) to a string.
+fn appendAscii(out: borrow mut String, bytes: Slice<u8>) -> Result<void, AllocError> {
+    let added = out.appendUtf8(bytes)?;
+    debugAssert(added, "ASCII bytes are UTF-8");
+    return Ok();
+}
 
 /// Appends a real as SQLite writes it as text (`%!.17g`).
 fn appendReal(out: borrow mut String, r: f64) -> Result<void, AllocError> {

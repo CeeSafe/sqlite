@@ -800,12 +800,10 @@ fn quoteValue(value: borrow SqliteValue) -> Result<String, AllocError> {
         }
         SqliteValue.Blob(b) => {
             out.append("X'")?;
-            var hex = Vector<u8>.withCapacity(b.length * 2)?;
             for (byte in b.view()) {
-                hex.push(hexDigit(byte >> 4))?;
-                hex.push(hexDigit(byte & 15))?;
+                let _ = out.appendChar(hexDigit(byte >> 4) as u32)?;
+                let _ = out.appendChar(hexDigit(byte & 15) as u32)?;
             }
-            appendAscii(mut out, hex.view())?;
             out.append("'")?;
         }
     }

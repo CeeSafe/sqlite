@@ -1082,8 +1082,7 @@ fn executeInsert(
     var output = Vector<Vector<SqliteValue>>.create();
     let action = stmt.conflict;
     var count: i64 = 0;
-    for (r in 0..rows.length) {
-        let given = takeRow(mut rows, r);
+    for (given in rows.drain()) {
         if (given.length != targets.length) {
             var message = String.create();
             if (stmt.columns.length == 0) {

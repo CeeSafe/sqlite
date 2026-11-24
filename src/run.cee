@@ -171,9 +171,7 @@ fn runRecursive(
     }
     loop {
         var next = Vector<Vector<SqliteValue>>.create();
-        while (pending.length != 0) {
-            let row = takeRow(mut pending, 0);
-            let _ = pending.remove(0);
+        for (row in pending.drain()) {
             if (plan.distinct) {
                 let key = groupKey(row.view(), binary.view())?;
                 if (seen.contains(borrow key)) {
@@ -201,9 +199,11 @@ fn runRecursive(
 fn skipRows(rows: Vector<Vector<SqliteValue>>, offset: usize) -> Result<Vector<Vector<SqliteValue>>, AllocError> {
     var all = rows;
     var out = Vector<Vector<SqliteValue>>.create();
-    for (index in 0..all.length) {
-        if (index >= offset) {
-            out.push(takeRow(mut all, index))?;
+    var index: usize = 0;
+    for (row in all.drain()) {
+        index += 1;
+        if (index > offset) {
+            out.push(row)?;
         }
     }
     return Ok(out);
@@ -308,11 +308,10 @@ fn joinLevel(
         _ => {
             var rows = sourceRows(borrow source.kind, frame, db)?;
             var rowId: i64 = 0;
-            for (r in 0..rows.length) {
+            for (values in rows.drain()) {
                 if (sink.stopAfter is Some(n) && sink.rows.length >= n) {
                     return Ok();
                 }
-                let values = takeRow(mut rows, r);
                 rowId += 1;
                 frame.slots[source.slot] = Slot { values: values, rowId: rowId, isNull: false };
                 if (borrow source.on is Some(on)) {
@@ -322,7 +321,7 @@ fn joinLevel(
                     }
                 }
                 matched = true;
-                markRightMatch(source, level, r, sink)?;
+                markRightMatch(source, level, truncate<usize>(rowId - 1), sink)?;
                 joinLevel(core, level + 1, frame, db, sink)?;
             }
         }
@@ -420,11 +419,12 @@ fn unmatchedRightRows(
             }
             _ => {
                 var rows = sourceRows(borrow source.kind, frame, db)?;
-                for (r in 0..rows.length) {
-                    if (wasMatched(r)) {
+                var r: usize = 0;
+                for (values in rows.drain()) {
+                    r += 1;
+                    if (wasMatched(r - 1)) {
                         continue;
                     }
-                    let values = takeRow(mut rows, r);
                     frame.slots[source.slot] = Slot { values: values, rowId: truncate<i64>(r + 1), isNull: false };
                     joinLevel(core, level + 1, frame, db, sink)?;
                 }
@@ -758,9 +758,11 @@ fn runSelect(
         result.sortStableBy((x, y) => compareByColumns(x.view(), y.view(), order));
     }
     var out = Vector<Vector<SqliteValue>>.create();
-    for (index in 0..result.length) {
-        if (index >= offset && (limit.isNull() || out.length < limit!)) {
-            out.push(takeRow(mut result, index))?;
+    var index: usize = 0;
+    for (row in result.drain()) {
+        index += 1;
+        if (index > offset && (limit.isNull() || out.length < limit!)) {
+            out.push(row)?;
         }
     }
     return Ok(out);
@@ -795,8 +797,8 @@ fn combine(
     var out = Vector<Vector<SqliteValue>>.create();
     if (op == CompoundOp.UnionAll) {
         out = left;
-        for (i in 0..right.length) {
-            out.push(takeRow(mut right, i))?;
+        for (row in right.drain()) {
+            out.push(row)?;
         }
         return Ok(out);
     }
@@ -807,8 +809,7 @@ fn combine(
         }
     }
     var seen = HashMap<Vector<u8>, bool>.create();
-    for (i in 0..left.length) {
-        let row = takeRow(mut left, i);
+    for (row in left.drain()) {
         let key = groupKey(row.view(), collations)?;
         if (seen.contains(borrow key)) {
             continue;
@@ -824,8 +825,7 @@ fn combine(
         }
     }
     if (op == CompoundOp.Union) {
-        for (i in 0..right.length) {
-            let row = takeRow(mut right, i);
+        for (row in right.drain()) {
             let key = groupKey(row.view(), collations)?;
             if (seen.contains(borrow key)) {
                 continue;
@@ -895,10 +895,6 @@ fn subqueryFirstColumn(
     }
     return Ok(out);
 }
-
-/// Takes row `i` out of a list, leaving an empty one in its place.
-fn takeRow(rows: borrow mut Vector<Vector<SqliteValue>>, i: usize) -> Vector<SqliteValue> =>
-    replace(mut rows[i], Vector<SqliteValue>.create());
 
 /// A walk over a table's rows: a rowid table's b-tree, or a WITHOUT ROWID table's index b-tree, whose entries
 /// are its records (in primary-key order, with no rowid).
