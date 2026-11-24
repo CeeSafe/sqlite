@@ -176,7 +176,7 @@ struct WritablePager {
             busyTimeout: busyTimeout,
             seen: null,
             committedHere: false,
-            dataVersion: 1,
+            dataVersion: 0,
             shared: null,
             walMode: false,
             autoCheckpoint: WAL_DEFAULT_AUTOCHECKPOINT,
@@ -452,7 +452,8 @@ struct WritablePager {
             Some(seen) => seen.schemaCookie() != now.schemaCookie(),
             null => true,
         };
-        // As pager_reset does, the first read too: sqlite3 answers 2 before any other connection commits.
+        // As pager_reset does, the first read too, from 0: sqlite3 3.54.1 answers 1 before any other connection
+        // commits (Apple's 3.54.0 says 2).
         this.dataVersion += 1;
         this.loadState()?;
         this.seen = now;
@@ -1138,8 +1139,15 @@ struct WritablePager {
     /// the running statement's own ends first. The transaction must have no changes.
     fn checkpoint(borrow mut this, mode: CheckpointMode) -> Result<WalCheckpoint, SqliteError> {
         assert(this.dirty.length() == 0, "a checkpoint is made between transactions");
+        // A connection opened read-only checkpoints as any other when it may write the log and the index (wal.c
+        // sets readOnly only from those files), and fails on the database file, which it opened for reading:
+        // "disk I/O error" (SQLITE_IOERR) in sqlite.org's 3.54.1, even with nothing to copy. Apple's 3.54.0
+        // answers "attempt to write a readonly database".
         if (this.readOnly && this.walMode) {
-            return Err(readOnlyError());
+            return match (borrow this.shared) {
+                Some(wal) => Err(if (wal.writable()) SqliteError.Io(IoError.BadDescriptor) else readOnlyError()),
+                null => Err(readOnlyError()),
+            };
         }
         let pageSize = this.pageSize;
         let timeout = this.busyTimeout;

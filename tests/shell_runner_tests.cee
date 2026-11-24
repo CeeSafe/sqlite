@@ -32,63 +32,92 @@ fn sqliteIsApples() -> bool {
 /// - U+FFFE and U+FFFF are characters (Apple's reads them as U+FFFD);
 /// - an empty printf() result is '' (Apple's gives NULL);
 /// - a time of 24:00:00 is the next day's midnight, and 24 with other minutes or seconds is no time;
-/// - `t.*` in a RIGHT or FULL join is the table's own columns (Apple's coalesces those USING or NATURAL shares).
-fn officialAnswerWhereAppleDiffers(path: StringView, sql: StringView) -> String? {
+/// - `t.*` in a RIGHT or FULL join is the table's own columns (Apple's coalesces those USING or NATURAL shares);
+/// - PRAGMA data_version starts at 1 (Apple's at 2);
+/// - a checkpoint by a connection opened read-only fails as it writes the database, "disk I/O error" (Apple's
+///   refuses it first, "attempt to write a readonly database").
+fn officialAnswerWhereAppleDiffers(path: StringView, sql: StringView, theirs: StringView) -> String? {
     var k: usize = 0;
-    while (k + 2 < APPLE_DIFFERS.length) {
-        if ((APPLE_DIFFERS[k].length == 0 || APPLE_DIFFERS[k] == path) && APPLE_DIFFERS[k + 1] == sql) {
-            return String.from(APPLE_DIFFERS[k + 2])!;
+    while (k + 3 < APPLE_DIFFERS.length) {
+        if ((APPLE_DIFFERS[k].length == 0 || APPLE_DIFFERS[k] == path) && APPLE_DIFFERS[k + 1] == sql &&
+            APPLE_DIFFERS[k + 2] == theirs) {
+            return String.from(APPLE_DIFFERS[k + 3])!;
         }
-        k += 3;
+        k += 4;
     }
     return null;
 }
 
-/// The statements of `officialAnswerWhereAppleDiffers`, three entries each: the database (any if empty), the
-/// statement and sqlite.org's answer.
-const APPLE_DIFFERS: [StringView; 36] = [
+/// The statements of `officialAnswerWhereAppleDiffers`, four entries each: the database (any if empty), the
+/// statement, Apple's answer and sqlite.org's. sqlite.org's stands in only when Apple's shell gave exactly the
+/// answer recorded for it.
+const APPLE_DIFFERS: [StringView; 60] = [
+    "out/ro-connection.db",
+    "PRAGMA wal_checkpoint(TRUNCATE)",
+    "error: attempt to write a readonly database\n",
+    "error: disk I/O error\n",
+    "out/lock-data-version.db",
+    "PRAGMA data_version",
+    "2\n",
+    "1\n",
     "",
     "SELECT date('2024-02-29 24:00'), datetime('2024-02-29 24:00:00.5'), datetime('2024-12-31 24:00', 'start of day'), datetime('2024-02-29 24:30'), time('24:59:59'), time('24:00:00.000'), datetime('2024-02-29 13:45:30', '+24:30')",
+    "2024-03-01|2024-03-01 24:00:00|2024-12-31 00:00:00|2024-03-01 24:30:00|24:59:59|24:00:00|2024-02-29 14:15:30\n",
     "2024-03-01||2025-01-01 00:00:00|||00:00:00|\n",
     "",
     "SELECT typeof(printf('%s', '')), typeof(printf('%n')), typeof(printf('%y')), typeof(printf('%.0s', 'abc')), typeof(printf('%')), typeof(printf('%.0c', '')), typeof(printf(x''))",
+    "null|null|null|null|text|text|null\n",
     "text|text|text|text|text|text|text\n",
     "",
     "SELECT id, x LIKE CAST(x'ff' AS TEXT), x LIKE '_', x LIKE '%', x GLOB '?', x GLOB '*' || CAST(x'ff' AS TEXT) FROM t ORDER BY id",
+    "1|1|1|1|1|1\n2|1|1|1|1|1\n3|1|1|1|1|1\n4|0|0|1|0|0\n5|0|0|1|0|0\n6|0|1|1|1|0\n7|0|0|1|0|0\n8|0|0|1|0|0\n9|0|0|1|0|0\n10|1|1|1|1|1\n11|0|0|1|0|0\n",
     "1|1|1|1|1|1\n2|1|1|1|1|1\n3|1|1|1|1|1\n4|0|0|1|0|0\n5|0|0|1|0|0\n6|0|1|1|1|0\n7|0|0|1|0|0\n8|0|0|1|0|0\n9|0|0|1|0|0\n10|0|1|1|1|0\n11|0|0|1|0|0\n",
     "",
     "SELECT id, x LIKE 'a_bc', x GLOB 'a?bc', x LIKE '%' || CAST(x'ff' AS TEXT) || '%', x GLOB '[' || CAST(x'ff' AS TEXT) || ']' FROM t ORDER BY id",
+    "1|0|0|1|1\n2|0|0|1|1\n3|0|0|1|1\n4|1|1|0|0\n5|0|0|1|0\n6|0|0|0|0\n7|0|0|1|0\n8|0|0|1|0\n9|0|0|0|0\n10|0|0|1|1\n11|0|0|0|0\n",
     "1|0|0|1|1\n2|0|0|1|1\n3|0|0|1|1\n4|1|1|0|0\n5|0|0|1|0\n6|0|0|0|0\n7|0|0|1|0\n8|0|0|1|0\n9|0|0|0|0\n10|0|0|0|0\n11|0|0|0|0\n",
     "",
     "SELECT unicode(CAST(x'80' AS TEXT)), unicode(CAST(x'bf41' AS TEXT)), unicode(CAST(x'c3' AS TEXT)), unicode(CAST(x'eda080' AS TEXT)), unicode(CAST(x'efbfbf' AS TEXT))",
+    "128|191|65533|65533|65533\n",
     "128|191|65533|65533|65535\n",
     "",
     "SELECT datetime('13:45'), datetime('13:45:30.5'), time('24:00'), datetime('24:00:00'), date('12:00')",
+    "2000-01-01 13:45:00|2000-01-01 13:45:30|24:00:00|2000-01-02 24:00:00|2000-01-01\n",
     "2000-01-01 13:45:00|2000-01-01 13:45:30|00:00:00|2000-01-02 00:00:00|2000-01-01\n",
     "",
     "SELECT strftime('%I %l %p', '2024-02-29 00:30'), strftime('%I %l %p', '2024-02-29 12:30'), strftime('%I %l %P', '2024-02-29 23:30'), strftime('%k %H', '24:00')",
+    "12 12 AM|12 12 PM|11 11 pm|24 24\n",
     "12 12 AM|12 12 PM|11 11 pm| 0 00\n",
     "",
     "SELECT printf(NULL), printf(NULL, 1), typeof(printf()), printf(''), typeof(printf('')), format('%d-%s', 1, 'a'), FORMAT('%5.1f', 2.25)",
+    "||null||null|1-a|  2.3\n",
     "||null||text|1-a|  2.3\n",
     "",
     "SELECT a.*, b.k FROM a NATURAL RIGHT JOIN b ORDER BY bv",
+    "1|2||2\n2|3||3\n4|5||5\n3|||\n",
     "|||2\n|||3\n|||5\n|||\n",
     "",
     "SELECT id, length(x), octet_length(x), unicode(x) FROM t ORDER BY id",
+    "1|1|1|65533\n2|1|1|65533\n3|1|3|65533\n4|4|4|97\n5|2|3|65533\n6|1|4|1114112\n7|5|5|65\n8|7|8|32\n9|5|6|104\n10|1|3|65533\n11|2|3|130\n",
     "1|1|1|65533\n2|1|1|65533\n3|1|3|65533\n4|4|4|97\n5|2|3|65533\n6|1|4|1114112\n7|5|5|65\n8|7|8|32\n9|5|6|104\n10|1|3|65534\n11|2|3|130\n",
     "out/utf16-functions-le.db",
     "SELECT group_concat(hex(CAST(column1 AS BLOB)), ' ') FROM (SELECT column1 FROM (VALUES ('a'), ('Ā'), ('😀'), ('￿'), ('b'), ('ab'), ('aĀ')) ORDER BY 1)",
+    "0001 3DD800DE 6100 61000001 61006200 6200 FDFF\n",
     "0001 3DD800DE 6100 61000001 61006200 6200 FFFF\n",
     "out/utf16-functions-be.db",
     "SELECT group_concat(hex(CAST(column1 AS BLOB)), ' ') FROM (SELECT column1 FROM (VALUES ('a'), ('Ā'), ('😀'), ('￿'), ('b'), ('ab'), ('aĀ')) ORDER BY 1)",
+    "0061 00610062 00610100 0062 0100 D83DDE00 FFFD\n",
     "0061 00610062 00610100 0062 0100 D83DDE00 FFFF\n",
+    "out/ro-connection.db",
+    "PRAGMA wal_checkpoint",
+    "error: attempt to write a readonly database\n",
+    "error: disk I/O error\n",
 ];
 
 /// What the shell answered to `sql` on `path`, or with Apple's shell, for a statement Apple's answers differently,
 /// sqlite.org's answer.
 fn officialAnswer(path: StringView, sql: StringView, theirs: String) -> String {
-    match (officialAnswerWhereAppleDiffers(path, sql)) {
+    match (officialAnswerWhereAppleDiffers(path, sql, theirs.view())) {
         Some(answer) => {
             if (sqliteIsApples()) {
                 return answer;

@@ -291,6 +291,9 @@ fn locksAJournalWhoseWriterHoldsReservedIsNotHot() -> Result<void, TestFailure> 
 /// for an instant, some of those attempts were "database is locked".
 @test
 fn locksTheHotJournalCheckTakesNoLock() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.FileLocks)) {
+        return Ok();
+    }
     let path = "out/lock-check.db";
     let link = "out/lock-check-link.db";
     let marker = "out/lock-check.marker";
@@ -302,7 +305,7 @@ fn locksTheHotJournalCheckTakesNoLock() -> Result<void, TestFailure> {
     var ln = Vector<StringView>.create();
     ln.push(path)!;
     ln.push(link)!;
-    Check.isTrue(Process.run("ln", borrow ln)! == 0, "a hard link to the file")?;
+    Check.isTrue(runProgram("ln", borrow ln)! == 0, "a hard link to the file")?;
     var connection = Connection.open(path)!;
     // One shell holds SHARED until told to go, so that the journal is never played back.
     var waitForGo = String.from(".shell for i in $(seq 1 3000); do [ -f ")!;
@@ -328,7 +331,7 @@ fn locksTheHotJournalCheckTakesNoLock() -> Result<void, TestFailure> {
         if (arguments.push(owned.view()).isErr()) {
             return String.from("no arguments").ok() ?? String.create();
         }
-        return match (Process.capture("sqlite3", borrow arguments, script.view().bytes())) {
+        return match (captureSqlite(borrow arguments, script.view().bytes())) {
             Ok(output) => shownText(output.stderr.view()),
             Err(_) => String.from("sqlite3 did not run").ok() ?? String.create(),
         };
@@ -402,7 +405,8 @@ fn locksTwoSessionsInOneProcessAreKeptApart() -> Result<void, TestFailure> {
     return expectIntact(path);
 }
 
-/// PRAGMA data_version as sqlite3 gives it: 2 before any other connection commits, one more for each that does.
+/// PRAGMA data_version as sqlite3 gives it: 1 before any other connection commits (Apple's sqlite3 3.54.0 says 2),
+/// one more for each that does.
 @test
 fn locksDataVersionCountsOtherConnectionsCommits() -> Result<void, TestFailure> {
     if (skippedOnWindows(WindowsGap.FileLocks)) {
@@ -412,9 +416,10 @@ fn locksDataVersionCountsOtherConnectionsCommits() -> Result<void, TestFailure> 
     lockFixture(path, "out/lock-data-version.marker")?;
     var connection = Connection.open(path)!;
     let none = Params.create();
-    Check.isTrue(connection.scalar("PRAGMA data_version", borrow none)! is Some(SqliteValue.Integer(2)), "first")?;
+    Check.isTrue(connection.scalar("PRAGMA data_version", borrow none)! is Some(SqliteValue.Integer(1)), "first")?;
+    Check.equalText("1\n", theirAnswer(path, "PRAGMA data_version").view())?;
     let _ = theirAnswer(path, "INSERT INTO t VALUES (2)");
-    Check.isTrue(connection.scalar("PRAGMA data_version", borrow none)! is Some(SqliteValue.Integer(3)), "next")?;
-    Check.equalText("2\n", theirAnswer(path, "PRAGMA data_version").view())?;
+    Check.isTrue(connection.scalar("PRAGMA data_version", borrow none)! is Some(SqliteValue.Integer(2)), "next")?;
+    Check.equalText("1\n", theirAnswer(path, "PRAGMA data_version").view())?;
     return Ok();
 }

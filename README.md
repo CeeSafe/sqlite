@@ -498,8 +498,8 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   hot journal (one with its header synced while no writer holds RESERVED) is rolled back under EXCLUSIVE; a
   journal whose writer still holds RESERVED is left alone. A connection forgets its pages when the file's header
   or the log changed since it last held a lock, as SQLite checks its change counter, and PRAGMA data_version
-  counts such changes as sqlite3 does (`locksSqliteHoldingExclusiveMakesThisEngineWait`,
-  `locksThisEngineHoldingLocksMakesSqliteWait`, `locksAReaderInATransactionSeesAStableSnapshot`,
+  counts such changes as sqlite3 does, from 1 in a new connection (2 in Apple's sqlite3 3.54.0;
+  `locksSqliteHoldingExclusiveMakesThisEngineWait`, `locksThisEngineHoldingLocksMakesSqliteWait`, `locksAReaderInATransactionSeesAStableSnapshot`,
   `locksConcurrentWritersNeverLoseACommit`, `locksHotJournalsAreRolledBackAndLiveOnesLeftAlone`,
   `locksAJournalWhoseWriterHoldsReservedIsNotHot`, `locksTwoSessionsInOneProcessAreKeptApart`,
   `locksDataVersionCountsOtherConnectionsCommits`; in WAL mode the `shm*` tests). Before CeeSafe had file
@@ -619,10 +619,13 @@ lease.get().execute(…)?;
 Choices where the C# concept does not fit CeeSafe:
 
 - **Errors** are `Result<T, SqliteError>`; `SqliteError.Busy` is new, for "database is locked", and
-  `SqliteError.ReadOnly` for "attempt to write a readonly database" (SQLITE_READONLY).
+  `SqliteError.ReadOnly` for "attempt to write a readonly database" (SQLITE_READONLY). `SqliteError.Io`'s message
+  is SQLite's "disk I/O error" (SQLITE_IOERR); its `IoError` says what the system answered.
 - **Read-only connections.** `Connection.openReadOnly(path)` opens as SQLITE_OPEN_READONLY (`sqlite3 -readonly`):
   the file must exist, statements that would write are refused, BEGIN IMMEDIATE and EXCLUSIVE are read
-  transactions, TEMP tables are the connection's own. `Connection.open` opens a file it may not write so too, as
+  transactions, TEMP tables are the connection's own. In WAL mode with a log and `-shm` it may write, PRAGMA
+  wal_checkpoint fails with "disk I/O error", as in sqlite.org's 3.54.1, which tries to write the database it
+  opened for reading (Apple's sqlite3 3.54.0 answers "attempt to write a readonly database"). `Connection.open` opens a file it may not write so too, as
   unixOpen falls back to reading.
 - **Lifetimes.** There is no IDisposable: a `Connection` closes when it is dropped (rolling back), and `close()`
   says whether that rollback worked. A `PooledConnection` gives its connection back when dropped.
@@ -826,6 +829,15 @@ Collations other than BINARY, NOCASE and RTRIM are refused.
 what it prints. The front ends have their own: `ceesafec test` in `cli/`, `pgwire/` and `daemon/` (`pgwire`'s
 `psqlTalksToTheServer` runs `psql` when it is installed and is skipped otherwise; `cli`'s `atATerminalAsSqlite3`
 builds the shell and runs `tests/terminal.py` when `python3` is installed).
+
+The answers are SQLite 3.54.1's, sqlite.org's build, which CI runs on macOS, Linux and Windows
+(`.github/workflows/ci.yml`). Apple's `/usr/bin/sqlite3` (3.54.0, from an earlier snapshot) differs in a few
+answers and settings: the tests set the settings they need (`legacy_alter_table` in the session, defensive mode
+off where they damage a schema), and where Apple's answer differs they check the engine against sqlite.org's
+(`APPLE_DIFFERS` in `tests/shell_runner_tests.cee` and `cli/tests/shell_tests.cee`), so they pass with either.
+On Windows the tests run sqlite3 through `tests/capture.py` (Python), as CeeSafe's `Process.capture` and
+`Process.run` cannot run it there yet (CEESAFE_FINDINGS.md 45, 46), and the WAL, `-shm` and lock tests are
+skipped until os_win.c's locks are ported (`tests/windows_skips_tests.cee`).
 
 The planner's timing probe (`tests/planner_probe_tests.cee`) times each kind of seek, covering read and index
 order against the same query with the index defeated (`+column`) on a 20,000-row table:

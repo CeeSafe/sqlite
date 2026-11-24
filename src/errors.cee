@@ -31,7 +31,8 @@ impl SqliteError {
     /// it held bytes that are not (`messageText` for a `String`).
     public fn message(borrow this) -> ByteStringView => match (this) {
         SqliteError.Alloc(_) => ByteStringView.fromText("out of memory"),
-        SqliteError.Io(e) => ByteStringView.fromText(e.message()),
+        // SQLITE_IOERR's message, as sqlite3_errmsg gives it; the IoError says what the system answered.
+        SqliteError.Io(_) => ByteStringView.fromText("disk I/O error"),
         SqliteError.Corrupt(m) => m.view(),
         SqliteError.NotADatabase(m) => m.view(),
         SqliteError.Sql(m) => m.view(),

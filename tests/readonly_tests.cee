@@ -29,12 +29,16 @@ fn chmodAll(mode: u32, files: borrow Vector<String>) {
 }
 
 /// What `sqlite3 -readonly` answers, or "error: " and its message.
-fn theirReadOnlyAnswer(path: StringView, sql: StringView) -> String {
+fn theirReadOnlyAnswer(path: StringView, sql: StringView) -> String =>
+    officialAnswer(path, sql, shellReadOnlyAnswer(path, sql));
+
+/// What `sqlite3 -readonly` answers, or "error: " and its message.
+fn shellReadOnlyAnswer(path: StringView, sql: StringView) -> String {
     var arguments = Vector<StringView>.create();
     arguments.push("-readonly")!;
     arguments.push(path)!;
     arguments.push(sql)!;
-    let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
+    let output = captureSqlite(borrow arguments, "".bytes())!;
     if (output.status == 0) {
         return shownText(output.stdout.view());
     }
@@ -68,7 +72,7 @@ fn walFixtureKeptInLog(path: StringView) -> Result<void, TestFailure> {
     script.append("INSERT INTO t VALUES (3);\n")!;
     var arguments = Vector<StringView>.create();
     arguments.push(path)!;
-    let output = Process.capture("sqlite3", borrow arguments, script.view().bytes())!;
+    let output = captureSqlite(borrow arguments, script.view().bytes())!;
     Check.isTrue(output.status == 0, "sqlite3 made the fixture")?;
     Check.isTrue(fileLength(files[1].view())!.isSome(), "the log stays")?;
     return Ok();
@@ -130,6 +134,9 @@ fn sameReadOnlyAnswers(
 /// and checkpoints are refused as SQLite refuses them, and closing leaves the three files as they were.
 @test
 fn readOnlyWalFilesAreReadThroughAnIndexOfTheirOwn() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     let path = "out/ro-heap.db";
     walFixtureKeptInLog(path)?;
     let files = walFiles(path);
@@ -159,6 +166,9 @@ fn readOnlyWalFilesAreReadThroughAnIndexOfTheirOwn() -> Result<void, TestFailure
 /// (WAL_SHM_RDONLY), as a second sqlite3 cannot.
 @test
 fn readOnlyShmIsMappedBesideAConnectionThatWrites() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     let path = "out/ro-shm.db";
     let marker = "out/ro-shm.marker";
     let go = "out/ro-shm.go";
@@ -273,6 +283,9 @@ fn readOnlyHotJournalIsRefused() -> Result<void, TestFailure> {
 /// transaction finds the DMS byte held, maps the `-shm` for reading, and sees the commit.
 @test
 fn readOnlyIndexOfItsOwnGivesWayToAWriter() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.WalMode)) {
+        return Ok();
+    }
     let path = "out/ro-handover.db";
     let marker = "out/ro-handover.marker";
     let go = "out/ro-handover.go";
