@@ -763,10 +763,10 @@ The report matches the `sqlite3` shell's row for row on the tests' damaged files
   broken is read as SQLite reads it: its fields in the page are checked, and only a check that needs a field on
   the missing pages ends the report.
 - **The order of tables.** SQLite checks tables in the order of its schema hash table, which depends on how
-  many buckets its allocator rounds the table's array up to; `sqliteHashOrder` follows the system: macOS's
-  allocator gives 16 buckets for the first 5 to 32 tables, glibc's and SQLite's own size header (Windows) the
-  number asked for (15 for 5 tables), so the shell lists tables with errors in another order on Linux, and so does
-  this (`tablesComeInSqlitesHashOrder`).
+  many buckets its allocator rounds the table's array up to; `sqliteHashOrder` takes the number asked for, as
+  glibc, SQLite's own size header (Windows) and macOS 15's allocator give it (15 buckets for 5 to 7 tables).
+  Newer macOS allocators round the first rehash's 240 bytes up to 256 (16 buckets), and sqlite3 there lists tables
+  with errors in another order; `tablesComeInSqlitesHashOrder` then says so and skips.
 - **Index order.** Among a table's automatic indexes, one made for a constraint with `ON CONFLICT REPLACE` comes
   last in SQLite's list; here it keeps its place, which matters only for the order of messages.
 - **Details not modelled.** "index X stores an imprecise floating-point value" (SQLite's near match of a real
