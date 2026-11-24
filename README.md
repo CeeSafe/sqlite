@@ -612,7 +612,12 @@ lease.get().execute(…)?;
 
 Choices where the C# concept does not fit CeeSafe:
 
-- **Errors** are `Result<T, SqliteError>`; `SqliteError.Busy` is new, for "database is locked".
+- **Errors** are `Result<T, SqliteError>`; `SqliteError.Busy` is new, for "database is locked", and
+  `SqliteError.ReadOnly` for "attempt to write a readonly database" (SQLITE_READONLY).
+- **Read-only connections.** `Connection.openReadOnly(path)` opens as SQLITE_OPEN_READONLY (`sqlite3 -readonly`):
+  the file must exist, statements that would write are refused, BEGIN IMMEDIATE and EXCLUSIVE are read
+  transactions, TEMP tables are the connection's own. `Connection.open` opens a file it may not write so too, as
+  unixOpen falls back to reading.
 - **Lifetimes.** There is no IDisposable: a `Connection` closes when it is dropped (rolling back), and `close()`
   says whether that rollback worked. A `PooledConnection` gives its connection back when dropped.
   `transaction(work)` takes a function rather than handing out a transaction object, so a transaction cannot
@@ -780,15 +785,25 @@ Collations other than BINARY, NOCASE and RTRIM are refused.
   network mounts) is not detected.
 - **WAL mode.** The wal-index is shared as wal.c and os_unix.c share it (walindex.cee), with fcntl locks on the
   `-shm`'s bytes, so readers run beside a writer, this engine's and sqlite3's alike (`shm*` tests); the DMS byte is
-  tested with `F_GETLK` as unixLockSharedMemory tests it. What differs: the index is mapped read-write only, so a database whose `-shm` cannot be written
-  is refused where SQLite would fall back to `readonly_shm` or heap memory (finding 37); a new log's salts are
+  tested with `F_GETLK` as unixLockSharedMemory tests it. A `-shm` or log this process may not write is opened for
+  reading, as SQLite's readonly_shm: while a connection that can write holds the DMS byte the index is mapped for
+  reading (PROT_READ) and read marks it set are used, else the index is rebuilt from the log in the connection's
+  memory and checked at each transaction as walBeginShmUnreliable checks it (`readOnly*` tests, against sqlite3
+  on chmod'ed files and `sqlite3 -readonly`). What differs: a new log's salts are
   always the old header's salt-1 plus one and a new salt-2 (or random), where SQLite reuses the index's salts after
   a restart (either way no old frame can pass for a new one); the index is in the host's byte order, as SQLite's,
   and every host CeeSafe builds for is little-endian; another process that shortens the `-shm` while this engine
-  maps it ends the program with SIGBUS (finding 37), as it would SQLite. The locking is POSIX-only: on Windows
+  maps it ends the program with SIGBUS, as it would SQLite (ADR 0235 keeps it a signal: SQLite shortens the file only
+  under the DMS byte's exclusive lock, which no connection mapping it allows). The locking is POSIX-only: on Windows
   (os_win.c's scheme is not ported) WAL mode is refused with `Unsupported`, in a build for
   Windows (`cfg("target.windows")`). The read-only `DatabaseReader` takes no locks: it reads the log as it finds it, rebuilding its own
   index of the frames.
+- **Read-only databases.** An empty file that can only be read is refused with "attempt to write a readonly
+  database", where SQLite reads it as an empty database. Leaving WAL mode on a database that can only be read is
+  refused with the same message, where sqlite3 answers "disk I/O error" (the write lock it tries on a file open for
+  reading fails with EBADF) or, while another connection holds the file, "database is locked". `file:` URIs, and
+  with them `?mode=ro` and `?readonly_shm=1`, are not taken: `Connection.openReadOnly` is SQLITE_OPEN_READONLY, and
+  a `-shm` is read-only when this process may not write it.
 - **Journal modes.** WAL and DELETE only: TRUNCATE, PERSIST, MEMORY and OFF are taken as DELETE, and
   `PRAGMA journal_mode` then answers `delete`. Leaving WAL mode writes the header's format numbers 1 and 1 and
   removes the log, as SQLite does.

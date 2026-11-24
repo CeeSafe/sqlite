@@ -1,0 +1,304 @@
+// Databases this process can only read: a connection opened read-only (SQLITE_OPEN_READONLY, `sqlite3 -readonly`),
+// and files it may not write (chmod), in rollback-journal and WAL mode. In WAL mode a `-shm` that cannot be written
+// is mapped for reading when a connection that can write holds it, and replaced by an index of the connection's
+// own, rebuilt from the log, when none does (wal.c's readonly_shm and heap-memory index). Answers and errors are
+// compared with sqlite3's on the same files.
+
+/// Sets the permissions of each file in `paths` to `mode` (as chmod takes it).
+fn chmod(mode: StringView, paths: Slice<StringView>) {
+    var arguments = Vector<StringView>.create();
+    arguments.push(mode)!;
+    for (i in 0..paths.length) {
+        arguments.push(paths[i])!;
+    }
+    let _ = Process.run("chmod", borrow arguments);
+}
+
+/// The database at `path` and the log and wal-index beside it.
+fn walFiles(path: StringView) -> Vector<String> {
+    var files = Vector<String>.create();
+    files.push(String.from(path)!)!;
+    files.push(withSuffix(path, "-wal")!)!;
+    files.push(withSuffix(path, "-shm")!)!;
+    return files;
+}
+
+fn chmodAll(mode: StringView, files: borrow Vector<String>) {
+    var views = Vector<StringView>.create();
+    for (i in 0..files.length) {
+        views.push(files[i].view())!;
+    }
+    chmod(mode, views.view());
+}
+
+/// What `sqlite3 -readonly` answers, or "error: " and its message.
+fn theirReadOnlyAnswer(path: StringView, sql: StringView) -> String {
+    var arguments = Vector<StringView>.create();
+    arguments.push("-readonly")!;
+    arguments.push(path)!;
+    arguments.push(sql)!;
+    let output = Process.capture("sqlite3", borrow arguments, "".bytes())!;
+    if (output.status == 0) {
+        return shownText(output.stdout.view());
+    }
+    let errors = shownText(output.stderr.view());
+    let firstLine = errors.view().splitOnce("\n") ?? TextHalves { left: errors.view(), right: "" };
+    let message = match (firstLine.left.splitOnce("argument: ")) {
+        Some(halves) => halves.right,
+        null => firstLine.left,
+    };
+    var text = String.from("error: ")!;
+    text.append(message)!;
+    text.append("\n")!;
+    return text;
+}
+
+/// A database in WAL mode whose last commits are in its log, which stays beside it with the `-shm` (sqlite3 does
+/// not checkpoint when it closes): table `t` in the file, table `u` and more rows of `t` in the log, over 4,200
+/// frames, so that the wal-index has two blocks.
+fn walFixtureKeptInLog(path: StringView) -> Result<void, TestFailure> {
+    let files = walFiles(path);
+    chmodAll("644", borrow files);
+    for (i in 0..files.length) {
+        let _ = File.remove(files[i].view());
+    }
+    var script = String.from("CREATE TABLE t(v); INSERT INTO t VALUES (1), (2);\n")!;
+    script.append(".dbconfig no_ckpt_on_close on\nPRAGMA journal_mode = WAL;\nPRAGMA wal_autocheckpoint = 0;\n")!;
+    script.append("PRAGMA synchronous = OFF;\nCREATE TABLE u(i INTEGER PRIMARY KEY, x TEXT);\n")!;
+    for (i in 0..4200) {
+        script.append("INSERT INTO u(x) VALUES ('row ' || (SELECT count(*) FROM u));\n")!;
+    }
+    script.append("INSERT INTO t VALUES (3);\n")!;
+    var arguments = Vector<StringView>.create();
+    arguments.push(path)!;
+    let output = Process.capture("sqlite3", borrow arguments, script.view().bytes())!;
+    Check.isTrue(output.status == 0, "sqlite3 made the fixture")?;
+    Check.isTrue(fileLength(files[1].view())!.isSome(), "the log stays")?;
+    return Ok();
+}
+
+const READ_ONLY_QUERIES: StringView = """
+    SELECT count(*), sum(v) FROM t
+    SELECT count(*), max(i), min(x), max(x) FROM u
+    SELECT x FROM u WHERE i IN (1, 4062, 4063, 4200)
+    SELECT name FROM sqlite_schema ORDER BY name
+    BEGIN IMMEDIATE; SELECT count(*) FROM u; COMMIT
+    PRAGMA journal_mode
+    INSERT INTO t VALUES (9)
+    CREATE TABLE z(a)
+    UPDATE u SET x = 'changed' WHERE 0
+    PRAGMA wal_checkpoint
+    PRAGMA wal_checkpoint(TRUNCATE)
+    PRAGMA journal_mode = DELETE
+    CREATE TEMP TABLE scratch(a); INSERT INTO scratch VALUES (5); SELECT * FROM scratch
+    """;
+
+/// What this engine answers for the statements of `sql` (separated by "; "), run in order up to the first error,
+/// as the shell runs a command-line argument.
+fn oursInOrder(session: borrow mut Session, sql: StringView) -> String {
+    var out = String.create();
+    for (statement in sql.split("; ")) {
+        let answer = ours(session, statement);
+        out.append(answer.view())!;
+        if (answer.view().startsWith("error: ")) {
+            break;
+        }
+    }
+    return out;
+}
+
+/// Each line of `queries` in this engine's connection and in sqlite3 (read-only with `readOnly`).
+fn sameReadOnlyAnswers(
+    connection: borrow mut Connection,
+    path: StringView,
+    queries: StringView,
+    readOnly: bool,
+    skipJournalMode: bool,
+) -> Result<void, TestFailure> {
+    for (line in queries.split("\n")) {
+        let sql = line.trim();
+        if (sql.length == 0 || (skipJournalMode && sql == "PRAGMA journal_mode = DELETE")) {
+            continue;
+        }
+        let mine = oursInOrder(mut connection.session, sql);
+        let theirs = if (readOnly) theirReadOnlyAnswer(path, sql) else theirAnswer(path, sql);
+        Check.equalText(theirs.view(), mine.view())?;
+    }
+    return Ok();
+}
+
+/// Every file of a WAL database made read-only, with no connection open: sqlite3 cannot trust the `-shm` (no
+/// connection that could write it holds its DMS byte), so it rebuilds an index of its own from the log in memory
+/// and reads through it; so does this engine, opening the files for reading. The answers are the log's, writes
+/// and checkpoints are refused as SQLite refuses them, and closing leaves the three files as they were.
+@test
+fn readOnlyWalFilesAreReadThroughAnIndexOfTheirOwn() -> Result<void, TestFailure> {
+    let path = "out/ro-heap.db";
+    walFixtureKeptInLog(path)?;
+    let files = walFiles(path);
+    let shmBefore = fileLength(files[2].view())!;
+    let logBefore = fileLength(files[1].view())!;
+    chmodAll("444", borrow files);
+    {
+        var connection = Connection.open(path)!;
+        // sqlite3 answers "disk I/O error" to leaving WAL mode here; this engine "attempt to write a readonly
+        // database" (README.md, "Differences").
+        sameReadOnlyAnswers(mut connection, path, READ_ONLY_QUERIES, false, true)?;
+        Check.equalText("error: attempt to write a readonly database\n", ours(mut connection.session, "PRAGMA journal_mode = DELETE").view())?;
+        connection.close()!;
+        var readOnly = Connection.openReadOnly(path)!;
+        sameReadOnlyAnswers(mut readOnly, path, READ_ONLY_QUERIES, true, true)?;
+        readOnly.close()!;
+    }
+    Check.isTrue(fileLength(files[1].view())! == logBefore, "the log is left as it was")?;
+    Check.isTrue(fileLength(files[2].view())! == shmBefore, "and the wal-index")?;
+    chmodAll("644", borrow files);
+    return expectIntact(path);
+}
+
+/// A `-shm` this process may not write, while a sqlite3 that can holds the database open in WAL mode: the index
+/// is current, and is mapped for reading (PROT_READ) rather than rebuilt. This engine reads sqlite3's commits
+/// through it, the one made while it is open too, picking among the read marks sqlite3 set, and cannot write
+/// (WAL_SHM_RDONLY), as a second sqlite3 cannot.
+@test
+fn readOnlyShmIsMappedBesideAConnectionThatWrites() -> Result<void, TestFailure> {
+    let path = "out/ro-shm.db";
+    let marker = "out/ro-shm.marker";
+    let go = "out/ro-shm.go";
+    let marker2 = "out/ro-shm.marker2";
+    let go2 = "out/ro-shm.go2";
+    let files = walFiles(path);
+    chmodAll("644", borrow files);
+    let _ = File.remove(marker2);
+    let _ = File.remove(go2);
+    shmFixture(path, marker, go)?;
+    let touch = shellTouch(marker);
+    let wait = shellWaitFor(go);
+    let touch2 = shellTouch(marker2);
+    let wait2 = shellWaitFor(go2);
+    let writer = sqliteInBackground(
+        path,
+        ["INSERT INTO t VALUES (2)", "SELECT count(*) FROM t", touch.view(), wait.view(), "INSERT INTO t VALUES (3)", "SELECT count(*) FROM t", touch2.view(), wait2.view()][..],
+    );
+    waitForFile(marker)?;
+    chmod("444", [files[2].view()][..]);
+    var connection = Connection.open(path)!;
+    let queries = """
+        SELECT count(*), sum(v) FROM t
+        INSERT INTO t VALUES (9)
+        BEGIN IMMEDIATE
+        PRAGMA wal_checkpoint
+        """;
+    sameReadOnlyAnswers(mut connection, path, queries, false, false)?;
+    Check.equalText("2|3\n", ours(mut connection.session, "SELECT count(*), sum(v) FROM t").view())?;
+    touchFile(go);
+    waitForFile(marker2)?;
+    sameReadOnlyAnswers(mut connection, path, queries, false, false)?;
+    Check.equalText("3|6\n", ours(mut connection.session, "SELECT count(*), sum(v) FROM t").view())?;
+    touchFile(go2);
+    Check.isTrue(writer.join() == 0, "the writer's commits ran")?;
+    connection.close()!;
+    chmodAll("644", borrow files);
+    Check.equalText("3\n", theirAnswer(path, "SELECT count(*) FROM t").view())?;
+    return expectIntact(path);
+}
+
+/// A connection opened read-only, as `sqlite3 -readonly` opens one, on files it could write: it reads, and every
+/// statement that would write is refused, BEGIN IMMEDIATE being a read transaction; TEMP tables are its own. In WAL
+/// mode it uses the `-shm` and the log as any connection does, and leaves them when it closes, since it cannot
+/// checkpoint. A file that does not exist is not made.
+@test
+fn readOnlyConnectionsAnswerAsSqlitesDo() -> Result<void, TestFailure> {
+    let path = "out/ro-connection.db";
+    lockFixture(path, "out/ro-connection.marker")?;
+    let queries = """
+        SELECT count(*) FROM t
+        INSERT INTO t VALUES (2)
+        DELETE FROM t WHERE 0
+        CREATE INDEX t_v ON t(v)
+        PRAGMA user_version = 3
+        PRAGMA journal_mode = WAL
+        VACUUM
+        BEGIN IMMEDIATE; SELECT count(*) FROM t; COMMIT
+        BEGIN EXCLUSIVE; SELECT 2; COMMIT
+        SAVEPOINT a; SELECT 3; RELEASE a
+        PRAGMA wal_checkpoint
+        CREATE TEMP TABLE scratch(a); INSERT INTO scratch VALUES (5); SELECT * FROM scratch
+        """;
+    var connection = Connection.openReadOnly(path)!;
+    sameReadOnlyAnswers(mut connection, path, queries, true, false)?;
+    connection.close()!;
+    Check.isTrue(!Journal.exists(path)!, "no journal was made")?;
+    // WAL mode: the log's commits are read, and the files stay when this connection closes, as sqlite3's do.
+    // Leaving WAL mode is left out: while this connection holds SHARED, sqlite3 meets the lock first and answers
+    // "database is locked", where this engine answers that it cannot write.
+    walFixtureKeptInLog(path)?;
+    var reader = Connection.openReadOnly(path)!;
+    sameReadOnlyAnswers(mut reader, path, READ_ONLY_QUERIES, true, true)?;
+    reader.close()!;
+    Check.isTrue(fileThere(withSuffix(path, "-wal")!.view()), "the log stays")?;
+    Check.isTrue(fileThere(withSuffix(path, "-shm")!.view()), "and the wal-index")?;
+    Check.equalText("4200|3\n", theirAnswer(path, "SELECT count(*), (SELECT count(*) FROM t) FROM u").view())?;
+    let missing = "out/ro-missing.db";
+    let _ = File.remove(missing);
+    Check.isTrue(Connection.openReadOnly(missing).isErr(), "a file that does not exist cannot be read")?;
+    Check.isTrue(!fileThere(missing), "and is not made")?;
+    return expectIntact(path);
+}
+
+/// A hot journal beside a database that can only be read cannot be played back: SQLITE_READONLY_ROLLBACK, "attempt
+/// to write a readonly database", for this engine and sqlite3 alike; the journal stays.
+@test
+fn readOnlyHotJournalIsRefused() -> Result<void, TestFailure> {
+    let path = "out/ro-hot.db";
+    lockFixture(path, "out/ro-hot.marker")?;
+    {
+        var journal = File.create(withSuffix(path, "-journal")!.view())!;
+        journal.write("hot journal".bytes())!;
+    }
+    var connection = Connection.openReadOnly(path);
+    Check.isTrue(
+        match (borrow connection) {
+            Err(SqliteError.ReadOnly(m)) => m.view().equals(ByteStringView.fromText("attempt to write a readonly database")),
+            _ => false,
+        },
+        "the journal cannot be played back",
+    )?;
+    Check.isTrue(theirReadOnlyAnswer(path, "SELECT 1").view().contains("attempt to write a readonly database"), "sqlite3 too")?;
+    Check.isTrue(Journal.exists(path)!, "the journal stays")?;
+    let _ = File.remove(withSuffix(path, "-journal")!.view());
+    return Ok();
+}
+
+/// An index of the connection's own gives way to the `-shm` once a connection that can write it comes: this engine
+/// opens the database while its `-shm` is read-only and nobody holds it (an index of its own), then a sqlite3 that
+/// can write it opens it (taking its DMS byte, emptying and rebuilding it) and commits. This engine's next
+/// transaction finds the DMS byte held, maps the `-shm` for reading, and sees the commit.
+@test
+fn readOnlyIndexOfItsOwnGivesWayToAWriter() -> Result<void, TestFailure> {
+    let path = "out/ro-handover.db";
+    let marker = "out/ro-handover.marker";
+    let go = "out/ro-handover.go";
+    let _ = File.remove(marker);
+    let _ = File.remove(go);
+    walFixtureKeptInLog(path)?;
+    let files = walFiles(path);
+    chmod("444", [files[2].view()][..]);
+    var connection = Connection.open(path)!;
+    Check.equalText("3|6\n", ours(mut connection.session, "SELECT count(*), sum(v) FROM t").view())?;
+    Check.equalText("error: attempt to write a readonly database\n", ours(mut connection.session, "INSERT INTO t VALUES (9)").view())?;
+    chmod("644", [files[2].view()][..]);
+    let touch = shellTouch(marker);
+    let wait = shellWaitFor(go);
+    let writer = sqliteInBackground(
+        path,
+        ["INSERT INTO t VALUES (10)", "SELECT count(*) FROM t", touch.view(), wait.view()][..],
+    );
+    waitForFile(marker)?;
+    Check.equalText("4|16\n", ours(mut connection.session, "SELECT count(*), sum(v) FROM t").view())?;
+    Check.equalText("4|16\n", theirAnswer(path, "SELECT count(*), sum(v) FROM t").view())?;
+    touchFile(go);
+    Check.isTrue(writer.join() == 0, "the writer committed")?;
+    connection.close()!;
+    return expectIntact(path);
+}
