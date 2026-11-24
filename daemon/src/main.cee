@@ -165,12 +165,19 @@ fn main() {
     }
     Console.writeErrorLine("sqlited: stopping");
     let _ = listener.get().shutdown();
-    match (acceptor.join()) {
-        Ok() => {}
-        Err(e) => { Console.writeErrorLine(e.message()); }
+    // `serve` returns once the clients still connected have left and their threads are joined.
+    let deadline = Timer.now() + 5000;
+    while (!acceptor.isFinished() && Timer.now() < deadline) {
+        Thread.sleep(20);
     }
-    if (!server.get().waitForClients(5000)) {
+    if (!acceptor.isFinished()) {
+        // Dropping the acceptor would wait for it: the process ends instead.
         Console.writeErrorLine("sqlited: clients still connected; exiting");
+        Process.exit(0);
+    }
+    match (acceptor.join()) {
+        Ok(_) => {}
+        Err(e) => { Console.writeErrorLine(e.message()); }
     }
     Process.exit(0);
 }

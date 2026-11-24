@@ -213,6 +213,19 @@ fn errorsInInput() -> Result<void, TestFailure> {
 }
 
 @test
+fn aCommentLeftOpenStartsAStatement() -> Result<void, TestFailure> {
+    // A line that only opens a `/*` comment is not blank to shell.c (_all_whitespace): the comment ends on a later
+    // line, and the statement after it runs. This shell skipped the line, and then failed on the `*/`.
+    return sameInput("open-comment", PEOPLE, """
+        /* a comment
+        */ SELECT 1;
+          ;
+        /* closed */ -- and a line comment
+        SELECT 2; /* to the end
+        """);
+}
+
+@test
 fn incompleteInputAtTheEnd() -> Result<void, TestFailure> {
     return sameInput("incomplete", PEOPLE, "SELECT 1;\nSELECT 1 +\n");
 }
@@ -359,5 +372,30 @@ fn valueTextIsSqlites() -> Result<void, TestFailure> {
     Check.equalText("1.0e+20", SqliteValue.Real(1e20).toText()!.view())?;
     Check.equalText("-7", SqliteValue.Integer(-7).toText()!.view())?;
     Check.equalText("", SqliteValue.Null.toText()!.view())?;
+    return Ok();
+}
+
+@test
+fn atATerminalAsSqlite3() -> Result<void, TestFailure> {
+    // Standard input is a terminal only under a pseudo-terminal, which `tests/terminal.py` makes with Python's
+    // `pty`, comparing sessions typed into both shells; it runs the built shell, so the shell is built first.
+    var probe = Vector<StringView>.create();
+    probe.push("--version")!;
+    if (Process.capture("python3", borrow probe, "".bytes()) is Err(_)) {
+        Console.writeLine("python3 is not installed: skipped");
+        return Ok();
+    }
+    var build = Vector<StringView>.create();
+    build.push("build")!;
+    let built = Process.capture("ceesafec", borrow build, "".bytes())!;
+    Check.isTrue(built.status == 0, "the shell builds")?;
+    var arguments = Vector<StringView>.create();
+    arguments.push("tests/terminal.py")!;
+    arguments.push("out/sqlite_shell")!;
+    arguments.push("out")!;
+    let compared = Process.capture("python3", borrow arguments, "".bytes())!;
+    if (compared.status != 0) {
+        return Check.fail(shown(compared.stdout.view()).view());
+    }
     return Ok();
 }
