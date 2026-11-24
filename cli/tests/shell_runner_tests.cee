@@ -1,0 +1,151 @@
+// A copy of the root package's tests/shell_runner_tests.cee (its process helpers), kept alike.
+//
+// Running the sqlite3 shell (and the few other programs the tests start) on every system. On macOS and Linux this
+// is lib/std's `Process.capture` and `Process.run`. On Windows neither can run the shell at ceesafec 0.95.5
+// (CEESAFE_FINDINGS.md 45 and 46): `Process.capture` keeps its input file open for writing while the runtime opens
+// it again to read, which Windows refuses, so it always fails; `Process.run` hands the arguments to `_wspawnvp`,
+// which joins them with spaces without quoting, so an argument of SQL arrives as many words. `Process.spawn`
+// quotes its arguments but cannot send a child's streams to files, and a package cannot call the runtime's
+// `ceesafe_host_spawn` itself (N0292). So on Windows `tests/capture.py`, started by `Process.spawn`, runs the
+// program with its streams in files.
+
+/// Whether the sqlite3 on the path is Apple's build (its source id ends in "aapl"). The engine follows sqlite.org's
+/// SQLite 3.54.1, which CI runs; Apple's sqlite3 3.54.0, from an earlier snapshot of SQLite, answers a few
+/// statements differently. Where a comparison meets one of them with Apple's shell, this shell is checked against
+/// sqlite.org's output (`APPLE_DIFFERS`, shell_tests.cee) instead of Apple's; with sqlite.org's shell every
+/// output is the shell's.
+fn sqliteIsApples() -> bool {
+    var arguments = Vector<StringView>.create();
+    arguments.push(":memory:")!;
+    arguments.push("SELECT sqlite_source_id()")!;
+    return match (captureSqlite(borrow arguments, "".bytes())) {
+        Ok(output) => withoutCarriageReturns(output.stdout.view()).view().endsWith("aapl\n".bytes()),
+        Err(_) => false,
+    };
+}
+
+/// Where the root package's `tests/capture.py` is, from this package's directory.
+const CAPTURE_SCRIPT: StringView = "../tests/capture.py";
+
+/// Whether the tests run on Windows.
+fn onWindowsHost() -> bool {
+    if (cfg("target.windows")) {
+        return true;
+    }
+    return false;
+}
+
+/// `program` run with `arguments` and `input` as its standard input: its exit status and what it wrote.
+fn captureProgram(program: StringView, arguments: borrow Vector<StringView>, input: Slice<u8>) -> Result<ProcessOutput, IoError> {
+    if (!onWindowsHost()) {
+        return Process.capture(program, arguments, input);
+    }
+    let directory = Directory.temporary()?;
+    let result = captureThroughPython(directory.view(), program, arguments, input);
+    for (name in ["in", "out", "err"]) {
+        let _ = File.remove(pathIn(directory.view(), name).view());
+    }
+    let _ = Directory.remove(directory.view());
+    return result;
+}
+
+/// `program` run with `arguments`: its exit status. What it writes is the test's output on macOS and Linux, and
+/// is dropped on Windows.
+fn runProgram(program: StringView, arguments: borrow Vector<StringView>) -> Result<i32, IoError> {
+    if (!onWindowsHost()) {
+        return Process.run(program, arguments);
+    }
+    return Ok(captureProgram(program, arguments, "".bytes())?.status);
+}
+
+/// The sqlite3 shell run with `arguments` and `input`. On Windows the shell ends its lines with "\r\n" unless told
+/// otherwise: `.crlf off`, run before the arguments, has it write what it writes elsewhere, and the "\r" of its
+/// messages, which `.crlf` does not cover, are dropped.
+fn captureSqlite(arguments: borrow Vector<StringView>, input: Slice<u8>) -> Result<ProcessOutput, IoError> {
+    if (!onWindowsHost()) {
+        return Process.capture("sqlite3", arguments, input);
+    }
+    var all = Vector<StringView>.create();
+    all.push("-cmd")!;
+    all.push(".crlf off")!;
+    for (argument in arguments) {
+        all.push(argument)!;
+    }
+    var output = captureProgram("sqlite3", borrow all, input)?;
+    output.stderr = withoutCarriageReturns(output.stderr.view());
+    return Ok(output);
+}
+
+/// The sqlite3 shell run with `arguments`: its exit status.
+fn runSqlite(arguments: borrow Vector<StringView>) -> Result<i32, IoError> {
+    if (!onWindowsHost()) {
+        return Process.run("sqlite3", arguments);
+    }
+    return Ok(captureSqlite(arguments, "".bytes())?.status);
+}
+
+/// `bytes` without the "\r" of each "\r\n".
+fn withoutCarriageReturns(bytes: Slice<u8>) -> Vector<u8> {
+    var out = Vector<u8>.create();
+    for (i in 0..bytes.length) {
+        if (bytes[i] == '\r' && i + 1 < bytes.length && bytes[i + 1] == '\n') {
+            continue;
+        }
+        out.push(bytes[i])!;
+    }
+    return out;
+}
+
+/// `directory/name`.
+fn pathIn(directory: StringView, name: StringView) -> String {
+    var path = String.from(directory)!;
+    path.append("/")!;
+    path.append(name)!;
+    return path;
+}
+
+/// The whole file's bytes.
+fn wholeFileOf(path: StringView) -> Result<Vector<u8>, IoError> {
+    var file = File.open(path)?;
+    var bytes = Vector<u8>.create();
+    var buffer = [0u8; 65536];
+    loop {
+        let n = file.read(mut buffer[..])?;
+        if (n == 0) {
+            break;
+        }
+        for (i in 0..n) {
+            bytes.push(buffer[i])!;
+        }
+    }
+    return Ok(bytes);
+}
+
+/// `program` run by `tests/capture.py` with its streams in files of `directory`.
+fn captureThroughPython(directory: StringView, program: StringView, arguments: borrow Vector<StringView>, input: Slice<u8>) -> Result<ProcessOutput, IoError> {
+    let inPath = pathIn(directory, "in");
+    let outPath = pathIn(directory, "out");
+    let errPath = pathIn(directory, "err");
+    {
+        var file = File.create(inPath.view())?;
+        file.write(input)?;
+    }
+    var all = Vector<StringView>.create();
+    all.push(CAPTURE_SCRIPT)!;
+    all.push(inPath.view())!;
+    all.push(outPath.view())!;
+    all.push(errPath.view())!;
+    all.push(program)!;
+    for (argument in arguments) {
+        all.push(argument)!;
+    }
+    var child = Process.spawn("python", borrow all, ChildOptions.quiet())?;
+    let status = match (child.wait()?) {
+        ChildExit.Status(code) => code,
+        ChildExit.Signal(number) => 128 + number,
+    };
+    if (status == 127) {
+        return Err(IoError.NotFound);
+    }
+    return Ok(ProcessOutput { status: status, stdout: wholeFileOf(outPath.view())?, stderr: wholeFileOf(errPath.view())? });
+}

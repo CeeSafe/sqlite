@@ -354,14 +354,16 @@ fn printColumns(out: borrow mut Vector<u8>, result: borrow QueryResult, headers:
     return Ok();
 }
 
-/// Prints `result` in `mode`; nothing when it has no row, as the shell does.
+/// Prints `result` in `mode`; nothing when it has no row, as the shell does, but the headings with `always`
+/// (`.headers always`; line mode has none).
 fn printResult(
     out: borrow mut Vector<u8>,
     result: borrow QueryResult,
     mode: OutputMode,
     headers: bool,
+    always: bool,
 ) -> Result<void, AllocError> {
-    if (result.columns.length == 0 || result.rows.length == 0) {
+    if (result.columns.length == 0 || (result.rows.length == 0 && !always)) {
         return Ok();
     }
     return match (mode) {

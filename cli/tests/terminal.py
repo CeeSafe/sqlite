@@ -161,6 +161,15 @@ def normalized(shown):
     return "\n".join(kept)
 
 
+def line_editing_off():
+    """sqlite3's options that turn its own line editor off, if it has one. sqlite.org's 3.54.1 shell edits lines
+    itself: it asks the terminal where its cursor is (ESC [6n) and redraws the line as it is typed. Apple's reads
+    the terminal's lines through libedit, as this shell reads them, and has no such option. This shell takes the
+    option too, so the arguments are numbered alike in messages."""
+    probe = subprocess.run(["sqlite3", "-cmdline-edit", "off", ":memory:", "SELECT 1"], capture_output=True)
+    return ["-cmdline-edit", "off"] if probe.returncode == 0 else []
+
+
 def make_database(path, sql):
     if os.path.exists(path):
         os.remove(path)
@@ -176,6 +185,7 @@ def main():
     os.makedirs(work, exist_ok=True)
     env = dict(os.environ, SQLITE_PS1="sqlite> ", SQLITE_PS2="   ...> ", HOME=work)
     problems = []
+    editing = line_editing_off()
     for case in CASES:
         name, options, setup, lines = case[:4]
         arguments = case[4] if len(case) > 4 else []
@@ -183,8 +193,9 @@ def main():
         ours_db = os.path.join(work, "terminal-" + name + "-ours.db")
         make_database(theirs_db, setup)
         make_database(ours_db, setup)
-        theirs, their_status = run_at_terminal(["sqlite3"] + options + [theirs_db] + arguments, lines, env)
-        ours, our_status = run_at_terminal([shell] + options + [ours_db] + arguments, lines, env)
+        # The editing options after the others: sqlite.org's 3.54.1 forgets a mode option given before them.
+        theirs, their_status = run_at_terminal(["sqlite3"] + options + editing + [theirs_db] + arguments, lines, env)
+        ours, our_status = run_at_terminal([shell] + options + editing + [ours_db] + arguments, lines, env)
         a, b = normalized(theirs).replace(theirs_db, "DB"), normalized(ours).replace(ours_db, "DB")
         if a != b or their_status != our_status:
             problems.append(f"{name}:\n  sqlite3 showed (status {their_status}):\n{a}\n"

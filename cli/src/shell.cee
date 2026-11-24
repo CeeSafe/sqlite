@@ -210,6 +210,8 @@ struct Shell {
     mode: OutputMode;
     /// `.headers`; null until it is given, when only column mode shows headings.
     headers: bool?;
+    /// `.headers always`: headings even for a result without rows.
+    alwaysHeaders: bool;
     /// `.bail`: stop at the first error.
     bail: bool;
     /// What is printed, until `flush` writes it.
@@ -295,15 +297,15 @@ struct Shell {
             match (this.connection.query(text, borrow none)) {
                 Ok(result) => {
                     let headers = this.showHeaders();
-                    printResult(mut this.out, borrow result, this.mode, headers)?;
+                    printResult(mut this.out, borrow result, this.mode, headers, this.alwaysHeaders)?;
                 }
                 Err(e) => {
                     let prepare = isPrepareError(borrow e);
                     this.reportSqlError(prepare, e.messageText()?.view(), place)?;
-                    if (prepare || this.bail) {
-                        this.flush();
-                        return Ok(false);
-                    }
+                    // Any error leaves the rest of `sql` (sqlite3 3.54.1; Apple's 3.54.0 went on after an
+                    // error that came as the statement ran).
+                    this.flush();
+                    return Ok(false);
                 }
             }
             this.flush();
@@ -407,7 +409,10 @@ struct Shell {
         for (r in 0..result.rows.length) {
             let row = borrow result.rows[r];
             let statement = cellBytes(borrow row[2])?;
+            // The statement and its ";", then a view's columns in a comment of their own (sqlite3 3.54.1; Apple's
+            // 3.54.0 put the ";" after the comment).
             this.out.extend(statement.view())?;
+            this.out.push(';')?;
             let kind = cellBytes(borrow row[0])?;
             if (kind.view() == "view".bytes()) {
                 let nameBytes = row[1].toText()?;
@@ -441,7 +446,7 @@ struct Shell {
                     this.out.extend(") */".bytes())?;
                 }
             }
-            this.out.extend(";\n".bytes())?;
+            this.out.push('\n')?;
         }
         return Ok();
     }
@@ -468,10 +473,11 @@ struct Shell {
         }
         if (name == "headers" || name == "header") {
             if (words.length != 2) {
-                this.reportError("Usage: .headers on|off")?;
+                this.reportError("Usage: .headers off|on|always")?;
                 return Ok(false);
             }
-            this.headers = this.booleanArgument(words[1].view())?;
+            this.alwaysHeaders = words[1].view() == "always";
+            this.headers = if (this.alwaysHeaders) true else this.booleanArgument(words[1].view())?;
             return Ok(true);
         }
         if (name == "bail") {
@@ -496,7 +502,11 @@ struct Shell {
                         OutputMode.Line => true,
                         _ => false,
                     };
-                    if (this.headers is Some(h) && h != column && !lineMode) {
+                    if (this.alwaysHeaders) {
+                        if (!column && !lineMode) {
+                            this.out.extend(" --titles always".bytes())?;
+                        }
+                    } else if (this.headers is Some(h) && h != column && !lineMode) {
                         this.out.extend((if (h) " --titles on" else " --titles off").bytes())?;
                     }
                     this.out.push('\n')?;
@@ -698,8 +708,14 @@ fn runShell(arguments: Slice<StringView>, input: Lines, live: bool) -> Result<Sh
     var mode = OutputMode.List;
     var headers: bool? = null;
     var bail = false;
+    var takesValue = false;
     for (i in 0..arguments.length) {
         let a = arguments[i];
+        if (takesValue) {
+            // `-cmdline-edit BOOL` (sqlite3 3.54.1): this shell has no line editor to turn on or off.
+            takesValue = false;
+            continue;
+        }
         if (path.isSome() && commands.length != 0 || !a.startsWith("-") || a.length == 1) {
             if (path.isNull()) {
                 path = a;
@@ -723,6 +739,8 @@ fn runShell(arguments: Slice<StringView>, input: Lines, live: bool) -> Result<Sh
             mode = OutputMode.Column;
         } else if (option == "bail") {
             bail = true;
+        } else if (option == "cmdline-edit" && i + 1 < arguments.length) {
+            takesValue = true;
         } else {
             var errors = String.from("sqlite3: Error: unknown option: ")?;
             errors.append(option)?;
@@ -772,6 +790,7 @@ fn runShell(arguments: Slice<StringView>, input: Lines, live: bool) -> Result<Sh
         connection: connection,
         mode: mode,
         headers: headers,
+        alwaysHeaders: false,
         bail: bail,
         out: Vector<u8>.create(),
         errors: String.create(),

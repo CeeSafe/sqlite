@@ -15,7 +15,7 @@ fn makeDatabase(path: StringView, sql: StringView) -> Result<void, TestFailure> 
     var arguments = Vector<StringView>.create();
     arguments.push(path)!;
     arguments.push(sql)!;
-    match (Process.run("sqlite3", borrow arguments)) {
+    match (runSqlite(borrow arguments)) {
         Ok(0) => { return Ok(); }
         Ok(_) => { return Check.fail("sqlite3 refused the fixture's SQL"); }
         Err(_) => { return Check.fail("the sqlite3 shell is needed to make fixtures"); }
@@ -49,8 +49,44 @@ fn withoutCarets(errors: Slice<u8>) -> String {
     return kept;
 }
 
+/// The runs Apple's sqlite3 3.54.0 answers otherwise than sqlite.org's 3.54.1, which this shell follows and CI runs
+/// (shell_runner_tests.cee): four entries each, the run's name and sqlite.org's output, errors (without the lines
+/// under a statement that point at its error) and exit status. Apple's goes on with the statements after one that
+/// failed as it ran, shows `.headers`' usage as "on|off", and writes a view's `;` after the comment that names its
+/// columns.
+const APPLE_DIFFERS: [StringView; 16] = [
+    "argument-runtime-error",
+    "",
+    "Error in 2nd command line argument: UNIQUE constraint failed: people.id\n",
+    "1",
+    "dot-errors",
+    "1\na\n1\n",
+    "Error: unknown command or invalid arguments:  \"bogus\". Enter \".help\" for help\nUsage: .headers off|on|always\nERROR: Not a boolean value: \"maybe\". Assuming \"no\".\nParse error near line 7: near \".\": syntax error\n",
+    "1",
+    "input-errors",
+    "1\n2\n7\n",
+    "Parse error near line 2: no such column: nope\nParse error near line 5: no such column: nope\nError near line 8: UNIQUE constraint failed: people.id\nParse error near line 9: no such column: nope\nError near line 10: cannot commit - no transaction is active\nParse error near line 11: no such table: missing\nParse error near line 12: near \"*\": syntax error\n",
+    "1",
+    "schema",
+    "one     two     v\ntwo\nCREATE TABLE one(x);\nCREATE TABLE two(id INTEGER PRIMARY KEY AUTOINCREMENT, y);\nCREATE TABLE sqlite_sequence(name,seq);\nCREATE INDEX two_y ON two(y);\nCREATE VIEW v AS SELECT 1, x AS k FROM one;\n/* v(\"1\",k) */\nCREATE TABLE two(id INTEGER PRIMARY KEY AUTOINCREMENT, y);\nCREATE INDEX two_y ON two(y);\nCREATE VIEW v AS SELECT 1, x AS k FROM one;\n/* v(\"1\",k) */\none     three     two     v\n",
+    "",
+    "0",
+];
+
+/// Where the run `name` is in `APPLE_DIFFERS`.
+fn officialRunWhereAppleDiffers(name: StringView) -> usize? {
+    var k: usize = 0;
+    while (k + 3 < APPLE_DIFFERS.length) {
+        if (APPLE_DIFFERS[k] == name) {
+            return k;
+        }
+        k += 4;
+    }
+    return null;
+}
+
 /// Runs `options`, a database made by `setup`, `arguments` and standard input `input` through sqlite3 and this
-/// shell, and compares them.
+/// shell, and compares them (with Apple's sqlite3, sqlite.org's output for a run in `APPLE_DIFFERS`).
 fn sameAsSqlite(
     name: StringView,
     setup: StringView,
@@ -78,10 +114,16 @@ fn sameAsSqlite(
         theirArguments.push(arguments[i])!;
         ourArguments.push(arguments[i])!;
     }
-    let theirs = Process.capture("sqlite3", borrow theirArguments, input.bytes())!;
+    var theirs = captureSqlite(borrow theirArguments, input.bytes())!;
     let ours = runShell(ourArguments.view(), Lines.ofText(String.from(input)!), false)!;
 
-    let theirErrors = withoutCarets(theirs.stderr.view());
+    var theirErrors = withoutCarets(theirs.stderr.view());
+    if (officialRunWhereAppleDiffers(name) is Some(k) && sqliteIsApples()) {
+        theirs.stdout = Vector<u8>.create();
+        theirs.stdout.extend(APPLE_DIFFERS[k + 1].bytes())!;
+        theirErrors = String.from(APPLE_DIFFERS[k + 2])!;
+        theirs.status = APPLE_DIFFERS[k + 3].parseInt<i32>() ?? -1;
+    }
     let ourErrors = withoutCarets(ours.errors.view().bytes());
     if (theirs.stdout.view() != ours.out.view() || theirErrors.view() != ourErrors.view()
         || theirs.status != ours.status) {
@@ -102,7 +144,7 @@ fn sameAsSqlite(
     var check = Vector<StringView>.create();
     check.push(ourPath.view())!;
     check.push("PRAGMA integrity_check")!;
-    let verdict = Process.capture("sqlite3", borrow check, "".bytes())!;
+    let verdict = captureSqlite(borrow check, "".bytes())!;
     return Check.equalBytes("ok\n".bytes(), verdict.stdout.view());
 }
 
@@ -408,21 +450,25 @@ fn valueTextIsSqlites() -> Result<void, TestFailure> {
 fn atATerminalAsSqlite3() -> Result<void, TestFailure> {
     // Standard input is a terminal only under a pseudo-terminal, which `tests/terminal.py` makes with Python's
     // `pty`, comparing sessions typed into both shells; it runs the built shell, so the shell is built first.
+    if (onWindowsHost()) {
+        Console.writeLine("pseudo-terminals are POSIX only: skipped on Windows");
+        return Ok();
+    }
     var probe = Vector<StringView>.create();
     probe.push("--version")!;
-    if (Process.capture("python3", borrow probe, "".bytes()) is Err(_)) {
+    if (captureProgram("python3", borrow probe, "".bytes()) is Err(_)) {
         Console.writeLine("python3 is not installed: skipped");
         return Ok();
     }
     var build = Vector<StringView>.create();
     build.push("build")!;
-    let built = Process.capture("ceesafec", borrow build, "".bytes())!;
+    let built = captureProgram("ceesafec", borrow build, "".bytes())!;
     Check.isTrue(built.status == 0, "the shell builds")?;
     var arguments = Vector<StringView>.create();
     arguments.push("tests/terminal.py")!;
     arguments.push("out/sqlite_shell")!;
     arguments.push("out")!;
-    let compared = Process.capture("python3", borrow arguments, "".bytes())!;
+    let compared = captureProgram("python3", borrow arguments, "".bytes())!;
     if (compared.status != 0) {
         return Check.fail(shown(compared.stdout.view()).view());
     }
