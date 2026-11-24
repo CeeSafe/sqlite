@@ -1,0 +1,134 @@
+name: ci
+
+# Every package's tests on macOS, Linux and Windows. The tests are differential: answers and files are compared with
+# what the sqlite3 shell gives, so each machine runs the same official sqlite3 build (sqlite.org's sqlite-tools,
+# checked against the SHA3-256 sums its download page lists), not the system's (Apple's differs: it reserves 12 bytes
+# per page). ceesafec is the latest CeeSafe release, checked against the release's SHA256SUMS.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SQLITE_VERSION: "3540100"
+  SQLITE_YEAR: "2026"
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            ceesafec: ceesafec-osx-arm64.tar.gz
+            sqlite: sqlite-tools-osx-arm64
+            sqlite_sha3: a3106c6db3b50ec9ef4fde4edfafe7504179e9bfd7e0816a280b29c4d56a2e7b
+          - os: ubuntu-24.04
+            ceesafec: ceesafec-linux-x64.tar.gz
+            sqlite: sqlite-tools-linux-x64
+            sqlite_sha3: 555635de98534d87a67ee2e6e1b0d79f494b1b33b223477d3e7a8ea0c66e416f
+          - os: windows-2022
+            ceesafec: ceesafec-win-x64.zip
+            sqlite: sqlite-tools-win-x64
+            sqlite_sha3: e171f3993a992edf076746926dd52b5e2ebfabaee38818e74987e1d8112ab987
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ceesafec, the latest CeeSafe release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ceesafec"
+          cd "$RUNNER_TEMP/ceesafec"
+          for try in 1 2 3 4 5; do
+            gh release download -R CeeSafe/CeeSafe -p "${{ matrix.ceesafec }}" -p SHA256SUMS --clobber && break
+            [ "$try" = 5 ] && exit 1
+            sleep 30
+          done
+          python3 - "${{ matrix.ceesafec }}" <<'EOF'
+          import hashlib, sys
+          name = sys.argv[1]
+          want = next(line.split()[0] for line in open("SHA256SUMS") if line.split()[-1].lstrip("*") == name)
+          got = hashlib.sha256(open(name, "rb").read()).hexdigest()
+          sys.exit(0 if got == want else f"{name}: sha256 {got}, SHA256SUMS says {want}")
+          EOF
+          case "${{ matrix.ceesafec }}" in
+            *.zip) unzip -q "${{ matrix.ceesafec }}" ;;
+            *) tar -xzf "${{ matrix.ceesafec }}" ;;
+          esac
+          dir=$(dirname "$(find "$PWD" -name 'ceesafec' -type f -o -name 'ceesafec.exe' -type f | head -1)")
+          echo "$dir" >> "$GITHUB_PATH"
+
+      - name: sqlite3 ${{ env.SQLITE_VERSION }}, sqlite.org's build
+        run: |
+          mkdir -p "$RUNNER_TEMP/sqlite3"
+          cd "$RUNNER_TEMP/sqlite3"
+          zip="${{ matrix.sqlite }}-$SQLITE_VERSION.zip"
+          for try in 1 2 3 4 5; do
+            python3 -c "import urllib.request, sys; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])" \
+              "https://sqlite.org/$SQLITE_YEAR/$zip" "$zip" && break
+            [ "$try" = 5 ] && exit 1
+            sleep 30
+          done
+          python3 -c "import hashlib, sys; got = hashlib.sha3_256(open(sys.argv[1], 'rb').read()).hexdigest(); sys.exit(0 if got == sys.argv[2] else f'{sys.argv[1]}: sha3-256 {got}')" \
+            "$zip" "${{ matrix.sqlite_sha3 }}"
+          unzip -q -o "$zip"
+          dir=$(dirname "$(find "$PWD" -name 'sqlite3' -type f -o -name 'sqlite3.exe' -type f | head -1)")
+          chmod +x "$dir"/sqlite3* || true
+          echo "$dir" >> "$GITHUB_PATH"
+
+      - name: The C compiler (MSVC)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Versions
+        run: |
+          ceesafec --version
+          sqlite3 --version
+
+      - name: Check and format
+        run: |
+          for package in . cli pgwire daemon; do
+            (cd "$package" && ceesafec check && ceesafec fmt --check) || exit 1
+          done
+
+      - name: Tests, the engine
+        if: always()
+        run: ceesafec test
+
+      - name: Tests, the engine with SQLITE_STEP_CHECK
+        if: always()
+        env:
+          SQLITE_STEP_CHECK: "1"
+        run: ceesafec test
+
+      - name: Tests, cli
+        if: always()
+        working-directory: cli
+        run: ceesafec test
+
+      - name: Tests, pgwire
+        if: always()
+        working-directory: pgwire
+        run: ceesafec test
+
+      - name: Tests, daemon
+        if: always()
+        working-directory: daemon
+        run: ceesafec test
