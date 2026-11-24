@@ -1,29 +1,27 @@
-// The tests that do not run on Windows yet, and why. Each such test starts with
+// The tests that do not run on Windows, and why. Each such test starts with
 // `if (skippedOnWindows(WindowsGap.…)) { return Ok(); }`; when a gap is closed, `skippedOnWindows` stops skipping
 // its tests here, and `grep -n "WindowsGap\.<name>" tests/*.cee` lists them.
 
-/// What a test needs that the engine or the tests do not have on Windows yet.
+/// What a test needs that Windows, or the tests there, do not have.
 enum WindowsGap {
-    /// WAL mode: the engine refuses it on Windows until os_win.c's locks (of the database and of the -shm file) are
-    /// ported, `src/pagerw.cee` and `src/walindex.cee`.
-    WalMode,
-    /// File locks as SQLite takes them on Windows (os_win.c): this engine takes POSIX's, so it cannot share a file
-    /// with sqlite3 or with another of its connections there.
-    FileLocks,
     /// Killing the sqlite3 shell in the middle of a transaction, which the tests do with `.shell kill -9 $PPID`, a
-    /// POSIX shell's command.
+    /// POSIX shell's command: on Windows `.shell` runs cmd.exe, which knows neither `kill` nor the shell's process
+    /// id.
     KillingTheShell,
+    /// A test that a check for RESERVED takes no lock (F_GETLK). Windows has no such test: os_win.c's
+    /// winCheckReservedLock takes the byte for an instant and releases it, and so does this engine there, so a
+    /// sqlite3.exe that takes RESERVED in that instant is turned away, as it would be by another sqlite3.exe.
+    LockTestTakesTheLock,
 }
 
-/// True, after saying so, when the test cannot run on Windows yet because of `gap`.
+/// True, after saying so, when the test cannot run on Windows because of `gap`.
 fn skippedOnWindows(gap: WindowsGap) -> bool {
     if (!onWindowsHost()) {
         return false;
     }
     let reason = match (gap) {
-        WindowsGap.WalMode => "WAL mode is not supported on Windows yet (os_win.c's locks are not ported)",
-        WindowsGap.FileLocks => "SQLite's Windows file locks (os_win.c) are not ported yet",
         WindowsGap.KillingTheShell => "killing the sqlite3 shell needs a POSIX shell's kill",
+        WindowsGap.LockTestTakesTheLock => "Windows tests a lock by taking it, as os_win.c does",
     };
     Console.write("skipped on Windows: ");
     Console.writeLine(reason);

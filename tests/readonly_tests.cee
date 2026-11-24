@@ -134,9 +134,6 @@ fn sameReadOnlyAnswers(
 /// and checkpoints are refused as SQLite refuses them, and closing leaves the three files as they were.
 @test
 fn readOnlyWalFilesAreReadThroughAnIndexOfTheirOwn() -> Result<void, TestFailure> {
-    if (skippedOnWindows(WindowsGap.WalMode)) {
-        return Ok();
-    }
     let path = "out/ro-heap.db";
     walFixtureKeptInLog(path)?;
     let files = walFiles(path);
@@ -166,9 +163,6 @@ fn readOnlyWalFilesAreReadThroughAnIndexOfTheirOwn() -> Result<void, TestFailure
 /// (WAL_SHM_RDONLY), as a second sqlite3 cannot.
 @test
 fn readOnlyShmIsMappedBesideAConnectionThatWrites() -> Result<void, TestFailure> {
-    if (skippedOnWindows(WindowsGap.WalMode)) {
-        return Ok();
-    }
     let path = "out/ro-shm.db";
     let marker = "out/ro-shm.marker";
     let go = "out/ro-shm.go";
@@ -288,9 +282,6 @@ fn readOnlyHotJournalIsRefused() -> Result<void, TestFailure> {
 /// transaction finds the DMS byte held, maps the `-shm` for reading, and sees the commit.
 @test
 fn readOnlyIndexOfItsOwnGivesWayToAWriter() -> Result<void, TestFailure> {
-    if (skippedOnWindows(WindowsGap.WalMode)) {
-        return Ok();
-    }
     let path = "out/ro-handover.db";
     let marker = "out/ro-handover.marker";
     let go = "out/ro-handover.go";

@@ -1,6 +1,7 @@
 // SQLite's file locks: this engine and the sqlite3 shell on one file at the same time, and two sessions of this
 // engine in one process. A lock is held by a sqlite3 process run on a thread of the test, which says it holds it
-// by making a marker file (`.shell touch`), and keeps it while it sleeps (`.shell sleep`).
+// by making a marker file (`shellTouch`), and keeps it while it sleeps (`shellSleep`) or until the test's signal
+// (`shellWaitFor`).
 
 /// Runs sqlite3 on `path` with `commands` (each an argument: SQL or a dot-command, run in one connection) on a
 /// thread of its own; the thread's value is the shell's exit status.
@@ -92,17 +93,16 @@ fn isLocked(result: borrow Result<SqliteValue?, SqliteError>) -> bool => match (
 /// with one, and as soon as sqlite3 commits with a timeout long enough. It then sees sqlite3's commit.
 @test
 fn locksSqliteHoldingExclusiveMakesThisEngineWait() -> Result<void, TestFailure> {
-    if (skippedOnWindows(WindowsGap.FileLocks)) {
-        return Ok();
-    }
     let path = "out/lock-their-exclusive.db";
     let marker = "out/lock-their-exclusive.marker";
     lockFixture(path, marker)?;
     var connection = Connection.open(path)!;
     Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(1)), "the fixture's row")?;
+    let touch = shellTouch(marker);
+    let sleep = shellSleep("1.5");
     let shell = sqliteInBackground(
         path,
-        ["BEGIN EXCLUSIVE", "INSERT INTO t VALUES (2)", ".shell touch out/lock-their-exclusive.marker", ".shell sleep 1.5", "COMMIT"][..],
+        ["BEGIN EXCLUSIVE", "INSERT INTO t VALUES (2)", touch.view(), sleep.view(), "COMMIT"][..],
     );
     waitForFile(marker)?;
     Check.isTrue(isLocked(borrow rowsOfT(mut connection)), "no timeout: database is locked at once")?;
@@ -121,9 +121,6 @@ fn locksSqliteHoldingExclusiveMakesThisEngineWait() -> Result<void, TestFailure>
 /// write; while it holds BEGIN EXCLUSIVE sqlite3 cannot read either; after COMMIT sqlite3 sees the rows.
 @test
 fn locksThisEngineHoldingLocksMakesSqliteWait() -> Result<void, TestFailure> {
-    if (skippedOnWindows(WindowsGap.FileLocks)) {
-        return Ok();
-    }
     let path = "out/lock-our-locks.db";
     lockFixture(path, "out/lock-our-locks.marker")?;
     var connection = Connection.open(path)!;
@@ -150,9 +147,6 @@ fn locksThisEngineHoldingLocksMakesSqliteWait() -> Result<void, TestFailure> {
 /// change until its transaction ends, and sqlite3's commit waits for it (here past its timeout).
 @test
 fn locksAReaderInATransactionSeesAStableSnapshot() -> Result<void, TestFailure> {
-    if (skippedOnWindows(WindowsGap.FileLocks)) {
-        return Ok();
-    }
     let path = "out/lock-snapshot.db";
     lockFixture(path, "out/lock-snapshot.marker")?;
     var connection = Connection.open(path)!;
@@ -173,9 +167,6 @@ fn locksAReaderInATransactionSeesAStableSnapshot() -> Result<void, TestFailure> 
 /// before it writes, at the same time: with the locks no update is lost, and the file stays sound.
 @test
 fn locksConcurrentWritersNeverLoseACommit() -> Result<void, TestFailure> {
-    if (skippedOnWindows(WindowsGap.FileLocks)) {
-        return Ok();
-    }
     let path = "out/lock-writers.db";
     lockFixture(path, "out/lock-writers.marker")?;
     let _ = askSqlite(path, "CREATE TABLE counter(n); INSERT INTO counter VALUES (0)")?;
@@ -211,17 +202,13 @@ fn locksConcurrentWritersNeverLoseACommit() -> Result<void, TestFailure> {
 /// EXCLUSIVE, before it reads. A journal whose writer still holds RESERVED is not hot: it is left alone.
 @test
 fn locksHotJournalsAreRolledBackAndLiveOnesLeftAlone() -> Result<void, TestFailure> {
-    if (skippedOnWindows(WindowsGap.FileLocks)) {
-        return Ok();
-    }
     let path = "out/lock-hot.db";
     let marker = "out/lock-hot.marker";
     lockFixture(path, marker)?;
     // A live journal: sqlite3 has written (RESERVED, its changes in its cache) and sleeps before committing.
-    let shell = sqliteInBackground(
-        path,
-        ["BEGIN", "INSERT INTO t VALUES (2)", ".shell touch out/lock-hot.marker", ".shell sleep 1", "COMMIT"][..],
-    );
+    let touch = shellTouch(marker);
+    let sleep = shellSleep("1");
+    let shell = sqliteInBackground(path, ["BEGIN", "INSERT INTO t VALUES (2)", touch.view(), sleep.view(), "COMMIT"][..]);
     waitForFile(marker)?;
     Check.isTrue(Journal.exists(path)!, "the shell's journal exists")?;
     var connection = Connection.open(path)!;
@@ -229,6 +216,9 @@ fn locksHotJournalsAreRolledBackAndLiveOnesLeftAlone() -> Result<void, TestFailu
     Check.isTrue(Journal.exists(path)!, "a journal whose writer holds RESERVED is not played back")?;
     Check.isTrue(shell.join() == 0, "the shell committed")?;
     Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(2)), "and its commit is seen")?;
+    if (skippedOnWindows(WindowsGap.KillingTheShell)) {
+        return expectIntact(path);
+    }
     // A hot journal: the shell's rows grow, it spills changed pages into the file (having synced the journal),
     // and it is killed before it commits.
     Check.equalText(
@@ -253,9 +243,6 @@ fn locksHotJournalsAreRolledBackAndLiveOnesLeftAlone() -> Result<void, TestFailu
 /// the journal is a header (synced, so its magic is written) that would cut the file to one page if played back.
 @test
 fn locksAJournalWhoseWriterHoldsReservedIsNotHot() -> Result<void, TestFailure> {
-    if (skippedOnWindows(WindowsGap.FileLocks)) {
-        return Ok();
-    }
     let path = "out/lock-live-journal.db";
     lockFixture(path, "out/lock-live-journal.marker")?;
     var writer = Connection.open(path)!;
@@ -291,7 +278,7 @@ fn locksAJournalWhoseWriterHoldsReservedIsNotHot() -> Result<void, TestFailure> 
 /// for an instant, some of those attempts were "database is locked".
 @test
 fn locksTheHotJournalCheckTakesNoLock() -> Result<void, TestFailure> {
-    if (skippedOnWindows(WindowsGap.FileLocks)) {
+    if (skippedOnWindows(WindowsGap.LockTestTakesTheLock)) {
         return Ok();
     }
     let path = "out/lock-check.db";
@@ -364,9 +351,6 @@ fn locksTheHotJournalCheckTakesNoLock() -> Result<void, TestFailure> {
 /// that then writes while another writes fails at once rather than deadlock, as in SQLite.
 @test
 fn locksTwoSessionsInOneProcessAreKeptApart() -> Result<void, TestFailure> {
-    if (skippedOnWindows(WindowsGap.FileLocks)) {
-        return Ok();
-    }
     let path = "out/lock-sessions.db";
     lockFixture(path, "out/lock-sessions.marker")?;
     var first = Connection.open(path)!;
@@ -409,9 +393,6 @@ fn locksTwoSessionsInOneProcessAreKeptApart() -> Result<void, TestFailure> {
 /// one more for each that does.
 @test
 fn locksDataVersionCountsOtherConnectionsCommits() -> Result<void, TestFailure> {
-    if (skippedOnWindows(WindowsGap.FileLocks)) {
-        return Ok();
-    }
     let path = "out/lock-data-version.db";
     lockFixture(path, "out/lock-data-version.marker")?;
     var connection = Connection.open(path)!;
@@ -422,4 +403,110 @@ fn locksDataVersionCountsOtherConnectionsCommits() -> Result<void, TestFailure> 
     Check.isTrue(connection.scalar("PRAGMA data_version", borrow none)! is Some(SqliteValue.Integer(2)), "next")?;
     Check.equalText("1\n", theirAnswer(path, "PRAGMA data_version").view())?;
     return Ok();
+}
+
+/// sqlite3 starts in the background on `path`, runs `before`, makes `marker` and waits for `go`, then runs `after`;
+/// the test waits for the marker. The marker and the signal are removed first.
+fn sqliteHoldingUntil(
+    path: StringView,
+    marker: StringView,
+    go: StringView,
+    before: Slice<StringView>,
+    after: Slice<StringView>,
+) -> Result<Thread<i32>, TestFailure> {
+    let _ = File.remove(marker);
+    let _ = File.remove(go);
+    let touch = shellTouch(marker);
+    let wait = shellWaitFor(go);
+    var commands = Vector<StringView>.create();
+    for (i in 0..before.length) {
+        commands.push(before[i])!;
+    }
+    commands.push(touch.view())!;
+    commands.push(wait.view())!;
+    for (i in 0..after.length) {
+        commands.push(after[i])!;
+    }
+    let shell = sqliteInBackground(path, commands.view());
+    waitForFile(marker)?;
+    return Ok(shell);
+}
+
+/// Each of SQLite's locks held by one side while the other tries what the lock forbids, sqlite3 and this engine
+/// both ways, as SQLite's connections meet each other's locks (on Windows, os_win.c's against this engine's):
+/// sqlite3 holding SHARED keeps this engine's commit out; sqlite3 holding RESERVED lets this engine read the last
+/// commit and keeps its write out; sqlite3 holding PENDING (its commit waiting for this engine's reader) keeps a new
+/// reader out while the reader that was there goes on; and this engine holding PENDING keeps sqlite3 from reading.
+@test
+fn locksEachLockKeepsOutWhatItForbids() -> Result<void, TestFailure> {
+    let path = "out/lock-each.db";
+    let marker = "out/lock-each.marker";
+    let go = "out/lock-each.go";
+    lockFixture(path, marker)?;
+    let none = Params.create();
+    var connection = Connection.open(path)!;
+    var reader = Connection.open(path)!;
+
+    // sqlite3 holds SHARED: this engine's commit waits for it, and fails after the busy timeout.
+    let shared = sqliteHoldingUntil(path, marker, go, ["BEGIN", "SELECT count(*) FROM t"][..], ["COMMIT"][..])?;
+    connection.setBusyTimeout(200);
+    Check.isTrue(
+        connection.execute("INSERT INTO t VALUES (2)", borrow none) is Err(SqliteError.Busy(_)),
+        "no commit beside sqlite3's SHARED",
+    )?;
+    touchFile(go);
+    Check.isTrue(shared.join() == 0, "the shell's read ended")?;
+    let _ = connection.execute("INSERT INTO t VALUES (2)", borrow none)!;
+
+    // sqlite3 holds RESERVED: this engine reads the last commit beside it, and cannot write.
+    let reserved = sqliteHoldingUntil(path, marker, go, ["BEGIN", "INSERT INTO t VALUES (3)"][..], ["COMMIT"][..])?;
+    connection.setBusyTimeout(0);
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(2)), "a reader beside sqlite3's RESERVED")?;
+    Check.isTrue(
+        connection.execute("INSERT INTO t VALUES (4)", borrow none) is Err(SqliteError.Busy(_)),
+        "one writer",
+    )?;
+    touchFile(go);
+    Check.isTrue(reserved.join() == 0, "the shell committed")?;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(3)), "sqlite3's commit is seen")?;
+
+    // sqlite3 holds PENDING: its commit waits for this engine's reader, and no new reader starts meanwhile.
+    reader.begin()!;
+    Check.isTrue(rowsOfT(mut reader)! is Some(SqliteValue.Integer(3)), "the reader's snapshot")?;
+    let pending = sqliteHoldingUntil(
+        path,
+        marker,
+        go,
+        [".timeout 10000", "BEGIN", "INSERT INTO t VALUES (4)"][..],
+        ["COMMIT"][..],
+    )?;
+    touchFile(go);
+    var refused = false;
+    for (i in 0..500) {
+        if (isLocked(borrow rowsOfT(mut connection))) {
+            refused = true;
+            break;
+        }
+        Thread.sleep(10);
+    }
+    Check.isTrue(refused, "no new reader beside sqlite3's PENDING")?;
+    Check.isTrue(rowsOfT(mut reader)! is Some(SqliteValue.Integer(3)), "the reader that was there goes on")?;
+    reader.commit()!;
+    Check.isTrue(pending.join() == 0, "the shell committed once the reader left")?;
+    Check.isTrue(rowsOfT(mut connection)! is Some(SqliteValue.Integer(4)), "and its commit is seen")?;
+
+    // This engine holds PENDING: a commit that met a reader keeps it, and sqlite3 cannot start reading.
+    reader.begin()!;
+    Check.isTrue(rowsOfT(mut reader)! is Some(SqliteValue.Integer(4)), "the reader's snapshot")?;
+    connection.begin()!;
+    connection.executeScript("INSERT INTO t VALUES (5)")!;
+    Check.isTrue(connection.execute("COMMIT", borrow none) is Err(SqliteError.Busy(_)), "the commit waits")?;
+    Check.isTrue(
+        sqliteSaysLocked(theirAnswer(path, "SELECT count(*) FROM t").view()),
+        "sqlite3 cannot read beside this engine's PENDING",
+    )?;
+    reader.commit()!;
+    connection.commit()!;
+    Check.equalText("5\n", theirAnswer(path, "SELECT count(*) FROM t").view())?;
+    return expectIntact(path);
 }
