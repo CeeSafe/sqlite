@@ -1,0 +1,139 @@
+// TEXT that is not UTF-8: SQLite keeps a text's bytes as they are, and its functions read them by its own rules
+// (utf8.c's READ_UTF8, SQLITE_SKIP_UTF8). Each answer is compared with the sqlite3 shell's, byte for byte (the
+// harness writes each byte of an ill-formed sequence as `\xHH`, so U+FFFD in place of a byte would differ).
+
+const BAD_TEXT_FIXTURE: StringView = """
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT, note);
+    INSERT INTO t VALUES (1, CAST(x'ff' AS TEXT), 'lone ff');
+    INSERT INTO t VALUES (2, CAST(x'c3' AS TEXT), 'cut lead');
+    INSERT INTO t VALUES (3, CAST(x'eda080' AS TEXT), 'surrogate');
+    INSERT INTO t VALUES (4, CAST(x'61806263' AS TEXT), 'stray continuation');
+    INSERT INTO t VALUES (5, CAST(x'c0af41' AS TEXT), 'overlong');
+    INSERT INTO t VALUES (6, CAST(x'f4908080' AS TEXT), 'past U+10FFFF');
+    INSERT INTO t VALUES (7, CAST(x'41fe42ff43' AS TEXT), 'fe and ff');
+    INSERT INTO t VALUES (8, CAST(x'2020ff20c3a92020' AS TEXT), 'spaces');
+    INSERT INTO t VALUES (9, 'héllo', 'valid');
+    INSERT INTO t VALUES (10, CAST(x'efbfbe' AS TEXT), 'U+FFFE');
+    INSERT INTO t VALUES (11, CAST(x'e282' AS TEXT) || 'z', 'cut three');
+    CREATE INDEX tx ON t(x);
+    """;
+
+@test
+fn textKeepsItsBytes() -> Result<void, TestFailure> {
+    let path = "out/text-bytes-kept.db";
+    makeDatabase(path, BAD_TEXT_FIXTURE)?;
+    return sameAnswers(path, """
+        SELECT hex(CAST(x'ff' AS TEXT)), CAST(x'ff' AS TEXT), typeof(CAST(x'ff' AS TEXT))
+        SELECT hex(CAST(x'c3' AS TEXT) || 'a'), CAST(x'c3' AS TEXT) || 'a'
+        SELECT id, hex(x), x FROM t ORDER BY id
+        SELECT id, hex(x || x), hex(x || 1), hex(concat(x, 'a', x)), hex(concat_ws(x, 'a', 'b')) FROM t ORDER BY id
+        SELECT hex(CAST(CAST(x'80ff' AS TEXT) AS BLOB)), CAST(x'80ff' AS TEXT) = CAST(x'80ff' AS TEXT)
+        SELECT id FROM t WHERE x = CAST(x'ff' AS TEXT)
+        SELECT id FROM t WHERE x > 'z' ORDER BY x
+        SELECT id FROM t ORDER BY x, id
+        SELECT id FROM t ORDER BY x COLLATE NOCASE, id
+        SELECT id FROM t ORDER BY x COLLATE RTRIM DESC, id
+        SELECT a.id, b.id FROM t a, t b WHERE a.x = b.x COLLATE NOCASE AND a.id < b.id
+        SELECT hex(x) FROM t WHERE x = CAST(x'2020ff20c3a9' AS TEXT) COLLATE RTRIM
+        SELECT count(DISTINCT x), hex(max(x)), hex(min(x)) FROM t
+        SELECT hex(group_concat(x, CAST(x'fe' AS TEXT))) FROM t
+        SELECT hex(group_concat(x)) FROM (SELECT x FROM t ORDER BY id)
+        SELECT id, quote(x), hex(quote(x)) FROM t ORDER BY id
+        SELECT hex(quote(CAST(x'27ff27' AS TEXT))), hex(quote(CAST(x'ff0041' AS TEXT)))
+        """);
+}
+
+@test
+fn textFunctionsReadBytesAsSqliteDoes() -> Result<void, TestFailure> {
+    let path = "out/text-bytes-functions.db";
+    makeDatabase(path, BAD_TEXT_FIXTURE)?;
+    return sameAnswers(path, """
+        SELECT id, length(x), octet_length(x), unicode(x) FROM t ORDER BY id
+        SELECT id, hex(substr(x, 1, 1)), hex(substr(x, 2)), hex(substr(x, -1)), hex(substr(x, -2, 1)) FROM t ORDER BY id
+        SELECT id, hex(upper(x)), hex(lower(x)) FROM t ORDER BY id
+        SELECT id, hex(trim(x)), hex(ltrim(x)), hex(rtrim(x)) FROM t ORDER BY id
+        SELECT id, hex(trim(x, CAST(x'ff' AS TEXT))), hex(trim(x, CAST(x'fe' AS TEXT))), hex(trim(x, 'A' || CAST(x'ff' AS TEXT) || 'C')) FROM t ORDER BY id
+        SELECT hex(trim(CAST(x'c3a9c3' AS TEXT), CAST(x'c3' AS TEXT))), hex(trim(CAST(x'c3a9c3' AS TEXT), 'é')), hex(trim('éaé', 'é'))
+        SELECT hex(rtrim(CAST(x'61a9' AS TEXT), CAST(x'a9' AS TEXT))), hex(ltrim(CAST(x'a961' AS TEXT), CAST(x'c3a9' AS TEXT)))
+        SELECT hex(trim('ab' || char(0) || 'ba', 'a')), hex(trim('xy', 'x' || char(0) || 'y'))
+        SELECT id, instr(x, CAST(x'ff' AS TEXT)), instr(x, 'b'), instr(x, CAST(x'80' AS TEXT)), instr(x, 'c') FROM t ORDER BY id
+        SELECT instr('é', CAST(x'a9' AS TEXT)), instr(CAST(x'418080' AS TEXT), CAST(x'80' AS TEXT)), instr(CAST(x'e282ac41' AS TEXT), 'A')
+        SELECT id, hex(replace(x, CAST(x'ff' AS TEXT), '!')), hex(replace(x, CAST(x'80' AS TEXT), CAST(x'fe' AS TEXT))) FROM t ORDER BY id
+        SELECT hex(replace('é', CAST(x'a9' AS TEXT), 'x')), hex(replace('abc', CAST(x'00' AS BLOB), 'x'))
+        SELECT id, x LIKE CAST(x'ff' AS TEXT), x LIKE '_', x LIKE '%', x GLOB '?', x GLOB '*' || CAST(x'ff' AS TEXT) FROM t ORDER BY id
+        SELECT id, x LIKE 'a_bc', x GLOB 'a?bc', x LIKE '%' || CAST(x'ff' AS TEXT) || '%', x GLOB '[' || CAST(x'ff' AS TEXT) || ']' FROM t ORDER BY id
+        SELECT CAST(x'ff' AS TEXT) LIKE CAST(x'fe' AS TEXT), CAST(x'ff' AS TEXT) GLOB CAST(x'fe' AS TEXT), CAST(x'eda080' AS TEXT) LIKE CAST(x'efbfbd' AS TEXT)
+        SELECT CAST(x'c0af' AS TEXT) GLOB '?', CAST(x'c0afc0af' AS TEXT) GLOB '??', CAST(x'f4908080' AS TEXT) GLOB '[' || CAST(x'efbfbd' AS TEXT) || ']'
+        SELECT unicode(CAST(x'80' AS TEXT)), unicode(CAST(x'bf41' AS TEXT)), unicode(CAST(x'c3' AS TEXT)), unicode(CAST(x'eda080' AS TEXT)), unicode(CAST(x'efbfbf' AS TEXT))
+        SELECT unicode(CAST(x'f8888080808041' AS TEXT)), unicode(CAST(x'fc8080808080' AS TEXT)), unicode(CAST(x'fe' AS TEXT)), unicode(CAST(x'c1bf' AS TEXT))
+        SELECT length(CAST(x'c3a9a9a9' AS TEXT)), length(CAST(x'80808041' AS TEXT)), length(CAST(x'41c3' AS TEXT)), length(CAST(x'4100ff' AS TEXT))
+        SELECT hex(char(0xd800)), hex(char(0xdfff, 0x41)), hex(char(0xfffe)), hex(char(0x110000)), hex(char(-1)), char(0xd800) = CAST(x'eda080' AS TEXT)
+        SELECT hex(CAST(x'ff' AS TEXT) || char(0xd800)), length(char(0xd800)), unicode(char(0xd800))
+        SELECT CAST(x'3132ff' AS TEXT) + 0, CAST(CAST(x'3132ff' AS TEXT) AS INTEGER), CAST(x'ff' AS TEXT) = 0
+        """);
+}
+
+@test
+fn textFormatsKeepBytes() -> Result<void, TestFailure> {
+    let path = "out/text-bytes-format.db";
+    makeDatabase(path, BAD_TEXT_FIXTURE)?;
+    return sameAnswers(path, """
+        SELECT id, hex(printf('[%s]', x)), hex(printf('%.1s', x)), hex(printf('%!.1s', x)), hex(printf('%q', x)), hex(printf('%Q', x)) FROM t ORDER BY id
+        SELECT id, hex(printf('%5s|%-5s', x, x)), hex(printf('%!5s', x)), hex(printf('%c', x)), hex(printf('%w', x)) FROM t ORDER BY id
+        SELECT hex(printf('%.2s', 'é')), hex(format('%.1s', 'é')), hex(printf(CAST(x'ff2564' AS TEXT), 7)), hex(format(CAST(x'c3' AS TEXT)))
+        SELECT hex(printf('%s', CAST(x'ff' AS BLOB))), hex(printf('%s%s', x'c3', x'a9'))
+        SELECT hex(strftime(CAST(x'ff' AS TEXT) || '%Y', '2024-01-02')), hex(strftime('%d' || CAST(x'c3' AS TEXT), '2024-01-02'))
+        SELECT hex(date(CAST(x'ff' AS TEXT))), hex(date('2024-01-02', CAST(x'ff' AS TEXT)))
+        """);
+}
+
+@test
+fn jsonKeepsSqlitesBytes() -> Result<void, TestFailure> {
+    let path = "out/text-bytes-json.db";
+    makeDatabase(path, BAD_TEXT_FIXTURE)?;
+    return sameAnswers(path, """
+        SELECT hex(json_extract('"\ud800"', '$')), hex('["\ud800"]' ->> '$[0]'), hex(json_extract('"\udc00x"', '$'))
+        SELECT hex(json_extract('"\ud800\u0041"', '$')), hex(json_extract('{"a":"\udbff"}', '$.a')), hex(json_extract('"\ud83d\ude00"', '$'))
+        SELECT hex(json_extract(jsonb('"\ud800"'), '$')), hex(jsonb_extract(jsonb('["\ud800"]'), '$[0]'))
+        SELECT hex(value), hex(key) FROM json_each('{"\ud800":"\udfff"}')
+        SELECT hex(value), hex(fullkey), hex(path) FROM json_tree('{"\ud800":["\udfff"]}')
+        SELECT id, hex(json_quote(x)), hex(json_array(x)), hex(json_object('k', x)) FROM t ORDER BY id
+        SELECT id, json_valid(json_quote(x)), hex(json_extract(json_quote(x), '$')) FROM t ORDER BY id
+        SELECT hex(json(CAST(x'22ff22' AS TEXT))), json_valid(CAST(x'22ff22' AS TEXT)), hex(json_extract(CAST(x'5b22ff225d' AS TEXT), '$[0]'))
+        SELECT hex(value) FROM json_each(CAST(x'5b22c3225d' AS TEXT))
+        SELECT hex(json_group_array(x)) FROM (SELECT x FROM t ORDER BY id)
+        """);
+}
+
+@test
+fn textFromRecordsIsKept() -> Result<void, TestFailure> {
+    // Text with ill-formed bytes, written by the sqlite3 shell into records, read here and written back.
+    let script = """
+        CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT);
+        INSERT INTO t VALUES (1, CAST(x'ff' AS TEXT)), (2, CAST(x'c3' AS TEXT) || 'a'), (3, CAST(x'eda080' AS TEXT));
+        INSERT INTO t SELECT id + 10, x || CAST(x'fe' AS TEXT) FROM t;
+        UPDATE t SET x = x || char(0xdc00) WHERE id = 2;
+        CREATE INDEX tx ON t(x);
+        SELECT id, hex(x) FROM t ORDER BY x;
+        SELECT id FROM t WHERE x = CAST(x'eda080' AS TEXT);
+        SELECT id, hex(x) FROM t INDEXED BY tx WHERE x > CAST(x'ed' AS TEXT) ORDER BY x;
+        """;
+    return sameScript("text-bytes-records", script);
+}
+
+@test
+fn utf16TextIsTranslatedAsSqliteDoes() -> Result<void, TestFailure> {
+    // sqlite3VdbeMemTranslate: a lone surrogate becomes its three UTF-8 bytes, a surrogate takes the unit after it
+    // whatever that is, and an odd last byte is dropped. Compared as printed: SQLite's hex() and length() of text
+    // in a UTF-16 database see its UTF-16 bytes.
+    let path = "out/text-bytes-utf16.db";
+    makeDatabase(path, """
+        PRAGMA encoding = 'UTF-16le';
+        CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT);
+        INSERT INTO t VALUES (1, CAST(x'00d8' AS TEXT)), (2, CAST(x'00d84100' AS TEXT)), (3, CAST(x'00dc' AS TEXT));
+        INSERT INTO t VALUES (4, CAST(x'410042' AS TEXT)), (5, 'é'), (6, CAST(x'3dd800de' AS TEXT)), (7, CAST(x'ffdb41004200' AS TEXT));
+        """)?;
+    return sameAnswers(path, """
+        SELECT id, x FROM t ORDER BY id
+        """);
+}
