@@ -84,7 +84,8 @@ fn appendValueText(out: borrow mut ByteString, value: borrow SqliteValue) -> Res
         SqliteValue.Real(r) => {
             var text = String.create();
             appendReal(mut text, r)?;
-            return out.append(text.view());
+            out.append(text.view())?;
+            return Ok();
         }
         SqliteValue.Text(s) => { return out.appendBytes(s.bytes()); }
         SqliteValue.Blob(b) => { return out.appendBytes(b.view()); }

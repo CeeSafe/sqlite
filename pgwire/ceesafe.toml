@@ -2,7 +2,7 @@
 name = "pgwire"
 version = "0.1.0"
 kind = "library"
-ceesafec = ">=0.95.9"
+ceesafec = ">=0.95.12"
 tests = ["tests"]
 
 [dependencies]
