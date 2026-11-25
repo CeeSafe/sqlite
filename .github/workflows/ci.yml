@@ -117,7 +117,7 @@ jobs:
           ceesafec --version
           sqlite3 --version
           if [ "$RUNNER_OS" = Windows ]; then cl 2>&1 | head -1; fi
-          # On Windows the tests run sqlite3 through tests/capture.py, with the python on PATH.
+          # On Windows the commands the tests give sqlite3's .shell run the python on PATH.
           if [ "$RUNNER_OS" = Windows ]; then python -c "import shutil, sys; print(sys.version.split()[0], shutil.which('sqlite3'))"; fi
 
       - name: Check and format

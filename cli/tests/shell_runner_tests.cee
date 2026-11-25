@@ -2,9 +2,8 @@
 //
 // Running the sqlite3 shell (and the few other programs the tests start) on every system, with lib/std's
 // `Process.capture` and `Process.run` (on Windows they run programs since ceesafec 0.95.7, CEESAFE_FINDINGS.md 45
-// and 46). One case is left on Windows: the shell must read `.crlf off` from a `.sqliterc` of its own, and
-// `Process.capture` cannot give a child an environment (a HOME) of its own (finding 51), so there
-// `tests/capture.py`, started by `Process.spawn`, runs the shell with HOME set to a directory that holds one.
+// and 46). On Windows the shell reads `.crlf off` from a `.sqliterc` of its own: `Process.captureWith` runs it with
+// HOME set to a directory that holds one (since ceesafec 0.95.12, finding 51).
 
 /// Whether the sqlite3 on the path is Apple's build (its source id ends in "aapl"). The engine follows sqlite.org's
 /// SQLite 3.54.1, which CI runs; Apple's sqlite3 3.54.0, from an earlier snapshot of SQLite, answers a few
@@ -20,9 +19,6 @@ fn sqliteIsApples() -> bool {
         Err(_) => false,
     };
 }
-
-/// Where the root package's `tests/capture.py` is, from this package's directory.
-const CAPTURE_SCRIPT: StringView = "../tests/capture.py";
 
 /// Whether the tests run on Windows.
 fn onWindowsHost() -> bool {
@@ -51,10 +47,9 @@ fn captureSqlite(arguments: borrow Vector<StringView>, input: Slice<u8>) -> Resu
         return Process.capture("sqlite3", arguments, input);
     }
     let directory = Directory.temporary()?;
-    let result = captureThroughPython(directory.view(), ".crlf off", "sqlite3", arguments, input);
-    for (name in ["in", "out", "err"]) {
-        let _ = File.remove(pathIn(directory.view(), name).view());
-    }
+    let rc = pathIn(directory.view(), ".sqliterc");
+    let result = captureWithHome(directory.view(), rc.view(), arguments, input);
+    let _ = File.remove(rc.view());
     let _ = Directory.remove(directory.view());
     var output = result?;
     let said = "crlf is OFF".bytes();
@@ -100,67 +95,14 @@ fn pathIn(directory: StringView, name: StringView) -> String {
     return path;
 }
 
-/// The whole file's bytes.
-fn wholeFileOf(path: StringView) -> Result<Vector<u8>, IoError> {
-    var file = File.open(path)?;
-    var bytes = Vector<u8>.create();
-    var buffer = [0u8; 65536];
-    loop {
-        let n = file.read(mut buffer[..])?;
-        if (n == 0) {
-            break;
-        }
-        for (i in 0..n) {
-            bytes.push(buffer[i])!;
-        }
-    }
-    return Ok(bytes);
-}
-
-/// `program` run by `tests/capture.py` with its streams in files of `directory` (and a `.sqliterc` of `sqliterc`
-/// unless it is empty).
-fn captureThroughPython(directory: StringView, sqliterc: StringView, program: StringView, arguments: borrow Vector<StringView>, input: Slice<u8>) -> Result<ProcessOutput, IoError> {
-    let inPath = pathIn(directory, "in");
-    let outPath = pathIn(directory, "out");
-    let errPath = pathIn(directory, "err");
+/// The sqlite3 shell run with HOME and USERPROFILE set to `home`, where `rc` is written with `.crlf off` first.
+fn captureWithHome(home: StringView, rc: StringView, arguments: borrow Vector<StringView>, input: Slice<u8>) -> Result<ProcessOutput, IoError> {
     {
-        var file = File.create(inPath.view())?;
-        file.write(input)?;
+        var file = File.create(rc)?;
+        file.write(".crlf off\n".bytes())?;
     }
-    var rc = String.from("--sqliterc=")!;
-    rc.append(sqliterc)!;
-    var all = Vector<StringView>.create();
-    all.push(CAPTURE_SCRIPT)!;
-    if (sqliterc.length > 0) {
-        all.push(rc.view())!;
-    }
-    all.push(inPath.view())!;
-    all.push(outPath.view())!;
-    all.push(errPath.view())!;
-    all.push(program)!;
-    for (argument in arguments) {
-        all.push(argument)!;
-    }
-    var child = match (Process.spawn("python", borrow all, ChildOptions.quiet())) {
-        Ok(c) => c,
-        Err(e) => {
-            // Shown under a test that fails for it.
-            Console.write("python could not be started: ");
-            Console.writeLine(e.message());
-            return Err(e);
-        }
-    };
-    let status = match (child.wait()?) {
-        ChildExit.Status(code) => code,
-        ChildExit.Signal(number) => 128 + number,
-    };
-    if (status == 127) {
-        Console.write("capture.py could not start ");
-        Console.write(program);
-        Console.write(": ");
-        Console.writeBytes(wholeFileOf(errPath.view())?.view());
-        Console.writeLine("");
-        return Err(IoError.NotFound);
-    }
-    return Ok(ProcessOutput { status: status, stdout: wholeFileOf(outPath.view())?, stderr: wholeFileOf(errPath.view())? });
+    var options = ChildOptions.inherit();
+    options.setEnvironment("HOME", home)!;
+    options.setEnvironment("USERPROFILE", home)!;
+    return Process.captureWith("sqlite3", arguments, input, borrow options);
 }

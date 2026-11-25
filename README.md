@@ -849,9 +849,9 @@ The answers are SQLite 3.54.1's, sqlite.org's build, which CI runs on macOS, Lin
 answers and settings: the tests set the settings they need (`legacy_alter_table` in the session, defensive mode
 off where they damage a schema), and where Apple's answer differs they check the engine against sqlite.org's
 (`APPLE_DIFFERS` in `tests/shell_runner_tests.cee` and `cli/tests/shell_tests.cee`), so they pass with either.
-On Windows the tests run sqlite3 through `tests/capture.py` (Python), as CeeSafe's `Process.capture` and
-`Process.run` cannot run it there yet (CEESAFE_FINDINGS.md 45, 46), and the commands the tests give sqlite3's
-`.shell` (a marker file, a sleep, a wait for the test's signal) run Python, as `.shell` runs cmd.exe there. Two
+On Windows the tests run sqlite3 with HOME set to a directory whose `.sqliterc` says `.crlf off`
+(`Process.captureWith`), and the commands the tests give sqlite3's `.shell` (a marker file, a sleep, a wait for the
+test's signal) run Python, as `.shell` runs cmd.exe there. Two
 tests are skipped on Windows (`tests/windows_skips_tests.cee`): those that kill the sqlite3 shell in a transaction
 (`.shell kill -9 $PPID`, which cmd.exe cannot do), and `locksTheHotJournalCheckTakesNoLock`, whose premise is
 POSIX's F_GETLK (os_win.c tests RESERVED by taking it).
