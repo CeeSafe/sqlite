@@ -39,10 +39,11 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 39 | fixed in 0.95.5: `s.intoBytes()`, `String.fromUtf8(v)`, `ByteString.fromString(s)`, `b.intoString()`, and `ceesafec doc NAME` for a lib/core name, ADR 0236; workaround removed: text built in a `String` becomes TEXT without a copy (`SqliteValue.sqlTextFrom`: CURRENT_TIMESTAMP, ALTER TABLE's edited SQL, ANALYZE's statistics; a real's text in `valueText`), and ASCII case changes give their bytes to a `String` (`asciiLower`, `asciiUpper`) |
 | 42, 43, 44 | open: found while adopting 0.95.5 (below) |
 | 41 | open: found while making SQL text bytes (below) |
-| 45, 46 | fixed for 0.95.8 (ADR 0245, CeeSafe branch `fix/windows-processes`; checked on windows-2022 and on a Windows 11 laptop with MSVC and gcc), not yet released; the `tests/capture.py` workaround stays until then |
+| 45, 46 | fixed in 0.95.7 (ADR 0245: `Process.run` quotes for `CommandLineToArgvW` through `CreateProcessW`, `Process.capture` closes its input file first); workaround removed for every program but the sqlite3 shell, which `tests/capture.py` still runs on Windows for finding 51 |
 | 47 | open: found making CI pass on Windows (below) |
 | 48 | open: found while porting os_win.c's locks (below) |
-| 49 | fixed for 0.95.7 (ADR 0247: initializers MSVC can nest; the sqlite package builds and passes with cl on the laptop) |
+| 49 | fixed in 0.95.7 (ADR 0247: initializers MSVC can nest); CI's Windows job builds with MSVC (`CC=cl`) |
+| 51 | open: found removing 45's workaround (below) |
 | 50 | to be fixed in 0.95.9 (ADR 0248, the system's ucrtbase.dll on every Windows toolchain); the cause was the Windows version, not MinGW (below) |
 | 40 | misreported: `cfg("target.windows")` (ADR 0179, guide/unsafe-and-c.md "Code for one system") names the system a build is for, in any code; `onWindows()` uses it, and the environment-variable check is gone |
 
@@ -521,3 +522,16 @@ Python's `math` does. Not yet released.
 
 Workaround: none yet; after 0.95.9 the three tests are to say, on Windows older than build 26100, that the shell's
 static UCRT differs from the system's, rather than compare those last bits.
+
+### 51. A child process cannot be given an environment of its own
+
+Found removing finding 45's workaround (ceesafec 0.95.7). On Windows the sqlite3 shell writes its lines with "\r\n",
+except in csv mode, where it writes "\r\n" itself; the tests have it read `.crlf off` from a `.sqliterc` so that
+its output is what it is elsewhere. sqlite3 finds `.sqliterc` in HOME (USERPROFILE), and `-cmd .crlf off` or
+`-init` would add arguments and so renumber them in its messages ("Error in 2nd command line argument"). That
+needs the child's environment set: `Process.capture`, `run` and `spawn` take a program and arguments only, and
+`ChildOptions` has no environment. A `ChildOptions.environment(name, value)` (or a capture that takes options)
+would let the tests drop `tests/capture.py`.
+
+Workaround: on Windows `tests/capture.py`, started by `Process.spawn`, runs the shell with HOME and USERPROFILE set to
+a directory that holds the `.sqliterc` (`captureSqlite`, tests/shell_runner_tests.cee and its copies).

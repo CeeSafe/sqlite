@@ -95,17 +95,22 @@ jobs:
           if [ "$RUNNER_OS" = Windows ]; then dir=$(cygpath -w "$dir"); fi
           echo "$dir" >> "$GITHUB_PATH"
 
-      # The C compiler on Windows is the runner's gcc (MinGW-w64), named so: MSVC cannot compile the test program yet
-      # (CEESAFE_FINDINGS.md, finding 49), and ceesafec takes gcc from PATH when CC is not set anyway.
-      - name: The C compiler (gcc on Windows)
+      # The C compiler on Windows is MSVC, named by CC: ceesafec takes the runner's gcc (MinGW-w64) from PATH when CC is
+      # not set. MSVC compiles the test program since ceesafec 0.95.7 (CEESAFE_FINDINGS.md, finding 49).
+      - name: The C compiler (MSVC on Windows)
         if: runner.os == 'Windows'
-        run: echo "CC=gcc" >> "$GITHUB_ENV"
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: CC on Windows
+        if: runner.os == 'Windows'
+        run: echo "CC=cl" >> "$GITHUB_ENV"
 
       - name: Versions
         run: |
           ceesafec --version
           sqlite3 --version
-          if [ "$RUNNER_OS" = Windows ]; then gcc --version | head -1; fi
+          if [ "$RUNNER_OS" = Windows ]; then cl 2>&1 | head -1; fi
           # On Windows the tests run sqlite3 through tests/capture.py, with the python on PATH.
           if [ "$RUNNER_OS" = Windows ]; then python -c "import shutil, sys; print(sys.version.split()[0], shutil.which('sqlite3'))"; fi
 

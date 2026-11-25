@@ -1,13 +1,10 @@
 // A copy of the root package's tests/shell_runner_tests.cee (its process helpers), kept alike.
 //
-// Running the sqlite3 shell (and the few other programs the tests start) on every system. On macOS and Linux this
-// is lib/std's `Process.capture` and `Process.run`. On Windows neither can run the shell at ceesafec 0.95.5
-// (CEESAFE_FINDINGS.md 45 and 46): `Process.capture` keeps its input file open for writing while the runtime opens
-// it again to read, which Windows refuses, so it always fails; `Process.run` hands the arguments to `_wspawnvp`,
-// which joins them with spaces without quoting, so an argument of SQL arrives as many words. `Process.spawn`
-// quotes its arguments but cannot send a child's streams to files, and a package cannot call the runtime's
-// `ceesafe_host_spawn` itself (N0292). So on Windows `tests/capture.py`, started by `Process.spawn`, runs the
-// program with its streams in files.
+// Running the sqlite3 shell (and the few other programs the tests start) on every system, with lib/std's
+// `Process.capture` and `Process.run` (on Windows they run programs since ceesafec 0.95.7, CEESAFE_FINDINGS.md 45
+// and 46). One case is left on Windows: the shell must read `.crlf off` from a `.sqliterc` of its own, and
+// `Process.capture` cannot give a child an environment (a HOME) of its own (finding 51), so there
+// `tests/capture.py`, started by `Process.spawn`, runs the shell with HOME set to a directory that holds one.
 
 /// Whether the sqlite3 on the path is Apple's build (its source id ends in "aapl"). The engine follows sqlite.org's
 /// SQLite 3.54.1, which CI runs; Apple's sqlite3 3.54.0, from an earlier snapshot of SQLite, answers a few
@@ -37,25 +34,12 @@ fn onWindowsHost() -> bool {
 
 /// `program` run with `arguments` and `input` as its standard input: its exit status and what it wrote.
 fn captureProgram(program: StringView, arguments: borrow Vector<StringView>, input: Slice<u8>) -> Result<ProcessOutput, IoError> {
-    if (!onWindowsHost()) {
-        return Process.capture(program, arguments, input);
-    }
-    let directory = Directory.temporary()?;
-    let result = captureThroughPython(directory.view(), "", program, arguments, input);
-    for (name in ["in", "out", "err"]) {
-        let _ = File.remove(pathIn(directory.view(), name).view());
-    }
-    let _ = Directory.remove(directory.view());
-    return result;
+    return Process.capture(program, arguments, input);
 }
 
-/// `program` run with `arguments`: its exit status. What it writes is the test's output on macOS and Linux, and
-/// is dropped on Windows.
+/// `program` run with `arguments`: its exit status. What it writes is the test's output.
 fn runProgram(program: StringView, arguments: borrow Vector<StringView>) -> Result<i32, IoError> {
-    if (!onWindowsHost()) {
-        return Process.run(program, arguments);
-    }
-    return Ok(captureProgram(program, arguments, "".bytes())?.status);
+    return Process.run(program, arguments);
 }
 
 /// The sqlite3 shell run with `arguments` and `input`. On Windows the shell ends its lines with "\r\n", except in

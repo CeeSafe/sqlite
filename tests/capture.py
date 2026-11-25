@@ -1,6 +1,6 @@
-"""Runs a program with its standard streams in files, for the tests on Windows, where CeeSafe's Process.capture and
-Process.run cannot run the sqlite3 shell at ceesafec 0.95.5 (CEESAFE_FINDINGS.md 45 and 46;
-tests/shell_runner_tests.cee).
+"""Runs the sqlite3 shell with its standard streams in files and a HOME of its own, for the tests on Windows, where
+the shell must read `.crlf off` from a .sqliterc and CeeSafe's Process.capture cannot set a child's environment
+(CEESAFE_FINDINGS.md 51; tests/shell_runner_tests.cee).
 
 usage: capture.py [--sqliterc=TEXT] <input> <output> <errors> <program> [<argument>...]
 
