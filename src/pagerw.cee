@@ -1455,12 +1455,14 @@ struct WritablePager {
     }
 }
 
-/// Whether the program is built for Windows, where the locks are os_win.c's rather than os_unix.c's.
+/// Whether the locks are os_win.c's rather than os_unix.c's: on Windows, or anywhere with SQLITE_WINDOWS_LOCKS set,
+/// so that the Windows scheme can be tested on another host under `CEESAFE_LOCK_RULES=strict`, which refuses there
+/// what Windows refuses (ceesafec's ADR 0256; CEESAFE_FINDINGS.md 48).
 fn onWindows() -> bool {
     if (cfg("target.windows")) {
         return true;
     }
-    return false;
+    return Environment.variable("SQLITE_WINDOWS_LOCKS").isSome();
 }
 
 impl PageSource for WritablePager {

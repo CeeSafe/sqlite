@@ -21,6 +21,12 @@ enum WindowsGap {
 
 /// True, after saying so, when the test cannot run on Windows because of `gap`.
 fn skippedOnWindows(gap: WindowsGap) -> bool {
+    // SQLITE_WINDOWS_LOCKS runs os_win.c's locks on any host (src/pagerw.cee, onWindows), which test RESERVED by
+    // taking it there too.
+    if (gap is WindowsGap.LockTestTakesTheLock && Environment.variable("SQLITE_WINDOWS_LOCKS").isSome()) {
+        Console.writeLine("skipped with SQLITE_WINDOWS_LOCKS: os_win.c tests a lock by taking it");
+        return true;
+    }
     if (!onWindowsHost()) {
         return false;
     }

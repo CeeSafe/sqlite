@@ -136,6 +136,15 @@ jobs:
           SQLITE_STEP_CHECK: "1"
         run: ceesafec test
 
+      # os_win.c's locks off Windows, under the rules Windows keeps: a lock over a range the file holds, or an unlock
+      # of a range not locked as given, panics (ceesafec's ADR 0256; CEESAFE_FINDINGS.md 48).
+      - name: Tests, the engine with Windows' locks under CEESAFE_LOCK_RULES=strict
+        if: always() && runner.os != 'Windows'
+        env:
+          SQLITE_WINDOWS_LOCKS: "1"
+          CEESAFE_LOCK_RULES: strict
+        run: ceesafec test
+
       - name: Tests, cli
         if: always()
         working-directory: cli

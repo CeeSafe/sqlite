@@ -402,11 +402,19 @@ struct SharedWal {
         writable: bool,
         unreliable: borrow mut bool,
     ) -> Result<bool, SqliteError> {
+        if (!writable) {
+            // A handle that only reads cannot take an exclusive lock on POSIX (EBADF), which the lock rules hold
+            // everywhere (CEESAFE_LOCK_RULES): the byte is tested, which on Windows tries it and lets it go at once,
+            // as os_win.c's exclusive try of a read-only -shm does, since nothing is written while it is held.
+            if (shm.testLock(FileLock.Exclusive, SHM_DMS, 1)?.isNull()) {
+                *unreliable = true;
+                return Ok(true);
+            }
+            return Ok(shm.tryLock(FileLock.Shared, SHM_DMS, 1)?);
+        }
         if (shm.tryLock(FileLock.Exclusive, SHM_DMS, 1)?) {
             var emptied: Result<void, SqliteError> = Ok();
-            if (!writable) {
-                *unreliable = true;
-            } else if (shm.setLength(0).isErr()) {
+            if (shm.setLength(0).isErr()) {
                 let zeros = [0u8; 8];
                 emptied = match (shm.writeAt(zeros[..], 0)) {
                     Ok(_) => Ok(),
