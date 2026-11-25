@@ -38,7 +38,7 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 38 | fixed in 0.95.12: `==` on an optional borrow compares what it refers to (`m.get(k) == Some(x)`), and owned optionals that are not Copy compare, ADR 0251; no `match` written for it was left in the package |
 | 39 | fixed in 0.95.5: `s.intoBytes()`, `String.fromUtf8(v)`, `ByteString.fromString(s)`, `b.intoString()`, and `ceesafec doc NAME` for a lib/core name, ADR 0236; workaround removed: text built in a `String` becomes TEXT without a copy (`SqliteValue.sqlTextFrom`: CURRENT_TIMESTAMP, ALTER TABLE's edited SQL, ANALYZE's statistics; a real's text in `valueText`), and ASCII case changes give their bytes to a `String` (`asciiLower`, `asciiUpper`) |
 | 42, 43, 44 | fixed in 0.95.12: lib/std's `MappedRead` (ADR 0254), two-phase `copyFrom`/`fill` receivers (ADR 0252), `File.link` (ADR 0255); workarounds removed: the wal-index reads its three kinds of block through `MappedRead` (`HeapBlock` implements it; the enum stays for the writes, which only `SharedMapping` makes), `HeapBlock.readAt` reads `into.length` in its own call, the hot-journal test links with `File.link` |
-| 41 | fixed in 0.95.12: lib/core's `TextView` and `TextBuffer`, ADR 0253; the workaround stays for now: moving the tokenizer, parser, catalog and messages to `ByteString` text is a rewrite of their own, not a removal (below) |
+| 41 | fixed in 0.95.12: lib/core's `TextView` and `TextBuffer`, ADR 0253; workaround removed: SQL text is `ByteString`/`ByteStringView` from the API to the output (tokens, syntax tree, catalog, sqlite_schema's SQL, messages), code taking either kind of text is generic over `TextView` (error constructors, message builders, `Parser.parseStatement`, `Tokenizer.tokenize`, catalog lookups, `statementParameters`), and `src/sqltext.cee`'s escaped form is deleted; findings 52 to 54 were met doing it |
 | 45, 46 | fixed in 0.95.7 (ADR 0245: `Process.run` quotes for `CommandLineToArgvW` through `CreateProcessW`, `Process.capture` closes its input file first); workaround removed (the sqlite3 shell's last one since 0.95.12, finding 51) |
 | 47 | fixed in 0.95.12: `OsString`/`OsStringView` file names, ADR 0257; the engine's paths are still `StringView`, so the workaround stays until they move (below) |
 | 48 | fixed in 0.95.12: `CEESAFE_LOCK_RULES=strict` or `portable` holds a program's locks to Windows' rules on any host, natively and in the interpreter, ADR 0256; workaround removed: `SQLITE_WINDOWS_LOCKS` runs os_win.c's scheme off Windows, and CI runs the engine's tests so on macOS and Linux (224 pass on macOS, the hot-journal test, whose premise is F_GETLK, skipping). It found one break: the exclusive try of a read-only `-shm`'s DMS byte, which POSIX refuses (EBADF); the byte is now tested (`testLock`, a try-and-release on Windows as os_win.c's) |
@@ -415,7 +415,8 @@ UTF-8 stands as one code point of U+10FF80..U+10FFFF, and a real one of those is
 messages. A text-view interface implemented by both `StringView` and `ByteStringView` (or `ByteStringView`
 methods that take text, as `ByteString.append` does) would let such code be generic.
 
-Fixed in 0.95.12 (ADR 0253: `TextView`, `TextBuffer`); the engine has not moved to it yet (status table).
+Fixed in 0.95.12 (ADR 0253: `TextView`, `TextBuffer`); workaround removed: the engine holds SQL text as bytes
+throughout and `src/sqltext.cee` is gone (status table).
 
 ### 42. `SharedMapping` and `ReadOnlyMapping` share no interface
 
@@ -551,3 +552,44 @@ Workaround: on Windows `tests/capture.py`, started by `Process.spawn`, runs the 
 a directory that holds the `.sqliterc` (`captureSqlite`, tests/shell_runner_tests.cee and its copies).
 
 Fixed in 0.95.12 (ADR 0258) (status table).
+
+### 52. A method cannot be called on a `borrow borrow ByteString`
+
+Found removing finding 41's workaround (ceesafec 0.95.12). `if (borrow target is Some(name))` with
+`target: borrow String?` gives `name: borrow borrow String`, and `name.view()` works. With `target: borrow
+ByteString?` the same code is N0200, "'borrow borrow ByteString' has no method named 'view'" (and `name.length()`
+likewise): the call does not look through the second borrow, as it does for `String`.
+
+Workaround: match without the extra borrow, `if (target is Some(name))`, which gives `name: borrow ByteString`
+(`executeAnalyze`, src/analyze.cee).
+
+### 53. `String.append` does not take a `ByteStringView`
+
+Found removing finding 41's workaround (ceesafec 0.95.12). ADR 0253 makes `String` a `TextBuffer`, whose
+`append<N: TextView>` takes any text (returning `false` for text that is not UTF-8), but `s.append(v)` with `v` a
+`ByteStringView` is N0205, "expected 'StringView', found 'ByteStringView'": `String`'s own `append(StringView)`
+is found first and the interface's method is not tried. `s.appendLossy(v)` (only the interface has it) and
+`TextBuffer.append(mut s, v)` work, as does `append` inside a function generic over `B: TextBuffer`.
+
+Workaround: none needed in the engine, whose messages are now built in `ByteString`s; the tests write
+`out.appendLossy(token.text.view())` (tests/tokenizer_tests.cee).
+
+### 54. Byte views are not quite text views
+
+Found removing finding 41's workaround (ceesafec 0.95.12). Moving names from `StringView` to `ByteStringView` met
+these, each a few lines of churn repeated across the package:
+
+- a string literal is not a `ByteStringView`: passing `"main"` where one is expected, or `ByteStringView?`, or
+  returning one from a function typed `-> ByteStringView`, is N0205; it takes `ByteStringView.fromText("main")`,
+  or a parameter generic over `TextView`;
+- `v.length` is a field of `StringView` and a method of `ByteStringView` (`v.length()`), so every use changes;
+- `v[a..b]` slices a `StringView` but not a `ByteStringView` ("only arrays and slices can be sliced"): it is
+  `v.slice(a, b)`, `sliceFrom`, `sliceTo`;
+- `parseInt<T>()` is on `StringView` only, not on `ByteStringView` or `TextView`;
+- lib/std's `Check.equalText` takes `StringView`s only, so a test comparing a name held as bytes needs
+  `Check.equalBytes` (whose failure shows bytes) or a conversion.
+
+Workaround: helpers generic over `TextView` (`parseUsize`, `parseI64`, `parseI32` in src/text.cee, which go through
+`toUtf8()`), `ByteStringView.fromText` for literals, and in the tests `equalName(expected, actual)`
+(tests/parser_tests.cee), `Check.equalText` on `actual.toUtf8() ?? "<not UTF-8>"`. `parseInt` on `TextView`, a
+literal that converts to `ByteStringView` where one is expected, and range slicing on byte views would remove them.
