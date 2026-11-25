@@ -289,10 +289,7 @@ fn locksTheHotJournalCheckTakesNoLock() -> Result<void, TestFailure> {
     let _ = File.remove(link);
     let _ = File.remove(withSuffix(link, "-journal")!.view());
     lockFixture(path, marker)?;
-    var ln = Vector<StringView>.create();
-    ln.push(path)!;
-    ln.push(link)!;
-    Check.isTrue(runProgram("ln", borrow ln)! == 0, "a hard link to the file")?;
+    Check.isTrue(File.link(path, link).isOk(), "a hard link to the file")?;
     var connection = Connection.open(path)!;
     // One shell holds SHARED until told to go, so that the journal is never played back.
     var waitForGo = String.from(".shell for i in $(seq 1 3000); do [ -f ")!;
