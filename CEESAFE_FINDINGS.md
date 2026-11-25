@@ -44,7 +44,7 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 48 | open: found while porting os_win.c's locks (below) |
 | 49 | fixed in 0.95.7 (ADR 0247: initializers MSVC can nest); CI's Windows job builds with MSVC (`CC=cl`) |
 | 51 | open: found removing 45's workaround (below) |
-| 50 | to be fixed in 0.95.9 (ADR 0248, the system's ucrtbase.dll on every Windows toolchain); the cause was the Windows version, not MinGW (below) |
+| 50 | fixed in 0.95.9 (ADR 0248: on Windows the float methods call System32's ucrtbase.dll whatever compiler built the program); on Windows older than build 26100 the three bit-for-bit math tests skip, saying why (`WindowsGap.OlderSystemMath`), and CI's windows-2025 job runs them (below) |
 | 40 | misreported: `cfg("target.windows")` (ADR 0179, guide/unsafe-and-c.md "Code for one system") names the system a build is for, in any code; `onWindows()` uses it, and the environment-variable check is gone |
 
 ## Gaps
@@ -520,8 +520,8 @@ The owner chose "the same as the platform": ADR 0248 (CeeSafe branch `fix/window
 Windows build call System32's `ucrtbase.dll`, whatever the compiler, so results follow the installed Windows, as
 Python's `math` does. Not yet released.
 
-Workaround: none yet; after 0.95.9 the three tests are to say, on Windows older than build 26100, that the shell's
-static UCRT differs from the system's, rather than compare those last bits.
+Since 0.95.9: on Windows older than build 26100 the three tests say why and skip (`WindowsGap.OlderSystemMath`,
+tests/windows_skips_tests.cee); CI runs them on windows-2025 (build 26100), where they compare bit for bit.
 
 ### 51. A child process cannot be given an environment of its own
 

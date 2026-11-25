@@ -40,6 +40,12 @@ jobs:
             ceesafec: ceesafec-win-x64.zip
             sqlite: sqlite-tools-win-x64
             sqlite_sha3: e171f3993a992edf076746926dd52b5e2ebfabaee38818e74987e1d8112ab987
+          # Windows build 26100, whose ucrtbase.dll agrees with sqlite3.exe's static UCRT: the bit-for-bit math tests,
+          # which skip on windows-2022 (tests/windows_skips_tests.cee, OlderSystemMath), run here.
+          - os: windows-2025
+            ceesafec: ceesafec-win-x64.zip
+            sqlite: sqlite-tools-win-x64
+            sqlite_sha3: e171f3993a992edf076746926dd52b5e2ebfabaee38818e74987e1d8112ab987
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     defaults:
