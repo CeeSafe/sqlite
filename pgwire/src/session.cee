@@ -321,7 +321,7 @@ fn parameterCount(sql: StringView) -> usize {
     for (i in 0..parameters.names.length) {
         let name = parameters.names[i].name.view();
         if (name.startsWith("$")) {
-            if (name[1..].parseInt<usize>() is Some(n)) {
+            if ((name.sliceFrom(1).toUtf8() ?? "").parseInt<usize>() is Some(n)) {
                 dollars = true;
                 highest = highest.max(n);
             }

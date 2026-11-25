@@ -144,15 +144,15 @@ fn entry(function: ScalarFunction, argc: usize, least: usize, most: usize) -> Fu
 
 const MANY: usize = 1000;
 
-fn scalarEntry(name: StringView, argc: usize) -> FunctionEntry? {
+fn scalarEntry(name: ByteStringView, argc: usize) -> FunctionEntry? {
     var lower = [0u8; 32];
-    if (name.length > 32) {
+    if (name.length() > 32) {
         return null;
     }
-    for (i in 0..name.length) {
+    for (i in 0..name.length()) {
         lower[i] = foldAscii(name[i]);
     }
-    let key = lower[0..name.length];
+    let key = lower[0..name.length()];
     return match (key) {
         "abs" => entry(ScalarFunction.Abs, argc, 1, 1),
         "ceil" | "ceiling" => entry(ScalarFunction.Ceil, argc, 1, 1),
@@ -261,7 +261,7 @@ fn scalarEntry(name: StringView, argc: usize) -> FunctionEntry? {
 }
 
 /// The scalar function `name` taking `argc` arguments.
-fn scalarFunctionNamed(name: StringView, argc: usize) -> Result<ScalarFunction, SqliteError> {
+fn scalarFunctionNamed(name: ByteStringView, argc: usize) -> Result<ScalarFunction, SqliteError> {
     let found = scalarEntry(name, argc) ?? {
         return Err(functionNameError("no such function: ", name, ""));
     };
@@ -287,7 +287,7 @@ enum AggregateFunction {
 }
 
 /// The aggregate `name` taking `argc` arguments, if it is one.
-fn aggregateFunctionNamed(name: StringView, argc: usize, star: bool) -> AggregateFunction? {
+fn aggregateFunctionNamed(name: ByteStringView, argc: usize, star: bool) -> AggregateFunction? {
     if (star) {
         return if (name.equalsIgnoreAsciiCase("count")) AggregateFunction.CountStar else null;
     }
@@ -349,7 +349,7 @@ enum WindowFunction {
 }
 
 /// The functions that exist only as window functions.
-fn windowOnlyFunctionNamed(name: StringView) -> WindowFunction? {
+fn windowOnlyFunctionNamed(name: ByteStringView) -> WindowFunction? {
     let names = [
         "row_number",
         "rank",
@@ -377,7 +377,7 @@ fn windowOnlyFunctionNamed(name: StringView) -> WindowFunction? {
 }
 
 /// The window function `name` taking `argc` arguments, if it is one.
-fn windowFunctionNamed(name: StringView, argc: usize, star: bool) -> WindowFunction? {
+fn windowFunctionNamed(name: ByteStringView, argc: usize, star: bool) -> WindowFunction? {
     if (aggregateFunctionNamed(name, argc, star) is Some(a)) {
         return WindowFunction.Aggregate(a);
     }
@@ -1299,12 +1299,12 @@ fn callFunction(
             let x = mathNumber(borrow v[0]) ?? { return Ok(SqliteValue.Null); };
             return Ok(realResult(x.sqrt()));
         }
-        ScalarFunction.SqliteVersion => { return Ok(SqliteValue.sqlText(SQLITE_VERSION)?); }
+        ScalarFunction.SqliteVersion => { return Ok(SqliteValue.ofText(SQLITE_VERSION)?); }
         ScalarFunction.Substr => {
             let z: SqliteValue? = if (v.length == 3) v[2].clone()? else null;
             return substrValue(borrow v[0], borrow v[1], borrow z);
         }
-        ScalarFunction.TypeOf => { return Ok(SqliteValue.sqlText(typeName(borrow v[0]))?); }
+        ScalarFunction.TypeOf => { return Ok(SqliteValue.ofText(typeName(borrow v[0]))?); }
         ScalarFunction.Unhex => {
             if (v[0].isNull() || (v.length == 2 && v[1].isNull())) {
                 return Ok(SqliteValue.Null);
@@ -1429,5 +1429,5 @@ fn nowText(kind: LiteralKind, unixMillis: i64) -> Result<SqliteValue, SqliteErro
         out.append(":")?;
         appendTwoDigits(mut out, inDay % 60)?;
     }
-    return Ok(SqliteValue.sqlTextFrom(out)?);
+    return Ok(SqliteValue.Text(ByteString.fromString(out)));
 }

@@ -6,11 +6,11 @@
 // changes() does not count them; RETURNING gives the NEW row (the OLD row for DELETE).
 
 /// A view as a table its triggers see: its result columns, without types.
-fn viewTable(name: StringView, db: borrow mut Session) -> Result<TableSchema, SqliteError> {
+fn viewTable(name: ByteStringView, db: borrow mut Session) -> Result<TableSchema, SqliteError> {
     let select = selectFromView(name, null, Vector<ResultColumn>.create(), null, null)?;
     var compiler = newCompiler(db)?;
     let plan = compileSelect(mut compiler, borrow select, db)?;
-    var sql = String.from("CREATE TABLE ")?;
+    var sql = ownedText("CREATE TABLE ")?;
     appendIdentPut(mut sql, name)?;
     sql.append("(")?;
     for (i in 0..plan.columnNames.length) {
@@ -28,14 +28,14 @@ fn viewTable(name: StringView, db: borrow mut Session) -> Result<TableSchema, Sq
 
 /// `[WITH …] SELECT view.*, extra… FROM view [, from…] [WHERE filter]`.
 fn selectFromView(
-    name: StringView,
+    name: ByteStringView,
     with: WithClause?,
     extra: Vector<ResultColumn>,
     from: FromClause?,
     filter: Expr?,
 ) -> Result<SelectStmt, AllocError> {
     var columns = Vector<ResultColumn>.create();
-    columns.push(ResultColumn.TableStar(String.from(name)?))?;
+    columns.push(ResultColumn.TableStar(ownedText(name)?))?;
     var more = extra;
     for (i in 0..more.length) {
         columns.push(replace(mut more[i], ResultColumn.Star))?;
@@ -58,7 +58,7 @@ fn selectFromView(
     }
     let source = FromItem.Table(
         TableSource {
-            name: QualifiedName { schema: null, name: String.from(name)? },
+            name: QualifiedName { schema: null, name: ownedText(name)? },
             alias: null,
             indexedBy: null,
             notIndexed: false,
@@ -75,7 +75,7 @@ fn selectFromView(
             having: null,
             windows: Vector<NamedWindow>.create(),
             isValues: false,
-            columnTexts: Vector<String>.create(),
+            columnTexts: Vector<ByteString>.create(),
         },
     )?;
     return Ok(
@@ -92,7 +92,7 @@ fn selectFromView(
 
 /// The view's INSTEAD OF triggers for `event`; "cannot modify" when none would fire.
 fn insteadOfTriggers(
-    name: StringView,
+    name: ByteStringView,
     event: TriggerEvent,
     table: borrow TableSchema,
     setColumns: Slice<usize>,
@@ -105,11 +105,11 @@ fn insteadOfTriggers(
         let trigger = replace(
             mut all[t],
             TriggerPlan {
-                name: String.create(),
+                name: ByteString.create(),
                 database: 0,
                 timing: TriggerTiming.Before,
                 event: TriggerEvent.Insert,
-                updateOf: Vector<String>.create(),
+                updateOf: Vector<ByteString>.create(),
                 when: null,
                 body: Vector<Stmt>.create(),
             },
@@ -129,7 +129,7 @@ fn insteadOfTriggers(
         out.push(trigger)?;
     }
     if (!fires) {
-        var message = String.from("cannot modify ")?;
+        var message = ownedText("cannot modify ")?;
         message.append(name)?;
         message.append(" because it is a view")?;
         return Err(sqlError(message.view()));
@@ -193,7 +193,7 @@ fn insertIntoView(
     } else {
         for (k in 0..stmt.columns.length) {
             let at = table.indexOf(stmt.columns[k].view()) ?? {
-                var message = String.from("table ")?;
+                var message = ownedText("table ")?;
                 message.append(name)?;
                 message.append(" has no column named ")?;
                 message.append(stmt.columns[k].view())?;
@@ -215,19 +215,19 @@ fn insertIntoView(
     var output = Vector<Vector<SqliteValue>>.create();
     for (given in rows.drain()) {
         if (given.length != targets.length) {
-            var message = String.create();
+            var message = ByteString.create();
             if (stmt.columns.length == 0) {
                 message.append("table ")?;
                 message.append(name)?;
                 message.append(" has ")?;
-                message.appendNumber(targets.length)?;
+                message.appendUnsigned(targets.length as u64)?;
                 message.append(" columns but ")?;
-                message.appendNumber(given.length)?;
+                message.appendUnsigned(given.length as u64)?;
                 message.append(" values were supplied")?;
             } else {
-                message.appendNumber(given.length)?;
+                message.appendUnsigned(given.length as u64)?;
                 message.append(" values for ")?;
-                message.appendNumber(targets.length)?;
+                message.appendUnsigned(targets.length as u64)?;
                 message.append(" columns")?;
             }
             return Err(sqlError(message.view()));
@@ -260,7 +260,7 @@ fn insertIntoView(
     db.changes = 0;
     return Ok(
         QueryResult {
-            columns: columnNamesOf(returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow table)?)?,
+            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow table)?,
             rows: output,
         },
     );
@@ -312,7 +312,7 @@ fn deleteFromView(
     db.changes = 0;
     return Ok(
         QueryResult {
-            columns: columnNamesOf(returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow table)?)?,
+            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow table)?,
             rows: output,
         },
     );
@@ -383,7 +383,7 @@ fn updateView(
     db.changes = 0;
     return Ok(
         QueryResult {
-            columns: columnNamesOf(returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow table)?)?,
+            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow table)?,
             rows: output,
         },
     );

@@ -2457,16 +2457,13 @@ fn jsonBadPathError(path: Slice<u8>, rc: usize) -> SqliteError {
     if (rc == JSON_LOOKUP_TOODEEP) {
         return sqlError("JSON path too deep");
     }
-    var message = String.create();
-    // The path keeps its bytes, in the engine's form for SQL text (sqltext.cee) until the message is made.
-    let text = match (sqlTextOf(path)) {
-        Ok(t) => t,
-        Err(e) => {
-            return SqliteError.Alloc(e);
-        }
-    };
+    // The path keeps its bytes.
+    var message = ByteString.create();
     let prefix = if (rc == JSON_LOOKUP_NOTARRAY) "not an array element: " else "bad JSON path: ";
-    let built = message.append(prefix).isOk() && SqlWriter.appendStringLiteral(mut message, text.view()).isOk();
+    let built = message.append(prefix).isOk() && SqlWriter.appendStringLiteral(
+        mut message,
+        ByteStringView.fromBytes(path),
+    ).isOk();
     if (!built) {
         return sqlError("out of memory");
     }
@@ -3057,7 +3054,7 @@ fn jsonTypeFunction(args: Slice<JsonValue>) -> Result<JsonValue, SqliteError> {
             return Err(jsonBadPathError(z, i));
         }
     }
-    return Ok(jsonPlain(SqliteValue.sqlText(jsonbTypeName(jsonAt(p.blob.view(), i) & 0x0F))?));
+    return Ok(jsonPlain(SqliteValue.ofText(jsonbTypeName(jsonAt(p.blob.view(), i) & 0x0F))?));
 }
 
 /// json_pretty(J [, INDENT]).
@@ -3433,7 +3430,7 @@ fn jsonGroupResult(
 /// The final value of json_group_array() or json_group_object() (jsonArrayCompute, jsonObjectCompute).
 fn jsonGroupFinish(isObject: bool, group: borrow JsonOut, started: bool) -> Result<SqliteValue, SqliteError> {
     if (!started) {
-        return Ok(SqliteValue.sqlText(if (isObject) "{}" else "[]")?);
+        return Ok(SqliteValue.ofText(if (isObject) "{}" else "[]")?);
     }
     var out = JsonOut { buf: group.buf.clone()?, err: group.err, failure: group.failure };
     out.byte(if (isObject) '}' else ']')?;

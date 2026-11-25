@@ -48,7 +48,7 @@ const ALIAS_STOP_WORDS: [StringView; 27] = [
     "WINDOW",
 ];
 
-fn wordIn(word: StringView, words: Slice<StringView>) -> bool {
+fn wordIn(word: ByteStringView, words: Slice<StringView>) -> bool {
     for (w in words) {
         if (word.equalsIgnoreAsciiCase(w)) {
             return true;
@@ -86,18 +86,19 @@ struct Parser {
     /// The height of the expression parsed last.
     private height: u32;
     /// The statement's text, for the names of result columns.
-    private source: String;
+    private source: ByteString;
     /// The statement's parameters, numbered in the order they are written, as SQLite numbers them.
     private params: ParamNumbering;
 
     /// The one statement in `sql`, which may end with a semicolon.
-    fn parseStatement(sql: StringView) -> Result<Stmt, SqliteError> {
+    fn parseStatement<N: TextView>(sqlText: N) -> Result<Stmt, SqliteError> {
+        let sql = ByteStringView.fromBytes(sqlText.bytes());
         var p = Parser {
             tokens: Tokenizer.tokenize(sql)?,
             at: 0,
             nesting: 0,
             height: 0,
-            source: String.from(sql)?,
+            source: ownedText(sql)?,
             params: ParamNumbering.create(),
         };
         let stmt = p.statement()?;
@@ -107,13 +108,14 @@ struct Parser {
     }
 
     /// Every statement in `sql`.
-    fn parseProgram(sql: StringView) -> Result<Vector<Stmt>, SqliteError> {
+    fn parseProgram<N: TextView>(sqlText: N) -> Result<Vector<Stmt>, SqliteError> {
+        let sql = ByteStringView.fromBytes(sqlText.bytes());
         var p = Parser {
             tokens: Tokenizer.tokenize(sql)?,
             at: 0,
             nesting: 0,
             height: 0,
-            source: String.from(sql)?,
+            source: ownedText(sql)?,
             params: ParamNumbering.create(),
         };
         var list = Vector<Stmt>.create();
@@ -139,7 +141,7 @@ struct Parser {
             at: 0,
             nesting: 0,
             height: 0,
-            source: String.create(),
+            source: ByteString.create(),
             params: ParamNumbering.create(),
         };
         let expr = p.expr()?;
@@ -188,7 +190,7 @@ struct Parser {
 
     /// SQLite's message for a token the grammar does not allow where it stands.
     private fn syntaxErrorHere(borrow this) -> SqliteError {
-        var text = String.create();
+        var text = ByteString.create();
         if (this.kind() == TokenKind.Eof) {
             let _ = text.append("incomplete input");
         } else {
@@ -221,14 +223,14 @@ struct Parser {
     }
 
     /// The current token's text, and moves past it.
-    private fn takeText(borrow mut this) -> Result<String, SqliteError> {
+    private fn takeText(borrow mut this) -> Result<ByteString, SqliteError> {
         let text = this.tokens[this.at].text.clone()?;
         this.advance();
         return Ok(text);
     }
 
     /// An identifier: a word that is not reserved, or a quoted identifier.
-    private fn name(borrow mut this) -> Result<String, SqliteError> {
+    private fn name(borrow mut this) -> Result<ByteString, SqliteError> {
         let kind = this.kind();
         if (kind == TokenKind.QuotedId || (kind == TokenKind.Word && !wordIn(
             this.tokens[this.at].text.view(),
@@ -239,8 +241,8 @@ struct Parser {
         return Err(this.syntaxErrorHere());
     }
 
-    private fn nameList(borrow mut this) -> Result<Vector<String>, SqliteError> {
-        var names = Vector<String>.create();
+    private fn nameList(borrow mut this) -> Result<Vector<ByteString>, SqliteError> {
+        var names = Vector<ByteString>.create();
         loop {
             names.push(this.name()?)?;
             if (!this.acceptOp(",")) {
@@ -250,7 +252,7 @@ struct Parser {
     }
 
     /// `( name, … )`.
-    private fn parenthesizedNames(borrow mut this) -> Result<Vector<String>, SqliteError> {
+    private fn parenthesizedNames(borrow mut this) -> Result<Vector<ByteString>, SqliteError> {
         this.expectOp("(")?;
         let names = this.nameList()?;
         this.expectOp(")")?;
@@ -267,7 +269,7 @@ struct Parser {
 
     /// An alias: after AS, a name or a string; without AS, a quoted name, a string, or a word that could not
     /// continue the statement.
-    private fn alias(borrow mut this) -> Result<String?, SqliteError> {
+    private fn alias(borrow mut this) -> Result<ByteString?, SqliteError> {
         if (this.acceptWord("AS")) {
             if (this.kind() == TokenKind.StringLit) {
                 return Ok(this.takeText()?);
@@ -422,7 +424,7 @@ struct Parser {
         var with = WithClause { recursive: this.acceptWord("RECURSIVE"), ctes: Vector<CommonTableExpr>.create() };
         loop {
             let name = this.name()?;
-            var columns = Vector<String>.create();
+            var columns = Vector<ByteString>.create();
             if (this.isOp("(")) {
                 columns = this.parenthesizedNames()?;
             }
@@ -501,7 +503,7 @@ struct Parser {
             let op: StringView = if (this.isWord(
                 "UNION",
             )) "UNION" else if (this.isWord("INTERSECT")) "INTERSECT" else "EXCEPT";
-            var message = String.create();
+            var message = ByteString.create();
             if (stmt.orderBy.length != 0) {
                 message.append("ORDER BY clause should come after ")?;
             } else if (stmt.limit.isSome()) {
@@ -552,7 +554,7 @@ struct Parser {
         having: null,
         windows: Vector<NamedWindow>.create(),
         isValues: false,
-        columnTexts: Vector<String>.create(),
+        columnTexts: Vector<ByteString>.create(),
     };
 
     private fn selectCore(borrow mut this) -> Result<SelectCore, SqliteError> {
@@ -593,7 +595,7 @@ struct Parser {
 
     private fn resultColumns(
         borrow mut this,
-        texts: borrow mut Vector<String>,
+        texts: borrow mut Vector<ByteString>,
     ) -> Result<Vector<ResultColumn>, SqliteError> {
         var columns = Vector<ResultColumn>.create();
         loop {
@@ -604,9 +606,12 @@ struct Parser {
         }
     }
 
-    private fn resultColumn(borrow mut this, texts: borrow mut Vector<String>) -> Result<ResultColumn, SqliteError> {
+    private fn resultColumn(
+        borrow mut this,
+        texts: borrow mut Vector<ByteString>,
+    ) -> Result<ResultColumn, SqliteError> {
         if (this.acceptOp("*")) {
-            texts.push(String.create())?;
+            texts.push(ByteString.create())?;
             return Ok(ResultColumn.Star);
         }
         if ((this.kind() == TokenKind.Word || this.kind() == TokenKind.QuotedId) && this.peekIsOp(
@@ -616,7 +621,7 @@ struct Parser {
             let table = this.name()?;
             this.advance();
             this.advance();
-            texts.push(String.create())?;
+            texts.push(ByteString.create())?;
             return Ok(ResultColumn.TableStar(table));
         }
         let start = this.at;
@@ -627,18 +632,18 @@ struct Parser {
 
     /// The text of tokens `start` up to the current one, as written (comments included), without the whitespace
     /// at its end: the name SQLite gives a result column with no alias.
-    private fn textSince(borrow this, start: usize) -> Result<String, AllocError> {
-        if (this.source.length == 0 || start >= this.tokens.length || this.at <= start) {
-            return Ok(String.create());
+    private fn textSince(borrow this, start: usize) -> Result<ByteString, AllocError> {
+        if (this.source.length() == 0 || start >= this.tokens.length || this.at <= start) {
+            return Ok(ByteString.create());
         }
         let from = this.tokens[start].offset;
-        var to = if (this.at < this.tokens.length) this.tokens[this.at].offset else this.source.length;
+        var to = if (this.at < this.tokens.length) this.tokens[this.at].offset else this.source.length();
         let last = this.tokens[this.at - 1].end;
-        to = to.max(last).min(this.source.length);
+        to = to.max(last).min(this.source.length());
         if (from >= to) {
-            return Ok(String.create());
+            return Ok(ByteString.create());
         }
-        return String.from(this.source.view()[from..to].trimEnd());
+        return ownedText(this.source.view().slice(from, to).trimEnd());
     }
 
     private fn exprList(borrow mut this) -> Result<Vector<Expr>, SqliteError> {
@@ -780,7 +785,7 @@ struct Parser {
                         kind: JoinKind.Comma,
                         natural: false,
                         item: FromItem.TableFunction(
-                            TableFunctionSource { name: String.create(), args: Vector<Expr>.create(), alias: null },
+                            TableFunctionSource { name: ByteString.create(), args: Vector<Expr>.create(), alias: null },
                         ),
                         constraint: JoinConstraint.None, group: 0, groupOn: null,
                     },
@@ -813,7 +818,7 @@ struct Parser {
             kind: JoinKind.Comma,
             natural: false,
             item: FromItem.TableFunction(
-                TableFunctionSource { name: String.create(), args: Vector<Expr>.create(), alias: null },
+                TableFunctionSource { name: ByteString.create(), args: Vector<Expr>.create(), alias: null },
             ),
             constraint: JoinConstraint.None,
             group: 0,
@@ -824,7 +829,7 @@ struct Parser {
     private fn fromClause(borrow mut this) -> Result<FromClause, SqliteError> {
         var clause = FromClause {
             source: FromItem.TableFunction(
-                TableFunctionSource { name: String.create(), args: Vector<Expr>.create(), alias: null },
+                TableFunctionSource { name: ByteString.create(), args: Vector<Expr>.create(), alias: null },
             ),
             joins: Vector<Join>.create(),
         };
@@ -925,7 +930,7 @@ struct Parser {
             );
         }
         // A pragma function may be written without parentheses.
-        if (name.schema.isNull() && name.name.length > 7 && startsWithIgnoreAsciiCase(name.name.view(), "pragma_")) {
+        if (name.schema.isNull() && name.name.length() > 7 && name.name.view().startsWithIgnoreAsciiCase("pragma_")) {
             return Ok(
                 FromItem.TableFunction(
                     TableFunctionSource { name: name.name, args: Vector<Expr>.create(), alias: this.alias()? },
@@ -983,7 +988,7 @@ struct Parser {
 
     private fn returning(
         borrow mut this,
-        texts: borrow mut Vector<String>,
+        texts: borrow mut Vector<ByteString>,
     ) -> Result<Vector<ResultColumn>, SqliteError> {
         if (!this.acceptWord("RETURNING")) {
             return Ok(Vector<ResultColumn>.create());
@@ -1003,11 +1008,11 @@ struct Parser {
         }
         this.expectWord("INTO")?;
         let table = this.qualifiedName()?;
-        var alias: String? = null;
+        var alias: ByteString? = null;
         if (this.acceptWord("AS")) {
             alias = this.name()?;
         }
-        var columns = Vector<String>.create();
+        var columns = Vector<ByteString>.create();
         if (this.isOp("(")) {
             columns = this.parenthesizedNames()?;
         }
@@ -1035,7 +1040,7 @@ struct Parser {
         while (this.acceptWord("ON")) {
             this.expectWord("CONFLICT")?;
             var clause = UpsertClause {
-                target: Vector<String>.create(),
+                target: Vector<ByteString>.create(),
                 assignments: Vector<Assignment>.create(),
                 filter: null,
             };
@@ -1057,7 +1062,7 @@ struct Parser {
             }
             upserts.push(clause)?;
         }
-        var texts = Vector<String>.create();
+        var texts = Vector<ByteString>.create();
         let returning = this.returning(mut texts)?;
         return Ok(InsertStmt {
             with: with,
@@ -1113,7 +1118,7 @@ struct Parser {
             conflict = this.conflictAction()?;
         }
         let table = this.qualifiedName()?;
-        var alias: String? = null;
+        var alias: ByteString? = null;
         if (this.acceptWord("AS")) {
             alias = this.name()?;
         }
@@ -1127,7 +1132,7 @@ struct Parser {
             filter: null,
             returning: Vector<ResultColumn>.create(),
             alias: alias,
-            returningTexts: Vector<String>.create(),
+            returningTexts: Vector<ByteString>.create(),
         };
         if (this.acceptWord("FROM")) {
             stmt.from = this.fromClause()?;
@@ -1148,7 +1153,7 @@ struct Parser {
             filter: null,
             returning: Vector<ResultColumn>.create(),
             alias: null,
-            returningTexts: Vector<String>.create(),
+            returningTexts: Vector<ByteString>.create(),
         };
         if (this.acceptWord("AS")) {
             stmt.alias = this.name()?;
@@ -1182,7 +1187,7 @@ struct Parser {
                 temporary: temporary,
                 ifNotExists: this.ifNotExists()?,
                 name: this.qualifiedName()?,
-                columns: Vector<String>.create(),
+                columns: Vector<ByteString>.create(),
                 select: Parser.emptySelect(),
             };
             if (this.isOp("(")) {
@@ -1317,7 +1322,7 @@ struct Parser {
             unique: unique,
             ifNotExists: this.ifNotExists()?,
             name: this.qualifiedName()?,
-            table: String.create(),
+            table: ByteString.create(),
             columns: Vector<IndexedColumn>.create(),
             filter: null,
         };
@@ -1327,10 +1332,10 @@ struct Parser {
         loop {
             // An indexed column is an expression: most often a column's name, perhaps with a COLLATE.
             var column = IndexedColumn {
-                name: String.create(),
+                name: ByteString.create(),
                 expression: null,
                 descending: false,
-                collation: String.create(),
+                collation: ByteString.create(),
             };
             var expr = this.expr()?;
             if (expr is Expr.Collate(operand, collation)) {
@@ -1370,8 +1375,8 @@ struct Parser {
             name: this.qualifiedName()?,
             timing: TriggerTiming.Before,
             event: TriggerEvent.Insert,
-            updateOf: Vector<String>.create(),
-            table: String.create(),
+            updateOf: Vector<ByteString>.create(),
+            table: ByteString.create(),
             when: null,
             body: Vector<Stmt>.create(),
         };
@@ -1485,8 +1490,8 @@ struct Parser {
     }
 
     /// A pragma's value: a name, a keyword such as ON, a string, or a number with an optional sign.
-    private fn pragmaValue(borrow mut this) -> Result<String, SqliteError> {
-        var value = String.create();
+    private fn pragmaValue(borrow mut this) -> Result<ByteString, SqliteError> {
+        var value = ByteString.create();
         if (this.acceptOp("-")) {
             value.append("-")?;
             if (this.kind() != TokenKind.IntLit && this.kind() != TokenKind.FloatLit) {
@@ -1604,7 +1609,7 @@ struct Parser {
         return Ok(left);
     }
 
-    private fn nullLiteral() -> Expr => Expr.Literal(Literal { kind: LiteralKind.Null, text: String.create() });
+    private fn nullLiteral() -> Expr => Expr.Literal(Literal { kind: LiteralKind.Null, text: ByteString.create() });
 
     private fn peekInfix(borrow this) -> InfixPeek {
         let token = borrow this.tokens[this.at];
@@ -1749,7 +1754,7 @@ struct Parser {
                 this.advance();
                 this.height = 1;
                 return Ok(
-                    Expr.Literal(Literal { kind: LiteralKind.Integer, text: String.from("-9223372036854775808")? }),
+                    Expr.Literal(Literal { kind: LiteralKind.Integer, text: ownedText("-9223372036854775808")? }),
                 );
             }
             let operand = this.exprAt(PREC_UNARY)?;
@@ -1773,7 +1778,7 @@ struct Parser {
     private fn keywordLiteral(borrow mut this, kind: LiteralKind) -> Result<Expr, SqliteError> {
         this.advance();
         this.height = 1;
-        return Ok(Expr.Literal(Literal { kind: kind, text: String.create() }));
+        return Ok(Expr.Literal(Literal { kind: kind, text: ByteString.create() }));
     }
 
     private fn primary(borrow mut this) -> Result<Expr, SqliteError> {
@@ -1788,8 +1793,8 @@ struct Parser {
                 this.height = 1;
                 let text = this.takeText()?;
                 let n = this.params.number(text.view())?;
-                var numbered = String.from("?")?;
-                numbered.appendNumber(n)?;
+                var numbered = ownedText("?")?;
+                numbered.appendUnsigned(n as u64)?;
                 return Ok(Expr.Param(numbered));
             }
             _ => {}
@@ -1871,17 +1876,17 @@ struct Parser {
     private fn integerLiteral(borrow mut this) -> Result<Expr, SqliteError> {
         let text = this.tokens[this.at].text.view();
         var kind = LiteralKind.Integer;
-        if (text.length > 2 && (text[1] == 'x' || text[1] == 'X')) {
-            var digits = text.length - 2;
+        if (text.length() > 2 && (text[1] == 'x' || text[1] == 'X')) {
+            var digits = text.length() - 2;
             var i: usize = 2;
-            while (i < text.length && text[i] == '0') {
+            while (i < text.length() && text[i] == '0') {
                 digits -= 1;
                 i += 1;
             }
             if (digits > 16) {
                 return Err(sqlError("hex literal too big"));
             }
-        } else if (text.parseInt<i64>().isNull()) {
+        } else if (parseI64(text).isNull()) {
             kind = LiteralKind.Float;
         }
         return this.literal(kind);
@@ -2053,9 +2058,9 @@ struct Parser {
         let height = this.height;
         this.expectWord("AS")?;
         // A type name: words, then perhaps one or two signed numbers in parentheses.
-        var typeName = String.create();
+        var typeName = ByteString.create();
         while (this.kind() == TokenKind.Word || this.kind() == TokenKind.QuotedId) {
-            if (typeName.length != 0) {
+            if (typeName.length() != 0) {
                 typeName.append(" ")?;
             }
             typeName.append(this.tokens[this.at].text.view())?;

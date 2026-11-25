@@ -1,0 +1,40 @@
+// SQL text of any bytes. SQLite takes a statement as bytes: a string literal keeps every byte it holds, an
+// identifier may hold any byte above 0x7F, and names, definitions and error messages carry those bytes on. The
+// engine holds them so from the API to the output: tokens, the syntax tree, the catalog's names, sqlite_schema's
+// SQL and messages are `ByteString`s and `ByteStringView`s, and code that takes any text is written over
+// `TextView` (lib/core), which string literals and `StringView`s implement too. Names compare as SQLite's do, by
+// their bytes with ASCII case folded (`equalsIgnoreAsciiCase`).
+
+/// A copy of `text` as bytes.
+fn ownedText<N: TextView>(text: N) -> Result<ByteString, AllocError> => ByteString.copyOf(text.bytes());
+
+/// `text` with ASCII letters made lower case, the key of a name that SQLite compares without regard to case.
+fn asciiLower<N: TextView>(text: N) -> Result<ByteString, AllocError> {
+    let bytes = text.bytes();
+    var out = Vector<u8>.withCapacity(bytes.length)?;
+    for (b in bytes) {
+        out.push(if (b >= 'A' && b <= 'Z') b + 32 else b)?;
+    }
+    return Ok(ByteString.fromBytes(out));
+}
+
+/// The decimal number `text` is, as `StringView.parseInt` reads it; null when it is not one (or not UTF-8).
+fn parseUsize<N: TextView>(text: N) -> usize? {
+    let utf8 = text.toUtf8()?;
+    return utf8.parseInt<usize>();
+}
+
+fn parseI64<N: TextView>(text: N) -> i64? {
+    let utf8 = text.toUtf8()?;
+    return utf8.parseInt<i64>();
+}
+
+fn parseI32<N: TextView>(text: N) -> i32? {
+    let utf8 = text.toUtf8()?;
+    return utf8.parseInt<i32>();
+}
+
+impl SqliteValue {
+    /// A text value of a copy of `text`'s bytes: a string literal's value, a name or a definition.
+    fn ofText<N: TextView>(text: N) -> Result<SqliteValue, AllocError> => Ok(SqliteValue.Text(ownedText(text)?));
+}

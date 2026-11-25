@@ -9,35 +9,38 @@
 
 struct SqlWriter {
     /// `expr` as SQL.
-    fn expression(expr: borrow Expr) -> Result<String, AllocError> {
-        var out = String.create();
+    fn expression(expr: borrow Expr) -> Result<ByteString, AllocError> {
+        var out = ByteString.create();
         SqlWriter.appendExpr(mut out, expr)?;
         return Ok(out);
     }
 
     /// `name` in double quotes, with any inside doubled.
-    fn appendIdentifier(out: borrow mut String, name: StringView) -> Result<void, AllocError> {
+    fn appendIdentifier(out: borrow mut ByteString, name: ByteStringView) -> Result<void, AllocError> {
         out.append("\"")?;
         SqlWriter.appendDoubling(out, name, '"')?;
-        return out.append("\"");
+        out.append("\"")?;
+        return Ok();
     }
 
     /// `text` as a string literal.
-    fn appendStringLiteral(out: borrow mut String, text: StringView) -> Result<void, AllocError> {
+    fn appendStringLiteral(out: borrow mut ByteString, text: ByteStringView) -> Result<void, AllocError> {
         out.append("'")?;
         SqlWriter.appendDoubling(out, text, '\'')?;
-        return out.append("'");
+        out.append("'")?;
+        return Ok();
     }
 
-    private fn appendDoubling(out: borrow mut String, text: StringView, quote: u8) -> Result<void, AllocError> {
+    private fn appendDoubling(out: borrow mut ByteString, text: ByteStringView, quote: u8) -> Result<void, AllocError> {
         var from: usize = 0;
-        for (i in 0..text.length) {
+        for (i in 0..text.length()) {
             if (text[i] == quote) {
-                out.append(text[from..i + 1])?;
+                out.append(text.slice(from, i + 1))?;
                 from = i;
             }
         }
-        return out.append(text[from..]);
+        out.append(text.sliceFrom(from))?;
+        return Ok();
     }
 
     fn binaryOperator(op: BinaryOp) -> StringView => match (op) {
@@ -63,7 +66,7 @@ struct SqlWriter {
         BinaryOp.JsonGetValue => "->>",
     };
 
-    private fn appendList(out: borrow mut String, items: Slice<Expr>) -> Result<void, AllocError> {
+    private fn appendList(out: borrow mut ByteString, items: Slice<Expr>) -> Result<void, AllocError> {
         for (i in 0..items.length) {
             if (i != 0) {
                 out.append(", ")?;
@@ -73,7 +76,7 @@ struct SqlWriter {
         return Ok();
     }
 
-    private fn appendOrderTerms(out: borrow mut String, terms: Slice<OrderTerm>) -> Result<void, AllocError> {
+    private fn appendOrderTerms(out: borrow mut ByteString, terms: Slice<OrderTerm>) -> Result<void, AllocError> {
         for (i in 0..terms.length) {
             if (i != 0) {
                 out.append(", ")?;
@@ -89,21 +92,22 @@ struct SqlWriter {
         return Ok();
     }
 
-    private fn appendFrameBound(out: borrow mut String, bound: borrow FrameBound) -> Result<void, AllocError> {
+    private fn appendFrameBound(out: borrow mut ByteString, bound: borrow FrameBound) -> Result<void, AllocError> {
         if (borrow bound.offset is Some(offset)) {
             SqlWriter.appendExpr(out, offset)?;
             out.append(" ")?;
         }
-        return out.append(match (bound.kind) {
+        out.append(match (bound.kind) {
             FrameBoundKind.UnboundedPreceding => "UNBOUNDED PRECEDING",
             FrameBoundKind.Preceding => "PRECEDING",
             FrameBoundKind.CurrentRow => "CURRENT ROW",
             FrameBoundKind.Following => "FOLLOWING",
             FrameBoundKind.UnboundedFollowing => "UNBOUNDED FOLLOWING",
-        });
+        })?;
+        return Ok();
     }
 
-    private fn appendOver(out: borrow mut String, over: borrow OverClause) -> Result<void, AllocError> {
+    private fn appendOver(out: borrow mut ByteString, over: borrow OverClause) -> Result<void, AllocError> {
         out.append(" OVER (")?;
         var written = false;
         if (borrow over.baseName is Some(base)) {
@@ -139,10 +143,11 @@ struct SqlWriter {
                 FrameExclude.Ties => " EXCLUDE TIES",
             })?;
         }
-        return out.append(")");
+        out.append(")")?;
+        return Ok();
     }
 
-    fn appendExpr(out: borrow mut String, expr: borrow Expr) -> Result<void, AllocError> {
+    fn appendExpr(out: borrow mut ByteString, expr: borrow Expr) -> Result<void, AllocError> {
         match (expr) {
             Expr.Literal(literal) => {
                 match (literal.kind) {

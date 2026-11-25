@@ -19,53 +19,53 @@
 struct TextEdit {
     start: usize;
     end: usize;
-    text: String;
+    text: ByteString;
 }
 
 /// `text` with `edits` (in any order, not overlapping) applied.
-fn applyEdits(text: StringView, edits: borrow mut Vector<TextEdit>) -> Result<String, AllocError> {
+fn applyEdits(text: ByteStringView, edits: borrow mut Vector<TextEdit>) -> Result<ByteString, AllocError> {
     edits.sortBy((a, b) => compareUsize(a.start, b.start));
-    var out = String.create();
+    var out = ByteString.create();
     var at: usize = 0;
     for (i in 0..edits.length) {
-        out.append(text[at..edits[i].start])?;
+        out.append(text.slice(at, edits[i].start))?;
         out.append(edits[i].text.view())?;
         at = edits[i].end;
     }
-    out.append(text[at..])?;
+    out.append(text.sliceFrom(at))?;
     return Ok(out);
 }
 
 /// A name in double quotes, as SQLite writes a renamed table.
-fn quotedName(name: StringView) -> Result<String, AllocError> {
-    var out = String.create();
+fn quotedName(name: ByteStringView) -> Result<ByteString, AllocError> {
+    var out = ByteString.create();
     SqlWriter.appendIdentifier(mut out, name)?;
     return Ok(out);
 }
 
 /// A name as it may stand in SQL: bare when it can be, else in double quotes.
-fn sqlName(name: StringView) -> Result<String, AllocError> {
-    var bare = name.length != 0 && isSqlIdStart(name[0]) && !wordIn(name, RESERVED_NAMES[..]);
+fn sqlName(name: ByteStringView) -> Result<ByteString, AllocError> {
+    var bare = name.length() != 0 && isSqlIdStart(name[0]) && !wordIn(name, RESERVED_NAMES[..]);
     for (c in name.bytes()) {
         bare = bare && isSqlIdChar(c);
     }
-    return if (bare) String.from(name) else quotedName(name);
+    return if (bare) ownedText(name) else quotedName(name);
 }
 
 /// The text that replaces `token`, a name of the column RENAME COLUMN renames, as renameEditSql writes it: the new
 /// name in double quotes when the statement quoted it (`quoted`) or `token` is not a bare name, else as it is.
-fn renamedColumnText(token: borrow Token, new: StringView, quoted: bool) -> Result<String, AllocError> =>
-    if (quoted || token.kind != TokenKind.Word) quotedName(new) else String.from(new);
+fn renamedColumnText(token: borrow Token, new: ByteStringView, quoted: bool) -> Result<ByteString, AllocError> =>
+    if (quoted || token.kind != TokenKind.Word) quotedName(new) else ownedText(new);
 
-fn isName(token: borrow Token, name: StringView) -> bool =>
+fn isName(token: borrow Token, name: ByteStringView) -> bool =>
     (token.kind == TokenKind.Word || token.kind == TokenKind.QuotedId) && token.text.view().equalsIgnoreAsciiCase(name);
 
 /// The edits that rename the identifiers naming column `old` in a CREATE TABLE or CREATE INDEX statement: every
 /// matching name except function names, collation and constraint names, and what REFERENCES names (another table).
 fn columnRenameEdits(
-    sql: StringView,
-    old: StringView,
-    new: StringView,
+    sql: ByteStringView,
+    old: ByteStringView,
+    new: ByteStringView,
     quoted: bool,
     isIndex: bool,
     edits: borrow mut Vector<TextEdit>,
@@ -115,7 +115,7 @@ fn columnRenameEdits(
 
 /// The edit that renames the object a CREATE statement makes (the name after TABLE/INDEX/VIEW [IF NOT EXISTS]),
 /// or with `afterOn`, the table after ON.
-fn nameEdit(sql: StringView, afterOn: bool, newName: StringView) -> Result<TextEdit?, SqliteError> {
+fn nameEdit(sql: ByteStringView, afterOn: bool, newName: ByteStringView) -> Result<TextEdit?, SqliteError> {
     let tokens = Tokenizer.tokenize(sql)?;
     for (i in 0..tokens.length) {
         let t = borrow tokens[i];
@@ -138,9 +138,9 @@ fn nameEdit(sql: StringView, afterOn: bool, newName: StringView) -> Result<TextE
 
 /// The edits that rename `old` after REFERENCES in a CREATE TABLE statement.
 fn referenceEdits(
-    sql: StringView,
-    old: StringView,
-    new: StringView,
+    sql: ByteStringView,
+    old: ByteStringView,
+    new: ByteStringView,
     edits: borrow mut Vector<TextEdit>,
 ) -> Result<void, SqliteError> {
     let tokens = Tokenizer.tokenize(sql)?;
@@ -175,7 +175,7 @@ fn writeSchemaRow(db: borrow mut Session, row: borrow SchemaRow) -> Result<void,
 }
 
 /// Refuses a rename that a view or a trigger refers to: SQLite would rewrite them, this engine cannot yet.
-fn refuseIfReferenced(db: borrow Session, table: StringView) -> Result<void, SqliteError> {
+fn refuseIfReferenced(db: borrow Session, table: ByteStringView) -> Result<void, SqliteError> {
     for (i in 0..db.entries.length) {
         let entry = borrow db.entries[i];
         let kind = entry.kind.view();
@@ -195,16 +195,10 @@ fn refuseIfReferenced(db: borrow Session, table: StringView) -> Result<void, Sql
     return Ok();
 }
 
-/// A column of sqlite_schema as SQL text in the engine's form (sqltext.cee): its bytes, whatever they are.
-fn valueTextOf(value: borrow SqliteValue) -> Result<String, AllocError> => match (value) {
-    SqliteValue.Text(s) => sqlTextOf(s.bytes()),
-    _ => Ok(String.create()),
-};
-
 /// ALTER TABLE.
 fn executeAlterTable(
     stmt: borrow AlterTableStmt,
-    sql: StringView,
+    sql: ByteStringView,
     db: borrow mut Session,
 ) -> Result<void, SqliteError> {
     let tableName = stmt.table.name.view();
@@ -213,7 +207,7 @@ fn executeAlterTable(
     };
     let name = table.name.clone()?;
     if (isReservedName(name.view())) {
-        var message = String.from("table ")?;
+        var message = ownedText("table ")?;
         message.append(name.view())?;
         message.append(" may not be altered")?;
         return Err(sqlError(message.view()));
@@ -230,45 +224,45 @@ fn executeAlterTable(
     return db.reloadSchema();
 }
 
-fn renameTable(old: StringView, new: StringView, db: borrow mut Session) -> Result<void, SqliteError> {
+fn renameTable(old: ByteStringView, new: ByteStringView, db: borrow mut Session) -> Result<void, SqliteError> {
     if (objectExists(db, new)) {
         return Err(namedError("there is already another table or index with this name: ", new));
     }
     if (isReservedName(new)) {
         return Err(namedError("object name reserved for internal use: ", new));
     }
-    var oldPrefix = String.from("sqlite_autoindex_")?;
+    var oldPrefix = ownedText("sqlite_autoindex_")?;
     oldPrefix.append(old)?;
     oldPrefix.append("_")?;
     var rows = schemaRows(db)?;
     for (r in 0..rows.length) {
-        let kind = valueTextOf(borrow rows[r].values[0])?;
-        let objectName = valueTextOf(borrow rows[r].values[1])?;
-        let ofTable = valueTextOf(borrow rows[r].values[2])?.view().equalsIgnoreAsciiCase(old);
-        let sqlText = valueTextOf(borrow rows[r].values[4])?;
+        let kind = textOrEmptyRef(borrow rows[r].values[0])?;
+        let objectName = textOrEmptyRef(borrow rows[r].values[1])?;
+        let ofTable = textOrEmptyRef(borrow rows[r].values[2])?.view().equalsIgnoreAsciiCase(old);
+        let sqlText = textOrEmptyRef(borrow rows[r].values[4])?;
         var edits = Vector<TextEdit>.create();
         var changed = false;
         if (kind.view() == "table" && objectName.view().equalsIgnoreAsciiCase(old)) {
             if (nameEdit(sqlText.view(), false, new)? is Some(edit)) {
                 edits.push(edit)?;
             }
-            rows[r].values[1] = SqliteValue.sqlText(new)?;
-            rows[r].values[2] = SqliteValue.sqlText(new)?;
+            rows[r].values[1] = SqliteValue.ofText(new)?;
+            rows[r].values[2] = SqliteValue.ofText(new)?;
             changed = true;
         } else if (kind.view() == "index" && ofTable) {
             if (!rows[r].values[4].isNull()) {
                 if (nameEdit(sqlText.view(), true, new)? is Some(edit)) {
                     edits.push(edit)?;
                 }
-            } else if (objectName.view().length > oldPrefix.length &&
-                startsWithIgnoreAsciiCase(objectName.view(), oldPrefix.view())) {
-                var renamed = String.from("sqlite_autoindex_")?;
+            } else if (objectName.view().length() > oldPrefix.length() &&
+                objectName.view().startsWithIgnoreAsciiCase(oldPrefix.view())) {
+                var renamed = ownedText("sqlite_autoindex_")?;
                 renamed.append(new)?;
                 renamed.append("_")?;
-                renamed.append(objectName.view()[oldPrefix.length..])?;
-                rows[r].values[1] = SqliteValue.sqlTextFrom(renamed)?;
+                renamed.append(objectName.view().sliceFrom(oldPrefix.length()))?;
+                rows[r].values[1] = SqliteValue.Text(renamed);
             }
-            rows[r].values[2] = SqliteValue.sqlText(new)?;
+            rows[r].values[2] = SqliteValue.ofText(new)?;
             changed = true;
         } else if (kind.view() == "table" && (!db.legacyAlterTable || db.foreignKeys)) {
             // Another table's REFERENCES; with legacy_alter_table only while foreign keys are on.
@@ -285,12 +279,12 @@ fn renameTable(old: StringView, new: StringView, db: borrow mut Session) -> Resu
                 }
             }
             if (isTrigger && ofTable) {
-                rows[r].values[2] = SqliteValue.sqlText(new)?;
+                rows[r].values[2] = SqliteValue.ofText(new)?;
             }
             changed = edits.length != 0 || (isTrigger && ofTable);
         }
         if (edits.length != 0) {
-            rows[r].values[4] = SqliteValue.sqlTextFrom(applyEdits(sqlText.view(), mut edits)?)?;
+            rows[r].values[4] = SqliteValue.Text(applyEdits(sqlText.view(), mut edits)?);
         }
         if (changed) {
             writeSchemaRow(db, borrow rows[r])?;
@@ -298,29 +292,29 @@ fn renameTable(old: StringView, new: StringView, db: borrow mut Session) -> Resu
     }
     if (db.catalog.table("sqlite_sequence")?.isSome()) {
         var params = Vector<SqliteValue>.create();
-        params.push(SqliteValue.sqlText(new)?)?;
-        params.push(SqliteValue.sqlText(old)?)?;
+        params.push(SqliteValue.ofText(new)?)?;
+        params.push(SqliteValue.ofText(old)?)?;
         let _ = db.runInternal("UPDATE sqlite_sequence SET name = ?1 WHERE name = ?2", params.view())?;
     }
     return Ok();
 }
 
 fn renameColumn(
-    tableName: StringView,
-    from: StringView,
-    to: StringView,
+    tableName: ByteStringView,
+    from: ByteStringView,
+    to: ByteStringView,
     quoted: bool,
     db: borrow mut Session,
 ) -> Result<void, SqliteError> {
     let table = db.catalog.tableCopy(tableName)?;
     if (table.indexOf(from).isNull()) {
-        var message = String.from("no such column: \"")?;
+        var message = ownedText("no such column: \"")?;
         message.append(from)?;
         message.append("\"")?;
         return Err(sqlError(message.view()));
     }
     if (!from.equalsIgnoreAsciiCase(to) && table.indexOf(to).isSome()) {
-        var message = String.from("error in table ")?;
+        var message = ownedText("error in table ")?;
         message.append(tableName)?;
         message.append(" after rename: duplicate column name: ")?;
         message.append(to)?;
@@ -328,15 +322,15 @@ fn renameColumn(
     }
     var rows = schemaRows(db)?;
     for (r in 0..rows.length) {
-        let kind = valueTextOf(borrow rows[r].values[0])?;
-        let ofTable = valueTextOf(borrow rows[r].values[2])?.view().equalsIgnoreAsciiCase(tableName);
+        let kind = textOrEmptyRef(borrow rows[r].values[0])?;
+        let ofTable = textOrEmptyRef(borrow rows[r].values[2])?.view().equalsIgnoreAsciiCase(tableName);
         if (rows[r].values[4].isNull()) {
             continue;
         }
-        let sqlText = valueTextOf(borrow rows[r].values[4])?;
+        let sqlText = textOrEmptyRef(borrow rows[r].values[4])?;
         var edits = Vector<TextEdit>.create();
         if (kind.view() == "view" || kind.view() == "trigger") {
-            let triggerTable = valueTextOf(borrow rows[r].values[2])?;
+            let triggerTable = textOrEmptyRef(borrow rows[r].values[2])?;
             columnRefEdits(
                 sqlText.view(),
                 tableName,
@@ -358,14 +352,14 @@ fn renameColumn(
         if (edits.length == 0) {
             continue;
         }
-        rows[r].values[4] = SqliteValue.sqlTextFrom(applyEdits(sqlText.view(), mut edits)?)?;
+        rows[r].values[4] = SqliteValue.Text(applyEdits(sqlText.view(), mut edits)?);
         writeSchemaRow(db, borrow rows[r])?;
     }
     return Ok();
 }
 
 /// Where a new column's definition goes in a CREATE TABLE statement: after the last column definition.
-fn columnInsertPoint(sql: StringView) -> Result<usize?, SqliteError> {
+fn columnInsertPoint(sql: ByteStringView) -> Result<usize?, SqliteError> {
     let tokens = Tokenizer.tokenize(sql)?;
     var depth: usize = 0;
     var lastColumnEnd: usize? = null;
@@ -408,9 +402,9 @@ fn columnInsertPoint(sql: StringView) -> Result<usize?, SqliteError> {
 }
 
 fn addColumn(
-    tableName: StringView,
+    tableName: ByteStringView,
     column: borrow ColumnDef,
-    alterSql: StringView,
+    alterSql: ByteStringView,
     db: borrow mut Session,
 ) -> Result<void, SqliteError> {
     let table = db.catalog.tableCopy(tableName)?;
@@ -429,7 +423,7 @@ fn addColumn(
             break;
         }
     }
-    let definition = alterSql[tokens[at].offset..];
+    let definition = alterSql.sliceFrom(tokens[at].offset);
     let schema = buildColumnSchema(column, false, alterSql)?;
     if (schema.primaryKey) {
         return Err(sqlError("Cannot add a PRIMARY KEY column"));
@@ -464,21 +458,21 @@ fn addColumn(
     }
     var rows = schemaRows(db)?;
     for (r in 0..rows.length) {
-        let isTable = valueTextOf(
+        let isTable = textOrEmptyRef(
             borrow rows[r].values[0],
-        )?.view() == "table" && valueTextOf(borrow rows[r].values[1])?.view().equalsIgnoreAsciiCase(tableName);
+        )?.view() == "table" && textOrEmptyRef(borrow rows[r].values[1])?.view().equalsIgnoreAsciiCase(tableName);
         if (!isTable) {
             continue;
         }
-        let sqlText = valueTextOf(borrow rows[r].values[4])?;
+        let sqlText = textOrEmptyRef(borrow rows[r].values[4])?;
         let point = columnInsertPoint(sqlText.view())? ?? {
             return Err(corrupt("a table's definition has no column list"));
         };
         var edits = Vector<TextEdit>.create();
-        var inserted = String.from(", ")?;
+        var inserted = ownedText(", ")?;
         inserted.append(definition)?;
         edits.push(TextEdit { start: point, end: point, text: inserted })?;
-        rows[r].values[4] = SqliteValue.sqlTextFrom(applyEdits(sqlText.view(), mut edits)?)?;
+        rows[r].values[4] = SqliteValue.Text(applyEdits(sqlText.view(), mut edits)?);
         writeSchemaRow(db, borrow rows[r])?;
     }
     return Ok();
@@ -486,10 +480,10 @@ fn addColumn(
 
 /// The edits that rename `column` in `REFERENCES table(… column …)` clauses.
 fn referencedColumnEdits(
-    sql: StringView,
-    table: StringView,
-    column: StringView,
-    new: StringView,
+    sql: ByteStringView,
+    table: ByteStringView,
+    column: ByteStringView,
+    new: ByteStringView,
     quoted: bool,
     edits: borrow mut Vector<TextEdit>,
 ) -> Result<void, SqliteError> {
@@ -531,7 +525,7 @@ struct ColumnSpans {
     lastEnd: usize;
 }
 
-fn columnSpans(sql: StringView) -> Result<ColumnSpans, SqliteError> {
+fn columnSpans(sql: ByteStringView) -> Result<ColumnSpans, SqliteError> {
     let tokens = Tokenizer.tokenize(sql)?;
     var spans = ColumnSpans { starts: Vector<usize>.create(), lastEnd: 0 };
     var depth: usize = 0;
@@ -574,22 +568,26 @@ fn columnSpans(sql: StringView) -> Result<ColumnSpans, SqliteError> {
     return Ok(spans);
 }
 
-fn afterDropError(kind: StringView, name: StringView, cause: borrow SqliteError) -> Result<SqliteError, AllocError> {
-    var message = String.from("error in ")?;
+fn afterDropError<N: TextView, M: TextView>(
+    kind: N,
+    name: M,
+    cause: borrow SqliteError,
+) -> Result<SqliteError, AllocError> {
+    var message = ownedText("error in ")?;
     message.append(kind)?;
     message.append(" ")?;
     message.append(name)?;
     message.append(" after drop column: ")?;
-    appendSqlText(mut message, cause.message().bytes())?;
+    message.append(cause.message())?;
     return Ok(sqlError(message.view()));
 }
 
 /// ALTER TABLE … DROP COLUMN, as SQLite does it: the column's definition leaves the statement (with its own
 /// constraints), what still names it is an error, and every row loses its value.
-fn dropColumn(tableName: StringView, column: StringView, db: borrow mut Session) -> Result<void, SqliteError> {
+fn dropColumn(tableName: ByteStringView, column: ByteStringView, db: borrow mut Session) -> Result<void, SqliteError> {
     let table = db.catalog.tableCopy(tableName)?;
     let at = table.indexOf(column) ?? {
-        var message = String.from("no such column: \"")?;
+        var message = ownedText("no such column: \"")?;
         message.append(column)?;
         message.append("\"")?;
         return Err(sqlError(message.view()));
@@ -617,7 +615,7 @@ fn dropColumn(tableName: StringView, column: StringView, db: borrow mut Session)
         }
     }
     if (table.columns.length == 1) {
-        var message = String.from("cannot drop column ")?;
+        var message = ownedText("cannot drop column ")?;
         message.append(quotedColumn.view())?;
         message.append(": no other columns exist")?;
         return Err(sqlError(message.view()));
@@ -626,13 +624,13 @@ fn dropColumn(tableName: StringView, column: StringView, db: borrow mut Session)
     // The statement without the column: up to the next column's name, or for the last, from the comma before it.
     var rows = schemaRows(db)?;
     for (r in 0..rows.length) {
-        let isTable = valueTextOf(
+        let isTable = textOrEmptyRef(
             borrow rows[r].values[0],
-        )?.view() == "table" && valueTextOf(borrow rows[r].values[1])?.view().equalsIgnoreAsciiCase(tableName);
+        )?.view() == "table" && textOrEmptyRef(borrow rows[r].values[1])?.view().equalsIgnoreAsciiCase(tableName);
         if (!isTable) {
             continue;
         }
-        let sqlText = valueTextOf(borrow rows[r].values[4])?;
+        let sqlText = textOrEmptyRef(borrow rows[r].values[4])?;
         let spans = columnSpans(sqlText.view())?;
         if (spans.starts.length != table.columns.length) {
             return Err(corrupt("a table's definition does not match its columns"));
@@ -647,8 +645,8 @@ fn dropColumn(tableName: StringView, column: StringView, db: borrow mut Session)
             }
         }
         var edits = Vector<TextEdit>.create();
-        edits.push(TextEdit { start: start, end: end, text: String.create() })?;
-        rows[r].values[4] = SqliteValue.sqlTextFrom(applyEdits(sqlText.view(), mut edits)?)?;
+        edits.push(TextEdit { start: start, end: end, text: ByteString.create() })?;
+        rows[r].values[4] = SqliteValue.Text(applyEdits(sqlText.view(), mut edits)?);
         writeSchemaRow(db, borrow rows[r])?;
     }
     db.pager.bumpSchemaCookie()?;
@@ -804,9 +802,9 @@ fn tablePositions(tokens: borrow Vector<Token>, isTrigger: bool) -> Result<Vecto
 /// RENAME TO in a view or trigger: each name of table `old` (where a table stands, or qualifying a column) becomes
 /// `new` in double quotes.
 fn tableNameEdits(
-    sql: StringView,
-    old: StringView,
-    new: StringView,
+    sql: ByteStringView,
+    old: ByteStringView,
+    new: ByteStringView,
     isTrigger: bool,
     edits: borrow mut Vector<TextEdit>,
 ) -> Result<void, SqliteError> {
@@ -829,13 +827,13 @@ fn tableNameEdits(
 /// the table and no other table it reads has such a column; names that define aliases, functions and tables do
 /// not. In a trigger's head, only its UPDATE OF list.
 fn columnRefEdits(
-    sql: StringView,
-    table: StringView,
-    from: StringView,
-    to: StringView,
+    sql: ByteStringView,
+    table: ByteStringView,
+    from: ByteStringView,
+    to: ByteStringView,
     quoted: bool,
     isTrigger: bool,
-    triggerTable: StringView,
+    triggerTable: ByteStringView,
     db: borrow Session,
     edits: borrow mut Vector<TextEdit>,
 ) -> Result<void, SqliteError> {
@@ -845,7 +843,7 @@ fn columnRefEdits(
     // The tables read, and the aliases of this one.
     var readsTable = false;
     var otherHasColumn = false;
-    var aliases = Vector<String>.create();
+    var aliases = Vector<ByteString>.create();
     for (i in 0..tokens.length) {
         if (!positions[i]) {
             continue;

@@ -236,7 +236,7 @@ struct BtreeChecker {
     referenced: Vector<bool>;
     errorsLeft: usize;
     errorCount: usize;
-    messages: Vector<String>;
+    messages: Vector<ByteString>;
     prefix: CheckPrefix;
     v0: u32;
     v1: u32;
@@ -248,8 +248,8 @@ struct BtreeChecker {
 }
 
 /// `before`, the number, then `after`.
-fn textWithNumber(before: StringView, n: i64, after: StringView) -> Result<String, AllocError> {
-    var text = String.from(before)?;
+fn textWithNumber<N: TextView, M: TextView>(before: N, n: i64, after: M) -> Result<ByteString, AllocError> {
+    var text = ownedText(before)?;
     text.appendNumber(n)?;
     text.append(after)?;
     return Ok(text);
@@ -257,13 +257,13 @@ fn textWithNumber(before: StringView, n: i64, after: StringView) -> Result<Strin
 
 impl BtreeChecker {
     /// checkAppendMsg: one message, while the budget lasts.
-    fn report(borrow mut this, text: StringView) -> Result<void, AllocError> {
+    fn report<N: TextView>(borrow mut this, text: N) -> Result<void, AllocError> {
         if (this.errorsLeft == 0) {
             return Ok();
         }
         this.errorsLeft -= 1;
         this.errorCount += 1;
-        var message = String.create();
+        var message = ByteString.create();
         match (this.prefix) {
             CheckPrefix.None => {}
             CheckPrefix.Freelist => { message.append("Freelist: ")?; }
@@ -336,7 +336,7 @@ impl BtreeChecker {
             page = get4(data, 0);
         }
         if (n != 0 && errorsAtStart == this.errorCount) {
-            var text = String.from(if (freelist) "size is " else "overflow list length is ")?;
+            var text = ownedText(if (freelist) "size is " else "overflow list length is ")?;
             text.appendNumber(expected.wrappingSub(n) as i64)?;
             text.append(" but should be ")?;
             text.appendNumber(expected as i64)?;
@@ -567,7 +567,7 @@ fn checkBtrees(
         referenced: referenced,
         errorsLeft: limit,
         errorCount: 0,
-        messages: Vector<String>.create(),
+        messages: Vector<ByteString>.create(),
         prefix: CheckPrefix.None,
         v0: 0,
         v1: 0,
@@ -614,19 +614,14 @@ fn checkBtrees(
 
 // ── SQLite's schema hash table ───────────────────────────────────────────────────────────────────────────────
 
-/// strHash in hash.c, over the bytes the name (SQL text in the engine's form, sqltext.cee) stands for.
-fn sqliteStrHash(name: StringView) -> u32 {
+/// strHash in hash.c, over the bytes of the name.
+fn sqliteStrHash(name: ByteStringView) -> u32 {
     var h: u32 = 0;
     let bytes = name.bytes();
     var at: usize = 0;
     while (at < bytes.length) {
-        var b = bytes[at];
-        if (isEscapeAt(bytes, at)) {
-            b = escapedByteAt(bytes, at);
-            at += 4;
-        } else {
-            at += 1;
-        }
+        let b = bytes[at];
+        at += 1;
         h = h.wrappingAdd((b & 0xdf) as u32);
         h = h.wrappingMul(0x9e3779b1);
     }
@@ -641,7 +636,7 @@ struct HashBucket {
 /// The order in which SQLite's Hash, given `names` one after another, lists them: hash.c's insertElement and
 /// rehash, with buckets of 16 bytes and SQLITE_MALLOC_SOFT_LIMIT of 1024. rehash keeps as many buckets as the
 /// allocation holds (sqlite3MallocSize), which depends on the system's allocator.
-fn sqliteHashOrder(names: Slice<StringView>) -> Result<Vector<usize>, AllocError> {
+fn sqliteHashOrder(names: Slice<ByteStringView>) -> Result<Vector<usize>, AllocError> {
     var hashes = Vector<u32>.withCapacity(names.length)?;
     for (n in names) {
         hashes.push(sqliteStrHash(n))?;
@@ -705,7 +700,7 @@ fn insertHashElement(
 
 /// An index of a table, in the order SQLite keeps them (Table.pIndex), or a WITHOUT ROWID table's primary key.
 struct CheckedIndex {
-    name: String;
+    name: ByteString;
     root: u32;
     primaryKey: bool;
     partial: bool;
@@ -715,7 +710,7 @@ struct CheckedIndex {
 
 /// A table (or view) of the schema, in SQLite's hash order.
 struct CheckedTable {
-    name: String;
+    name: ByteString;
     root: u32;
     hasRowid: bool;
     ordinary: bool;
@@ -726,14 +721,14 @@ struct CheckedTable {
 }
 
 /// The number at the end of sqlite_autoindex_T_N.
-fn autoindexNumber(name: StringView) -> usize => match (name.lastIndexOf("_")) {
-    Some(at) => name[at + 1..].parseInt<usize>() ?? 0,
+fn autoindexNumber(name: ByteStringView) -> usize => match (name.lastIndexOf("_")) {
+    Some(at) => parseUsize(name.sliceFrom(at + 1)) ?? 0,
     null => 0,
 };
 
 /// The indexes of `table`, newest first, as SQLite links them: CREATE INDEX ones in reverse schema order, then
 /// the automatic ones by their number, the last first.
-fn sqliteIndexOrder(db: borrow Session, table: StringView, root: u32) -> Result<Vector<CheckedIndex>, AllocError> {
+fn sqliteIndexOrder(db: borrow Session, table: ByteStringView, root: u32) -> Result<Vector<CheckedIndex>, AllocError> {
     var out = Vector<CheckedIndex>.create();
     var e = db.entries.length;
     while (e > 0) {
@@ -771,10 +766,10 @@ fn sqliteIndexOrder(db: borrow Session, table: StringView, root: u32) -> Result<
                     number = k + 1;
                 }
             }
-            var name = String.from("sqlite_autoindex_")?;
+            var name = ownedText("sqlite_autoindex_")?;
             name.append(t.name.view())?;
             name.append("_")?;
-            name.appendNumber(number)?;
+            name.appendUnsigned(number as u64)?;
             automatic.push(CheckedIndex { name: name, root: root, primaryKey: true, partial: false, at: 0 })?;
             numbers.push(number)?;
         }
@@ -810,7 +805,7 @@ fn tablesInSqliteOrder(db: borrow Session) -> Result<Vector<CheckedTable>, Alloc
     var all = Vector<CheckedTable>.create();
     all.push(
         CheckedTable {
-            name: String.from("sqlite_master")?,
+            name: ownedText("sqlite_master")?,
             root: 1,
             hasRowid: true,
             ordinary: true,
@@ -845,7 +840,7 @@ fn tablesInSqliteOrder(db: borrow Session) -> Result<Vector<CheckedTable>, Alloc
             },
         )?;
     }
-    var names = Vector<StringView>.withCapacity(all.length)?;
+    var names = Vector<ByteStringView>.withCapacity(all.length)?;
     for (i in 0..all.length) {
         names.push(all[i].name.view())?;
     }
@@ -874,9 +869,9 @@ struct Verdict {
 
 impl Verdict {
     /// integrityCheckResultRow: the message, then a halt when the budget is spent.
-    fn emit(borrow mut this, text: StringView) -> Result<bool, AllocError> {
+    fn emit<N: TextView>(borrow mut this, text: N) -> Result<bool, AllocError> {
         var row = Vector<SqliteValue>.create();
-        row.push(SqliteValue.sqlText(text)?)?;
+        row.push(SqliteValue.ofText(text)?)?;
         this.rows.push(row)?;
         if (this.left > 0) {
             this.left -= 1;
@@ -887,7 +882,7 @@ impl Verdict {
     }
 }
 
-fn strictTypeMask(declaredType: StringView) -> u8 {
+fn strictTypeMask(declaredType: ByteStringView) -> u8 {
     if (declaredType.equalsIgnoreAsciiCase("INT") || declaredType.equalsIgnoreAsciiCase("INTEGER")) {
         return 0x11;
     }
@@ -911,8 +906,12 @@ fn typeBit(value: borrow SqliteValue) -> u8 => match (value) {
     SqliteValue.Blob(_) => 0x08,
 };
 
-fn columnMessage(prefix: StringView, table: StringView, column: StringView) -> Result<String, AllocError> {
-    var text = String.from(prefix)?;
+fn columnMessage<N: TextView, M: TextView, P: TextView>(
+    prefix: N,
+    table: M,
+    column: P,
+) -> Result<ByteString, AllocError> {
+    var text = ownedText(prefix)?;
     text.append(table)?;
     text.append(".")?;
     text.append(column)?;
@@ -921,11 +920,11 @@ fn columnMessage(prefix: StringView, table: StringView, column: StringView) -> R
 
 /// What pragma.c's checks find wrong with a computed (VIRTUAL) column's value: NOT NULL, then its type.
 fn columnProblem(
-    table: StringView,
+    table: ByteStringView,
     column: borrow ColumnSchema,
     strict: bool,
     value: borrow SqliteValue,
-) -> Result<String?, AllocError> {
+) -> Result<ByteString?, AllocError> {
     if (column.notNull && isNullish(value)) {
         return Ok(columnMessage("NULL value in ", table, column.name.view())?);
     }
@@ -937,16 +936,16 @@ fn isNullish(value: borrow SqliteValue) -> bool => value.isNull() || (value is S
 
 /// The type checks of a column whose type, as OP_IsType sees it, is `bits`; `value` is what OP_Column reads.
 fn typeProblem(
-    table: StringView,
+    table: ByteStringView,
     column: borrow ColumnSchema,
     strict: bool,
     bits: u8,
     value: borrow SqliteValue,
-) -> Result<String?, AllocError> {
+) -> Result<ByteString?, AllocError> {
     if (strict) {
         let mask = strictTypeMask(column.declaredType.view());
         if (mask != 0x1f && (bits & mask) == 0) {
-            var prefix = String.from("non-")?;
+            var prefix = ownedText("non-")?;
             prefix.append(asciiUpper(column.declaredType.view())?.view())?;
             prefix.append(" value in ")?;
             return Ok(columnMessage(prefix.view(), table, column.name.view())?);
@@ -1063,7 +1062,7 @@ fn wholeRecord(available: Slice<bool>) -> bool {
 /// The checks of each column of a row: `stored` is its record, `values` its columns as read (with VIRTUAL ones
 /// computed). True when the budget of messages is spent.
 fn checkColumns(
-    table: StringView,
+    table: ByteStringView,
     schema: borrow TableSchema,
     positions: Slice<usize?>,
     defaults: Slice<SqliteValue>,
@@ -1083,7 +1082,7 @@ fn checkColumns(
         if (!column.notNull && !typed) {
             continue;
         }
-        var problem: String? = null;
+        var problem: ByteString? = null;
         if (positions[c] is Some(p)) {
             let defaultValue = applyColumnAffinity(defaults[c].clone()?, column.affinity)?;
             let defaultBits = typeBit(borrow defaultValue);
@@ -1122,13 +1121,12 @@ fn checkColumns(
     return Ok(false);
 }
 
-fn asciiUpper(text: StringView) -> Result<String, AllocError> {
-    var out = Vector<u8>.withCapacity(text.length)?;
+fn asciiUpper(text: ByteStringView) -> Result<ByteString, AllocError> {
+    var out = Vector<u8>.withCapacity(text.length())?;
     for (b in text.bytes()) {
         out.push(if (b >= 'a' && b <= 'z') b - 32 else b)?;
     }
-    // Only ASCII bytes changed, so the text is still UTF-8, and the bytes become the string without a copy.
-    return Ok(String.fromUtf8(out)!);
+    return Ok(ByteString.fromBytes(out));
 }
 
 /// The rows of sqlite_master: each record must decode, and its typed columns hold their types.
@@ -1145,7 +1143,7 @@ fn checkSchemaRows(db: borrow mut Session, verdict: borrow mut Verdict) -> Resul
         let fields = row.columns.length;
         var cache = HeaderCache { fields: fields, parsed: fields.min(table.columns.length), valid: true };
         if (checkColumns(
-            "sqlite_master",
+            ByteStringView.fromText("sqlite_master"),
             borrow table,
             positions.view(),
             defaults.view(),
@@ -1278,7 +1276,7 @@ fn checkTableRows(
             }
             if (borrow previous is Some(p)) {
                 if (writer.primaryKey.order.comparePrefixIn(key.view(), p.view(), db.textEncoding()) <= 0) {
-                    var text = String.from("row not in PRIMARY KEY order for ")?;
+                    var text = ownedText("row not in PRIMARY KEY order for ")?;
                     text.append(tableName)?;
                     if (verdict.emit(text.view())?) {
                         return Ok();
@@ -1319,7 +1317,7 @@ fn checkTableRows(
                 failed = truthOf(borrow v) == Some(false);
             }
             if (failed) {
-                var text = String.from("CHECK constraint failed in ")?;
+                var text = ownedText("CHECK constraint failed in ")?;
                 text.append(tableName)?;
                 if (verdict.emit(text.view())?) {
                     return Ok();
@@ -1351,7 +1349,7 @@ fn checkTableRows(
                 continue;
             };
             let name = index.name.view();
-            var problem: String? = null;
+            var problem: ByteString? = null;
             match (findIndexEntry(mut db.pager, index, entry.view())?) {
                 null => {
                     var text = textWithNumber("row ", count, " missing from index ")?;
@@ -1396,7 +1394,7 @@ fn checkTableRows(
                                 found.view(),
                                 entry.view()[0..index.columns.length],
                             )?) {
-                                var text = String.from("non-unique entry in index ")?;
+                                var text = ownedText("non-unique entry in index ")?;
                                 text.append(name)?;
                                 problem = text;
                             }
@@ -1435,19 +1433,19 @@ fn pagesToCheck(db: borrow mut Session) -> Result<u32, SqliteError> {
 /// table to check alone.
 fn integrityCheck(
     db: borrow mut Session,
-    name: StringView,
+    name: ByteStringView,
     quick: bool,
-    argument: StringView?,
+    argument: ByteStringView?,
 ) -> Result<QueryResult, SqliteError> {
     var limit: i64 = 100;
-    var only: String? = null;
+    var only: ByteString? = null;
     if (argument is Some(a)) {
-        if (a.parseInt<i32>() is Some(n)) {
+        if (parseI32(a) is Some(n)) {
             if (n > 0) {
                 limit = n as i64;
             }
         } else if (a.equalsIgnoreAsciiCase("sqlite_schema") || a.equalsIgnoreAsciiCase("sqlite_master")) {
-            only = String.from("sqlite_master")?;
+            only = ownedText("sqlite_master")?;
         } else {
             for (e in 0..db.entries.length) {
                 let kind = db.entries[e].kind.view();
@@ -1498,7 +1496,7 @@ fn integrityCheck(
     let checker = checkBtrees(mut db.pager, roots.view(), partial, checkFreelist, pageCount, truncate<usize>(limit))?;
     if (checker.errorCount > 0) {
         verdict.left -= truncate<i64>(checker.errorCount) - 1;
-        var text = String.from("*** in database main ***\n")?;
+        var text = ownedText("*** in database main ***\n")?;
         for (m in 0..checker.messages.length) {
             if (m != 0) {
                 text.append("\n")?;
@@ -1522,7 +1520,7 @@ fn integrityCheck(
                     continue;
                 }
                 if (checker.counts[index.at] != checker.counts[rowsAt]) {
-                    var text = String.from("wrong # of entries in index ")?;
+                    var text = ownedText("wrong # of entries in index ")?;
                     text.append(index.name.view())?;
                     if (verdict.emit(text.view())?) {
                         break;
@@ -1550,7 +1548,7 @@ fn integrityCheck(
             Err(SqliteError.Corrupt(_)) => {
                 // SQLite stops at a record it cannot read, with this as the last row.
                 var row = Vector<SqliteValue>.create();
-                row.push(SqliteValue.sqlText("database disk image is malformed")?)?;
+                row.push(SqliteValue.ofText("database disk image is malformed")?)?;
                 verdict.rows.push(row)?;
                 verdict.halted = true;
             }
@@ -1560,7 +1558,7 @@ fn integrityCheck(
     if (verdict.rows.length == 0) {
         let _ = verdict.emit("ok")?;
     }
-    var columns = Vector<String>.create();
-    columns.push(String.from(name)?)?;
-    return Ok(QueryResult { columns: columnNamesOf(columns)?, rows: verdict.rows });
+    var columns = Vector<ByteString>.create();
+    columns.push(ownedText(name)?)?;
+    return Ok(QueryResult { columns: columns, rows: verdict.rows });
 }

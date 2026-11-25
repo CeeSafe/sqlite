@@ -35,7 +35,7 @@ fn tableNamed(catalog: borrow SchemaCatalog, name: StringView) -> borrow(catalog
 }
 
 fn exprTextOf(value: borrow SchemaExpr?) -> StringView => match (value) {
-    Some(e) => e.text.view(),
+    Some(e) => e.text.toUtf8() ?? "<not UTF-8>",
     null => "<none>",
 };
 
@@ -56,11 +56,11 @@ fn catalogReadsTables() -> Result<void, TestFailure> {
     Check.equalU64(10, child.columns.length as u64)?;
     // A table-level PRIMARY KEY on an INTEGER column is the rowid, DESC or not.
     Check.isTrue(child.rowidAlias == Some(0) && child.columns[0].isRowidAlias, "PRIMARY KEY (id DESC) is the rowid")?;
-    Check.equalText("unique", child.columns[1].name.view())?;
-    Check.equalText("VARCHAR ( 10 )", child.columns[1].declaredType.view())?;
+    equalName("unique", child.columns[1].name.view())?;
+    equalName("VARCHAR ( 10 )", child.columns[1].declaredType.view())?;
     Check.isTrue(child.columns[1].notNull && !child.columns[1].unique, "a column named \"unique\" is not UNIQUE")?;
     Check.equalText("'x'", exprTextOf(child.columns[1].defaultValue))?;
-    Check.equalText("DECIMAL(10, 2)", child.columns[2].declaredType.view())?;
+    equalName("DECIMAL(10, 2)", child.columns[2].declaredType.view())?;
     Check.isTrue(child.columns[2].affinity == Affinity.Numeric, "DECIMAL is NUMERIC")?;
     // The C# engine recorded this default as "-"; SQLite shows definitions as written.
     Check.equalText("-1", exprTextOf(child.columns[2].defaultValue))?;
@@ -76,24 +76,24 @@ fn catalogReadsTables() -> Result<void, TestFailure> {
     Check.isTrue(child.columns[6].affinity == Affinity.Integer, "INT is INTEGER")?;
     Check.equalText("id * 2", exprTextOf(child.columns[7].generated))?;
     Check.isTrue(child.columns[7].generatedStored, "STORED")?;
-    Check.isTrue(child.columns[8].affinity == Affinity.Blob && child.columns[8].declaredType.length == 0, "no type is BLOB")?;
+    Check.isTrue(child.columns[8].affinity == Affinity.Blob && child.columns[8].declaredType.length() == 0, "no type is BLOB")?;
     Check.isTrue(child.columns[9].affinity == Affinity.Real, "DOUBLE PRECISION is REAL")?;
 
     Check.equalU64(2, child.checks.length as u64)?;
-    Check.equalText("amount >= -1", child.checks[0].text.view())?;
-    Check.equalText("id > 0", child.checks[1].text.view())?;
+    equalName("amount >= -1", child.checks[0].text.view())?;
+    equalName("id > 0", child.checks[1].text.view())?;
     Check.equalU64(1, child.keys.length as u64)?;
     Check.isTrue(!child.keys[0].primaryKey, "the rowid's PRIMARY KEY needs no index; UNIQUE does")?;
-    Check.equalText("unique", child.keys[0].columns[0].name.view())?;
-    Check.equalText("amount", child.keys[0].columns[1].name.view())?;
+    equalName("unique", child.keys[0].columns[0].name.view())?;
+    equalName("amount", child.keys[0].columns[1].name.view())?;
     Check.equalU64(1, parent.keys.length as u64)?;
     Check.isTrue(parent.keyCollation(parent.keys[0].columns[0]) == Collation.NoCase, "a key takes its column's collation")?;
 
     Check.equalU64(2, child.foreignKeys.length as u64)?;
     let first = borrow child.foreignKeys[0];
-    Check.equalText("parent_id", first.columns[0].view())?;
-    Check.equalText("parent", first.refTable.view())?;
-    Check.equalText("id", first.refColumns[0].view())?;
+    equalName("parent_id", first.columns[0].view())?;
+    equalName("parent", first.refTable.view())?;
+    equalName("id", first.refColumns[0].view())?;
     Check.isTrue(first.onDelete == ForeignKeyAction.Cascade && first.onUpdate == ForeignKeyAction.SetNull && first.deferred, "the key's actions")?;
     let second = borrow child.foreignKeys[1];
     Check.equalU64(2, second.columns.length as u64)?;
@@ -102,8 +102,8 @@ fn catalogReadsTables() -> Result<void, TestFailure> {
 
     let keyed = tableNamed(catalog, "keyed");
     Check.isTrue(keyed.withoutRowid && keyed.rowidAlias.isNull(), "WITHOUT ROWID")?;
-    Check.equalText("b", keyed.primaryKey[0].name.view())?;
-    Check.equalText("a", keyed.primaryKey[1].name.view())?;
+    equalName("b", keyed.primaryKey[0].name.view())?;
+    equalName("a", keyed.primaryKey[1].name.view())?;
     Check.isTrue(keyed.columns[0].primaryKey && keyed.columns[1].primaryKey && !keyed.columns[2].primaryKey, "the key's columns")?;
     Check.isTrue(keyed.keys.length == 1 && keyed.keys[0].primaryKey, "the key is listed once")?;
 
@@ -132,9 +132,9 @@ fn catalogReadsIndexes() -> Result<void, TestFailure> {
     Check.equalU64(5, catalog.indexes.length as u64)?;
 
     let word = indexNamed(catalog, "child_word");
-    Check.equalText("child", word.table.view())?;
+    equalName("child", word.table.view())?;
     Check.equalU64(2, word.columns.length as u64)?;
-    Check.equalText("word", word.columns[0].name.view())?;
+    equalName("word", word.columns[0].name.view())?;
     Check.isTrue(!word.columns[0].descending && word.columns[1].descending, "amount DESC")?;
     Check.isTrue(word.coversEveryRow() && word.rootPage > 1, "a plain index")?;
 

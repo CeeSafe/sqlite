@@ -19,7 +19,7 @@ public enum Collation {
 
 impl Collation {
     /// The collation called `name` (ASCII case is ignored), or `null` for a name that is not built in.
-    public fn named(name: StringView) -> Collation? {
+    public fn named<N: TextView>(name: N) -> Collation? {
         if (name.equalsIgnoreAsciiCase("BINARY")) {
             return Collation.Binary;
         }

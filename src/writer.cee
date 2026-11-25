@@ -36,13 +36,13 @@ struct WriterOptions {
 
 struct WriterTable {
     schema: TableSchema;
-    sql: String;
+    sql: ByteString;
     rows: Vector<TableRow>;
 }
 
 struct WriterIndex {
     schema: IndexSchema;
-    sql: String;
+    sql: ByteString;
     /// A partial or expression index's entries, each its key columns and then its rowid; `null` for an index
     /// whose entries come from its table's rows.
     entries: Vector<Vector<SqliteValue>>?;
@@ -51,16 +51,16 @@ struct WriterIndex {
 /// A view or a trigger: a row of sqlite_schema without a b-tree.
 struct WriterObject {
     isTrigger: bool;
-    name: String;
-    table: String;
-    sql: String;
+    name: ByteString;
+    table: ByteString;
+    sql: ByteString;
 }
 
 /// The SQLITE_VERSION_NUMBER recorded in files this writes: the release whose format they follow.
 const WRITER_SQLITE_VERSION: u32 = 3051000;
 
-fn namedConstraintError(message: StringView, name: StringView) -> SqliteError {
-    var text = String.create();
+fn namedConstraintError<N: TextView, M: TextView>(message: N, name: M) -> SqliteError {
+    var text = ByteString.create();
     let _ = text.append(message);
     let _ = text.append(name);
     return constraintError(text.view());
@@ -86,7 +86,8 @@ struct DatabaseWriter {
     }
 
     /// Adds the table that `createSql` defines, and returns its number for `addRow`.
-    fn addTable(borrow mut this, createSql: StringView) -> Result<usize, SqliteError> {
+    fn addTable<N: TextView>(borrow mut this, createSqlText: N) -> Result<usize, SqliteError> {
+        let createSql = ByteStringView.fromBytes(createSqlText.bytes());
         let sql = createSql.trim();
         let Stmt.CreateTable(stmt) = Parser.parseStatement(sql)? else {
             return Err(sqlError("not a CREATE TABLE statement"));
@@ -95,7 +96,7 @@ struct DatabaseWriter {
         if (this.findTable(schema.name.view()).isSome()) {
             return Err(namedConstraintError("there is already a table named ", schema.name.view()));
         }
-        this.tables.push(WriterTable { schema: schema, sql: String.from(sql)?, rows: Vector<TableRow>.create() })?;
+        this.tables.push(WriterTable { schema: schema, sql: ownedText(sql)?, rows: Vector<TableRow>.create() })?;
         return Ok(this.tables.length - 1);
     }
 
@@ -111,11 +112,12 @@ struct DatabaseWriter {
 
     /// Adds the index that `createSql` defines. A partial or expression index needs `entries`: for each row in
     /// the index, its key columns' values and then its rowid.
-    fn addIndex(
+    fn addIndex<N: TextView>(
         borrow mut this,
-        createSql: StringView,
+        createSqlText: N,
         entries: Vector<Vector<SqliteValue>>?,
     ) -> Result<void, SqliteError> {
+        let createSql = ByteStringView.fromBytes(createSqlText.bytes());
         let sql = createSql.trim();
         let Stmt.CreateIndex(stmt) = Parser.parseStatement(sql)? else {
             return Err(sqlError("not a CREATE INDEX statement"));
@@ -132,42 +134,47 @@ struct DatabaseWriter {
         if (this.tables[table].schema.withoutRowid && entries.isSome()) {
             return Err(unsupported("partial and expression indexes on WITHOUT ROWID tables are not supported"));
         }
-        this.indexes.push(WriterIndex { schema: schema, sql: String.from(sql)?, entries: entries })?;
+        this.indexes.push(WriterIndex { schema: schema, sql: ownedText(sql)?, entries: entries })?;
         return Ok();
     }
 
     /// Adds a view, with the statement that defines it.
-    fn addView(borrow mut this, name: StringView, createSql: StringView) -> Result<void, SqliteError> {
+    fn addView<N: TextView, M: TextView>(borrow mut this, nameText: N, createSqlText: M) -> Result<void, SqliteError> {
+        let name = ByteStringView.fromBytes(nameText.bytes());
+        let createSql = ByteStringView.fromBytes(createSqlText.bytes());
         this.objects.push(
             WriterObject {
                 isTrigger: false,
-                name: String.from(name)?,
-                table: String.from(name)?,
-                sql: String.from(createSql.trim())?,
+                name: ownedText(name)?,
+                table: ownedText(name)?,
+                sql: ownedText(createSql.trim())?,
             },
         )?;
         return Ok();
     }
 
     /// Adds a trigger on `table`, with the statement that defines it.
-    fn addTrigger(
+    fn addTrigger<N: TextView, M: TextView, P: TextView>(
         borrow mut this,
-        name: StringView,
-        table: StringView,
-        createSql: StringView,
+        nameText: N,
+        tableText: M,
+        createSqlText: P,
     ) -> Result<void, SqliteError> {
+        let name = ByteStringView.fromBytes(nameText.bytes());
+        let table = ByteStringView.fromBytes(tableText.bytes());
+        let createSql = ByteStringView.fromBytes(createSqlText.bytes());
         this.objects.push(
             WriterObject {
                 isTrigger: true,
-                name: String.from(name)?,
-                table: String.from(table)?,
-                sql: String.from(createSql.trim())?,
+                name: ownedText(name)?,
+                table: ownedText(table)?,
+                sql: ownedText(createSql.trim())?,
             },
         )?;
         return Ok();
     }
 
-    private fn findTable(borrow this, name: StringView) -> usize? {
+    private fn findTable(borrow this, name: ByteStringView) -> usize? {
         for (i in 0..this.tables.length) {
             if (this.tables[i].schema.name.view().equalsIgnoreAsciiCase(name)) {
                 return i;
@@ -235,7 +242,7 @@ struct DatabaseWriter {
         entries: borrow mut Vector<Vector<SqliteValue>>,
         order: borrow IndexOrder,
         uniqueColumns: usize,
-        name: StringView,
+        name: ByteStringView,
     ) -> Result<u32, SqliteError> {
         entries.sortBy((a, b) => order.comparePrefix(a.view(), b.view()));
         var records = Vector<Vector<u8>>.withCapacity(entries.length)?;
@@ -264,7 +271,7 @@ struct DatabaseWriter {
         positions: Slice<usize>,
         order: IndexOrder,
         unique: bool,
-        name: StringView,
+        name: ByteStringView,
     ) -> Result<u32, SqliteError> {
         let schema = borrow table.schema;
         var fullOrder = order;
@@ -380,23 +387,23 @@ struct DatabaseWriter {
     // ── assembly ─────────────────────────────────────────────────────────────────────────────────────────────
 
     /// Adds a row of sqlite_schema as a cell of its b-tree.
-    private fn schemaRow(
+    private fn schemaRow<N: TextView>(
         store: borrow mut PageStore,
         cells: borrow mut Vector<Vector<u8>>,
         rowIds: borrow mut Vector<i64>,
-        kind: StringView,
-        name: StringView,
-        table: StringView,
+        kind: N,
+        name: ByteStringView,
+        table: ByteStringView,
         rootPage: u32,
-        sql: StringView?,
+        sql: ByteStringView?,
     ) -> Result<void, SqliteError> {
         var values = Vector<SqliteValue>.create();
-        values.push(SqliteValue.sqlText(kind)?)?;
-        values.push(SqliteValue.sqlText(name)?)?;
-        values.push(SqliteValue.sqlText(table)?)?;
+        values.push(SqliteValue.ofText(kind)?)?;
+        values.push(SqliteValue.ofText(name)?)?;
+        values.push(SqliteValue.ofText(table)?)?;
         values.push(SqliteValue.Integer(rootPage as i64))?;
         if (sql is Some(text)) {
-            values.push(SqliteValue.sqlText(text)?)?;
+            values.push(SqliteValue.ofText(text)?)?;
         } else {
             values.push(SqliteValue.Null)?;
         }
@@ -441,10 +448,10 @@ struct DatabaseWriter {
                 if (key.primaryKey && schema.withoutRowid) {
                     continue;
                 }
-                var name = String.from("sqlite_autoindex_")?;
+                var name = ownedText("sqlite_autoindex_")?;
                 name.append(schema.name.view())?;
                 name.append("_")?;
-                name.appendNumber(sequence)?;
+                name.appendUnsigned(sequence)?;
                 let positions = DatabaseWriter.keyPositions(schema, key.columns.view())?;
                 let order = DatabaseWriter.keyOrder(schema, key.columns.view())?;
                 let indexRoot = DatabaseWriter.buildTableIndex(

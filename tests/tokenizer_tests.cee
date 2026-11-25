@@ -20,7 +20,7 @@ fn tokenText(sql: StringView) -> String {
             TokenKind.Op => "o",
         })!;
         out.append(":")!;
-        out.append(tokens[i].text.view())!;
+        out.appendLossy(tokens[i].text.view())!;
     }
     return out;
 }

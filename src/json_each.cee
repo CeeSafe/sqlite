@@ -56,7 +56,7 @@ struct JsonEachName {
     jsonb: bool;
 }
 
-fn jsonEachNamed(name: StringView) -> JsonEachName? {
+fn jsonEachNamed(name: ByteStringView) -> JsonEachName? {
     if (name.equalsIgnoreAsciiCase("json_each")) {
         return JsonEachName { recursive: false, jsonb: false };
     }
@@ -119,7 +119,7 @@ fn compileJsonEach(
     let name = f.name.view();
     if (f.args.length > 2) {
         // SQLite names the module as it registered it, in lower case.
-        var message = String.from("too many arguments on ")?;
+        var message = ownedText("too many arguments on ")?;
         message.append(if (kind.jsonb) "jsonb_" else "json_")?;
         message.append(if (kind.recursive) "tree" else "each")?;
         message.append("() - max 2")?;
@@ -132,14 +132,14 @@ fn compileJsonEach(
     for (k in 0..JSON_EACH_COLUMN_COUNT) {
         columns.push(
             ScopeColumn {
-                name: String.from(jsonEachColumnName(k))?,
+                name: ownedText(jsonEachColumnName(k))?,
                 affinity: Affinity.Blob,
                 collation: Collation.Binary,
                 hidden: k >= 8,
             },
         )?;
     }
-    let alias = if (borrow f.alias is Some(a)) a.clone()? else String.from(name)?;
+    let alias = if (borrow f.alias is Some(a)) a.clone()? else ownedText(name)?;
     scope.sources.push(
         ScopeSource {
             name: alias,
@@ -147,7 +147,7 @@ fn compileJsonEach(
             slot: slot,
             hasRowid: false,
             rowidAlias: null,
-            merged: Vector<String>.create(),
+            merged: Vector<ByteString>.create(),
             coalesceMerged: false,
         },
     )?;
@@ -408,7 +408,7 @@ struct JsonEachCursor {
     /// Appends the current element's name in its container to the path (jsonAppendPathName).
     fn appendPathName(borrow mut this) -> Result<void, AllocError> {
         if (this.eType == JSONB_ARRAY) {
-            var text = String.from("[")?;
+            var text = ownedText("[")?;
             text.appendNumber(this.parents[this.parents.length - 1].iKey)?;
             text.append("]")?;
             return this.path.extend(text.view().bytes());
@@ -498,7 +498,7 @@ struct JsonEachCursor {
         } else {
             row.push(jsonReturnFromBlob(blob, i)?)?;
         }
-        row.push(SqliteValue.sqlText(jsonbTypeName(t))?)?;
+        row.push(SqliteValue.ofText(jsonbTypeName(t))?)?;
         row.push(if (t < JSONB_ARRAY) jsonReturnFromBlob(blob, i)? else SqliteValue.Null)?;
         row.push(SqliteValue.Integer(truncate<i64>(this.i)))?;
         let hasParent = this.recursive && this.parents.length > 0;

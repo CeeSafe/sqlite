@@ -19,7 +19,7 @@ struct IndexKeyColumn {
 
 /// An index of a table, as writes keep it.
 struct TableIndex {
-    name: String;
+    name: ByteString;
     root: u32;
     unique: bool;
     columns: Vector<IndexKeyColumn>;
@@ -27,7 +27,7 @@ struct TableIndex {
     /// The order of whole entries: the key's collations and directions, then the rowid.
     order: IndexOrder;
     /// For error messages: "t.a, t.b", or "index 'name'" for an expression index.
-    keyNames: String;
+    keyNames: ByteString;
     /// In a WITHOUT ROWID table: the primary key's columns the entry holds after the indexed ones (those the index
     /// does not already hold), and where in the entry each primary-key column is.
     suffix: Vector<usize>;
@@ -49,7 +49,7 @@ struct TableWriter {
     /// Generated columns, VIRTUAL and STORED, computed in declaration order.
     generated: Vector<GeneratedColumn>;
     checks: Vector<XExpr>;
-    checkNames: Vector<String>;
+    checkNames: Vector<ByteString>;
     triggers: Vector<TriggerPlan>;
     /// A WITHOUT ROWID table's primary key; no columns for a rowid table.
     primaryKey: PrimaryKeyColumns;
@@ -74,7 +74,7 @@ impl RowKey {
 struct PrimaryKeyColumns {
     columns: Vector<usize>;
     order: IndexOrder;
-    names: String;
+    names: ByteString;
 }
 
 fn copyOrder(order: borrow IndexOrder) -> Result<IndexOrder, AllocError> {
@@ -90,7 +90,11 @@ fn copyOrder(order: borrow IndexOrder) -> Result<IndexOrder, AllocError> {
 
 /// The primary key of a WITHOUT ROWID table (none for a rowid table).
 fn withoutRowidKey(table: borrow TableSchema) -> Result<PrimaryKeyColumns, SqliteError> {
-    var key = PrimaryKeyColumns { columns: Vector<usize>.create(), order: IndexOrder.plain(), names: String.create() };
+    var key = PrimaryKeyColumns {
+        columns: Vector<usize>.create(),
+        order: IndexOrder.plain(),
+        names: ByteString.create(),
+    };
     if (!table.withoutRowid) {
         return Ok(key);
     }
@@ -138,12 +142,12 @@ fn addKeySuffix(
 }
 
 fn tableScope(table: borrow TableSchema, slot: usize) -> Result<Scope, AllocError> {
-    let none: String? = null;
+    let none: ByteString? = null;
     return tableScopeNamed(table, slot, borrow none);
 }
 
 /// The table's scope, its row named by `alias` when there is one (`UPDATE t AS x`), else by the table's name.
-fn tableScopeNamed(table: borrow TableSchema, slot: usize, alias: borrow String?) -> Result<Scope, AllocError> {
+fn tableScopeNamed(table: borrow TableSchema, slot: usize, alias: borrow ByteString?) -> Result<Scope, AllocError> {
     var scope = Scope { sources: Vector<ScopeSource>.create() };
     scope.sources.push(
         ScopeSource {
@@ -152,7 +156,7 @@ fn tableScopeNamed(table: borrow TableSchema, slot: usize, alias: borrow String?
             slot: slot,
             hasRowid: !table.withoutRowid,
             rowidAlias: table.rowidAlias,
-            merged: Vector<String>.create(), coalesceMerged: false,
+            merged: Vector<ByteString>.create(), coalesceMerged: false,
         },
     )?;
     return Ok(scope);
@@ -173,13 +177,14 @@ fn compileInTable(
     return result;
 }
 
-fn appendKeyName(out: borrow mut String, table: borrow TableSchema, column: usize) -> Result<void, AllocError> {
-    if (out.length != 0) {
+fn appendKeyName(out: borrow mut ByteString, table: borrow TableSchema, column: usize) -> Result<void, AllocError> {
+    if (out.length() != 0) {
         out.append(", ")?;
     }
     out.append(table.name.view())?;
     out.append(".")?;
-    return out.append(table.columns[column].name.view());
+    out.append(table.columns[column].name.view())?;
+    return Ok();
 }
 
 /// The indexes of a table: its automatic ones (for PRIMARY KEY and UNIQUE) and the ones CREATE INDEX made.
@@ -192,7 +197,7 @@ fn tableIndexes(
     var out = Vector<TableIndex>.create();
     let primaryKey = withoutRowidKey(table)?;
     // Automatic indexes have no SQL; sqlite_autoindex_T_N is the N-th of the table's key constraints.
-    var prefix = String.from("sqlite_autoindex_")?;
+    var prefix = ownedText("sqlite_autoindex_")?;
     prefix.append(table.name.view())?;
     prefix.append("_")?;
     for (e in 0..db.entries.length) {
@@ -203,10 +208,10 @@ fn tableIndexes(
             continue;
         }
         let name = entry.name.view();
-        if (name.length <= prefix.length || !startsWithIgnoreAsciiCase(name, prefix.view())) {
+        if (name.length() <= prefix.length() || !name.startsWithIgnoreAsciiCase(prefix.view())) {
             continue;
         }
-        let n = name[prefix.length..].parseInt<usize>() ?? 0;
+        let n = parseUsize(name.sliceFrom(prefix.length())) ?? 0;
         // A WITHOUT ROWID table's primary key, which is the table itself, keeps its number.
         var key: usize? = null;
         if (n >= 1 && n <= table.keys.length && !(table.keys[n - 1].primaryKey && table.withoutRowid)) {
@@ -217,7 +222,7 @@ fn tableIndexes(
         };
         var columns = Vector<IndexKeyColumn>.create();
         var order = IndexOrder.plain();
-        var keyNames = String.create();
+        var keyNames = ByteString.create();
         for (c in 0..table.keys[k].columns.length) {
             let kc = borrow table.keys[k].columns[c];
             let at = table.indexOf(kc.name.view()) ?? {
@@ -263,7 +268,7 @@ fn tableIndexes(
         let schema = buildIndexSchema(cloneIndexStmt(borrow stmt)?, name.view(), root, table)?;
         var columns = Vector<IndexKeyColumn>.create();
         var order = IndexOrder.plain();
-        var keyNames = String.create();
+        var keyNames = ByteString.create();
         var plainKey = true;
         for (c in 0..schema.columns.length) {
             let ic = borrow schema.columns[c];
@@ -281,7 +286,7 @@ fn tableIndexes(
             order.descending.push(ic.descending)?;
         }
         if (!plainKey) {
-            keyNames = String.from("index '")?;
+            keyNames = ownedText("index '")?;
             keyNames.append(name.view())?;
             keyNames.append("'")?;
         }
@@ -340,7 +345,7 @@ impl TableWriter {
     /// Everything needed to write to the table `name`.
     fn create(
         compiler: borrow mut Compiler,
-        name: StringView,
+        name: ByteStringView,
         db: borrow mut Session,
     ) -> Result<TableWriter, SqliteError> {
         let table = db.catalog.tableCopy(name)?;
@@ -370,7 +375,7 @@ impl TableWriter {
             }
         }
         var checks = Vector<XExpr>.create();
-        var checkNames = Vector<String>.create();
+        var checkNames = Vector<ByteString>.create();
         for (k in 0..table.checks.length) {
             checks.push(compileInTable(compiler, borrow table.checks[k].expr, borrow table, slot, db)?)?;
             checkNames.push(table.checks[k].text.clone()?)?;
@@ -764,7 +769,7 @@ impl TableWriter {
                     }
                 }
             }
-            var message = String.from("NOT NULL constraint failed: ")?;
+            var message = ownedText("NOT NULL constraint failed: ")?;
             message.append(this.table.name.view())?;
             message.append(".")?;
             message.append(column.name.view())?;
@@ -776,7 +781,7 @@ impl TableWriter {
                 if (action == Some(ConflictAction.Ignore)) {
                     return Ok(false);
                 }
-                var message = String.from("CHECK constraint failed: ")?;
+                var message = ownedText("CHECK constraint failed: ")?;
                 message.append(this.checkNames[k].view())?;
                 return Err(conflictError(db, action ?? ConflictAction.Abort, message));
             }
@@ -785,8 +790,8 @@ impl TableWriter {
     }
 
     /// The message of a PRIMARY KEY conflict on the table itself.
-    fn keyConflictMessage(borrow this) -> Result<String, AllocError> {
-        var message = String.from("UNIQUE constraint failed: ")?;
+    fn keyConflictMessage(borrow this) -> Result<ByteString, AllocError> {
+        var message = ownedText("UNIQUE constraint failed: ")?;
         if (this.table.withoutRowid) {
             message.append(this.primaryKey.names.view())?;
             return Ok(message);
@@ -861,7 +866,7 @@ impl TableWriter {
                     return Ok(false);
                 }
                 if (!replacing) {
-                    var message = String.from("UNIQUE constraint failed: ")?;
+                    var message = ownedText("UNIQUE constraint failed: ")?;
                     message.append(index.keyNames.view())?;
                     return Err(conflictError(db, effective, message));
                 }
@@ -1060,14 +1065,14 @@ fn executeInsert(
                 at = table.columns.length;
             }
             let found = at ?? {
-                var message = String.from("table ")?;
+                var message = ownedText("table ")?;
                 message.append(table.name.view())?;
                 message.append(" has no column named ")?;
                 message.append(name)?;
                 return Err(sqlError(message.view()));
             };
             if (found < table.columns.length && table.columns[found].generated.isSome()) {
-                var message = String.from("cannot INSERT into generated column \"")?;
+                var message = ownedText("cannot INSERT into generated column \"")?;
                 message.append(name)?;
                 message.append("\"")?;
                 return Err(sqlError(message.view()));
@@ -1090,19 +1095,19 @@ fn executeInsert(
     var count: i64 = 0;
     for (given in rows.drain()) {
         if (given.length != targets.length) {
-            var message = String.create();
+            var message = ByteString.create();
             if (stmt.columns.length == 0) {
                 message.append("table ")?;
                 message.append(table.name.view())?;
                 message.append(" has ")?;
-                message.appendNumber(targets.length)?;
+                message.appendUnsigned(targets.length as u64)?;
                 message.append(" columns but ")?;
-                message.appendNumber(given.length)?;
+                message.appendUnsigned(given.length as u64)?;
                 message.append(" values were supplied")?;
             } else {
-                message.appendNumber(given.length)?;
+                message.appendUnsigned(given.length as u64)?;
                 message.append(" values for ")?;
-                message.appendNumber(targets.length)?;
+                message.appendUnsigned(targets.length as u64)?;
                 message.append(" columns")?;
             }
             return Err(sqlError(message.view()));
@@ -1250,9 +1255,7 @@ fn executeInsert(
     db.totalChanges += count;
     return Ok(
         QueryResult {
-            columns: columnNamesOf(
-                returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
-            )?,
+            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
             rows: output,
         },
     );
@@ -1284,10 +1287,10 @@ fn compileReturning(
 /// RETURNING's column names, as SQLite gives them: an alias; a column's declared name; else the text as written.
 fn returningNames(
     columns: borrow Vector<ResultColumn>,
-    texts: borrow Vector<String>,
+    texts: borrow Vector<ByteString>,
     table: borrow TableSchema,
-) -> Result<Vector<String>, AllocError> {
-    var names = Vector<String>.create();
+) -> Result<Vector<ByteString>, AllocError> {
+    var names = Vector<ByteString>.create();
     for (i in 0..columns.length) {
         match (borrow columns[i]) {
             ResultColumn.Expr(e, alias) => {
@@ -1297,9 +1300,9 @@ fn returningNames(
                     names.push(table.columns[at].name.clone()?)?;
                 } else if (e is Expr.Column(c) && isRowidName(c.name.view())) {
                     names.push(
-                        if (table.rowidAlias is Some(at)) table.columns[at].name.clone()? else String.from("rowid")?,
+                        if (table.rowidAlias is Some(at)) table.columns[at].name.clone()? else ownedText("rowid")?,
                     )?;
-                } else if (i < texts.length && texts[i].length != 0) {
+                } else if (i < texts.length && texts[i].length() != 0) {
                     names.push(texts[i].clone()?)?;
                 } else {
                     names.push(defaultColumnName(e)?)?;
@@ -1452,9 +1455,7 @@ fn executeDelete(
     db.totalChanges += db.changes;
     return Ok(
         QueryResult {
-            columns: columnNamesOf(
-                returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
-            )?,
+            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
             rows: output,
         },
     );
@@ -1468,7 +1469,7 @@ struct Assignments {
 }
 
 /// The column `name` of a SET: its position, or the column count for the rowid itself.
-fn assignmentTarget(name: StringView, table: borrow TableSchema) -> Result<usize, SqliteError> {
+fn assignmentTarget(name: ByteStringView, table: borrow TableSchema) -> Result<usize, SqliteError> {
     var at = table.indexOf(name);
     if (at.isNull() && isRowidName(name)) {
         at = table.rowidAlias ?? table.columns.length;
@@ -1477,7 +1478,7 @@ fn assignmentTarget(name: StringView, table: borrow TableSchema) -> Result<usize
         return Err(namedError("no such column: ", name));
     };
     if (found < table.columns.length && table.columns[found].generated.isSome()) {
-        var message = String.from("cannot UPDATE generated column \"")?;
+        var message = ownedText("cannot UPDATE generated column \"")?;
         message.append(name)?;
         message.append("\"")?;
         return Err(sqlError(message.view()));
@@ -1680,9 +1681,7 @@ fn executeUpdate(
     db.totalChanges += count;
     return Ok(
         QueryResult {
-            columns: columnNamesOf(
-                returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
-            )?,
+            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
             rows: output,
         },
     );
@@ -1775,13 +1774,13 @@ fn compileUpserts(
         let saved = replace(mut compiler.scopes, compiler.freshScopes()?);
         var scope = tableScopeNamed(table, writer.slot, borrow stmt.alias)?;
         // Unqualified names are the table's: "excluded" is named only when written.
-        var hidden = Vector<String>.create();
+        var hidden = Vector<ByteString>.create();
         for (c in 0..table.columns.length) {
             hidden.push(table.columns[c].name.clone()?)?;
         }
         scope.sources.push(
             ScopeSource {
-                name: String.from("excluded")?,
+                name: ownedText("excluded")?,
                 columns: tableScopeColumns(table)?,
                 slot: excludedSlot,
                 hasRowid: true,
@@ -1833,13 +1832,13 @@ fn executeUpdateFrom(
     }
     // SELECT <what names the row>, value, … FROM t, <from> WHERE <filter>: the rowid, or the primary key.
     var columns = Vector<ResultColumn>.withCapacity(stmt.assignments.length + 1)?;
-    var keyNames = Vector<String>.create();
+    var keyNames = Vector<ByteString>.create();
     if (writer.table.withoutRowid) {
         for (k in 0..writer.primaryKey.columns.length) {
             keyNames.push(writer.table.columns[writer.primaryKey.columns[k]].name.clone()?)?;
         }
     } else {
-        keyNames.push(String.from("rowid")?)?;
+        keyNames.push(ownedText("rowid")?)?;
     }
     let keyLength = keyNames.length;
     for (k in 0..keyNames.length) {
@@ -1847,7 +1846,7 @@ fn executeUpdateFrom(
             ColumnRef {
                 schema: null,
                 table: if (borrow stmt.alias is Some(a)) a.clone()? else stmt.table.name.clone()?,
-                name: replace(mut keyNames[k], String.create()),
+                name: replace(mut keyNames[k], ByteString.create()),
                 doubleQuoted: false,
             },
         );
@@ -1892,7 +1891,7 @@ fn executeUpdateFrom(
             having: null,
             windows: Vector<NamedWindow>.create(),
             isValues: false,
-            columnTexts: Vector<String>.create(),
+            columnTexts: Vector<ByteString>.create(),
         },
     )?;
     let select = SelectStmt {
@@ -1961,16 +1960,14 @@ fn executeUpdateFrom(
     db.totalChanges += count;
     return Ok(
         QueryResult {
-            columns: columnNamesOf(
-                returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
-            )?,
+            columns: returningNames(borrow stmt.returning, borrow stmt.returningTexts, borrow writer.table)?,
             rows: output,
         },
     );
 }
 
 /// A constraint's failure, noting for the session an OR FAIL or OR ROLLBACK that decides what it undoes.
-fn conflictError(db: borrow mut Session, action: ConflictAction, message: String) -> SqliteError {
+fn conflictError(db: borrow mut Session, action: ConflictAction, message: ByteString) -> SqliteError {
     if (action == ConflictAction.Fail || action == ConflictAction.Rollback) {
         db.conflictFailure = action;
     }

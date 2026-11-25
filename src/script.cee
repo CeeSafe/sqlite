@@ -51,7 +51,7 @@ fn nextScriptState(state: u8, token: ScriptToken) -> u8 {
 }
 
 /// The class of the word `word`.
-fn scriptWord(word: StringView) -> ScriptToken {
+fn scriptWord(word: ByteStringView) -> ScriptToken {
     if (word.equalsIgnoreAsciiCase("create")) {
         return ScriptToken.Create;
     }
@@ -72,8 +72,8 @@ fn scriptWord(word: StringView) -> ScriptToken {
 
 /// Where the quoted text or comment starting at `at` ends: past its closing quote, or the script's end when
 /// it is not closed (the parser then reports it).
-fn skipQuoted(text: StringView, at: usize, close: u8) -> usize {
-    let n = text.length;
+fn skipQuoted(text: ByteStringView, at: usize, close: u8) -> usize {
+    let n = text.length();
     var i = at + 1;
     while (i < n) {
         if (text[i] == close) {
@@ -90,9 +90,10 @@ fn skipQuoted(text: StringView, at: usize, close: u8) -> usize {
 
 /// The statements of the script `sql`, in order. Empty statements (stray semicolons, comments alone) are left
 /// out; text after the last semicolon is a statement when it has any token.
-public fn splitScript(sql: StringView) -> Result<Vector<StatementSpan>, AllocError> {
+public fn splitScript<N: TextView>(sqlText: N) -> Result<Vector<StatementSpan>, AllocError> {
+    let sql = ByteStringView.fromBytes(sqlText.bytes());
     var spans = Vector<StatementSpan>.create();
-    let n = sql.length;
+    let n = sql.length();
     var state: u8 = 0;
     // The current statement's first token and the end of its last one, while it has one.
     var first: usize? = null;
@@ -128,7 +129,7 @@ public fn splitScript(sql: StringView) -> Result<Vector<StatementSpan>, AllocErr
             while (i < n && isSqlIdChar(sql[i])) {
                 i += 1;
             }
-            token = scriptWord(sql[start..i]);
+            token = scriptWord(sql.slice(start, i));
         } else {
             i += 1;
         }
@@ -167,11 +168,12 @@ public fn splitScript(sql: StringView) -> Result<Vector<StatementSpan>, AllocErr
 }
 
 /// The text of each statement of the script `sql`, as `splitScript` finds them.
-public fn splitStatements(sql: StringView) -> Result<Vector<String>, AllocError> {
+public fn splitStatements<N: TextView>(sqlText: N) -> Result<Vector<ByteString>, AllocError> {
+    let sql = ByteStringView.fromBytes(sqlText.bytes());
     let spans = splitScript(sql)?;
-    var list = Vector<String>.create();
+    var list = Vector<ByteString>.create();
     for (i in 0..spans.length) {
-        list.push(String.from(sql[spans[i].start..spans[i].end])?)?;
+        list.push(ownedText(sql.slice(spans[i].start, spans[i].end))?)?;
     }
     return Ok(list);
 }

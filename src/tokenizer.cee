@@ -32,7 +32,7 @@ enum TokenKind {
 
 struct Token {
     kind: TokenKind;
-    text: String;
+    text: ByteString;
     /// Where the token starts in the SQL text, for error messages.
     offset: usize;
     /// Where the token ends in the SQL text.
@@ -59,15 +59,15 @@ fn isSqlIdStart(c: u8) -> bool => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z
 fn isSqlIdChar(c: u8) -> bool => isSqlIdStart(c) || isSqlDigit(c) || c == '$';
 
 struct Tokenizer<region r> {
-    private text: StringView<r>;
+    private text: ByteStringView<r>;
     private at: usize;
     private tokens: Vector<Token>;
 
     /// SQLite's error for a token it cannot read: `unrecognized token: "…"`, with the token's text.
     private fn unrecognized(borrow this, start: usize, end: usize) -> SqliteError {
-        let stop = end.min(this.text.length).max(start);
-        var text = String.from("unrecognized token: \"").ok() ?? String.create();
-        let _ = text.append(this.text[start..stop]);
+        let stop = end.min(this.text.length()).max(start);
+        var text = ownedText("unrecognized token: \"").ok() ?? ByteString.create();
+        let _ = text.append(this.text.slice(start, stop));
         let _ = text.append("\"");
         return sqlError(text.view());
     }
@@ -75,21 +75,22 @@ struct Tokenizer<region r> {
     /// Where a token that runs into letters ends: the letters, digits and `$` after `start`.
     private fn wordEnd(borrow this, start: usize) -> usize {
         var end = start;
-        while (end < this.text.length && (isSqlIdChar(this.text[end]) || this.text[end] == '.')) {
+        while (end < this.text.length() && (isSqlIdChar(this.text[end]) || this.text[end] == '.')) {
             end += 1;
         }
         return end;
     }
 
     /// The tokens of `sql`, ending with one of kind `Eof`.
-    fn tokenize(sql: StringView) -> Result<Vector<Token>, SqliteError> {
+    fn tokenize<N: TextView>(sqlText: N) -> Result<Vector<Token>, SqliteError> {
+        let sql = ByteStringView.fromBytes(sqlText.bytes());
         var t = Tokenizer { text: sql, at: 0, tokens: Vector<Token>.create() };
         t.run()?;
         return Ok(t.tokens);
     }
 
     private fn peek(borrow this, ahead: usize) -> u8 =>
-        if (this.at + ahead < this.text.length) this.text[this.at + ahead] else 0;
+        if (this.at + ahead < this.text.length()) this.text[this.at + ahead] else 0;
 
     private fn add(
         borrow mut this,
@@ -101,7 +102,7 @@ struct Tokenizer<region r> {
         this.tokens.push(
             Token {
                 kind: kind,
-                text: String.from(this.text[start..end])?,
+                text: ownedText(this.text.slice(start, end))?,
                 offset: offset,
                 end: if (kind == TokenKind.BlobLit || kind == TokenKind.QuotedId) end + 1 else end,
                 doubleQuoted: false,
@@ -111,7 +112,7 @@ struct Tokenizer<region r> {
     }
 
     private fn run(borrow mut this) -> Result<void, SqliteError> {
-        let n = this.text.length;
+        let n = this.text.length();
         while (this.at < n) {
             let start = this.at;
             let c = this.text[start];
@@ -213,7 +214,9 @@ struct Tokenizer<region r> {
             this.add(TokenKind.Op, start, start + length, start)?;
             this.at += length;
         }
-        this.tokens.push(Token { kind: TokenKind.Eof, text: String.create(), offset: n, end: n, doubleQuoted: false })?;
+        this.tokens.push(
+            Token { kind: TokenKind.Eof, text: ByteString.create(), offset: n, end: n, doubleQuoted: false },
+        )?;
         return Ok();
     }
 
@@ -258,7 +261,7 @@ struct Tokenizer<region r> {
 
     /// Digits, with single underscores between them.
     private fn digits(borrow mut this, hex: bool, numberStart: usize) -> Result<void, SqliteError> {
-        let n = this.text.length;
+        let n = this.text.length();
         let start = this.at;
         while (this.at < n) {
             let c = this.text[this.at];
@@ -279,7 +282,7 @@ struct Tokenizer<region r> {
     }
 
     private fn number(borrow mut this) -> Result<void, SqliteError> {
-        let n = this.text.length;
+        let n = this.text.length();
         let start = this.at;
         var kind = TokenKind.IntLit;
         if (this.text[start] == '0' && (this.peek(1) == 'x' || this.peek(1) == 'X')) {
@@ -310,24 +313,24 @@ struct Tokenizer<region r> {
             return Err(this.unrecognized(start, this.wordEnd(start)));
         }
         // The token's text is the number without its separators.
-        var text = String.withCapacity(this.at - start)?;
+        var text = ByteString.withCapacity(this.at - start)?;
         var from = start;
         for (i in start..this.at) {
             if (this.text[i] == '_') {
-                text.append(this.text[from..i])?;
+                text.append(this.text.slice(from, i))?;
                 from = i + 1;
             }
         }
-        text.append(this.text[from..this.at])?;
+        text.append(this.text.slice(from, this.at))?;
         this.tokens.push(Token { kind: kind, text: text, offset: start, end: this.at, doubleQuoted: false })?;
         return Ok();
     }
 
     /// A literal between two `delimiter`s, in which a doubled delimiter stands for one.
     private fn delimited(borrow mut this, delimiter: u8, kind: TokenKind) -> Result<void, SqliteError> {
-        let n = this.text.length;
+        let n = this.text.length();
         let start = this.at;
-        var text = String.create();
+        var text = ByteString.create();
         var from = start + 1;
         var i = from;
         loop {
@@ -338,7 +341,7 @@ struct Tokenizer<region r> {
                 i += 1;
                 continue;
             }
-            text.append(this.text[from..i])?;
+            text.append(this.text.slice(from, i))?;
             if (i + 1 < n && this.text[i + 1] == delimiter) {
                 from = i + 1;
                 i += 2;

@@ -19,7 +19,7 @@
 /// How a table's rows are read into a slot.
 struct TablePlan {
     /// The table's name, as its schema has it.
-    name: String;
+    name: ByteString;
     /// The database it is in (main is 0; see Session.databaseNames).
     database: usize;
     root: u32;
@@ -49,7 +49,7 @@ enum SourceKind {
     /// A recursive CTE's current step.
     Working(usize),
     /// A pragma_* table-valued function: the pragma's name and its argument.
-    Pragma(String, XExpr?),
+    Pragma(ByteString, XExpr?),
     /// json_each, json_tree, jsonb_each or jsonb_tree (json_each.cee).
     JsonEach(JsonEachPlan),
 }
@@ -108,7 +108,7 @@ struct SelectPlan {
     compoundOrder: Vector<ColumnOrder>;
     limit: XExpr?;
     offset: XExpr?;
-    columnNames: Vector<String>;
+    columnNames: Vector<ByteString>;
     columnAffinities: Vector<ExprAffinity>;
     columnCollations: Vector<Collation?>;
     firstColumnAffinity: ExprAffinity;
@@ -140,14 +140,14 @@ struct SortedRow {
 
 /// What a core's result column gives: its expression and the name it shows.
 struct OutputColumn {
-    name: String;
+    name: ByteString;
     affinity: ExprAffinity;
     collation: Collation?;
 }
 
-fn ordinalWord(n: usize) -> Result<String, AllocError> {
-    var s = String.create();
-    s.appendNumber(n)?;
+fn ordinalWord(n: usize) -> Result<ByteString, AllocError> {
+    var s = ByteString.create();
+    s.appendUnsigned(n as u64)?;
     s.append(match (n) {
         1 => "st",
         2 => "nd",
@@ -157,13 +157,13 @@ fn ordinalWord(n: usize) -> Result<String, AllocError> {
     return Ok(s);
 }
 
-fn termError(n: usize, clause: StringView, message: StringView, count: usize) -> SqliteError {
-    var s = ordinalWord(n).ok() ?? String.create();
+fn termError<N: TextView, M: TextView>(n: usize, clause: N, message: M, count: usize) -> SqliteError {
+    var s = ordinalWord(n).ok() ?? ByteString.create();
     let _ = s.append(" ");
     let _ = s.append(clause);
     let _ = s.append(message);
     if (count != 0) {
-        let _ = s.appendNumber(count);
+        let _ = s.appendUnsigned(count as u64);
     }
     return sqlError(s.view());
 }
@@ -171,7 +171,7 @@ fn termError(n: usize, clause: StringView, message: StringView, count: usize) ->
 /// A literal positive integer term: an ordinal.
 fn ordinalOf(e: borrow Expr) -> i64? {
     if (e is Expr.Literal(Literal { kind: LiteralKind.Integer, text })) {
-        return text.view().parseInt<i64>();
+        return parseI64(text.view());
     }
     return null;
 }
@@ -276,10 +276,10 @@ fn resultColumnName(
     core: borrow SelectCore,
     i: usize,
     e: borrow Expr,
-) -> Result<String, AllocError> {
+) -> Result<ByteString, AllocError> {
     if (core.isValues) {
-        var name = String.from("column")?;
-        name.appendNumber(i + 1)?;
+        var name = ownedText("column")?;
+        name.appendUnsigned((i + 1) as u64)?;
         return Ok(name);
     }
     if (e is Expr.Column(c)) {
@@ -312,18 +312,18 @@ fn resultColumnName(
                         break;
                     }
                 }
-                return String.from("rowid");
+                return ownedText("rowid");
             }
         }
         return c.name.clone();
     }
-    if (i < core.columnTexts.length && core.columnTexts[i].length != 0) {
+    if (i < core.columnTexts.length && core.columnTexts[i].length() != 0) {
         return core.columnTexts[i].clone();
     }
     return defaultColumnName(e);
 }
 
-fn defaultColumnName(e: borrow Expr) -> Result<String, AllocError> {
+fn defaultColumnName(e: borrow Expr) -> Result<ByteString, AllocError> {
     if (e is Expr.Column(c)) {
         return c.name.clone();
     }
@@ -343,12 +343,15 @@ fn tableScopeColumns(table: borrow TableSchema) -> Result<Vector<ScopeColumn>, A
 }
 
 /// A plan's result columns as names see them, for a subquery, view or CTE in FROM.
-fn planScopeColumns(plan: borrow SelectPlan, names: borrow Vector<String>) -> Result<Vector<ScopeColumn>, SqliteError> {
+fn planScopeColumns(
+    plan: borrow SelectPlan,
+    names: borrow Vector<ByteString>,
+) -> Result<Vector<ScopeColumn>, SqliteError> {
     if (names.length != 0 && names.length != plan.columnNames.length) {
-        var message = String.from("table has ")?;
-        message.appendNumber(plan.columnNames.length)?;
+        var message = ownedText("table has ")?;
+        message.appendUnsigned(plan.columnNames.length as u64)?;
         message.append(" values for ")?;
-        message.appendNumber(names.length)?;
+        message.appendUnsigned(names.length as u64)?;
         message.append(" columns")?;
         return Err(sqlError(message.view()));
     }
@@ -435,7 +438,7 @@ fn tablePlan(
                     slot: slot,
                     hasRowid: !table.withoutRowid,
                     rowidAlias: table.rowidAlias,
-                    merged: Vector<String>.create(), coalesceMerged: false,
+                    merged: Vector<ByteString>.create(), coalesceMerged: false,
                 },
             )?;
             let saved = replace(mut compiler.scopes, Vector<Scope>.create());
@@ -483,7 +486,7 @@ fn constantValue(e: borrow Expr) -> Result<SqliteValue?, SqliteError> {
     }
 }
 
-fn findCte(compiler: borrow Compiler, name: StringView) -> usize? {
+fn findCte(compiler: borrow Compiler, name: ByteStringView) -> usize? {
     var i = compiler.cteNames.length;
     while (i > 0) {
         i -= 1;
@@ -526,7 +529,7 @@ fn compileWith(
 }
 
 /// Whether a SELECT's FROM clauses name `name` (a CTE referring to itself).
-fn selectRefersTo(select: borrow SelectStmt, name: StringView) -> bool {
+fn selectRefersTo(select: borrow SelectStmt, name: ByteStringView) -> bool {
     for (c in 0..select.cores.length) {
         if (borrow select.cores[c].from is Some(from)) {
             if (fromItemRefersTo(borrow from.source, name)) {
@@ -542,7 +545,7 @@ fn selectRefersTo(select: borrow SelectStmt, name: StringView) -> bool {
     return false;
 }
 
-fn fromItemRefersTo(item: borrow FromItem, name: StringView) -> bool => match (item) {
+fn fromItemRefersTo(item: borrow FromItem, name: ByteStringView) -> bool => match (item) {
     FromItem.Table(t) => t.name.schema.isNull() && t.name.name.view().equalsIgnoreAsciiCase(name),
     FromItem.Subquery(s) => selectRefersTo(borrow s.select, name),
     _ => false,
@@ -681,7 +684,7 @@ fn compileCores(
         compoundOrder: Vector<ColumnOrder>.create(),
         limit: null,
         offset: null,
-        columnNames: Vector<String>.create(),
+        columnNames: Vector<ByteString>.create(),
         columnAffinities: Vector<ExprAffinity>.create(),
         columnCollations: Vector<Collation?>.create(),
         firstColumnAffinity: ExprAffinity.None,
@@ -700,7 +703,7 @@ fn compileCores(
             }
         } else if (outputs.length != plan.columnNames.length) {
             let op = select.compoundOps[c - 1];
-            var message = String.from("SELECTs to the left and right of ")?;
+            var message = ownedText("SELECTs to the left and right of ")?;
             message.append(match (op) {
                 CompoundOp.Union => "UNION",
                 CompoundOp.UnionAll => "UNION ALL",
@@ -749,7 +752,7 @@ fn compileFromItem(
                             slot: slot,
                             hasRowid: false,
                             rowidAlias: null,
-                            merged: Vector<String>.create(), coalesceMerged: false,
+                            merged: Vector<ByteString>.create(), coalesceMerged: false,
                         },
                     )?;
                     sources.push(
@@ -795,7 +798,7 @@ fn compileFromItem(
                         slot: slot,
                         hasRowid: true,
                         rowidAlias: null,
-                        merged: Vector<String>.create(), coalesceMerged: false,
+                        merged: Vector<ByteString>.create(), coalesceMerged: false,
                     },
                 )?;
                 sources.push(
@@ -832,7 +835,7 @@ fn compileFromItem(
                         slot: slot,
                         hasRowid: !tableCopy.withoutRowid,
                         rowidAlias: tableCopy.rowidAlias,
-                        merged: Vector<String>.create(), coalesceMerged: false,
+                        merged: Vector<ByteString>.create(), coalesceMerged: false,
                     },
                 )?;
                 sources.push(
@@ -880,7 +883,7 @@ fn compileFromItem(
                         slot: slot,
                         hasRowid: false,
                         rowidAlias: null,
-                        merged: Vector<String>.create(), coalesceMerged: false,
+                        merged: Vector<ByteString>.create(), coalesceMerged: false,
                     },
                 )?;
                 sources.push(
@@ -900,7 +903,7 @@ fn compileFromItem(
                 return Ok();
             }
             // SQLite names the table with the schema that was written: `no such table: aux.t`.
-            var missing = String.create();
+            var missing = ByteString.create();
             if (borrow t.name.schema is Some(schema)) {
                 missing.append(schema.view())?;
                 missing.append(".")?;
@@ -910,10 +913,10 @@ fn compileFromItem(
         }
         FromItem.Subquery(sub) => {
             let plan = compileSelect(compiler, borrow sub.select, db)?;
-            let none = Vector<String>.create();
+            let none = Vector<ByteString>.create();
             let columns = planScopeColumns(borrow plan, borrow none)?;
             let count = columns.length;
-            var name = String.create();
+            var name = ByteString.create();
             if (borrow sub.alias is Some(a)) {
                 name = a.clone()?;
             }
@@ -924,7 +927,7 @@ fn compileFromItem(
                     slot: slot,
                     hasRowid: false,
                     rowidAlias: null,
-                    merged: Vector<String>.create(), coalesceMerged: false,
+                    merged: Vector<ByteString>.create(), coalesceMerged: false,
                 },
             )?;
             sources.push(
@@ -949,8 +952,8 @@ fn compileFromItem(
                 sources.push(compileJsonEach(compiler, f, kind, slot, scope, db)?)?;
                 return Ok();
             }
-            let isPragma = name.length > 7 && startsWithIgnoreAsciiCase(name, "pragma_");
-            let columnNames = (if (isPragma) pragmaColumns(name[7..]) else null) ?? {
+            let isPragma = name.length() > 7 && name.startsWithIgnoreAsciiCase("pragma_");
+            let columnNames = (if (isPragma) pragmaColumns(name.sliceFrom(7)) else null) ?? {
                 return Err(namedError("no such table: ", name));
             };
             var argument: XExpr? = null;
@@ -964,7 +967,7 @@ fn compileFromItem(
             for (c in columnNames) {
                 columns.push(
                     ScopeColumn {
-                        name: String.from(c)?,
+                        name: ownedText(c)?,
                         affinity: Affinity.Blob,
                         collation: Collation.Binary,
                         hidden: false,
@@ -973,14 +976,14 @@ fn compileFromItem(
             }
             columns.push(
                 ScopeColumn {
-                    name: String.from("arg")?,
+                    name: ownedText("arg")?,
                     affinity: Affinity.Blob,
                     collation: Collation.Binary,
                     hidden: true,
                 },
             )?;
             let count = columns.length;
-            let alias = if (borrow f.alias is Some(a)) a.clone()? else String.from(name)?;
+            let alias = if (borrow f.alias is Some(a)) a.clone()? else ownedText(name)?;
             scope.sources.push(
                 ScopeSource {
                     name: alias,
@@ -988,12 +991,12 @@ fn compileFromItem(
                     slot: slot,
                     hasRowid: false,
                     rowidAlias: null,
-                    merged: Vector<String>.create(), coalesceMerged: false,
+                    merged: Vector<ByteString>.create(), coalesceMerged: false,
                 },
             )?;
             sources.push(
                 SourcePlan {
-                    kind: SourceKind.Pragma(String.from(name[7..])?, argument),
+                    kind: SourceKind.Pragma(ownedText(name.sliceFrom(7))?, argument),
                     slot: slot,
                     columnCount: count,
                     left: false,
@@ -1026,7 +1029,7 @@ fn cloneScopeColumns(columns: borrow Vector<ScopeColumn>) -> Result<Vector<Scope
 }
 
 /// `left = right` for a NATURAL or USING join, on the slots' columns.
-fn joinEquality(scope: borrow Scope, name: StringView, rightIndex: usize) -> Result<XExpr?, SqliteError> {
+fn joinEquality(scope: borrow Scope, name: ByteStringView, rightIndex: usize) -> Result<XExpr?, SqliteError> {
     let right = borrow scope.sources[rightIndex];
     let rightColumn = Compiler.findColumn(right, name) ?? {
         return Ok(null);
@@ -1100,14 +1103,14 @@ fn compileCoreInner(
             sources[at].left = join.kind == JoinKind.Left || join.kind == JoinKind.Full;
             sources[at].right = join.kind == JoinKind.Right || join.kind == JoinKind.Full;
             // NATURAL and USING: equality on the shared columns, which the right side then hides.
-            var shared = Vector<String>.create();
+            var shared = Vector<ByteString>.create();
             if (join.natural) {
                 let right = borrow scope.sources[at];
                 for (k in 0..right.columns.length) {
                     let name = right.columns[k].name.view();
                     for (s in 0..at) {
                         if (Compiler.findColumn(borrow scope.sources[s], name).isSome()) {
-                            shared.push(String.from(name)?)?;
+                            shared.push(ownedText(name)?)?;
                             break;
                         }
                     }
@@ -1582,7 +1585,7 @@ fn schemaTableSchema() -> Result<TableSchema, SqliteError> {
     let Stmt.CreateTable(stmt) = Parser.parseStatement(definition)? else {
         return Err(corrupt("sqlite_schema's definition"));
     };
-    return buildTableSchema(stmt, "sqlite_schema", 1, definition);
+    return buildTableSchema(stmt, "sqlite_schema", 1, ByteStringView.fromText(definition));
 }
 
 fn isLiteral(e: borrow Expr) -> bool => e is Expr.Literal(_);
@@ -1598,7 +1601,7 @@ fn inLeftGroup(sources: Slice<SourcePlan>, s: usize) -> bool {
 }
 
 /// The CREATE VIEW statement of view `name` in database `database`.
-fn viewSqlIn(db: borrow Session, database: usize, name: StringView) -> Result<String?, SqliteError> {
+fn viewSqlIn(db: borrow Session, database: usize, name: ByteStringView) -> Result<ByteString?, SqliteError> {
     let entries = db.entriesOf(database);
     for (i in 0..entries.length) {
         let entry = borrow entries[i];

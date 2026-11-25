@@ -3,38 +3,29 @@
 /// One row of `sqlite_schema`.
 struct SchemaEntry {
     /// "table", "index", "view" or "trigger".
-    kind: String;
-    name: String;
-    tableName: String;
+    kind: ByteString;
+    name: ByteString;
+    tableName: ByteString;
     /// The root page of a table's or an index's b-tree; 0 for a view, a trigger and a virtual table.
     rootPage: u32;
     /// The statement that made the object; `null` for an automatic index.
-    sql: String?;
+    sql: ByteString?;
 }
 
 /// ASCII letters in lower case, which is how SQLite compares names.
-fn asciiLower(text: StringView) -> Result<String, AllocError> {
-    var out = Vector<u8>.withCapacity(text.length)?;
-    for (b in text.bytes()) {
-        out.push(if (b >= 'A' && b <= 'Z') b + 32 else b)?;
-    }
-    // Only ASCII bytes changed, so the text is still UTF-8, and the bytes become the string without a copy.
-    return Ok(String.fromUtf8(out)!);
-}
-
 struct DatabaseReader {
     pager: Pager;
     // The reader is a snapshot, so the schema is read once.
     private entries: Vector<SchemaEntry>;
-    private tablesByName: HashMap<String, usize>;
-    private indexesByName: HashMap<String, usize>;
+    private tablesByName: HashMap<ByteString, usize>;
+    private indexesByName: HashMap<ByteString, usize>;
 
     /// Opens the database file at `path` and reads its schema.
     fn open(path: StringView) -> Result<DatabaseReader, SqliteError> {
         var pager = Pager.open(path)?;
         let entries = readSchemaEntries(mut pager)?;
-        var tables = HashMap<String, usize>.create();
-        var indexes = HashMap<String, usize>.create();
+        var tables = HashMap<ByteString, usize>.create();
+        var indexes = HashMap<ByteString, usize>.create();
         for (at in 0..entries.length) {
             let key = asciiLower(entries[at].name.view())?;
             let kind = entries[at].kind.view();
@@ -58,9 +49,9 @@ fn readSchemaEntries<P: PageSource>(pager: borrow mut P) -> Result<Vector<Schema
         if (columns.length < 5) {
             return Err(corrupt("a row of sqlite_schema has too few columns"));
         }
-        // The schema's text keeps its bytes, in the engine's form for SQL text (sqltext.cee).
-        let sql: String? = match (columns.pop()!) {
-            SqliteValue.Text(s) => sqlTextOf(s.bytes())?,
+        // The schema's text keeps its bytes.
+        let sql: ByteString? = match (columns.pop()!) {
+            SqliteValue.Text(s) => s,
             _ => null,
         };
         let rootPage: u32 = match (columns.pop()!) {
@@ -86,7 +77,8 @@ impl DatabaseReader {
     fn schema(borrow this) -> Slice<SchemaEntry> => this.entries.view();
 
     /// The table named `name` (ASCII case is ignored), or `null`.
-    fn findTable(borrow this, name: StringView) -> Result<borrow SchemaEntry?, AllocError> {
+    fn findTable<N: TextView>(borrow this, nameText: N) -> Result<borrow SchemaEntry?, AllocError> {
+        let name = ByteStringView.fromBytes(nameText.bytes());
         let key = asciiLower(name)?;
         if (this.tablesByName.get(borrow key) is Some(at)) {
             return Ok(borrow this.entries[*at]);
@@ -95,7 +87,8 @@ impl DatabaseReader {
     }
 
     /// The index named `name` (ASCII case is ignored), or `null`.
-    fn findIndex(borrow this, name: StringView) -> Result<borrow SchemaEntry?, AllocError> {
+    fn findIndex<N: TextView>(borrow this, nameText: N) -> Result<borrow SchemaEntry?, AllocError> {
+        let name = ByteStringView.fromBytes(nameText.bytes());
         let key = asciiLower(name)?;
         if (this.indexesByName.get(borrow key) is Some(at)) {
             return Ok(borrow this.entries[*at]);
@@ -103,7 +96,7 @@ impl DatabaseReader {
         return Ok(null);
     }
 
-    private fn tableRoot(borrow this, name: StringView) -> Result<u32, SqliteError> {
+    private fn tableRoot<N: TextView>(borrow this, name: N) -> Result<u32, SqliteError> {
         let table = this.findTable(name)? ?? {
             return Err(sqlError("no such table"));
         };
@@ -114,11 +107,11 @@ impl DatabaseReader {
     }
 
     /// A cursor over every row of table `name`, in rowid order. Read it with `nextRow`.
-    fn scanTable(borrow this, name: StringView) -> Result<TableCursor, SqliteError> =>
+    fn scanTable<N: TextView>(borrow this, name: N) -> Result<TableCursor, SqliteError> =>
         Ok(TableCursor.scan(this.tableRoot(name)?));
 
     /// A cursor over the rows of table `name` whose rowid is from `min` to `max`.
-    fn scanRange(borrow this, name: StringView, min: i64, max: i64) -> Result<TableCursor, SqliteError> =>
+    fn scanRange<N: TextView>(borrow this, name: N, min: i64, max: i64) -> Result<TableCursor, SqliteError> =>
         Ok(TableCursor.range(this.tableRoot(name)?, min, max));
 
     /// The cursor's next row, or `null` after the last.
@@ -126,7 +119,8 @@ impl DatabaseReader {
         cursor.next(mut this.pager);
 
     /// The row of table `name` with `rowId`, or `null` when the table has none (or does not exist).
-    fn seekRow(borrow mut this, name: StringView, rowId: i64) -> Result<TableRow?, SqliteError> {
+    fn seekRow<N: TextView>(borrow mut this, nameText: N, rowId: i64) -> Result<TableRow?, SqliteError> {
+        let name = ByteStringView.fromBytes(nameText.bytes());
         let root = match (this.findTable(name)?) {
             Some(table) => table.rootPage,
             null => 0,
@@ -138,7 +132,7 @@ impl DatabaseReader {
     }
 
     /// Whether table `name` is stored as an index b-tree (a WITHOUT ROWID table).
-    fn tableIsIndexBTree(borrow mut this, name: StringView) -> Result<bool, SqliteError> {
+    fn tableIsIndexBTree(borrow mut this, name: ByteStringView) -> Result<bool, SqliteError> {
         let root = match (this.findTable(name)?) {
             Some(table) => table.rootPage,
             null => 0,
@@ -152,9 +146,8 @@ impl DatabaseReader {
     }
 }
 
-/// A name in sqlite_schema, in the engine's form for SQL text (its bytes, whatever they are), or empty when it is
-/// not text.
-fn textOrEmpty(value: SqliteValue) -> Result<String, AllocError> => match (value) {
-    SqliteValue.Text(s) => sqlTextOf(s.bytes()),
-    _ => Ok(String.create()),
+/// A name in sqlite_schema, its bytes whatever they are, or empty when it is not text.
+fn textOrEmpty(value: SqliteValue) -> Result<ByteString, AllocError> => match (value) {
+    SqliteValue.Text(s) => Ok(s),
+    _ => Ok(ByteString.create()),
 };
