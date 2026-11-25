@@ -178,34 +178,50 @@ struct WalIndexHeader {
 /// A block of the wal-index: the `-shm`'s bytes mapped for reading and writing, or for reading only when this
 /// process may not write the file (os_unix.c's readonly_shm, mapped PROT_READ), or this connection's own memory
 /// when the read-only `-shm` cannot be trusted (wal.c's heap-memory index, bShmUnreliable).
+/// Its three kinds are read alike, through `MappedRead`; only the writes tell them apart.
 enum IndexBlock {
     Shared(SharedMapping),
     ReadOnly(ReadOnlyMapping),
-    Heap(Vector<u8>),
+    Heap(HeapBlock),
+}
+
+/// A block of the wal-index in this connection's memory, read as a mapping is.
+struct HeapBlock {
+    bytes: Vector<u8>;
+}
+
+impl MappedRead for HeapBlock {
+    @effects()
+    fn length(borrow this) -> usize => this.bytes.length;
+
+    @effects()
+    fn offset(borrow this) -> u64 => 0;
+
+    @effects()
+    fn readAt(borrow this, at: usize, into: SliceMut<u8>) {
+        into.copyFrom(this.bytes.view()[at..at + into.length]);
+    }
+
+    @effects()
+    fn load16(borrow this, at: usize, order: LoadOrdering) -> u16 => this.bytes.view().readLE<u16>(at);
+
+    @effects()
+    fn load32(borrow this, at: usize, order: LoadOrdering) -> u32 => this.bytes.view().readLE<u32>(at);
 }
 
 impl IndexBlock {
-    fn load32(borrow this, at: usize, order: LoadOrdering) -> u32 => match (this) {
-        IndexBlock.Shared(m) => m.load32(at, order),
-        IndexBlock.ReadOnly(m) => m.load32(at, order),
-        IndexBlock.Heap(v) => v.view().readLE<u32>(at),
+    fn reading(borrow this) -> borrow dyn MappedRead => match (this) {
+        IndexBlock.Shared(m) => m,
+        IndexBlock.ReadOnly(m) => m,
+        IndexBlock.Heap(h) => h,
     };
 
-    fn load16(borrow this, at: usize, order: LoadOrdering) -> u16 => match (this) {
-        IndexBlock.Shared(m) => m.load16(at, order),
-        IndexBlock.ReadOnly(m) => m.load16(at, order),
-        IndexBlock.Heap(v) => v.view().readLE<u16>(at),
-    };
+    fn load32(borrow this, at: usize, order: LoadOrdering) -> u32 => this.reading().load32(at, order);
+
+    fn load16(borrow this, at: usize, order: LoadOrdering) -> u16 => this.reading().load16(at, order);
 
     fn readAt(borrow this, at: usize, into: SliceMut<u8>) {
-        match (this) {
-            IndexBlock.Shared(m) => { m.readAt(at, into); }
-            IndexBlock.ReadOnly(m) => { m.readAt(at, into); }
-            IndexBlock.Heap(v) => {
-                let end = at + into.length;
-                into.copyFrom(v.view()[at..end]);
-            }
-        }
+        this.reading().readAt(at, into);
     }
 
     // The writes: never on a read-only block, which only a connection that cannot write has, and which takes no
@@ -215,7 +231,7 @@ impl IndexBlock {
         match (this) {
             IndexBlock.Shared(m) => { m.store32(at, value, order); }
             IndexBlock.ReadOnly(_) => { assert(false, "a read-only wal-index is not written"); }
-            IndexBlock.Heap(v) => { v.viewMut().writeLE(at, value); }
+            IndexBlock.Heap(h) => { h.bytes.viewMut().writeLE(at, value); }
         }
     }
 
@@ -223,7 +239,7 @@ impl IndexBlock {
         match (this) {
             IndexBlock.Shared(m) => { m.store16(at, value, order); }
             IndexBlock.ReadOnly(_) => { assert(false, "a read-only wal-index is not written"); }
-            IndexBlock.Heap(v) => { v.viewMut().writeLE(at, value); }
+            IndexBlock.Heap(h) => { h.bytes.viewMut().writeLE(at, value); }
         }
     }
 
@@ -231,7 +247,7 @@ impl IndexBlock {
         match (this) {
             IndexBlock.Shared(m) => { m.writeAt(at, bytes); }
             IndexBlock.ReadOnly(_) => { assert(false, "a read-only wal-index is not written"); }
-            IndexBlock.Heap(v) => { v.viewMut()[at..at + bytes.length].copyFrom(bytes); }
+            IndexBlock.Heap(h) => { h.bytes.viewMut()[at..at + bytes.length].copyFrom(bytes); }
         }
     }
 }
@@ -460,7 +476,7 @@ struct SharedWal {
             if (this.unreliable) {
                 var memory = Vector<u8>.create();
                 memory.resize(WALINDEX_BLOCK, 0)?;
-                this.regions.push(IndexBlock.Heap(memory))?;
+                this.regions.push(IndexBlock.Heap(HeapBlock { bytes: memory }))?;
             } else if (!this.shmWritable) {
                 if (this.shm.length()? < at + (WALINDEX_BLOCK as u64)) {
                     return Err(corrupt("the wal-index is shorter than its header says"));
