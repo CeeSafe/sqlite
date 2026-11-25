@@ -147,10 +147,11 @@ fn sameByteSessionMaking(name: StringView, fixture: StringView, script: StringVi
     return expectIntact(ourPath.view());
 }
 
-/// Removes each file named (by its bytes) in `names`; one that is not there is skipped.
+/// Removes each file named (by its bytes, as SQL names it: `fileNameOf`) in `names`; one that is not there is
+/// skipped.
 fn removeAll(names: borrow Vector<ByteString>) {
     for (i in 0..names.length) {
-        let _ = File.remove(OsStringView.fromByteString(names[i].view()));
+        let _ = File.remove(fileNameOf(names[i].clone()!)!.view());
     }
 }
 
@@ -159,7 +160,7 @@ fn whichAreThere(names: borrow Vector<ByteString>) -> String {
     var out = String.create();
     for (i in 0..names.length) {
         out.append(shownText(names[i].bytes()).view())!;
-        let there = File.open(OsStringView.fromByteString(names[i].view())).isOk();
+        let there = File.open(fileNameOf(names[i].clone()!)!.view()).isOk();
         out.append(if (there) ": there\n" else ": not there\n")!;
     }
     return out;
