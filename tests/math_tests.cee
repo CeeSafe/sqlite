@@ -26,6 +26,9 @@ fn mathFunctionsOnOrdinaryValues() -> Result<void, TestFailure> {
 
 @test
 fn mathFunctionsOnSpecialValues() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.OlderSystemMath)) {
+        return Ok();
+    }
     let path = "out/math-special.db";
     makeDatabase(path, "CREATE TABLE t(x)")?;
     return sameAnswers(path, """
@@ -57,6 +60,9 @@ fn trigonometryOfLargeArguments() -> Result<void, TestFailure> {
 
 @test
 fn mathFunctionsAgreeWithTheShellOnManyArguments() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.OlderSystemMath)) {
+        return Ok();
+    }
     // The engine calls the platform's libm, as sqlite3 does: every result the same, bit for bit (%!.17g).
     let path = "out/math-sweep.db";
     makeDatabase(path, """
@@ -89,6 +95,9 @@ fn mathFunctionsOnTextAndNull() -> Result<void, TestFailure> {
 
 @test
 fn mathFunctionsOverTableRows() -> Result<void, TestFailure> {
+    if (skippedOnWindows(WindowsGap.OlderSystemMath)) {
+        return Ok();
+    }
     let path = "out/math-rows.db";
     makeDatabase(path, """
         CREATE TABLE t(x REAL);

@@ -12,6 +12,11 @@ enum WindowsGap {
     /// winCheckReservedLock takes the byte for an instant and releases it, and so does this engine there, so a
     /// sqlite3.exe that takes RESERVED in that instant is turned away, as it would be by another sqlite3.exe.
     LockTestTakesTheLock,
+    /// A float result compared bit for bit with sqlite3.exe on a Windows older than build 26100. Since ceesafec
+    /// 0.95.9 (ADR 0248) the engine's math is the system's ucrtbase.dll, while sqlite.org's sqlite3.exe carries the
+    /// static UCRT of the Windows SDK it was built with (10.0.26100); on older Windows the two differ in the last
+    /// bit for some arguments (CEESAFE_FINDINGS.md, finding 50). From build 26100 on they agree, and the tests run.
+    OlderSystemMath,
 }
 
 /// True, after saying so, when the test cannot run on Windows because of `gap`.
@@ -19,11 +24,39 @@ fn skippedOnWindows(gap: WindowsGap) -> bool {
     if (!onWindowsHost()) {
         return false;
     }
+    match (gap) {
+        WindowsGap.OlderSystemMath => {
+            let build = windowsBuild() ?? 0;
+            if (build >= 26100) {
+                return false;
+            }
+        }
+        _ => {}
+    }
     let reason = match (gap) {
         WindowsGap.KillingTheShell => "killing the sqlite3 shell needs a POSIX shell's kill",
         WindowsGap.LockTestTakesTheLock => "Windows tests a lock by taking it, as os_win.c does",
+        WindowsGap.OlderSystemMath => "this Windows's ucrtbase.dll is older than sqlite3.exe's static UCRT (build 26100)",
     };
     Console.write("skipped on Windows: ");
     Console.writeLine(reason);
     return true;
+}
+
+/// The build number of the running Windows ("Version 10.0.22621.4317" gives 22621), as `ver` prints it; null if it
+/// cannot be read.
+fn windowsBuild() -> u32? {
+    var arguments = Vector<StringView>.create();
+    arguments.push("/d")!;
+    arguments.push("/c")!;
+    arguments.push("ver")!;
+    let output = captureProgram("cmd", borrow arguments, "".bytes()).ok()?;
+    let text = StringView.fromUtf8(output.stdout.view())?;
+    let at = text.indexOf("10.0.")?;
+    let rest = text[at + 5..];
+    var end: usize = 0;
+    while (end < rest.length && rest[end] >= '0' && rest[end] <= '9') {
+        end += 1;
+    }
+    return rest[..end].parseInt<u32>();
 }
