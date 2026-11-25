@@ -1,9 +1,9 @@
 # CeeSafe findings
 
 Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed in CeeSafe later. Compiler:
-`ceesafec 0.93.7` when the port began, `0.95.5` now. Each entry says what was needed, what happened, and the workaround used in this package.
+`ceesafec 0.93.7` when the port began, `0.95.12` now. Each entry says what was needed, what happened, and the workaround used in this package.
 
-## Status (ceesafec 0.95.5)
+## Status (ceesafec 0.95.12)
 
 | Finding | Status |
 |---|---|
@@ -35,15 +35,15 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 35 | fixed in 0.95.2: a `Thread<void>` in a generic signature is checked as a return type, no longer N0226; workaround removed (`pgwire`'s client threads are `Thread<void>`) |
 | 36 | fixed in 0.95.5: `f.testLock(kind, start, length)` (F_GETLK, takes nothing) and conversion of a held lock in place made part of the contract on POSIX, atomic, ADR 0234; workaround removed: the hot-journal check tests RESERVED as unixCheckReservedLock does (`WritablePager.tryStart`), and the `-shm`'s DMS byte is tested as unixLockSharedMemory tests it (`SharedWal.open`); `locksTheHotJournalCheckTakesNoLock` shows a sqlite3 taking RESERVED 400 times beside the check without a refusal (with `tryLock` and `unlock` some were "database is locked"); the conversions (SHARED to EXCLUSIVE and back, the DMS byte) were already in place and are now in the contract |
 | 37 | fixed in 0.95.5: `SharedMapping.load16`/`store16`/`compareExchange16`/`fetchAdd16` and `f.mapSharedReadOnly` (`ReadOnlyMapping`), ADR 0235; SIGBUS on a shortened file stays a signal, by decision (ADR 0235 §2.3, as SQLite has it); workaround removed: hash slots are loaded and stored as 16-bit atomics (`findInBlock`, `writeBlock`), and a `-shm` this process may not write is mapped read-only beside a connection that can write it, or replaced by an index rebuilt in memory when none does (SQLite's readonly_shm and heap-memory index, `src/walindex.cee`; `readOnly*` tests); `Connection.openReadOnly` is SQLITE_OPEN_READONLY |
-| 38 | open: found with 19's fix (below) |
+| 38 | fixed in 0.95.12: `==` on an optional borrow compares what it refers to (`m.get(k) == Some(x)`), and owned optionals that are not Copy compare, ADR 0251; no `match` written for it was left in the package |
 | 39 | fixed in 0.95.5: `s.intoBytes()`, `String.fromUtf8(v)`, `ByteString.fromString(s)`, `b.intoString()`, and `ceesafec doc NAME` for a lib/core name, ADR 0236; workaround removed: text built in a `String` becomes TEXT without a copy (`SqliteValue.sqlTextFrom`: CURRENT_TIMESTAMP, ALTER TABLE's edited SQL, ANALYZE's statistics; a real's text in `valueText`), and ASCII case changes give their bytes to a `String` (`asciiLower`, `asciiUpper`) |
-| 42, 43, 44 | open: found while adopting 0.95.5 (below) |
-| 41 | open: found while making SQL text bytes (below) |
-| 45, 46 | fixed in 0.95.7 (ADR 0245: `Process.run` quotes for `CommandLineToArgvW` through `CreateProcessW`, `Process.capture` closes its input file first); workaround removed for every program but the sqlite3 shell, which `tests/capture.py` still runs on Windows for finding 51 |
-| 47 | open: found making CI pass on Windows (below) |
-| 48 | open: found while porting os_win.c's locks (below) |
+| 42, 43, 44 | fixed in 0.95.12: lib/std's `MappedRead` (ADR 0254), two-phase `copyFrom`/`fill` receivers (ADR 0252), `File.link` (ADR 0255); workarounds removed: the wal-index reads its three kinds of block through `MappedRead` (`HeapBlock` implements it; the enum stays for the writes, which only `SharedMapping` makes), `HeapBlock.readAt` reads `into.length` in its own call, the hot-journal test links with `File.link` |
+| 41 | fixed in 0.95.12: lib/core's `TextView` and `TextBuffer`, ADR 0253; the workaround stays for now: moving the tokenizer, parser, catalog and messages to `ByteString` text is a rewrite of their own, not a removal (below) |
+| 45, 46 | fixed in 0.95.7 (ADR 0245: `Process.run` quotes for `CommandLineToArgvW` through `CreateProcessW`, `Process.capture` closes its input file first); workaround removed (the sqlite3 shell's last one since 0.95.12, finding 51) |
+| 47 | fixed in 0.95.12: `OsString`/`OsStringView` file names, ADR 0257; the engine's paths are still `StringView`, so the workaround stays until they move (below) |
+| 48 | fixed in 0.95.12: `CEESAFE_LOCK_RULES=strict` or `portable` holds a program's locks to Windows' rules on any host, natively and in the interpreter, ADR 0256; workaround removed: `SQLITE_WINDOWS_LOCKS` runs os_win.c's scheme off Windows, and CI runs the engine's tests so on macOS and Linux (224 pass on macOS, the hot-journal test, whose premise is F_GETLK, skipping). It found one break: the exclusive try of a read-only `-shm`'s DMS byte, which POSIX refuses (EBADF); the byte is now tested (`testLock`, a try-and-release on Windows as os_win.c's) |
 | 49 | fixed in 0.95.7 (ADR 0247: initializers MSVC can nest); CI's Windows job builds with MSVC (`CC=cl`) |
-| 51 | open: found removing 45's workaround (below) |
+| 51 | fixed in 0.95.12: `ChildOptions.setEnvironment`, `Process.captureWith` and `runWith`, ADR 0258; workaround removed: on Windows the sqlite3 shell runs by `Process.captureWith` with HOME and USERPROFILE set to a directory that holds its `.sqliterc`, and `tests/capture.py` is gone |
 | 50 | fixed in 0.95.9 (ADR 0248: on Windows the float methods call System32's ucrtbase.dll whatever compiler built the program); on Windows older than build 26100 the three bit-for-bit math tests skip, saying why (`WindowsGap.OlderSystemMath`), and CI's windows-2025 job runs them (below) |
 | 40 | misreported: `cfg("target.windows")` (ADR 0179, guide/unsafe-and-c.md "Code for one system") names the system a build is for, in any code; `onWindows()` uses it, and the environment-variable check is gone |
 
@@ -383,6 +383,8 @@ Found with finding 19's fix. `m.get(k) == Some(x)`, where `get` gives a `borrow 
 
 Workaround: `match`, or `m.get(k).isSome()` and a separate comparison.
 
+Fixed in 0.95.12 (ADR 0251) (status table).
+
 ### 39. A `String` cannot become a `ByteString` without a copy
 
 Found while removing finding 19's workaround. `ByteString.fromBytes(v)` takes a `Vector<u8>` without copying, but
@@ -413,6 +415,8 @@ UTF-8 stands as one code point of U+10FF80..U+10FFFF, and a real one of those is
 messages. A text-view interface implemented by both `StringView` and `ByteStringView` (or `ByteStringView`
 methods that take text, as `ByteString.append` does) would let such code be generic.
 
+Fixed in 0.95.12 (ADR 0253: `TextView`, `TextBuffer`); the engine has not moved to it yet (status table).
+
 ### 42. `SharedMapping` and `ReadOnlyMapping` share no interface
 
 Found while adopting ADR 0235. The wal-index's blocks are mapped read-write, mapped read-only, or kept in memory
@@ -423,6 +427,8 @@ take either; a generic `Mapping<Access>` was considered and not taken (ADR 0235 
 Workaround: an enum of the three (`IndexBlock`, `src/walindex.cee`) whose methods match on the variant; its writes
 assert that a read-only block is never written, a check the types made at compile time before.
 
+Fixed in 0.95.12 (ADR 0254) (status table).
+
 ### 43. An argument cannot read the receiver a method borrows mutably
 
 Found while writing `IndexBlock.readAt`: `into.copyFrom(v.view()[at..at + into.length])` is N0242 ("cannot use
@@ -432,11 +438,15 @@ borrows.)
 
 Workaround: read it into a local first (`let end = at + into.length;`).
 
+Fixed in 0.95.12 (ADR 0252) (status table).
+
 ### 44. No hard link
 
 Found while testing the hot-journal check: a test opens one database file through two names, so that sqlite3 does
 not see a journal planted for this engine, and `File` has no `hardLink(existing, new)` (nor `symlink`). The test
 runs `ln` through `Process.run`. (`File.setPermissions`, which the read-only tests use, is there.)
+
+Fixed in 0.95.12 (ADR 0255: `File.link`) (status table).
 
 
 ### 45. `Process.capture` always fails on Windows
@@ -473,6 +483,8 @@ type of bytes (`ByteStringView` on POSIX, UTF-16 on Windows) would let it follow
 Workaround: `fileNamesThatAreNotUtf8AreRefused` compares with sqlite3 on macOS only, and elsewhere checks the
 engine's refusal.
 
+Fixed in 0.95.12 (ADR 0257: `OsString`, `OsStringView`); the engine's paths have not moved to it yet (status table).
+
 ### 48. Windows' lock rules cannot be checked off Windows
 
 Found porting os_win.c's locks (`WritablePager.win*`, `SharedWal.winLockSharedMemory`). On Windows a `File` must
@@ -489,6 +501,8 @@ portable program be checked on any host.
 Workaround: the Windows scheme was run on macOS by forcing `onWindows()` (not committed), which checks its logic
 but not those two rules; the code keeps the ranges it holds (`WritablePager.held`) and wal.c's `ckptLock` rule so
 that no lock is taken twice, and CI's windows-2022 runner is the check.
+
+Fixed in 0.95.12 (ADR 0256: `CEESAFE_LOCK_RULES`) (status table).
 
 ### 49. MSVC refuses the C for a zeroed optional of a deeply nested type
 
@@ -535,3 +549,5 @@ would let the tests drop `tests/capture.py`.
 
 Workaround: on Windows `tests/capture.py`, started by `Process.spawn`, runs the shell with HOME and USERPROFILE set to
 a directory that holds the `.sqliterc` (`captureSqlite`, tests/shell_runner_tests.cee and its copies).
+
+Fixed in 0.95.12 (ADR 0258) (status table).
