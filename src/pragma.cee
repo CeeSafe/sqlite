@@ -306,7 +306,7 @@ fn pragmaRows(
             var row = Vector<SqliteValue>.create();
             row.push(SqliteValue.Integer(seq))?;
             row.push(SqliteValue.sqlText(db.databaseNames[i].view())?)?;
-            row.push(SqliteValue.sqlText(db.databaseShownPaths[i].view())?)?;
+            row.push(SqliteValue.textOfBytes(db.databaseShownPaths[i].bytes())?)?;
             rows.push(row)?;
         }
         return Ok(rows);

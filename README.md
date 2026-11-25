@@ -93,9 +93,10 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   ASCII case only; a name or definition leaves as its bytes wherever it becomes a value (a literal, sqlite_schema's
   columns, a pragma's rows, sqlite_stat1) or a message, and a RAISE message keeps its value's bytes
   (`stringLiteralsKeepTheirBytes`, `namesKeepTheirBytes`, `schemasSqliteWroteWithBytesRoundTrip`,
-  `connectionsTakeSqlOfAnyBytes`). A file name for ATTACH or VACUUM INTO that is not UTF-8 is refused with
-  SQLite's "unable to open database: …", as macOS's file system makes sqlite3 refuse it
-  (`fileNamesThatAreNotUtf8AreRefused`); on Linux SQLite would make such a file.
+  `connectionsTakeSqlOfAnyBytes`). A file name for ATTACH or VACUUM INTO is its bytes, as in SQLite: on Linux a
+  name that is not UTF-8 makes that file, macOS's file system refuses it and the open fails with SQLite's "unable
+  to open database: …", and on Windows the name is read as UTF-8 with U+FFFD, as os_win.c reads it
+  (`fileNamesOfAnyBytesAreSqlites`, against sqlite3 on each). Paths are CeeSafe's OS strings throughout.
 - **UTF-16 databases.** The C# translated a UTF-16 database's text to .NET strings on reading, but wrote text
   into its records as UTF-8 (so sqlite3 then read `wörld` as `썷状摬`), kept its indexes in UTF-8 order, and showed
   UTF-8 wherever text met bytes. SQLite holds text in the database's encoding, and that shows; here text is held as

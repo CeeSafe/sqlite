@@ -563,7 +563,7 @@ struct DatabaseWriter {
     }
 
     /// Writes the database to `path`, replacing a file that is there in one atomic step.
-    fn writeToFile(borrow mut this, path: StringView) -> Result<void, SqliteError> {
+    fn writeToFile(borrow mut this, path: OsStringView) -> Result<void, SqliteError> {
         // A journal or a log beside the old file belongs to a transaction on it; SQLite would apply it to
         // whatever file it finds there next.
         if (DatabaseWriter.sidecarExists(path, "-journal")? || DatabaseWriter.sidecarExists(path, "-wal")?) {
@@ -572,8 +572,7 @@ struct DatabaseWriter {
             );
         }
         let store = this.buildPages()?;
-        var temporary = String.from(path)?;
-        temporary.append(".tmp")?;
+        let temporary = withSuffix(path, ".tmp")?;
         {
             var file = File.create(temporary.view())?;
             for (i in 0..store.pages.length) {
@@ -583,19 +582,13 @@ struct DatabaseWriter {
         }
         File.rename(temporary.view(), path)?;
         // The rename is durable once its directory is.
-        let directory: StringView = match (path.lastIndexOf("/")) {
-            Some(0) => "/",
-            Some(slash) => path[0..slash],
-            null => ".",
-        };
-        Directory.sync(directory)?;
+        Directory.sync(directoryOf(path))?;
         return Ok();
     }
 
     /// Whether `path` with `suffix` is a file with something in it.
-    private fn sidecarExists(path: StringView, suffix: StringView) -> Result<bool, SqliteError> {
-        var name = String.from(path)?;
-        name.append(suffix)?;
+    private fn sidecarExists(path: OsStringView, suffix: StringView) -> Result<bool, SqliteError> {
+        let name = withSuffix(path, suffix)?;
         match (File.open(name.view())) {
             Ok(file) => { return Ok(file.length()? > 0); }
             Err(IoError.NotFound) => { return Ok(false); }

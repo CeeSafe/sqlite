@@ -15,7 +15,7 @@ fn executeVacuum(into: borrow Expr?, params: Slice<SqliteValue>, db: borrow mut 
         return Err(sqlError("cannot VACUUM from within a transaction"));
     }
     // VACUUM INTO: the packed image goes to a new file, and this database stays as it is.
-    var target: String? = null;
+    var target: OsString? = null;
     if (into is Some(e)) {
         var compiler = newCompiler(db)?;
         let compiled = compiler.compile(e, db)?;
@@ -25,7 +25,13 @@ fn executeVacuum(into: borrow Expr?, params: Slice<SqliteValue>, db: borrow mut 
         };
         let path = fileNameOf(name.clone()?)?;
         // The file must not exist or be empty (SQLite 3.54.1; Apple's 3.54.0 refuses an empty one too).
-        if ((fileLength(path.view())? ?? 0) > 0) {
+        // A name the file system refuses is SQLite's "unable to open database: NAME", as an ATTACH's.
+        let length = match (fileLength(path.view())) {
+            Ok(n) => n,
+            Err(SqliteError.Io(_)) => { return Err(unableToOpen(path.bytes())?); }
+            Err(other) => { return Err(other); }
+        };
+        if ((length ?? 0) > 0) {
             return Err(sqlError("output file already exists"));
         }
         target = path;
@@ -92,7 +98,10 @@ fn executeVacuum(into: borrow Expr?, params: Slice<SqliteValue>, db: borrow mut 
         first.writeBE(40, cookie);
         first.writeBE(92, counter);
         first.writeBE(96, WRITER_SQLITE_VERSION);
-        var file = File.create(path.view())?;
+        var file = match (File.create(path.view())) {
+            Ok(f) => f,
+            Err(_) => { return Err(unableToOpen(path.bytes())?); }
+        };
         for (i in 0..store.pages.length) {
             file.writeAt(store.pages[i].view(), (i as u64) * (pageSize as u64))?;
         }

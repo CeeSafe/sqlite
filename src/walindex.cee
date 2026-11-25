@@ -262,8 +262,8 @@ enum ReadTry {
 /// A connection's handle on a database's write-ahead log and its wal-index: wal.c's Wal.
 struct SharedWal {
     private shm: File;
-    private shmPath: String;
-    private logPath: String;
+    private shmPath: OsString;
+    private logPath: OsString;
     private log: File;
     /// Whether the `-shm` and the log were opened for writing; a connection that has either for reading only
     /// (wal.c's WAL_SHM_RDONLY, WAL_RDONLY) reads and never writes, and takes only shared locks.
@@ -298,7 +298,7 @@ struct SharedWal {
     /// lock (unixLockSharedMemory): the first connection empties the index, which is then rebuilt. Null when
     /// another connection is doing that now. A file this process may not write is opened for reading, as
     /// unixOpenSharedMemory and sqlite3WalOpen fall back: the connection then only reads.
-    fn open(path: StringView) -> Result<SharedWal?, SqliteError> {
+    fn open(path: OsStringView) -> Result<SharedWal?, SqliteError> {
         let shmPath = withSuffix(path, SHM_SUFFIX)?;
         let logPath = withSuffix(path, WAL_SUFFIX)?;
         var shmWritable = true;
@@ -1484,7 +1484,7 @@ struct SharedWal {
     }
 }
 
-fn removeIfThere(path: StringView) -> Result<void, SqliteError> {
+fn removeIfThere(path: OsStringView) -> Result<void, SqliteError> {
     match (File.remove(path)) {
         Ok() => {}
         Err(IoError.NotFound) => {}

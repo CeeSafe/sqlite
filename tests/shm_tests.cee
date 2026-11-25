@@ -87,7 +87,7 @@ fn executes(connection: borrow mut Connection, sql: StringView) -> Result<void, 
     return Ok();
 }
 
-fn fileThere(path: StringView) -> bool => fileLength(path)!.isSome();
+fn fileThere(path: OsStringView) -> bool => fileLength(path)!.isSome();
 
 /// While sqlite3 holds the writer's lock (BEGIN IMMEDIATE, with a row written), this engine reads beside it, with
 /// no busy timeout, and sees sqlite3's last commit, read through the `-shm` sqlite3 wrote: it could not rebuild

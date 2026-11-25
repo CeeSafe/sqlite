@@ -7,7 +7,7 @@ const JOURNAL_FIXTURE_SQL: StringView = """
     CREATE INDEX t_n ON t(n);
     """;
 
-fn wholeFile(path: StringView) -> Vector<u8> {
+fn wholeFile(path: OsStringView) -> Vector<u8> {
     var file = File.open(path)!;
     var bytes = Vector<u8>.create();
     bytes.resize(truncate<usize>(file.length()!), 0)!;

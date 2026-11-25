@@ -30,7 +30,7 @@ struct DatabaseReader {
     private indexesByName: HashMap<String, usize>;
 
     /// Opens the database file at `path` and reads its schema.
-    fn open(path: StringView) -> Result<DatabaseReader, SqliteError> {
+    fn open(path: OsStringView) -> Result<DatabaseReader, SqliteError> {
         var pager = Pager.open(path)?;
         let entries = readSchemaEntries(mut pager)?;
         var tables = HashMap<String, usize>.create();

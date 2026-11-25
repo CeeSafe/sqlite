@@ -22,8 +22,8 @@ public struct Session {
     /// Each database's name (`main`, `temp`, or the name ATTACH gave), its file, and the file as PRAGMA
     /// database_list shows it (empty for TEMP and private databases).
     databaseNames: Vector<String>;
-    databasePaths: Vector<String>;
-    databaseShownPaths: Vector<String>;
+    databasePaths: Vector<OsString>;
+    databaseShownPaths: Vector<OsString>;
     /// The TEMP database's place in the list, once a TEMP object made it.
     tempIndex: usize?;
     /// While a view or trigger stored outside TEMP compiles: its database, the only one its names may find.
@@ -57,20 +57,20 @@ public struct Session {
     activeTriggers: Vector<String>;
 
     /// Opens the database file at `path`, making an empty database if there is none.
-    public fn open(name: StringView) -> Result<Session, SqliteError> => Session.openWaiting(name, 0);
+    public fn open(name: OsStringView) -> Result<Session, SqliteError> => Session.openWaiting(name, 0);
 
     /// `open`, waiting up to `busyTimeout` milliseconds (which also becomes PRAGMA busy_timeout) for another
     /// connection's lock on the file.
-    fn openWaiting(name: StringView, busyTimeout: i64) -> Result<Session, SqliteError> =>
+    fn openWaiting(name: OsStringView, busyTimeout: i64) -> Result<Session, SqliteError> =>
         Session.openWith(name, busyTimeout, false);
 
     /// `openWaiting`, for reading only when `readOnly` (SQLITE_OPEN_READONLY).
-    fn openWith(name: StringView, busyTimeout: i64, readOnly: bool) -> Result<Session, SqliteError> {
+    fn openWith(name: OsStringView, busyTimeout: i64, readOnly: bool) -> Result<Session, SqliteError> {
         // `:memory:` and the empty name: a private database, a file of its own removed when the session closes.
-        let isPrivate = name.length == 0 || name == ":memory:";
-        var privatePath = String.create();
+        let isPrivate = name.isEmpty() || name.toByteStringView() == ":memory:";
+        var privatePath = OsString.create();
         if (isPrivate) {
-            privatePath = privateDatabasePath("sqlite-memory-")?;
+            privatePath = OsString.fromString(privateDatabasePath("sqlite-memory-")?);
         }
         let path = if (isPrivate) privatePath.view() else name;
         // The pager comes back in a read transaction, which ends once the schema is read.
@@ -82,10 +82,10 @@ public struct Session {
         stash.push(null)?;
         var names = Vector<String>.create();
         names.push(String.from("main")?)?;
-        var paths = Vector<String>.create();
-        paths.push(String.from(path)?)?;
-        var shownPaths = Vector<String>.create();
-        shownPaths.push(String.from(if (isPrivate) "" else path)?)?;
+        var paths = Vector<OsString>.create();
+        paths.push(path.toOsString()?)?;
+        var shownPaths = Vector<OsString>.create();
+        shownPaths.push(if (isPrivate) OsString.create() else path.toOsString()?)?;
         return Ok(Session {
             pager: pager,
             catalog: catalog,
@@ -121,7 +121,7 @@ public struct Session {
     public fn close(this) -> Result<void, SqliteError> {
         var me = this;
         me.closeOthers()?;
-        let isPrivate = me.databaseShownPaths[0].length == 0;
+        let isPrivate = me.databaseShownPaths[0].isEmpty();
         let path = me.databasePaths[0].clone()?;
         me.pager.close()?;
         if (isPrivate) {
@@ -135,7 +135,7 @@ public struct Session {
         this.inTransaction = false;
         this.closeOthers()?;
         this.pager.closeLog()?;
-        if (this.databaseShownPaths[0].length == 0) {
+        if (this.databaseShownPaths[0].isEmpty()) {
             removeDatabaseFiles(this.databasePaths[0].view())?;
         }
         return Ok();
@@ -471,6 +471,17 @@ public struct Session {
 
     /// Where the table or view `name` is, or `fallback` when it is nowhere (the error then names it there).
     fn objectDatabase(borrow mut this, name: borrow QualifiedName, fallback: usize) -> Result<usize, SqliteError> {
+        // A table in a database that is not there is SQLite's "no such table: aux.t" (DDL that makes one says
+        // "unknown database aux" instead, through databaseNamed).
+        if (borrow name.schema is Some(schema)) {
+            let temp = schema.view().equalsIgnoreAsciiCase("temp") || schema.view().equalsIgnoreAsciiCase("temporary");
+            if (!temp && this.databaseIndex(schema.view()).isNull()) {
+                var missing = String.from(schema.view())?;
+                missing.append(".")?;
+                missing.append(name.name.view())?;
+                return Err(namedError("no such table: ", missing.view()));
+            }
+        }
         if (this.findTable(borrow name.schema, name.name.view())? is Some(i)) {
             return Ok(i);
         }
@@ -755,7 +766,7 @@ impl Session {
         let path = privateDatabasePath("sqlite-temp-")?;
         let state = openDatabaseState(path.view(), this.busyTimeout)?;
         this.attachState("temp", path.view(), state)?;
-        this.databaseShownPaths.push(String.create())?;
+        this.databaseShownPaths.push(OsString.create())?;
         let index = this.databaseNames.length - 1;
         this.tempIndex = index;
         return Ok(index);
@@ -765,7 +776,7 @@ impl Session {
     fn attachState(
         borrow mut this,
         name: StringView,
-        path: StringView,
+        path: OsStringView,
         state: DatabaseState,
     ) -> Result<void, SqliteError> {
         var added = state;
@@ -774,7 +785,7 @@ impl Session {
         }
         this.stash.push(added)?;
         this.databaseNames.push(String.from(name)?)?;
-        this.databasePaths.push(String.from(path)?)?;
+        this.databasePaths.push(path.toOsString()?)?;
         return Ok();
     }
 
@@ -936,8 +947,36 @@ impl Session {
 
 /// A database file opened for a session, made empty when it does not exist.
 /// Its pager holds SHARED until the statement's transaction ends.
-fn openDatabaseState(path: StringView, busyTimeout: i64) -> Result<DatabaseState, SqliteError> {
-    var pager = WritablePager.openWaiting(path, busyTimeout)?;
+fn openDatabaseState(path: OsStringView, busyTimeout: i64) -> Result<DatabaseState, SqliteError> {
+    let pager = WritablePager.openWaiting(path, busyTimeout)?;
+    return stateOf(pager);
+}
+
+/// An attached database's state: a file that cannot be opened is SQLite's "unable to open database: NAME"
+/// (SQLITE_CANTOPEN), the name as given.
+fn attachedDatabaseState(
+    path: OsStringView,
+    given: OsStringView,
+    busyTimeout: i64,
+) -> Result<DatabaseState, SqliteError> {
+    let pager = match (WritablePager.openWaiting(path, busyTimeout)) {
+        Ok(p) => p,
+        Err(SqliteError.Io(_)) => { return Err(unableToOpen(given.bytes())?); }
+        Err(e) => { return Err(e); }
+    };
+    return stateOf(pager);
+}
+
+/// "unable to open database: " and the name's bytes.
+fn unableToOpen(name: Slice<u8>) -> Result<SqliteError, AllocError> {
+    var message = ByteString.fromText("unable to open database: ")?;
+    message.appendBytes(name)?;
+    return Ok(SqliteError.Sql(message));
+}
+
+/// A database's state, its schema read through `opened`.
+fn stateOf(opened: WritablePager) -> Result<DatabaseState, SqliteError> {
+    var pager = opened;
     let entries = readSchemaEntries(mut pager)?;
     let catalog = SchemaCatalog.fromEntries(entries.view())?;
     return Ok(DatabaseState { pager: pager, catalog: catalog, entries: entries });
@@ -972,17 +1011,15 @@ impl Session {
         let compiled = compiler.compile(target, this)?;
         var frame = newFrame(mut compiler, params, this)?;
         let value = evaluate(borrow compiled, mut frame, this)?;
-        // A file name is UTF-8 here; the file system refuses one that is not (on macOS, as here, SQLite's open
-        // fails the same way).
-        let file = if (value.isNull()) String.create() else fileNameOf(valueText(borrow value)?)?;
+        let file = if (value.isNull()) OsString.create() else fileNameOf(valueText(borrow value)?)?;
         // An empty name (and :memory:) is a private database: a temporary file here, shown without a name.
         var path = file.clone()?;
         var shown = file.clone()?;
-        if (file.length == 0 || file.view() == ":memory:") {
-            path = privateDatabasePath("sqlite-attached-")?;
-            shown = String.create();
+        if (file.isEmpty() || file.view().toByteStringView() == ":memory:") {
+            path = OsString.fromString(privateDatabasePath("sqlite-attached-")?);
+            shown = OsString.create();
         }
-        let state = openDatabaseState(path.view(), this.busyTimeout)?;
+        let state = attachedDatabaseState(path.view(), file.view(), this.busyTimeout)?;
         // As in SQLite, every database of a connection has main's text encoding (an empty file takes it).
         if (state.pager.pageCount != 0 && state.pager.textEncoding != this.textEncoding()) {
             return Err(sqlError("attached databases must use the same text encoding as main database"));
@@ -1029,7 +1066,7 @@ impl Session {
         let pager = state.pager;
         pager.close()?;
         // A private database goes with its file.
-        if (shown.length == 0) {
+        if (shown.isEmpty()) {
             let _ = File.remove(removedPath.view());
         }
         return Ok();
@@ -1048,7 +1085,7 @@ impl Session {
                 let pager = s.pager;
                 pager.close()?;
             }
-            if (shown.length == 0) {
+            if (shown.isEmpty()) {
                 let _ = File.remove(path.view());
                 let _ = File.remove(withSuffix(path.view(), "-journal")?.view());
             }
@@ -1084,7 +1121,7 @@ fn temporaryDirectory() -> StringView {
 }
 
 /// Removes a private database's file and the journal or log beside it.
-fn removeDatabaseFiles(path: StringView) -> Result<void, SqliteError> {
+fn removeDatabaseFiles(path: OsStringView) -> Result<void, SqliteError> {
     let _ = File.remove(path);
     let _ = File.remove(withSuffix(path, "-journal")?.view());
     let _ = File.remove(withSuffix(path, "-wal")?.view());
@@ -1111,13 +1148,12 @@ fn statementWrites(stmt: borrow Stmt) -> bool {
     }
 }
 
-/// A file name given in SQL (ATTACH, VACUUM INTO): the file system's names are UTF-8 here, so one that is not
-/// cannot be opened, and is refused with SQLite's message.
-fn fileNameOf(name: ByteString) -> Result<String, SqliteError> {
-    if (name.toUtf8() is Some(text)) {
-        return Ok(String.from(text)?);
+/// A file name given in SQL (ATTACH, VACUUM INTO), as SQLite takes it: on POSIX its bytes are the name, whatever
+/// they are (a file system that refuses them, as macOS's does a name that is not UTF-8, fails the open as it fails
+/// SQLite's); on Windows they are read as UTF-8 with U+FFFD for what is not, as os_win.c's MultiByteToWideChar does.
+fn fileNameOf(name: ByteString) -> Result<OsString, AllocError> {
+    if (cfg("target.windows")) {
+        return Ok(OsString.fromString(name.view().toUtf8Lossy()?));
     }
-    var message = ByteString.fromText("unable to open database: ")?;
-    message.appendBytes(name.bytes())?;
-    return Err(SqliteError.Sql(message));
+    return Ok(OsString.fromByteString(name));
 }

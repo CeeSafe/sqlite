@@ -5,27 +5,25 @@
 // compared with sqlite3's on the same files.
 
 /// Sets the permissions of each file in `paths` to `mode`, as chmod does; a file that is not there is skipped.
-fn chmod(mode: u32, paths: Slice<StringView>) {
+fn chmod(mode: u32, paths: Slice<OsStringView>) {
     for (i in 0..paths.length) {
         let _ = File.setPermissions(paths[i], mode);
     }
 }
 
 /// The database at `path` and the log and wal-index beside it.
-fn walFiles(path: StringView) -> Vector<String> {
-    var files = Vector<String>.create();
-    files.push(String.from(path)!)!;
+fn walFiles(path: StringView) -> Vector<OsString> {
+    var files = Vector<OsString>.create();
+    files.push(OsString.fromText(path)!)!;
     files.push(withSuffix(path, "-wal")!)!;
     files.push(withSuffix(path, "-shm")!)!;
     return files;
 }
 
-fn chmodAll(mode: u32, files: borrow Vector<String>) {
-    var views = Vector<StringView>.create();
+fn chmodAll(mode: u32, files: borrow Vector<OsString>) {
     for (i in 0..files.length) {
-        views.push(files[i].view())!;
+        let _ = File.setPermissions(files[i].view(), mode);
     }
-    chmod(mode, views.view());
 }
 
 /// What `sqlite3 -readonly` answers, or "error: " and its message.

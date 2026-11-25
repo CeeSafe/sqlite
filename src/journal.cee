@@ -26,21 +26,21 @@ const JOURNAL_SECTOR_SIZE: usize = 512;
 /// The byte at which SQLite's locks lie; the page that holds it is never used.
 const PENDING_BYTE: u64 = 0x40000000;
 
-fn withSuffix(path: StringView, suffix: StringView) -> Result<String, AllocError> {
-    var name = String.from(path)?;
-    name.append(suffix)?;
+fn withSuffix(path: OsStringView, suffix: StringView) -> Result<OsString, AllocError> {
+    var name = path.toOsString()?;
+    name.appendBytes(suffix.bytes())?;
     return Ok(name);
 }
 
 /// The directory that holds `path`.
-fn directoryOf(path: StringView) -> StringView => match (path.lastIndexOf("/")) {
-    Some(0) => "/",
-    Some(slash) => path[0..slash],
-    null => ".",
+fn directoryOf(path: OsStringView) -> OsStringView => match (path.toByteStringView().lastIndexOf("/")) {
+    Some(0) => OsStringView.fromText("/"),
+    Some(slash) => OsStringView.fromBytes(path.bytes()[0..slash]),
+    null => OsStringView.fromText("."),
 };
 
 /// The length of the file at `path`, or `null` when there is none.
-fn fileLength(path: StringView) -> Result<u64?, SqliteError> {
+fn fileLength(path: OsStringView) -> Result<u64?, SqliteError> {
     match (File.open(path)) {
         Ok(file) => { return Ok(file.length()?); }
         Err(IoError.NotFound) => { return Ok(null); }
@@ -65,14 +65,14 @@ fn isPowerOfTwoBetween(value: usize, low: usize, high: usize) -> bool =>
 /// Writes a journal, a record at a time.
 struct JournalWriter {
     private file: File;
-    private directory: String;
+    private directory: OsString;
     private nonce: u32;
     private pageSize: usize;
     private records: u32;
     private record: Vector<u8>;
 
     /// Starts the journal of the database at `path`, which has `initialPages` pages of `pageSize` bytes now.
-    fn begin(path: StringView, pageSize: usize, initialPages: u32) -> Result<JournalWriter, SqliteError> {
+    fn begin(path: OsStringView, pageSize: usize, initialPages: u32) -> Result<JournalWriter, SqliteError> {
         let name = withSuffix(path, JOURNAL_SUFFIX)?;
         var file = File.create(name.view())?;
         let nonce = truncate<u32>(Random.below(0x1_0000_0000)?);
@@ -87,7 +87,7 @@ struct JournalWriter {
         file.write(header.view())?;
         return Ok(JournalWriter {
             file: file,
-            directory: String.from(directoryOf(path))?,
+            directory: directoryOf(path).toOsString()?,
             nonce: nonce,
             pageSize: pageSize,
             records: 0,
@@ -121,13 +121,13 @@ struct JournalWriter {
 
 struct Journal {
     /// Whether the database at `path` has a journal with something in it: a commit that may need undoing.
-    fn exists(path: StringView) -> Result<bool, SqliteError> {
+    fn exists(path: OsStringView) -> Result<bool, SqliteError> {
         let name = withSuffix(path, JOURNAL_SUFFIX)?;
         return Ok((fileLength(name.view())? ?? 0) > 0);
     }
 
     /// Removes the journal: the commit it guarded is complete.
-    fn remove(path: StringView) -> Result<void, SqliteError> {
+    fn remove(path: OsStringView) -> Result<void, SqliteError> {
         let name = withSuffix(path, JOURNAL_SUFFIX)?;
         match (File.remove(name.view())) {
             Ok() => {}
@@ -141,7 +141,7 @@ struct Journal {
     /// Whether the database at `path` has a journal that may be hot, as SQLite's hasHotJournal reads it before
     /// asking whether a writer holds RESERVED: the journal has something in it and its first byte is not zero
     /// (a journal whose header was zeroed belongs to a commit that finished).
-    fn mayBeHot(path: StringView) -> Result<bool, SqliteError> {
+    fn mayBeHot(path: OsStringView) -> Result<bool, SqliteError> {
         let name = withSuffix(path, JOURNAL_SUFFIX)?;
         var journal = match (File.open(name.view())) {
             Ok(file) => file,
@@ -154,7 +154,7 @@ struct Journal {
 
     /// Undoes an interrupted commit of the database at `path`, if its journal shows one, and removes the
     /// journal. True when pages were put back. The caller holds the database's EXCLUSIVE lock, or is alone.
-    fn recover(path: StringView) -> Result<bool, SqliteError> {
+    fn recover(path: OsStringView) -> Result<bool, SqliteError> {
         match (File.openReadWrite(path)) {
             Ok(database) => {
                 var db = database;
@@ -170,7 +170,7 @@ struct Journal {
     }
 
     /// `recover` through `db`, the database file already open (the handle that holds its lock).
-    fn rollBack(path: StringView, db: borrow mut File) -> Result<bool, SqliteError> {
+    fn rollBack(path: OsStringView, db: borrow mut File) -> Result<bool, SqliteError> {
         let name = withSuffix(path, JOURNAL_SUFFIX)?;
         var journal = match (File.open(name.view())) {
             Ok(file) => file,
@@ -288,7 +288,7 @@ struct Journal {
 
 /// Makes the file at `path` hold exactly the pages of `store`, as one commit: an interrupted one is undone from
 /// the journal. Pages that are already what `store` holds are not written. Returns the number of pages written.
-fn commitImage(path: StringView, store: borrow PageStore) -> Result<u64, SqliteError> {
+fn commitImage(path: OsStringView, store: borrow PageStore) -> Result<u64, SqliteError> {
     let _ = Journal.recover(path)?;
     let wal = withSuffix(path, "-wal")?;
     if ((fileLength(wal.view())? ?? 0) > 0) {

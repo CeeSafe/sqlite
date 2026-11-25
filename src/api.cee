@@ -164,11 +164,11 @@ public struct Connection {
 
     /// Opens the database file at `path`, making an empty database if there is none. `:memory:` and the empty
     /// name give a private database, as in SQLite: here a file of its own, removed when the connection closes.
-    public fn open(path: StringView) -> Result<Connection, SqliteError> => Connection.openWaiting(path, 0);
+    public fn open(path: OsStringView) -> Result<Connection, SqliteError> => Connection.openWaiting(path, 0);
 
     /// Opens a connection whose busy timeout is `busyTimeout` milliseconds, which opening waits for too.
-    fn openWaiting(path: StringView, busyTimeout: i64) -> Result<Connection, SqliteError> {
-        if (path.startsWith("file:")) {
+    fn openWaiting(path: OsStringView, busyTimeout: i64) -> Result<Connection, SqliteError> {
+        if (path.toByteStringView().startsWith("file:")) {
             return Err(unsupported("URI file names are not supported; give a file's path"));
         }
         return Ok(Connection { session: Session.openWaiting(path, busyTimeout.max(0))? });
@@ -178,8 +178,8 @@ public struct Connection {
     /// file must exist, and a statement that would write it fails with `SqliteError.ReadOnly`. A database file
     /// this process may not write is opened so by `open` too. In WAL mode the `-shm` and the log are opened for
     /// writing when they can be, as SQLite opens them, and for reading otherwise.
-    public fn openReadOnly(path: StringView) -> Result<Connection, SqliteError> {
-        if (path.startsWith("file:")) {
+    public fn openReadOnly(path: OsStringView) -> Result<Connection, SqliteError> {
+        if (path.toByteStringView().startsWith("file:")) {
             return Err(unsupported("URI file names are not supported; give a file's path"));
         }
         return Ok(Connection { session: Session.openWith(path, 0, true)? });

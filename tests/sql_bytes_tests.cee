@@ -71,7 +71,17 @@ fn makeDatabaseOfBytes(path: StringView, script: StringView) -> Result<void, Tes
 /// Runs `script` (one statement a line, `\xHH` for a byte) through one sqlite3 process and through one session on
 /// a database of each engine's own, made by `fixture` in the shell (none when empty); compares what both print,
 /// headers and errors included.
-fn sameByteSession(name: StringView, fixture: StringView, script: StringView) -> Result<void, TestFailure> {
+fn sameByteSession(name: StringView, fixture: StringView, script: StringView) -> Result<void, TestFailure> =>
+    sameByteSessionMaking(name, fixture, script, [][..]);
+
+/// `sameByteSession` for a script that makes the files `made` (names written as the script's, `\xHH` for a byte):
+/// each is removed before either engine runs, and both must leave the same ones.
+fn sameByteSessionMaking(name: StringView, fixture: StringView, script: StringView, made: Slice<StringView>) -> Result<void, TestFailure> {
+    var madeNames = Vector<ByteString>.create();
+    for (m in made) {
+        madeNames.push(unescaped(m))!;
+    }
+    removeAll(borrow madeNames);
     var ourPath = String.from("out/bytes-ours-")!;
     ourPath.append(name)!;
     ourPath.append(".db")!;
@@ -100,6 +110,8 @@ fn sameByteSession(name: StringView, fixture: StringView, script: StringView) ->
     var arguments = Vector<StringView>.create();
     arguments.push(theirPath.view())!;
     let output = captureSqlite(borrow arguments, input.bytes())!;
+    let theirFiles = whichAreThere(borrow madeNames);
+    removeAll(borrow madeNames);
     let theirs = shownText(output.stdout.view());
     // Errors, in order, as "error: message"; the shell writes "… near line N: message", then for a parse error
     // the statement and a caret, on lines that start with spaces.
@@ -127,9 +139,30 @@ fn sameByteSession(name: StringView, fixture: StringView, script: StringView) ->
             }
         }
     }
+    let myFiles = whichAreThere(borrow madeNames);
+    removeAll(borrow madeNames);
     sameLines(theirs.view(), mine.view())?;
     sameLines(theirErrors.view(), myErrors.view())?;
+    sameLines(theirFiles.view(), myFiles.view())?;
     return expectIntact(ourPath.view());
+}
+
+/// Removes each file named (by its bytes) in `names`; one that is not there is skipped.
+fn removeAll(names: borrow Vector<ByteString>) {
+    for (i in 0..names.length) {
+        let _ = File.remove(OsStringView.fromByteString(names[i].view()));
+    }
+}
+
+/// Which of the files named in `names` are there, one line each, as the tests show bytes.
+fn whichAreThere(names: borrow Vector<ByteString>) -> String {
+    var out = String.create();
+    for (i in 0..names.length) {
+        out.append(shownText(names[i].bytes()).view())!;
+        let there = File.open(OsStringView.fromByteString(names[i].view())).isOk();
+        out.append(if (there) ": there\n" else ": not there\n")!;
+    }
+    return out;
 }
 
 /// Fails at the first line where `mine` differs from `theirs`, naming both.
@@ -244,37 +277,19 @@ fn schemasSqliteWroteWithBytesRoundTrip() -> Result<void, TestFailure> {
 }
 
 @test
-fn fileNamesThatAreNotUtf8AreRefused() -> Result<void, TestFailure> {
+fn fileNamesOfAnyBytesAreSqlites() -> Result<void, TestFailure> {
+    // SQLite takes a file name's bytes as they are: Linux's file system makes such a file, macOS's refuses the name
+    // and the open fails, and on Windows the name is read as UTF-8, with U+FFFD for the byte. Each engine does what
+    // its host lets it, as the other does.
     let script = """
         ATTACH 'out/a\xffb.db' AS x
+        CREATE TABLE x.t(a)
+        INSERT INTO x.t VALUES (1)
+        SELECT * FROM x.t
         CREATE TABLE t(a)
         VACUUM INTO 'out/v\xff.db'
         """;
-    if (cfg("target.macos")) {
-        // macOS's file system refuses such names, and SQLite's open fails with them as this does.
-        return sameByteSession("files", "", script);
-    }
-    // Linux's file system takes such a name, and so does sqlite3 on Windows (as U+FFFD): SQLite makes the file.
-    // This engine cannot name it (CeeSafe's file names are text, CEESAFE_FINDINGS.md 47) and refuses it as
-    // sqlite3 does on macOS (README.md, "Text of any bytes").
-    let path = "out/bytes-ours-files.db";
-    freshPath(path);
-    var session = Session.open(path)!;
-    let none = Vector<SqliteValue>.create();
-    var errors = String.create();
-    var lines = script.split("\n");
-    while (lines.next() is Some(line)) {
-        let sql = line.trim();
-        if (sql.length == 0) {
-            continue;
-        }
-        if (session.queryBytes(unescaped(sql).view(), none.view()) is Err(e)) {
-            errors.append(shownText(e.message().bytes()).view())!;
-            errors.append("\n")!;
-        }
-    }
-    Check.equalText("unable to open database: out/a\\xFFb.db\nunable to open database: out/v\\xFF.db\n", errors.view())?;
-    return expectIntact(path);
+    return sameByteSessionMaking("files", "", script, ["out/a\\xffb.db", "out/v\\xff.db"][..]);
 }
 
 @test

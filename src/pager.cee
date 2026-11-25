@@ -43,10 +43,10 @@ struct Pager {
     private generationSize: usize;
 
     /// Opens the database file at `path` for reading.
-    fn open(path: StringView) -> Result<Pager, SqliteError> => Pager.openWithCache(path, PAGER_DEFAULT_CACHE_PAGES);
+    fn open(path: OsStringView) -> Result<Pager, SqliteError> => Pager.openWithCache(path, PAGER_DEFAULT_CACHE_PAGES);
 
     /// Opens the database file at `path`, keeping at most about `cachePages` pages in memory.
-    fn openWithCache(path: StringView, cachePages: usize) -> Result<Pager, SqliteError> {
+    fn openWithCache(path: OsStringView, cachePages: usize) -> Result<Pager, SqliteError> {
         var file = File.open(path)?;
         var headerBytes = [0u8; 100];
         if (!readFully(mut file, mut headerBytes[..], 0)?) {

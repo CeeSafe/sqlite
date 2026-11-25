@@ -40,7 +40,7 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 42, 43, 44 | fixed in 0.95.12: lib/std's `MappedRead` (ADR 0254), two-phase `copyFrom`/`fill` receivers (ADR 0252), `File.link` (ADR 0255); workarounds removed: the wal-index reads its three kinds of block through `MappedRead` (`HeapBlock` implements it; the enum stays for the writes, which only `SharedMapping` makes), `HeapBlock.readAt` reads `into.length` in its own call, the hot-journal test links with `File.link` |
 | 41 | fixed in 0.95.12: lib/core's `TextView` and `TextBuffer`, ADR 0253; the workaround stays for now: moving the tokenizer, parser, catalog and messages to `ByteString` text is a rewrite of their own, not a removal (below) |
 | 45, 46 | fixed in 0.95.7 (ADR 0245: `Process.run` quotes for `CommandLineToArgvW` through `CreateProcessW`, `Process.capture` closes its input file first); workaround removed (the sqlite3 shell's last one since 0.95.12, finding 51) |
-| 47 | fixed in 0.95.12: `OsString`/`OsStringView` file names, ADR 0257; the engine's paths are still `StringView`, so the workaround stays until they move (below) |
+| 47 | fixed in 0.95.12: `OsString`/`OsStringView` file names, ADR 0257; workaround removed: every path in the engine is an OS string, ATTACH and VACUUM INTO take a name's bytes (U+FFFD on Windows, as os_win.c), and `fileNamesOfAnyBytesAreSqlites` compares with sqlite3 on every host |
 | 48 | fixed in 0.95.12: `CEESAFE_LOCK_RULES=strict` or `portable` holds a program's locks to Windows' rules on any host, natively and in the interpreter, ADR 0256; workaround removed: `SQLITE_WINDOWS_LOCKS` runs os_win.c's scheme off Windows, and CI runs the engine's tests so on macOS and Linux (224 pass on macOS, the hot-journal test, whose premise is F_GETLK, skipping). It found one break: the exclusive try of a read-only `-shm`'s DMS byte, which POSIX refuses (EBADF); the byte is now tested (`testLock`, a try-and-release on Windows as os_win.c's) |
 | 49 | fixed in 0.95.7 (ADR 0247: initializers MSVC can nest); CI's Windows job builds with MSVC (`CC=cl`) |
 | 51 | fixed in 0.95.12: `ChildOptions.setEnvironment`, `Process.captureWith` and `runWith`, ADR 0258; workaround removed: on Windows the sqlite3 shell runs by `Process.captureWith` with HOME and USERPROFILE set to a directory that holds its `.sqliterc`, and `tests/capture.py` is gone |
@@ -483,7 +483,7 @@ type of bytes (`ByteStringView` on POSIX, UTF-16 on Windows) would let it follow
 Workaround: `fileNamesThatAreNotUtf8AreRefused` compares with sqlite3 on macOS only, and elsewhere checks the
 engine's refusal.
 
-Fixed in 0.95.12 (ADR 0257: `OsString`, `OsStringView`); the engine's paths have not moved to it yet (status table).
+Fixed in 0.95.12 (ADR 0257: `OsString`, `OsStringView`); the workaround is gone (status table).
 
 ### 48. Windows' lock rules cannot be checked off Windows
 

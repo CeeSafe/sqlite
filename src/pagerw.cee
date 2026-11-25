@@ -147,7 +147,7 @@ struct WritablePager {
     private checkpointDue: bool;
     /// Whether a transaction was open on this database before the running statement began (the session says).
     readBeforeStatement: bool;
-    private path: String;
+    private path: OsString;
     pageSize: usize;
     usable: usize;
     textEncoding: TextEncoding;
@@ -173,15 +173,15 @@ struct WritablePager {
     /// Opens the database at `path` for changes, making the file (an empty database) when there is none, and
     /// starts a read transaction on it (`startRead`): the pager comes back holding SHARED, which the caller ends
     /// with `endTransaction`. A commit that was interrupted is undone first.
-    fn open(path: StringView) -> Result<WritablePager, SqliteError> => WritablePager.openWaiting(path, 0);
+    fn open(path: OsStringView) -> Result<WritablePager, SqliteError> => WritablePager.openWaiting(path, 0);
 
     /// `open`, waiting up to `busyTimeout` milliseconds for another connection's lock.
-    fn openWaiting(path: StringView, busyTimeout: i64) -> Result<WritablePager, SqliteError> =>
+    fn openWaiting(path: OsStringView, busyTimeout: i64) -> Result<WritablePager, SqliteError> =>
         WritablePager.openWith(path, busyTimeout, false);
 
     /// `openWaiting`, for reading only when `readOnly` (SQLITE_OPEN_READONLY: the file must exist). A file that
     /// cannot be opened for writing is opened for reading, as unixOpen falls back, and the pager is read-only.
-    fn openWith(path: StringView, busyTimeout: i64, readOnly: bool) -> Result<WritablePager, SqliteError> {
+    fn openWith(path: OsStringView, busyTimeout: i64, readOnly: bool) -> Result<WritablePager, SqliteError> {
         var onlyReads = readOnly;
         var opened: Result<File, IoError> = Err(IoError.NotFound);
         if (!readOnly) {
@@ -209,7 +209,7 @@ struct WritablePager {
             autoCheckpoint: WAL_DEFAULT_AUTOCHECKPOINT,
             checkpointDue: false,
             readBeforeStatement: false,
-            path: String.from(path)?,
+            path: path.toOsString()?,
             pageSize: 4096,
             usable: 4096,
             textEncoding: TextEncoding.Utf8,
@@ -858,7 +858,7 @@ struct WritablePager {
     }
 
     /// The file's path, as it was opened.
-    fn filePath(borrow this) -> StringView => this.path.view();
+    fn filePath(borrow this) -> OsStringView => this.path.view();
 
     /// Whether the transaction has changed anything.
     fn hasChanges(borrow this) -> bool => this.dirty.length() != 0;

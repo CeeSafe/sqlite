@@ -68,7 +68,7 @@ struct WalLog {
     private latest: HashMap<u32, u32>;
 
     /// The log of the database at `path`, read and indexed. A missing file is an empty log.
-    fn open(path: StringView) -> Result<WalLog, SqliteError> {
+    fn open(path: OsStringView) -> Result<WalLog, SqliteError> {
         let name = withSuffix(path, WAL_SUFFIX)?;
         let file: File? = match (File.open(name.view())) {
             Ok(f) => f,
