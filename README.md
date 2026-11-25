@@ -14,7 +14,7 @@ pure-managed C# engine `CosmoNova.Engine.Sqlite` from CosmoStack.
 | Index b-tree reader | `Btree/IndexBTreeReader` | `index.cee` | done, except the integer batch-count fast paths, which belong with the executor |
 | Value ordering, collations | `Exec/ValueComparer` | `compare.cee` | done |
 | Schema and tables by name | `SqliteDatabaseReader` | `reader.cee` | done |
-| Tokenizer, parser, AST | `Engine/Sql` | `tokenizer.cee`, `parser.cee`, `ast.cee` | done: SQL text of any bytes (`sqltext.cee`), as SQLite takes it |
+| Tokenizer, parser, AST | `Engine/Sql` | `tokenizer.cee`, `parser.cee`, `ast.cee` | done: SQL text of any bytes, held as bytes (`text.cee`), as SQLite takes it |
 | SQL writer | `Sql/SqlWriter` | `sqlwriter.cee` | expressions only, by design (see below) |
 | Schema catalog, affinity | `Engine/Schema`, `Exec/Affinity` | `schema.cee` | done |
 | Database writer, b-tree builder | `Storage/DatabaseWriter`, `BTreeBuilder`, `PageStore` | `writer.cee`, `builder.cee` | done: files pass `PRAGMA integrity_check` in `sqlite3` |
@@ -87,10 +87,10 @@ The port fixes what was wrong in the source instead of copying it. Each item has
   `ByteStringView` (`Connection.executeBytes`, `queryBytes`, `scalarBytes`, `executeScriptBytes`,
   `Params.bindBytes`, `Session.queryBytes`; the `StringView` forms are conveniences over them),
   `QueryResult.columns` are `ByteString`s, and `SqliteError.message()` is a `ByteStringView` (`messageText()` for
-  a `String`, U+FFFD for bytes that are not UTF-8). Inside, SQL text stays a `String`, in which each byte of a
-  sequence that is not UTF-8 stands as one code point of U+10FF80..U+10FFFF (a real one of those is escaped the
-  same way, so the mapping is one to one; `src/sqltext.cee`). Names therefore compare as their bytes, folding
-  ASCII case only; a name or definition leaves as its bytes wherever it becomes a value (a literal, sqlite_schema's
+  a `String`, U+FFFD for bytes that are not UTF-8). Inside, SQL text is bytes all the way: tokens, the syntax
+  tree, the catalog's names, sqlite_schema's SQL and messages are `ByteString`s and `ByteStringView`s, and code
+  that takes text of either kind is written over lib/core's `TextView` (`src/text.cee`). Names compare as their
+  bytes, folding ASCII case only; a name or definition leaves as its bytes wherever it becomes a value (a literal, sqlite_schema's
   columns, a pragma's rows, sqlite_stat1) or a message, and a RAISE message keeps its value's bytes
   (`stringLiteralsKeepTheirBytes`, `namesKeepTheirBytes`, `schemasSqliteWroteWithBytesRoundTrip`,
   `connectionsTakeSqlOfAnyBytes`). A file name for ATTACH or VACUUM INTO is its bytes, as in SQLite: on Linux a

@@ -20,18 +20,18 @@ struct TriggerContext {
 
 /// A trigger of a table, parsed from its statement.
 struct TriggerPlan {
-    name: String;
+    name: ByteString;
     /// The database whose schema keeps it; its body's names are looked up there, unless it is TEMP's.
     database: usize;
     timing: TriggerTiming;
     event: TriggerEvent;
-    updateOf: Vector<String>;
+    updateOf: Vector<ByteString>;
     when: Expr?;
     body: Vector<Stmt>;
 }
 
 /// The triggers on table `name` of the active database: its own, and TEMP's on a table of that name.
-fn tableTriggers(db: borrow Session, name: StringView) -> Result<Vector<TriggerPlan>, SqliteError> {
+fn tableTriggers(db: borrow Session, name: ByteStringView) -> Result<Vector<TriggerPlan>, SqliteError> {
     var out = Vector<TriggerPlan>.create();
     var databases = Vector<usize>.create();
     databases.push(db.active)?;
@@ -49,7 +49,7 @@ fn tableTriggers(db: borrow Session, name: StringView) -> Result<Vector<TriggerP
 fn triggersIn(
     db: borrow Session,
     database: usize,
-    name: StringView,
+    name: ByteStringView,
     out: borrow mut Vector<TriggerPlan>,
 ) -> Result<void, SqliteError> {
     let entries = db.entriesOf(database);
@@ -105,22 +105,22 @@ fn newCompiler(db: borrow Session) -> Result<Compiler, AllocError> {
         var scope = Scope { sources: Vector<ScopeSource>.create() };
         scope.sources.push(
             ScopeSource {
-                name: String.from("old")?,
+                name: ownedText("old")?,
                 columns: cloneScopeColumns(borrow context.columns)?,
                 slot: 0,
                 hasRowid: true,
                 rowidAlias: context.rowidAlias,
-                merged: Vector<String>.create(), coalesceMerged: false,
+                merged: Vector<ByteString>.create(), coalesceMerged: false,
             },
         )?;
         scope.sources.push(
             ScopeSource {
-                name: String.from("new")?,
+                name: ownedText("new")?,
                 columns: cloneScopeColumns(borrow context.columns)?,
                 slot: 1,
                 hasRowid: true,
                 rowidAlias: context.rowidAlias,
-                merged: Vector<String>.create(), coalesceMerged: false,
+                merged: Vector<ByteString>.create(), coalesceMerged: false,
             },
         )?;
         compiler.triggerScope = copyScope(borrow scope)?;
@@ -253,7 +253,7 @@ fn runTriggerBody(trigger: borrow TriggerPlan, db: borrow mut Session) -> Result
         let changes = db.changes;
         let last = db.lastInsertRowid;
         let running = db.runningChanges;
-        let result = db.run(borrow trigger.body[s], "", []);
+        let result = db.run(borrow trigger.body[s], ByteStringView.fromText(""), []);
         db.changes = changes;
         db.lastInsertRowid = last;
         db.runningChanges = running;
@@ -265,7 +265,7 @@ fn runTriggerBody(trigger: borrow TriggerPlan, db: borrow mut Session) -> Result
 /// CREATE TRIGGER.
 fn executeCreateTrigger(
     stmt: borrow CreateTriggerStmt,
-    sql: StringView,
+    sql: ByteStringView,
     db: borrow mut Session,
 ) -> Result<void, SqliteError> {
     let name = stmt.name.name.view();
@@ -274,7 +274,7 @@ fn executeCreateTrigger(
             if (stmt.ifNotExists) {
                 return Ok();
             }
-            var message = String.from("trigger ")?;
+            var message = ownedText("trigger ")?;
             message.append(writtenObjectName(sql, name).view())?;
             message.append(" already exists")?;
             return Err(sqlError(message.view()));
@@ -282,7 +282,7 @@ fn executeCreateTrigger(
     }
     let table = stmt.table.view();
     // A TEMP trigger may be on a table or view of any database; another only on its own database's.
-    let anywhere: String? = null;
+    let anywhere: ByteString? = null;
     let isView = if (stmt.temporary) db.findObject(
         borrow anywhere,
         "view",
@@ -299,7 +299,7 @@ fn executeCreateTrigger(
         return Err(sqlError("cannot create trigger on system table"));
     }
     if (isView && stmt.timing != TriggerTiming.InsteadOf) {
-        var message = String.from("cannot create ")?;
+        var message = ownedText("cannot create ")?;
         message.append(if (stmt.timing == TriggerTiming.Before) "BEFORE" else "AFTER")?;
         message.append(" trigger on view: ")?;
         message.append(table)?;

@@ -47,22 +47,18 @@ impl SqliteError {
     public fn messageText(borrow this) -> Result<String, AllocError> => this.message().toUtf8Lossy();
 }
 
-/// A message made in the engine, whose names are SQL text in the engine's form (sqltext.cee), as the bytes it
-/// stands for.
-fn ownedMessage(message: StringView) -> ByteString => match (sqlBytes(message)) {
-    Ok(s) => s,
-    Err(_) => ByteString.create(),
-};
+/// A message made in the engine: its bytes, names in it as the SQL text held them.
+fn ownedMessage<N: TextView>(message: N) -> ByteString => ownedText(message).ok() ?? ByteString.create();
 
-fn corrupt(message: StringView) -> SqliteError => SqliteError.Corrupt(ownedMessage(message));
+fn corrupt<N: TextView>(message: N) -> SqliteError => SqliteError.Corrupt(ownedMessage(message));
 
-fn notADatabase(message: StringView) -> SqliteError => SqliteError.NotADatabase(ownedMessage(message));
+fn notADatabase<N: TextView>(message: N) -> SqliteError => SqliteError.NotADatabase(ownedMessage(message));
 
-fn sqlError(message: StringView) -> SqliteError => SqliteError.Sql(ownedMessage(message));
+fn sqlError<N: TextView>(message: N) -> SqliteError => SqliteError.Sql(ownedMessage(message));
 
-fn unsupported(message: StringView) -> SqliteError => SqliteError.Unsupported(ownedMessage(message));
+fn unsupported<N: TextView>(message: N) -> SqliteError => SqliteError.Unsupported(ownedMessage(message));
 
 /// SQLITE_READONLY's message, which SQLite gives for each of its read-only cases.
 fn readOnlyError() -> SqliteError => SqliteError.ReadOnly(ownedMessage("attempt to write a readonly database"));
 
-fn constraintError(message: StringView) -> SqliteError => SqliteError.Constraint(ownedMessage(message));
+fn constraintError<N: TextView>(message: N) -> SqliteError => SqliteError.Constraint(ownedMessage(message));

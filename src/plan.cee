@@ -629,8 +629,8 @@ fn usableBound(
 
 /// A row of sqlite_stat1: the table, the index (empty for the table's own row), and its numbers.
 struct IndexStat {
-    table: String;
-    index: String;
+    table: ByteString;
+    index: ByteString;
     numbers: Vector<u64>;
 }
 
@@ -736,17 +736,17 @@ fn loadStats(db: borrow mut Session) -> Result<PlanStats, SqliteError> {
         if (row.columns.length < 3) {
             continue;
         }
-        // Names keep their bytes (in the engine's form for SQL text); the numbers are UTF-8.
+        // Names keep their bytes; the numbers are UTF-8.
         let SqliteValue.Text(tableBytes) = borrow row.columns[0] else {
             continue;
         };
-        let table = sqlTextOf(tableBytes.bytes())?;
+        let table = tableBytes.clone()?;
         let Some(stat) = row.columns[2].textView() else {
             continue;
         };
-        var index = String.create();
+        var index = ByteString.create();
         if (borrow row.columns[1] is SqliteValue.Text(name)) {
-            index = sqlTextOf(name.bytes())?;
+            index = name.clone()?;
         }
         var numbers = Vector<u64>.create();
         var parts = stat.split(" ");
@@ -764,10 +764,10 @@ fn loadStats(db: borrow mut Session) -> Result<PlanStats, SqliteError> {
 }
 
 /// The statistic of index `name` for `column` columns fixed (0: the rows in the index).
-fn statFor(stats: borrow PlanStats, name: StringView, column: usize) -> u64? {
+fn statFor(stats: borrow PlanStats, name: ByteStringView, column: usize) -> u64? {
     for (i in 0..stats.rows.length) {
         let row = borrow stats.rows[i];
-        if (row.index.length != 0 && row.index.view().equalsIgnoreAsciiCase(name)) {
+        if (row.index.length() != 0 && row.index.view().equalsIgnoreAsciiCase(name)) {
             return if (column < row.numbers.length) row.numbers[column] else null;
         }
     }
@@ -781,7 +781,7 @@ fn statTableRows(stats: borrow PlanStats, table: borrow TableSchema, indexes: bo
         if (!row.table.view().equalsIgnoreAsciiCase(table.name.view())) {
             continue;
         }
-        var whole = row.index.length == 0;
+        var whole = row.index.length() == 0;
         for (k in 0..indexes.length) {
             if (indexes[k].filter.isNull() && indexes[k].name.view().equalsIgnoreAsciiCase(row.index.view())) {
                 whole = true;
@@ -1181,7 +1181,7 @@ fn neededColumns(core: borrow CorePlan, slot: usize, count: usize) -> Result<Vec
 
 /// SQLite's estimate of a column's size from its declared type, in units of 4 bytes (sqlite3AffinityType): 1 for
 /// none and for numbers, `k/4 + 1` for `CHAR(k)` and the like, else 5 for text and blobs.
-fn columnWidth(declared: StringView) -> u64 {
+fn columnWidth(declared: ByteStringView) -> u64 {
     let bytes = declared.bytes();
     if (bytes.length == 0) {
         return 1;

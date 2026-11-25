@@ -207,10 +207,10 @@ struct FrameOffsets {
     end: SqliteValue;
 }
 
-fn frameOffset(
+fn frameOffset<N: TextView>(
     e: borrow XExpr?,
     mode: FrameMode,
-    which: StringView,
+    which: N,
     frame: borrow mut Frame,
     db: borrow mut Session,
 ) -> Result<SqliteValue, SqliteError> {
@@ -225,7 +225,7 @@ fn frameOffset(
         _ => false,
     };
     if (!ok) {
-        var message = String.from("frame ")?;
+        var message = ownedText("frame ")?;
         message.append(which)?;
         message.append(" offset must be a non-negative ")?;
         message.append(if (mode == FrameMode.Range) "number" else "integer")?;

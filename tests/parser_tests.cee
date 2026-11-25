@@ -1,5 +1,9 @@
 // The SQL parser. Expressions are checked in the writer's canonical form, which shows how operators grouped.
 
+/// `Check.equalText` for a name the engine holds as bytes.
+fn equalName(expected: StringView, actual: ByteStringView) -> Result<void, TestFailure> =>
+    Check.equalText(expected, actual.toUtf8() ?? "<not UTF-8>");
+
 /// The canonical form of the expression `text`.
 fn shape(text: StringView) -> String {
     var sql = String.from("SELECT ")!;
@@ -7,7 +11,7 @@ fn shape(text: StringView) -> String {
     match (Parser.parseStatement(sql.view())) {
         Ok(Stmt.Select(select)) => {
             match (borrow select.cores[0].columns[0]) {
-                ResultColumn.Expr(expr, _) => { return SqlWriter.expression(expr)!; }
+                ResultColumn.Expr(expr, _) => { return shownText(SqlWriter.expression(expr)!.bytes()); }
                 _ => { return String.from("<star>")!; }
             }
         }
@@ -25,13 +29,13 @@ fn parseError(sql: StringView) -> String => match (Parser.parseStatement(sql)) {
     Err(e) => shownText(e.message().bytes()),
 };
 
-fn textOf(value: borrow String?) -> StringView => match (value) {
-    Some(text) => text.view(),
+fn textOf(value: borrow ByteString?) -> StringView => match (value) {
+    Some(text) => text.toUtf8() ?? "<not UTF-8>",
     null => "<null>",
 };
 
 fn exprText(value: borrow Expr?) -> String => match (value) {
-    Some(expr) => SqlWriter.expression(expr)!,
+    Some(expr) => shownText(SqlWriter.expression(expr)!.bytes()),
     null => String.from("<null>")!,
 };
 
@@ -141,7 +145,7 @@ fn selectsParse() -> Result<void, TestFailure> {
         return Check.fail("expected WITH");
     };
     Check.isTrue(with.recursive, "RECURSIVE")?;
-    Check.equalText("c", with.ctes[0].name.view())?;
+    equalName("c", with.ctes[0].name.view())?;
     Check.equalU64(1, with.ctes[0].columns.length as u64)?;
     Check.equalU64(2, with.ctes[0].select.cores.length as u64)?;
     Check.isTrue(with.ctes[0].select.compoundOps[0] == CompoundOp.UnionAll, "UNION ALL in the CTE")?;
@@ -152,7 +156,7 @@ fn selectsParse() -> Result<void, TestFailure> {
     Check.equalU64(3, core.columns.length as u64)?;
     Check.isTrue(core.columns[0] is ResultColumn.TableStar(_), "t.*")?;
     match (borrow core.columns[2]) {
-        ResultColumn.Expr(_, Some(alias)) => { Check.equalText("label", alias.view())?; }
+        ResultColumn.Expr(_, Some(alias)) => { equalName("label", alias.view())?; }
         _ => { return Check.fail("a string literal is an alias"); }
     }
     let Some(from) = borrow core.from else {
@@ -161,7 +165,7 @@ fn selectsParse() -> Result<void, TestFailure> {
     match (borrow from.source) {
         FromItem.Table(table) => {
             Check.equalText("main", textOf(table.name.schema))?;
-            Check.equalText("t", table.name.name.view())?;
+            equalName("t", table.name.name.view())?;
             Check.equalText("t", textOf(table.alias))?;
             Check.equalText("t_n", textOf(table.indexedBy))?;
         }
@@ -182,7 +186,7 @@ fn selectsParse() -> Result<void, TestFailure> {
     }
     Check.isTrue(core.filter.isSome() && core.having.isSome(), "WHERE and HAVING")?;
     Check.equalU64(2, core.groupBy.length as u64)?;
-    Check.equalText("w", core.windows[0].name.view())?;
+    equalName("w", core.windows[0].name.view())?;
     Check.equalU64(2, select.orderBy.length as u64)?;
     Check.isTrue(select.orderBy[0].descending && select.orderBy[0].nullsFirst == Some(true), "DESC NULLS FIRST")?;
     Check.isTrue(select.limit.isSome() && select.offset.isSome(), "LIMIT and OFFSET")?;
@@ -215,7 +219,7 @@ fn dataChangesParse() -> Result<void, TestFailure> {
                 _ => { return Check.fail("expected VALUES"); }
             }
             Check.equalU64(2, insert.upserts.length as u64)?;
-            Check.equalText("a", insert.upserts[0].target[0].view())?;
+            equalName("a", insert.upserts[0].target[0].view())?;
             Check.equalU64(1, insert.upserts[0].assignments.length as u64)?;
             Check.isTrue(insert.upserts[0].filter.isSome(), "DO UPDATE … WHERE")?;
             Check.equalU64(0, insert.upserts[1].assignments.length as u64)?;
@@ -253,9 +257,9 @@ fn schemaStatementsParse() -> Result<void, TestFailure> {
         Stmt.CreateTable(table) => {
             Check.isTrue(table.temporary && table.ifNotExists && table.withoutRowid && table.strict, "the table's flags")?;
             Check.equalU64(3, table.columns.length as u64)?;
-            Check.equalText("n", table.columns[1].name.view())?;
+            equalName("n", table.columns[1].name.view())?;
             Check.equalU64(14, table.columns[1].body.length as u64)?;
-            Check.equalText("primary", table.columns[2].name.view())?;
+            equalName("primary", table.columns[2].name.view())?;
             Check.equalU64(2, table.constraints.length as u64)?;
         }
         _ => { return Check.fail("expected CREATE TABLE"); }
@@ -263,8 +267,8 @@ fn schemaStatementsParse() -> Result<void, TestFailure> {
     match (Parser.parseStatement("CREATE UNIQUE INDEX i ON t (a COLLATE NOCASE DESC, lower(b)) WHERE a IS NOT NULL")!) {
         Stmt.CreateIndex(index) => {
             Check.isTrue(index.unique && index.filter.isSome(), "UNIQUE and WHERE")?;
-            Check.equalText("a", index.columns[0].name.view())?;
-            Check.equalText("NOCASE", index.columns[0].collation.view())?;
+            equalName("a", index.columns[0].name.view())?;
+            equalName("NOCASE", index.columns[0].collation.view())?;
             Check.isTrue(index.columns[0].descending, "DESC")?;
             Check.isTrue(index.columns[1].expression.isSome(), "an expression column")?;
         }

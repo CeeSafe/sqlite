@@ -109,11 +109,11 @@ fn sourceRows(
             return Ok(copy);
         }
         SourceKind.Pragma(name, argument) => {
-            var text: String? = null;
+            var text: ByteString? = null;
             if (argument is Some(a)) {
                 let v = evaluate(a, frame, db)?;
-                // A pragma's argument keeps its bytes, in the engine's form for SQL text (sqltext.cee).
-                text = sqlTextOf(valueText(borrow v)?.bytes())?;
+                // A pragma's argument keeps its bytes.
+                text = valueText(borrow v)?;
             }
             var rows = pragmaRows(name.view(), text, db)?;
             // The hidden argument column.

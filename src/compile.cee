@@ -57,10 +57,10 @@ fn literalValue(literal: borrow Literal) -> Result<SqliteValue, SqliteError> {
         LiteralKind.Null => { return Ok(SqliteValue.Null); }
         LiteralKind.True => { return Ok(SqliteValue.Integer(1)); }
         LiteralKind.False => { return Ok(SqliteValue.Integer(0)); }
-        LiteralKind.String => { return Ok(SqliteValue.sqlText(text)?); }
+        LiteralKind.String => { return Ok(SqliteValue.ofText(text)?); }
         LiteralKind.Float => { return Ok(SqliteValue.Real(RealParse.of(text.bytes()).value)); }
         LiteralKind.Integer => {
-            if (text.length > 2 && (text[1] == 'x' || text[1] == 'X')) {
+            if (text.length() > 2 && (text[1] == 'x' || text[1] == 'X')) {
                 // Up to 16 hex digits, as the two's-complement bits of the integer.
                 var bits: u64 = 0;
                 for (c in text.bytes()[2..]) {
@@ -71,9 +71,9 @@ fn literalValue(literal: borrow Literal) -> Result<SqliteValue, SqliteError> {
             return Ok(SqliteValue.Integer(IntegerPrefix.scan(text.bytes()).value));
         }
         LiteralKind.Blob => {
-            var bytes = Vector<u8>.withCapacity(text.length / 2)?;
+            var bytes = Vector<u8>.withCapacity(text.length() / 2)?;
             var i: usize = 0;
-            while (i + 1 < text.length) {
+            while (i + 1 < text.length()) {
                 bytes.push((hexValue(text[i]) << 4) | hexValue(text[i + 1]))?;
                 i += 2;
             }
@@ -83,18 +83,18 @@ fn literalValue(literal: borrow Literal) -> Result<SqliteValue, SqliteError> {
     }
 }
 
-fn isRowidName(name: StringView) -> bool =>
+fn isRowidName(name: ByteStringView) -> bool =>
     name.equalsIgnoreAsciiCase("rowid") || name.equalsIgnoreAsciiCase("_rowid_") || name.equalsIgnoreAsciiCase("oid");
 
-fn namedError(prefix: StringView, name: StringView) -> SqliteError {
-    var text = String.create();
+fn namedError<N: TextView, M: TextView>(prefix: N, name: M) -> SqliteError {
+    var text = ByteString.create();
     let _ = text.append(prefix);
     let _ = text.append(name);
     return sqlError(text.view());
 }
 
 fn columnNameError(column: borrow ColumnRef) -> SqliteError {
-    var text = String.create();
+    var text = ByteString.create();
     let _ = text.append("no such column: ");
     if (borrow column.table is Some(table)) {
         let _ = text.append(table.view());
@@ -104,8 +104,8 @@ fn columnNameError(column: borrow ColumnRef) -> SqliteError {
     return sqlError(text.view());
 }
 
-fn functionNameError(prefix: StringView, name: StringView, suffix: StringView) -> SqliteError {
-    var text = String.create();
+fn functionNameError<N: TextView, M: TextView, P: TextView>(prefix: N, name: M, suffix: P) -> SqliteError {
+    var text = ByteString.create();
     let _ = text.append(prefix);
     let _ = text.append(name);
     let _ = text.append(suffix);
@@ -166,7 +166,7 @@ impl Compiler {
         };
     }
 
-    fn findColumn(source: borrow ScopeSource, name: StringView) -> usize? {
+    fn findColumn(source: borrow ScopeSource, name: ByteStringView) -> usize? {
         for (i in 0..source.columns.length) {
             if (source.columns[i].name.view().equalsIgnoreAsciiCase(name)) {
                 return i;
@@ -175,7 +175,7 @@ impl Compiler {
         return null;
     }
 
-    fn isMerged(source: borrow ScopeSource, name: StringView) -> bool {
+    fn isMerged(source: borrow ScopeSource, name: ByteStringView) -> bool {
         for (i in 0..source.merged.length) {
             if (source.merged[i].view().equalsIgnoreAsciiCase(name)) {
                 return true;
@@ -189,7 +189,7 @@ impl Compiler {
     fn withMergedSides(
         scope: borrow Scope,
         sourceAt: usize,
-        name: StringView,
+        name: ByteStringView,
         compiled: Compiled,
     ) -> Result<Compiled, AllocError> {
         var result = compiled;
@@ -249,7 +249,7 @@ impl Compiler {
                 }
             }
             if (matches > 1) {
-                var text = String.from("ambiguous column name: ")?;
+                var text = ownedText("ambiguous column name: ")?;
                 if (borrow column.table is Some(table)) {
                     text.append(table.view())?;
                     text.append(".")?;
@@ -302,7 +302,7 @@ impl Compiler {
         return Ok(null);
     }
 
-    private fn aliasNamed(borrow this, name: StringView) -> usize? {
+    private fn aliasNamed(borrow this, name: ByteStringView) -> usize? {
         for (i in 0..this.aliases.length) {
             if (this.aliases[i].name.view().equalsIgnoreAsciiCase(name)) {
                 return i;
@@ -348,7 +348,7 @@ impl Compiler {
         }
         // SQLite's double-quoted string fallback.
         if (unqualified && column.doubleQuoted) {
-            return Ok(plain(XExpr.Value(SqliteValue.sqlText(column.name.view())?)));
+            return Ok(plain(XExpr.Value(SqliteValue.ofText(column.name.view())?)));
         }
         return Err(columnNameError(column));
     }
@@ -687,10 +687,10 @@ impl Compiler {
                 for (i in 0..list.length) {
                     let terms = if (borrow list[i] is Expr.RowValue(cells)) cells.length else 1;
                     if (terms != width) {
-                        var message = String.from("IN(...) element has ")?;
-                        message.appendNumber(terms)?;
+                        var message = ownedText("IN(...) element has ")?;
+                        message.appendUnsigned(terms as u64)?;
                         message.append(if (terms == 1) " term - expected " else " terms - expected ")?;
-                        message.appendNumber(width)?;
+                        message.appendUnsigned(width as u64)?;
                         return Err(sqlError(message.view()));
                     }
                     items.push(this.compile(borrow list[i], db)?)?;
@@ -1013,10 +1013,10 @@ fn selectAllFrom(table: borrow QualifiedName) -> Result<SelectStmt, AllocError> 
         having: null,
         windows: Vector<NamedWindow>.create(),
         isValues: false,
-        columnTexts: Vector<String>.create(),
+        columnTexts: Vector<ByteString>.create(),
     };
     core.columns.push(ResultColumn.Star)?;
-    var schema: String? = null;
+    var schema: ByteString? = null;
     if (borrow table.schema is Some(s)) {
         schema = s.clone()?;
     }
@@ -1041,9 +1041,9 @@ fn selectAllFrom(table: borrow QualifiedName) -> Result<SelectStmt, AllocError> 
 
 /// SQLite's error for an IN subquery of the wrong width.
 fn inColumnCount(found: usize, expected: usize) -> SqliteError {
-    var message = String.from("sub-select returns ").ok() ?? String.create();
-    let _ = message.appendNumber(found);
+    var message = ownedText("sub-select returns ").ok() ?? ByteString.create();
+    let _ = message.appendUnsigned(found as u64);
     let _ = message.append(" columns - expected ");
-    let _ = message.appendNumber(expected);
+    let _ = message.appendUnsigned(expected as u64);
     return sqlError(message.view());
 }

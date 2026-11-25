@@ -9,14 +9,14 @@
 
 /// An index as ANALYZE sees it: its name in sqlite_stat1, its key columns as SQL, and its WHERE.
 struct AnalyzedIndex {
-    name: String;
-    columns: Vector<String>;
-    filter: String?;
+    name: ByteString;
+    columns: Vector<ByteString>;
+    filter: ByteString?;
 }
 
 /// The SQL that names a key column under its collation.
-fn keyColumnSql(name: StringView, collation: Collation) -> Result<String, AllocError> {
-    var out = String.create();
+fn keyColumnSql(name: ByteStringView, collation: Collation) -> Result<ByteString, AllocError> {
+    var out = ByteString.create();
     SqlWriter.appendIdentifier(mut out, name)?;
     out.append(match (collation) {
         Collation.Binary => " COLLATE BINARY",
@@ -31,16 +31,16 @@ fn analyzedIndexes(table: borrow TableSchema, db: borrow mut Session) -> Result<
     var out = Vector<AnalyzedIndex>.create();
     for (k in 0..table.keys.length) {
         let key = borrow table.keys[k];
-        var name = String.create();
+        var name = ByteString.create();
         if (key.primaryKey && table.withoutRowid) {
             name.append(table.name.view())?;
         } else {
             name.append("sqlite_autoindex_")?;
             name.append(table.name.view())?;
             name.append("_")?;
-            name.appendNumber(k + 1)?;
+            name.appendUnsigned((k + 1) as u64)?;
         }
-        var columns = Vector<String>.create();
+        var columns = Vector<ByteString>.create();
         for (c in 0..key.columns.length) {
             columns.push(keyColumnSql(key.columns[c].name.view(), table.keyCollation(borrow key.columns[c]))?)?;
         }
@@ -51,11 +51,11 @@ fn analyzedIndexes(table: borrow TableSchema, db: borrow mut Session) -> Result<
         if (!index.table.view().equalsIgnoreAsciiCase(table.name.view())) {
             continue;
         }
-        var columns = Vector<String>.create();
+        var columns = Vector<ByteString>.create();
         for (c in 0..index.columns.length) {
             let column = borrow index.columns[c];
             if (borrow column.expression is Some(e)) {
-                var text = String.from("(")?;
+                var text = ownedText("(")?;
                 text.append(SqlWriter.expression(e)?.view())?;
                 text.append(")")?;
                 text.append(match (column.collation) {
@@ -68,7 +68,7 @@ fn analyzedIndexes(table: borrow TableSchema, db: borrow mut Session) -> Result<
                 columns.push(keyColumnSql(column.name.view(), column.collation)?)?;
             }
         }
-        var filter: String? = null;
+        var filter: ByteString? = null;
         if (borrow index.filter is Some(f)) {
             filter = SqlWriter.expression(f)?;
         }
@@ -77,7 +77,7 @@ fn analyzedIndexes(table: borrow TableSchema, db: borrow mut Session) -> Result<
     return Ok(out);
 }
 
-fn countOf(db: borrow mut Session, sql: StringView) -> Result<i64, SqliteError> {
+fn countOf(db: borrow mut Session, sql: ByteStringView) -> Result<i64, SqliteError> {
     let result = db.runInternal(sql, [])?;
     if (result.rows.length != 0 && result.rows[0].length != 0 && result.rows[0][0] is SqliteValue.Integer(n)) {
         return Ok(n);
@@ -92,24 +92,31 @@ fn ensureStatTable(db: borrow mut Session) -> Result<void, SqliteError> {
     }
     let root = db.pager.allocatePage()?;
     initRoot(mut db.pager, root, PAGE_LEAF_TABLE)?;
-    addSchemaRow(db, "table", "sqlite_stat1", "sqlite_stat1", root, "CREATE TABLE sqlite_stat1(tbl,idx,stat)")?;
+    addSchemaRow(
+        db,
+        "table",
+        "sqlite_stat1",
+        "sqlite_stat1",
+        root,
+        ByteStringView.fromText("CREATE TABLE sqlite_stat1(tbl,idx,stat)"),
+    )?;
     db.pager.bumpSchemaCookie()?;
     return db.reloadSchema();
 }
 
 /// The statistics of one table (or of one of its indexes, `only`).
-fn analyzeTable(table: borrow TableSchema, only: StringView?, db: borrow mut Session) -> Result<void, SqliteError> {
+fn analyzeTable(table: borrow TableSchema, only: ByteStringView?, db: borrow mut Session) -> Result<void, SqliteError> {
     let quoted = quotedName(table.name.view())?;
     var params = Vector<SqliteValue>.create();
-    params.push(SqliteValue.sqlText(table.name.view())?)?;
+    params.push(SqliteValue.ofText(table.name.view())?)?;
     if (only is Some(index)) {
-        params.push(SqliteValue.sqlText(index)?)?;
+        params.push(SqliteValue.ofText(index)?)?;
         let _ = db.runInternal("DELETE FROM sqlite_stat1 WHERE tbl = ?1 AND idx = ?2", params.view())?;
     } else {
         let _ = db.runInternal("DELETE FROM sqlite_stat1 WHERE tbl = ?1", params.view())?;
     }
     let indexes = analyzedIndexes(table, db)?;
-    var tableSql = String.from("SELECT count(*) FROM ")?;
+    var tableSql = ownedText("SELECT count(*) FROM ")?;
     tableSql.append(quoted.view())?;
     let tableRows = countOf(db, tableSql.view())?;
     // An empty table has no statistics, not even for its indexes.
@@ -120,10 +127,10 @@ fn analyzeTable(table: borrow TableSchema, only: StringView?, db: borrow mut Ses
         let rows = tableRows;
         if (rows > 0) {
             var insert = Vector<SqliteValue>.create();
-            insert.push(SqliteValue.sqlText(table.name.view())?)?;
-            var stat = String.create();
+            insert.push(SqliteValue.ofText(table.name.view())?)?;
+            var stat = ByteString.create();
             stat.appendNumber(rows)?;
-            insert.push(SqliteValue.sqlTextFrom(stat)?)?;
+            insert.push(SqliteValue.Text(stat))?;
             let _ = db.runInternal("INSERT INTO sqlite_stat1 VALUES (?1, NULL, ?2)", insert.view())?;
         }
         return Ok();
@@ -135,19 +142,19 @@ fn analyzeTable(table: borrow TableSchema, only: StringView?, db: borrow mut Ses
                 continue;
             }
         }
-        var whereText = String.create();
+        var whereText = ByteString.create();
         if (borrow index.filter is Some(f)) {
             whereText.append(" WHERE ")?;
             whereText.append(f.view())?;
         }
-        var countSql = String.from("SELECT count(*) FROM ")?;
+        var countSql = ownedText("SELECT count(*) FROM ")?;
         countSql.append(quoted.view())?;
         countSql.append(whereText.view())?;
         let rows = countOf(db, countSql.view())?;
-        var stat = String.create();
+        var stat = ByteString.create();
         stat.appendNumber(rows)?;
         for (c in 0..index.columns.length) {
-            var sql = String.from("SELECT count(*) FROM (SELECT DISTINCT ")?;
+            var sql = ownedText("SELECT count(*) FROM (SELECT DISTINCT ")?;
             for (k in 0..c + 1) {
                 if (k != 0) {
                     sql.append(", ")?;
@@ -163,19 +170,19 @@ fn analyzeTable(table: borrow TableSchema, only: StringView?, db: borrow mut Ses
             stat.appendNumber(if (distinct == 0) 0 else (rows + distinct - 1) / distinct)?;
         }
         var insert = Vector<SqliteValue>.create();
-        insert.push(SqliteValue.sqlText(table.name.view())?)?;
-        insert.push(SqliteValue.sqlText(index.name.view())?)?;
-        insert.push(SqliteValue.sqlTextFrom(stat)?)?;
+        insert.push(SqliteValue.ofText(table.name.view())?)?;
+        insert.push(SqliteValue.ofText(index.name.view())?)?;
+        insert.push(SqliteValue.Text(stat))?;
         let _ = db.runInternal("INSERT INTO sqlite_stat1 VALUES (?1, ?2, ?3)", insert.view())?;
     }
     return Ok();
 }
 
 /// ANALYZE [schema | table | index].
-fn executeAnalyze(target: borrow String?, db: borrow mut Session) -> Result<void, SqliteError> {
-    var tables = Vector<String>.create();
-    var only: String? = null;
-    if (borrow target is Some(name)) {
+fn executeAnalyze(target: borrow ByteString?, db: borrow mut Session) -> Result<void, SqliteError> {
+    var tables = Vector<ByteString>.create();
+    var only: ByteString? = null;
+    if (target is Some(name)) {
         if (name.view().equalsIgnoreAsciiCase("main")) {
             // The whole database.
         } else if (db.catalog.table(name.view())?.isSome()) {
@@ -199,10 +206,10 @@ fn executeAnalyze(target: borrow String?, db: borrow mut Session) -> Result<void
     if (tables.length == 0 && only.isNull()) {
         for (i in 0..db.catalog.tables.length) {
             let name = db.catalog.tables[i].name.view();
-            if (startsWithIgnoreAsciiCase(name, "sqlite_")) {
+            if (name.startsWithIgnoreAsciiCase("sqlite_")) {
                 continue;
             }
-            tables.push(String.from(name)?)?;
+            tables.push(ownedText(name)?)?;
         }
     }
     ensureStatTable(db)?;
@@ -219,7 +226,7 @@ fn executeAnalyze(target: borrow String?, db: borrow mut Session) -> Result<void
 
 /// REINDEX [collation | table | index]: builds the indexes again from their tables.
 fn executeReindex(db: borrow mut Session) -> Result<void, SqliteError> {
-    var names = Vector<String>.create();
+    var names = Vector<ByteString>.create();
     for (i in 0..db.catalog.tables.length) {
         names.push(db.catalog.tables[i].name.clone()?)?;
     }

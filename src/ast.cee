@@ -24,13 +24,13 @@ enum LiteralKind {
 
 struct Literal {
     kind: LiteralKind;
-    text: String;
+    text: ByteString;
 }
 
 struct ColumnRef {
-    schema: String?;
-    table: String?;
-    name: String;
+    schema: ByteString?;
+    table: ByteString?;
+    name: ByteString;
     /// An unqualified name written in double quotes: a string when no column has the name.
     doubleQuoted: bool;
 }
@@ -148,14 +148,14 @@ struct FrameSpec {
 
 struct OverClause {
     /// `OVER w`, or `OVER (w …)`: the window of the WINDOW clause this one builds on.
-    baseName: String?;
+    baseName: ByteString?;
     partitionBy: Vector<Expr>;
     orderBy: Vector<OrderTerm>;
     frame: FrameSpec?;
 }
 
 struct FunctionCall {
-    name: String;
+    name: ByteString;
     distinct: bool;
     /// `count(*)`.
     star: bool;
@@ -186,11 +186,11 @@ enum Expr {
     /// `(a, b, …)`.
     RowValue(Vector<Expr>),
     /// `?`, `?1`, `:name`, `@name` or `$name`, as written.
-    Param(String),
+    Param(ByteString),
     Unary(UnaryOp, Box<Expr>),
     Binary(BinaryOp, Box<Expr>, Box<Expr>),
     /// `operand COLLATE name`.
-    Collate(Box<Expr>, String),
+    Collate(Box<Expr>, ByteString),
     /// `left IS right`, or with `true`, `left IS NOT right`.
     Is(Box<Expr>, Box<Expr>, bool),
     Between(Box<BetweenExpr>),
@@ -198,7 +198,7 @@ enum Expr {
     In(Box<InExpr>),
     Function(Box<FunctionCall>),
     /// `CAST(operand AS type)`.
-    Cast(Box<Expr>, String),
+    Cast(Box<Expr>, ByteString),
     Case(Box<CaseExpr>),
     Subquery(Box<SelectStmt>),
     Exists(Box<SelectStmt>),
@@ -210,8 +210,8 @@ enum Expr {
 
 struct QualifiedName {
     /// `main`, `temp` or an attached database's name, as written; `null` when the name is not qualified.
-    schema: String?;
-    name: String;
+    schema: ByteString?;
+    name: ByteString;
 }
 
 // ── SELECT ───────────────────────────────────────────────────────────────────────────────────────────────────
@@ -220,27 +220,27 @@ enum ResultColumn {
     /// `*`.
     Star,
     /// `table.*`.
-    TableStar(String),
+    TableStar(ByteString),
     /// An expression and its alias.
-    Expr(Expr, String?),
+    Expr(Expr, ByteString?),
 }
 
 struct TableSource {
     name: QualifiedName;
-    alias: String?;
-    indexedBy: String?;
+    alias: ByteString?;
+    indexedBy: ByteString?;
     notIndexed: bool;
 }
 
 struct SubquerySource {
     select: SelectStmt;
-    alias: String?;
+    alias: ByteString?;
 }
 
 struct TableFunctionSource {
-    name: String;
+    name: ByteString;
     args: Vector<Expr>;
-    alias: String?;
+    alias: ByteString?;
 }
 
 enum FromItem {
@@ -263,7 +263,7 @@ enum JoinKind {
 enum JoinConstraint {
     None,
     On(Expr),
-    Using(Vector<String>),
+    Using(Vector<ByteString>),
 }
 
 struct Join {
@@ -290,7 +290,7 @@ struct OrderTerm {
 }
 
 struct NamedWindow {
-    name: String;
+    name: ByteString;
     spec: OverClause;
 }
 
@@ -305,7 +305,7 @@ struct SelectCore {
     /// A row of VALUES: `columns` are its expressions, and there is nothing else.
     isValues: bool;
     /// Each result column's text as written (empty for `*`), which names a column without an alias.
-    columnTexts: Vector<String>;
+    columnTexts: Vector<ByteString>;
 }
 
 enum CompoundOp {
@@ -316,8 +316,8 @@ enum CompoundOp {
 }
 
 struct CommonTableExpr {
-    name: String;
-    columns: Vector<String>;
+    name: ByteString;
+    columns: Vector<ByteString>;
     select: SelectStmt;
 }
 
@@ -347,14 +347,14 @@ enum ConflictAction {
 }
 
 struct Assignment {
-    column: String;
+    column: ByteString;
     value: Expr;
 }
 
 /// One `ON CONFLICT [(columns)] DO …` of an INSERT.
 struct UpsertClause {
     /// The conflict target's columns; empty for a bare `ON CONFLICT`.
-    target: Vector<String>;
+    target: Vector<ByteString>;
     /// `DO NOTHING` when empty.
     assignments: Vector<Assignment>;
     filter: Expr?;
@@ -371,14 +371,14 @@ struct InsertStmt {
     /// `INSERT OR action`, or `Replace` for `REPLACE INTO`.
     conflict: ConflictAction?;
     table: QualifiedName;
-    columns: Vector<String>;
+    columns: Vector<ByteString>;
     source: InsertSource;
     upserts: Vector<UpsertClause>;
     returning: Vector<ResultColumn>;
     /// `INTO t AS alias`: the name DO UPDATE uses for the row.
-    alias: String?;
+    alias: ByteString?;
     /// Each RETURNING column's text as written, which names it.
-    returningTexts: Vector<String>;
+    returningTexts: Vector<ByteString>;
 }
 
 struct UpdateStmt {
@@ -390,8 +390,8 @@ struct UpdateStmt {
     filter: Expr?;
     returning: Vector<ResultColumn>;
     /// `UPDATE t AS alias`: the name SET, FROM and WHERE use for the row.
-    alias: String?;
-    returningTexts: Vector<String>;
+    alias: ByteString?;
+    returningTexts: Vector<ByteString>;
 }
 
 struct DeleteStmt {
@@ -400,13 +400,13 @@ struct DeleteStmt {
     filter: Expr?;
     returning: Vector<ResultColumn>;
     /// `DELETE FROM t AS alias`: the name WHERE uses for the row.
-    alias: String?;
-    returningTexts: Vector<String>;
+    alias: ByteString?;
+    returningTexts: Vector<ByteString>;
 }
 
 /// A column of CREATE TABLE: its name, and the tokens of its type and constraints, which the schema catalog reads.
 struct ColumnDef {
-    name: String;
+    name: ByteString;
     body: Vector<Token>;
 }
 
@@ -425,18 +425,18 @@ struct CreateTableStmt {
 
 struct IndexedColumn {
     /// A plain column's name; empty for an expression.
-    name: String;
+    name: ByteString;
     expression: Expr?;
     descending: bool;
     /// The column's COLLATE; empty to inherit the table column's.
-    collation: String;
+    collation: ByteString;
 }
 
 struct CreateIndexStmt {
     unique: bool;
     ifNotExists: bool;
     name: QualifiedName;
-    table: String;
+    table: ByteString;
     columns: Vector<IndexedColumn>;
     filter: Expr?;
 }
@@ -445,7 +445,7 @@ struct CreateViewStmt {
     temporary: bool;
     ifNotExists: bool;
     name: QualifiedName;
-    columns: Vector<String>;
+    columns: Vector<ByteString>;
     select: SelectStmt;
 }
 
@@ -468,19 +468,19 @@ struct CreateTriggerStmt {
     timing: TriggerTiming;
     event: TriggerEvent;
     /// `UPDATE OF a, b`.
-    updateOf: Vector<String>;
-    table: String;
+    updateOf: Vector<ByteString>;
+    table: ByteString;
     when: Expr?;
     body: Vector<Stmt>;
 }
 
 enum AlterAction {
     AddColumn(ColumnDef),
-    RenameTo(String),
+    RenameTo(ByteString),
     /// From, to.
     /// The old name, the new, and whether the statement quoted the new name (renameEditSql's bQuote).
-    RenameColumn(String, String, bool),
-    DropColumn(String),
+    RenameColumn(ByteString, ByteString, bool),
+    DropColumn(ByteString),
 }
 
 struct AlterTableStmt {
@@ -504,7 +504,7 @@ struct DropStmt {
 struct PragmaStmt {
     name: QualifiedName;
     /// The value as written (a quoted one without its quotes); `null` for a query.
-    value: String?;
+    value: ByteString?;
     /// `PRAGMA x(value)` rather than `PRAGMA x = value`.
     parenthesized: bool;
 }
@@ -518,7 +518,7 @@ enum TransactionKind {
 struct AttachStmt {
     /// ':memory:' or a file name.
     target: Expr;
-    schema: String;
+    schema: ByteString;
 }
 
 enum Stmt {
@@ -536,27 +536,27 @@ enum Stmt {
     Begin(TransactionKind),
     Commit,
     /// `ROLLBACK`, or `ROLLBACK TO name`.
-    Rollback(String?),
-    Savepoint(String),
-    Release(String),
+    Rollback(ByteString?),
+    Savepoint(ByteString),
+    Release(ByteString),
     Attach(Box<AttachStmt>),
-    Detach(String),
+    Detach(ByteString),
     /// `VACUUM [schema] [INTO filename]`.
     Vacuum(Expr?),
     /// `ANALYZE`, or `ANALYZE name`.
-    Analyze(String?),
+    Analyze(ByteString?),
     Reindex,
 }
 
 // ── copies ───────────────────────────────────────────────────────────────────────────────────────────────────
 
-fn cloneString(s: borrow String?) -> Result<String?, AllocError> => match (s) {
+fn cloneString(s: borrow ByteString?) -> Result<ByteString?, AllocError> => match (s) {
     Some(x) => Ok(x.clone()?),
     null => Ok(null),
 };
 
-fn cloneStrings(list: borrow Vector<String>) -> Result<Vector<String>, AllocError> {
-    var out = Vector<String>.withCapacity(list.length)?;
+fn cloneStrings(list: borrow Vector<ByteString>) -> Result<Vector<ByteString>, AllocError> {
+    var out = Vector<ByteString>.withCapacity(list.length)?;
     for (i in 0..list.length) {
         out.push(list[i].clone()?)?;
     }

@@ -8,7 +8,7 @@ const MAX_PARAMETER_NUMBER: usize = 32766;
 
 /// A parameter's name and its number from 1.
 public struct ParameterName {
-    public name: String;
+    public name: ByteString;
     public number: usize;
 }
 
@@ -22,13 +22,13 @@ struct ParamNumbering {
     fn create() -> ParamNumbering => ParamNumbering { count: 0, names: Vector<ParameterName>.create() };
 
     /// The number, from 1, of the parameter written as `text` (`?`, `?NNN`, `:a`, `@a` or `$a`).
-    fn number(borrow mut this, text: StringView) -> Result<usize, SqliteError> {
+    fn number(borrow mut this, text: ByteStringView) -> Result<usize, SqliteError> {
         if (text == "?") {
             this.count += 1;
             return this.checked(this.count);
         }
         if (text[0] == '?') {
-            let n = text[1..].parseInt<usize>() ?? 0;
+            let n = parseUsize(text.sliceFrom(1)) ?? 0;
             if (n == 0 || n > MAX_PARAMETER_NUMBER) {
                 return Err(sqlError("variable number must be between ?1 and ?32766"));
             }
@@ -36,7 +36,7 @@ struct ParamNumbering {
                 this.count = n;
             }
             if (this.nameOf(n).isNull()) {
-                this.names.push(ParameterName { name: String.from(text)?, number: n })?;
+                this.names.push(ParameterName { name: ownedText(text)?, number: n })?;
             }
             return Ok(n);
         }
@@ -46,7 +46,7 @@ struct ParamNumbering {
             }
         }
         this.count += 1;
-        this.names.push(ParameterName { name: String.from(text)?, number: this.count })?;
+        this.names.push(ParameterName { name: ownedText(text)?, number: this.count })?;
         return this.checked(this.count);
     }
 
@@ -58,7 +58,7 @@ struct ParamNumbering {
     }
 
     /// The name of parameter `n`: the first one written with that number.
-    fn nameOf(borrow this, n: usize) -> StringView? {
+    fn nameOf(borrow this, n: usize) -> ByteStringView? {
         for (i in 0..this.names.length) {
             if (this.names[i].number == n) {
                 return this.names[i].name.view();
@@ -75,7 +75,8 @@ public struct StatementParameters {
 
     /// The number of the parameter called `name`, written with its prefix (`:a`, `@a`, `$a`, `?3`), as
     /// sqlite3_bind_parameter_index finds it; null when the statement has none of that name.
-    public fn indexOf(borrow this, name: StringView) -> usize? {
+    public fn indexOf<N: TextView>(borrow this, nameText: N) -> usize? {
+        let name = ByteStringView.fromBytes(nameText.bytes());
         for (i in 0..this.names.length) {
             if (this.names[i].name.view() == name) {
                 return this.names[i].number;
@@ -86,7 +87,8 @@ public struct StatementParameters {
 }
 
 /// The parameters of the statement `sql`, numbered as SQLite numbers them.
-public fn statementParameters(sql: StringView) -> Result<StatementParameters, SqliteError> {
+public fn statementParameters<N: TextView>(sqlText: N) -> Result<StatementParameters, SqliteError> {
+    let sql = ByteStringView.fromBytes(sqlText.bytes());
     let tokens = Tokenizer.tokenize(sql)?;
     var numbering = ParamNumbering.create();
     for (i in 0..tokens.length) {

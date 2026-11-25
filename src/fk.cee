@@ -11,11 +11,11 @@
 fn fkError() -> SqliteError => SqliteError.Constraint(ownedMessage("FOREIGN KEY constraint failed"));
 
 /// The parent's columns a key refers to: those named, or the parent's primary key.
-fn parentColumns(key: borrow ForeignKeySchema, parent: borrow TableSchema) -> Result<Vector<String>, SqliteError> {
+fn parentColumns(key: borrow ForeignKeySchema, parent: borrow TableSchema) -> Result<Vector<ByteString>, SqliteError> {
     if (key.refColumns.length != 0) {
         return Ok(cloneStrings(borrow key.refColumns)?);
     }
-    var out = Vector<String>.create();
+    var out = Vector<ByteString>.create();
     for (k in 0..parent.primaryKey.length) {
         out.push(parent.primaryKey[k].name.clone()?)?;
     }
@@ -23,7 +23,7 @@ fn parentColumns(key: borrow ForeignKeySchema, parent: borrow TableSchema) -> Re
         out.push(parent.columns[alias].name.clone()?)?;
     }
     if (out.length != key.columns.length) {
-        var message = String.from("foreign key mismatch - \"")?;
+        var message = ownedText("foreign key mismatch - \"")?;
         message.append(key.refTable.view())?;
         message.append("\" referencing a table")?;
         return Err(sqlError(message.view()));
@@ -32,14 +32,14 @@ fn parentColumns(key: borrow ForeignKeySchema, parent: borrow TableSchema) -> Re
 }
 
 /// `a = ?n AND b = ?m …` over `columns`, numbering the parameters from `first`.
-fn keyCondition(out: borrow mut String, columns: Slice<String>, first: usize) -> Result<void, AllocError> {
+fn keyCondition(out: borrow mut ByteString, columns: Slice<ByteString>, first: usize) -> Result<void, AllocError> {
     for (i in 0..columns.length) {
         if (i != 0) {
             out.append(" AND ")?;
         }
         out.append(sqlName(columns[i].view())?.view())?;
         out.append(" = ?")?;
-        out.appendNumber(first + i)?;
+        out.appendUnsigned((first + i) as u64)?;
     }
     return Ok();
 }
@@ -48,7 +48,7 @@ fn keyCondition(out: borrow mut String, columns: Slice<String>, first: usize) ->
 fn keyValues(
     table: borrow TableSchema,
     row: borrow Slot,
-    columns: Slice<String>,
+    columns: Slice<ByteString>,
 ) -> Result<Vector<SqliteValue>?, SqliteError> {
     var values = Vector<SqliteValue>.withCapacity(columns.length)?;
     for (i in 0..columns.length) {
@@ -75,7 +75,7 @@ fn checkChildRow(table: borrow TableSchema, row: borrow Slot, db: borrow mut Ses
             return Err(fkError());
         };
         let columns = parentColumns(key, borrow parent)?;
-        var sql = String.from("SELECT 1 FROM ")?;
+        var sql = ownedText("SELECT 1 FROM ")?;
         sql.append(quotedName(parent.name.view())?.view())?;
         sql.append(" WHERE ")?;
         keyCondition(mut sql, columns.view(), 1)?;
@@ -96,7 +96,7 @@ fn parentChanged(
     db: borrow mut Session,
 ) -> Result<void, SqliteError> {
     // Every key, in every table, that refers to this one.
-    var tables = Vector<String>.create();
+    var tables = Vector<ByteString>.create();
     for (i in 0..db.catalog.tables.length) {
         tables.push(db.catalog.tables[i].name.clone()?)?;
     }
@@ -125,11 +125,11 @@ fn parentChanged(
                 }
                 action = key.onUpdate;
             }
-            var condition = String.create();
+            var condition = ByteString.create();
             keyCondition(mut condition, key.columns.view(), 1)?;
             var params = cloneValues(oldValues.view())?;
             let childName = quotedName(child.name.view())?;
-            var sql = String.create();
+            var sql = ByteString.create();
             match (action) {
                 ForeignKeyAction.NoAction | ForeignKeyAction.Restrict => {
                     sql.append("SELECT 1 FROM ")?;
@@ -157,7 +157,7 @@ fn parentChanged(
                             }
                             sql.append(sqlName(key.columns[c].view())?.view())?;
                             sql.append(" = ?")?;
-                            sql.appendNumber(oldValues.length + c + 1)?;
+                            sql.appendUnsigned((oldValues.length + c + 1) as u64)?;
                         }
                         for (i in 0..newValues.length) {
                             params.push(newValues[i].clone()?)?;

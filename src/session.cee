@@ -21,7 +21,7 @@ public struct Session {
     stash: Vector<DatabaseState?>;
     /// Each database's name (`main`, `temp`, or the name ATTACH gave), its file, and the file as PRAGMA
     /// database_list shows it (empty for TEMP and private databases).
-    databaseNames: Vector<String>;
+    databaseNames: Vector<ByteString>;
     databasePaths: Vector<OsString>;
     databaseShownPaths: Vector<OsString>;
     /// The TEMP database's place in the list, once a TEMP object made it.
@@ -54,7 +54,7 @@ public struct Session {
     legacyAlterTable: bool;
     /// The trigger firing now, and the names of those running.
     trigger: TriggerContext?;
-    activeTriggers: Vector<String>;
+    activeTriggers: Vector<ByteString>;
 
     /// Opens the database file at `path`, making an empty database if there is none.
     public fn open(name: OsStringView) -> Result<Session, SqliteError> => Session.openWaiting(name, 0);
@@ -80,8 +80,8 @@ public struct Session {
         pager.endTransaction()?;
         var stash = Vector<DatabaseState?>.create();
         stash.push(null)?;
-        var names = Vector<String>.create();
-        names.push(String.from("main")?)?;
+        var names = Vector<ByteString>.create();
+        names.push(ownedText("main")?)?;
         var paths = Vector<OsString>.create();
         paths.push(path.toOsString()?)?;
         var shownPaths = Vector<OsString>.create();
@@ -112,7 +112,7 @@ public struct Session {
             runningChanges: 0,
             savepointBegan: false,
             trigger: null,
-            activeTriggers: Vector<String>.create(),
+            activeTriggers: Vector<ByteString>.create(),
         });
     }
 
@@ -149,7 +149,7 @@ public struct Session {
     }
 
     /// The CREATE VIEW statement of the view called `name`.
-    fn viewSql(borrow this, name: StringView) -> Result<String?, SqliteError> {
+    fn viewSql(borrow this, name: ByteStringView) -> Result<ByteString?, SqliteError> {
         for (i in 0..this.entries.length) {
             let entry = borrow this.entries[i];
             if (entry.kind.view() == "view" && entry.name.view().equalsIgnoreAsciiCase(name)) {
@@ -162,7 +162,7 @@ public struct Session {
     }
 
     /// The CREATE INDEX statement of the index called `name`.
-    fn indexSql(borrow this, name: StringView) -> Result<String?, SqliteError> {
+    fn indexSql(borrow this, name: ByteStringView) -> Result<ByteString?, SqliteError> {
         for (i in 0..this.entries.length) {
             let entry = borrow this.entries[i];
             if (entry.kind.view() == "index" && entry.name.view().equalsIgnoreAsciiCase(name)) {
@@ -175,7 +175,7 @@ public struct Session {
     }
 
     /// Whether any trigger is on the table called `name`.
-    fn hasTriggers(borrow this, name: StringView) -> bool {
+    fn hasTriggers(borrow this, name: ByteStringView) -> bool {
         for (i in 0..this.entries.length) {
             if (this.entries[i].kind.view() == "trigger" && this.entries[i].tableName.view().equalsIgnoreAsciiCase(
                 name,
@@ -187,7 +187,12 @@ public struct Session {
     }
 
     /// Runs SQL inside the current statement, leaving the change counts as they were.
-    fn runInternal(borrow mut this, sql: StringView, params: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> {
+    fn runInternal<N: TextView>(
+        borrow mut this,
+        sqlText: N,
+        params: Slice<SqliteValue>,
+    ) -> Result<QueryResult, SqliteError> {
+        let sql = ByteStringView.fromBytes(sqlText.bytes());
         let changes = this.changes;
         let total = this.totalChanges;
         let last = this.lastInsertRowid;
@@ -200,12 +205,12 @@ public struct Session {
     }
 
     /// sqlite_sequence's value for the AUTOINCREMENT table `name`.
-    fn sequenceValue(borrow mut this, name: StringView) -> Result<i64?, SqliteError> {
+    fn sequenceValue(borrow mut this, name: ByteStringView) -> Result<i64?, SqliteError> {
         if (this.catalog.table("sqlite_sequence")?.isNull()) {
             return Ok(null);
         }
         var params = Vector<SqliteValue>.create();
-        params.push(SqliteValue.sqlText(name)?)?;
+        params.push(SqliteValue.ofText(name)?)?;
         let result = this.runInternal("SELECT max(seq) FROM sqlite_sequence WHERE name = ?", params.view())?;
         if (result.rows.length != 0 && result.rows[0][0] is SqliteValue.Integer(n)) {
             return Ok(n);
@@ -214,10 +219,10 @@ public struct Session {
     }
 
     /// Records that the AUTOINCREMENT table `name` used `rowId`.
-    fn updateSequence(borrow mut this, name: StringView, rowId: i64) -> Result<void, SqliteError> {
+    fn updateSequence(borrow mut this, name: ByteStringView, rowId: i64) -> Result<void, SqliteError> {
         let current = this.sequenceValue(name)?;
         var params = Vector<SqliteValue>.create();
-        params.push(SqliteValue.sqlText(name)?)?;
+        params.push(SqliteValue.ofText(name)?)?;
         params.push(SqliteValue.Integer(rowId))?;
         if (current is Some(seq)) {
             if (seq < rowId) {
@@ -230,9 +235,9 @@ public struct Session {
     }
 
     /// Forgets the AUTOINCREMENT counter of a dropped table.
-    fn removeSequence(borrow mut this, name: StringView) -> Result<void, SqliteError> {
+    fn removeSequence(borrow mut this, name: ByteStringView) -> Result<void, SqliteError> {
         var params = Vector<SqliteValue>.create();
-        params.push(SqliteValue.sqlText(name)?)?;
+        params.push(SqliteValue.ofText(name)?)?;
         let _ = this.runInternal("DELETE FROM sqlite_sequence WHERE name = ?", params.view())?;
         return Ok();
     }
@@ -246,13 +251,10 @@ public struct Session {
         borrow mut this,
         sql: ByteStringView,
         params: Slice<SqliteValue>,
-    ) -> Result<QueryResult, SqliteError> {
-        let text = sqlTextOf(sql.bytes())?;
-        return this.queryText(text.view(), params);
-    }
+    ) -> Result<QueryResult, SqliteError> => this.queryText(sql, params);
 
-    /// `query`, for SQL text in the engine's form (sqltext.cee).
-    fn queryText(borrow mut this, sql: StringView, params: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> {
+    /// `queryBytes`: runs the statement and, outside a transaction, ends the statement's own.
+    fn queryText(borrow mut this, sql: ByteStringView, params: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> {
         let result = this.queryLocked(sql, params);
         if (!this.inTransaction) {
             // The transaction ended (or was the statement's own): what it left uncommitted is forgotten, and every
@@ -272,12 +274,16 @@ public struct Session {
     }
 
     /// `query`, between taking the locks the statement needs and its transaction's end.
-    fn queryLocked(borrow mut this, sql: StringView, params: Slice<SqliteValue>) -> Result<QueryResult, SqliteError> {
+    fn queryLocked(
+        borrow mut this,
+        sql: ByteStringView,
+        params: Slice<SqliteValue>,
+    ) -> Result<QueryResult, SqliteError> {
         // The statement's text, as sqlite_schema keeps a definition; token offsets are into it.
         let written = sql.trim();
         var text = written;
         while (text.endsWith(";")) {
-            text = text[0..text.length - 1].trimEnd();
+            text = text.slice(0, text.length() - 1).trimEnd();
         }
         // Parsed as written, so that `SELECT 3 +;` is an error near ";" as in SQLite; the text without its
         // semicolons is what a definition keeps.
@@ -388,7 +394,7 @@ public struct Session {
     fn run(
         borrow mut this,
         stmt: borrow Stmt,
-        sql: StringView,
+        sql: ByteStringView,
         params: Slice<SqliteValue>,
     ) -> Result<QueryResult, SqliteError> {
         // The statement's database is made the active one while it runs.
@@ -429,7 +435,7 @@ public struct Session {
                 if (borrow s.name.schema is Some(name)) {
                     return this.databaseNamed(name.view());
                 }
-                let anywhere: String? = null;
+                let anywhere: ByteString? = null;
                 return Ok(this.findTable(borrow anywhere, s.table.view())? ?? 0);
             }
             Stmt.CreateTrigger(s) => {
@@ -439,7 +445,7 @@ public struct Session {
                 if (borrow s.name.schema is Some(name)) {
                     return this.databaseNamed(name.view());
                 }
-                let anywhere: String? = null;
+                let anywhere: ByteString? = null;
                 let table = this.findTable(borrow anywhere, s.table.view())?;
                 return Ok(table ?? this.findObject(borrow anywhere, "view", s.table.view())? ?? 0);
             }
@@ -476,7 +482,7 @@ public struct Session {
         if (borrow name.schema is Some(schema)) {
             let temp = schema.view().equalsIgnoreAsciiCase("temp") || schema.view().equalsIgnoreAsciiCase("temporary");
             if (!temp && this.databaseIndex(schema.view()).isNull()) {
-                var missing = String.from(schema.view())?;
+                var missing = ownedText(schema.view())?;
                 missing.append(".")?;
                 missing.append(name.name.view())?;
                 return Err(namedError("no such table: ", missing.view()));
@@ -498,7 +504,7 @@ public struct Session {
     fn runHere(
         borrow mut this,
         stmt: borrow Stmt,
-        sql: StringView,
+        sql: ByteStringView,
         params: Slice<SqliteValue>,
     ) -> Result<QueryResult, SqliteError> {
         match (stmt) {
@@ -535,7 +541,7 @@ public struct Session {
                 let plan = compileSelect(mut compiler, select, this)?;
                 var frame = newFrame(mut compiler, params, this)?;
                 let rows = runSelect(borrow plan, mut frame, this)?;
-                return Ok(QueryResult { columns: columnNamesOf(cloneStrings(borrow plan.columnNames)?)?, rows: rows });
+                return Ok(QueryResult { columns: cloneStrings(borrow plan.columnNames)?, rows: rows });
             }
             Stmt.Begin(_) => {
                 if (this.inTransaction) {
@@ -624,19 +630,19 @@ public struct Session {
 
 /// An index a statement must rebuild before it ends.
 struct StaleIndex {
-    table: String;
+    table: ByteString;
     root: u32;
 }
 
 /// A SAVEPOINT in progress: its name and its level in the pager.
 struct NamedSavepoint {
-    name: String;
+    name: ByteString;
     level: usize;
 }
 
 impl Session {
     /// The innermost open savepoint called `name`.
-    fn savepointNamed(borrow this, name: StringView) -> Result<usize, SqliteError> {
+    fn savepointNamed(borrow this, name: ByteStringView) -> Result<usize, SqliteError> {
         var i = this.savepoints.length;
         while (i > 0) {
             i -= 1;
@@ -685,7 +691,7 @@ impl Session {
     fn databaseCount(borrow this) -> usize => this.databaseNames.length;
 
     /// The database called `name` (`main`, `temp`, or an attached one), if there is one.
-    fn databaseIndex(borrow this, name: StringView) -> usize? {
+    fn databaseIndex(borrow this, name: ByteStringView) -> usize? {
         for (i in 0..this.databaseNames.length) {
             if (this.databaseNames[i].view().equalsIgnoreAsciiCase(name)) {
                 return i;
@@ -695,7 +701,7 @@ impl Session {
     }
 
     /// The database a schema name in a statement names: an error for an unknown one. `temp` is made on demand.
-    fn databaseNamed(borrow mut this, name: StringView) -> Result<usize, SqliteError> {
+    fn databaseNamed(borrow mut this, name: ByteStringView) -> Result<usize, SqliteError> {
         if (name.equalsIgnoreAsciiCase("temp") || name.equalsIgnoreAsciiCase("temporary")) {
             return this.ensureTemp();
         }
@@ -765,7 +771,7 @@ impl Session {
         }
         let path = privateDatabasePath("sqlite-temp-")?;
         let state = openDatabaseState(path.view(), this.busyTimeout)?;
-        this.attachState("temp", path.view(), state)?;
+        this.attachState(ByteStringView.fromText("temp"), path.view(), state)?;
         this.databaseShownPaths.push(OsString.create())?;
         let index = this.databaseNames.length - 1;
         this.tempIndex = index;
@@ -775,7 +781,7 @@ impl Session {
     /// Adds a database to the list, with as many savepoint levels as the others have open.
     fn attachState(
         borrow mut this,
-        name: StringView,
+        name: ByteStringView,
         path: OsStringView,
         state: DatabaseState,
     ) -> Result<void, SqliteError> {
@@ -784,14 +790,14 @@ impl Session {
             added.pager.beginStatement();
         }
         this.stash.push(added)?;
-        this.databaseNames.push(String.from(name)?)?;
+        this.databaseNames.push(ownedText(name)?)?;
         this.databasePaths.push(path.toOsString()?)?;
         return Ok();
     }
 
     /// The database where table `name` is: in `schema` when one is written, else TEMP first, then main, then the
     /// attached ones in order.
-    fn findTable(borrow mut this, schema: borrow String?, name: StringView) -> Result<usize?, SqliteError> {
+    fn findTable(borrow mut this, schema: borrow ByteString?, name: ByteStringView) -> Result<usize?, SqliteError> {
         if (schema is Some(s)) {
             let i = this.databaseNamed(s.view())?;
             return Ok(if (this.catalogOf(i).table(name)?.isSome()) i else null);
@@ -813,9 +819,9 @@ impl Session {
     /// `findTable` does.
     fn findObject(
         borrow mut this,
-        schema: borrow String?,
+        schema: borrow ByteString?,
         kind: StringView,
-        name: StringView,
+        name: ByteStringView,
     ) -> Result<usize?, SqliteError> {
         var order = Vector<usize>.create();
         if (schema is Some(s)) {
@@ -987,13 +993,13 @@ impl Session {
     fn attachDatabase(
         borrow mut this,
         target: borrow Expr,
-        name: StringView,
+        name: ByteStringView,
         params: Slice<SqliteValue>,
     ) -> Result<void, SqliteError> {
         if (this.databaseIndex(
             name,
         ).isSome() || name.equalsIgnoreAsciiCase("main") || name.equalsIgnoreAsciiCase("temp")) {
-            var message = String.from("database ")?;
+            var message = ByteString.fromText("database ")?;
             message.append(name)?;
             message.append(" is already in use")?;
             return Err(sqlError(message.view()));
@@ -1031,9 +1037,9 @@ impl Session {
         return Ok();
     }
 
-    fn detachDatabase(borrow mut this, name: StringView) -> Result<void, SqliteError> {
+    fn detachDatabase(borrow mut this, name: ByteStringView) -> Result<void, SqliteError> {
         if (name.equalsIgnoreAsciiCase("main") || name.equalsIgnoreAsciiCase("temp")) {
-            var message = String.from("cannot detach database ")?;
+            var message = ByteString.fromText("cannot detach database ")?;
             message.append(name)?;
             return Err(sqlError(message.view()));
         }
@@ -1044,7 +1050,7 @@ impl Session {
             return Err(namedError("cannot detach database ", name));
         }
         if (this.pagerOf(i).hasChanges()) {
-            var message = String.from("database ")?;
+            var message = ByteString.fromText("database ")?;
             message.append(name)?;
             message.append(" is locked")?;
             return Err(sqlError(message.view()));

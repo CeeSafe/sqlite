@@ -18,20 +18,20 @@ fn initRoot(pager: borrow mut WritablePager, page: u32, kind: u8) -> Result<void
 }
 
 /// Adds a row to sqlite_schema.
-fn addSchemaRow(
+fn addSchemaRow<N: TextView, M: TextView, P: TextView>(
     db: borrow mut Session,
-    kind: StringView,
-    name: StringView,
-    table: StringView,
+    kind: N,
+    name: M,
+    table: P,
     root: u32,
-    sql: StringView?,
+    sql: ByteStringView?,
 ) -> Result<void, SqliteError> {
     var values = Vector<SqliteValue>.create();
-    values.push(SqliteValue.sqlText(kind)?)?;
-    values.push(SqliteValue.sqlText(name)?)?;
-    values.push(SqliteValue.sqlText(table)?)?;
+    values.push(SqliteValue.ofText(kind)?)?;
+    values.push(SqliteValue.ofText(name)?)?;
+    values.push(SqliteValue.ofText(table)?)?;
     values.push(SqliteValue.Integer(root as i64))?;
-    values.push(if (sql is Some(s)) SqliteValue.sqlText(s)? else SqliteValue.Null)?;
+    values.push(if (sql is Some(s)) SqliteValue.ofText(s)? else SqliteValue.Null)?;
     let rowId = (lastRowid(mut db.pager, 1)? ?? 0) + 1;
     var op = Vector<TableOp>.create();
     op.push(TableOp { rowId: rowId, record: Record.encodeIn(values.view(), db.pager.textEncoding)? })?;
@@ -40,7 +40,7 @@ fn addSchemaRow(
 }
 
 /// Removes the rows of sqlite_schema for which `pick` is true, and gives back their b-trees' pages.
-fn removeSchemaRows(db: borrow mut Session, name: StringView, alsoOfTable: bool) -> Result<void, SqliteError> {
+fn removeSchemaRows(db: borrow mut Session, name: ByteStringView, alsoOfTable: bool) -> Result<void, SqliteError> {
     var cursor = TableCursor.scan(1);
     var doomed = Vector<i64>.create();
     var roots = Vector<u32>.create();
@@ -72,10 +72,10 @@ fn removeSchemaRows(db: borrow mut Session, name: StringView, alsoOfTable: bool)
     return Ok();
 }
 
-/// A name in sqlite_schema in the engine's form for SQL text, or empty when it is not text.
-fn textOrEmptyRef(value: borrow SqliteValue) -> Result<String, AllocError> => match (value) {
-    SqliteValue.Text(s) => sqlTextOf(s.bytes()),
-    _ => Ok(String.create()),
+/// A column of sqlite_schema as SQL text, its bytes whatever they are, or empty when it is not text.
+fn textOrEmptyRef(value: borrow SqliteValue) -> Result<ByteString, AllocError> => match (value) {
+    SqliteValue.Text(s) => s.clone(),
+    _ => Ok(ByteString.create()),
 };
 
 /// Gives every page of a b-tree (table or index, overflow pages included) back to the freelist.
@@ -131,7 +131,7 @@ fn freeBTree(pager: borrow mut WritablePager, root: u32) -> Result<void, SqliteE
     return Ok();
 }
 
-fn objectExists(db: borrow Session, name: StringView) -> bool {
+fn objectExists(db: borrow Session, name: ByteStringView) -> bool {
     for (i in 0..db.entries.length) {
         if (db.entries[i].name.view().equalsIgnoreAsciiCase(name)) {
             return true;
@@ -142,7 +142,7 @@ fn objectExists(db: borrow Session, name: StringView) -> bool {
 
 /// The name a CREATE TABLE, VIEW or TRIGGER statement gives its object, as written (quotes and all), which
 /// SQLite's "… already exists" shows (`%T`); `name` when it cannot be found.
-fn writtenObjectName(sql: StringView, name: StringView) -> String {
+fn writtenObjectName(sql: ByteStringView, name: ByteStringView) -> ByteString {
     let tokens = match (Tokenizer.tokenize(sql)) {
         Ok(t) => t,
         Err(_) => { return ownedName(name); }
@@ -159,18 +159,18 @@ fn writtenObjectName(sql: StringView, name: StringView) -> String {
         if (at + 2 < tokens.length && tokens[at + 1].isOp(".")) {
             at += 2;
         }
-        if (at < tokens.length && tokens[at].offset <= tokens[at].end && tokens[at].end <= sql.length) {
-            return ownedName(sql[tokens[at].offset..tokens[at].end]);
+        if (at < tokens.length && tokens[at].offset <= tokens[at].end && tokens[at].end <= sql.length()) {
+            return ownedName(sql.slice(tokens[at].offset, tokens[at].end));
         }
         break;
     }
     return ownedName(name);
 }
 
-fn ownedName(name: StringView) -> String => String.from(name).ok() ?? String.create();
+fn ownedName(name: ByteStringView) -> ByteString => ownedText(name).ok() ?? ByteString.create();
 
-fn existsError(kind: StringView, name: StringView) -> SqliteError {
-    var message = String.create();
+fn existsError<N: TextView, M: TextView>(kind: N, name: M) -> SqliteError {
+    var message = ByteString.create();
     let _ = message.append(kind);
     let _ = message.append(" ");
     let _ = message.append(name);
@@ -178,12 +178,12 @@ fn existsError(kind: StringView, name: StringView) -> SqliteError {
     return sqlError(message.view());
 }
 
-fn isReservedName(name: StringView) -> bool => startsWithIgnoreAsciiCase(name, "sqlite_");
+fn isReservedName(name: ByteStringView) -> bool => name.startsWithIgnoreAsciiCase("sqlite_");
 
 /// CREATE TABLE.
 fn executeCreateTable(
     stmt: borrow CreateTableStmt,
-    sql: StringView,
+    sql: ByteStringView,
     db: borrow mut Session,
 ) -> Result<void, SqliteError> {
     let name = stmt.name.name.view();
@@ -220,10 +220,10 @@ fn executeCreateTable(
         if (table.keys[k].primaryKey && table.withoutRowid) {
             continue;
         }
-        var indexName = String.from("sqlite_autoindex_")?;
+        var indexName = ownedText("sqlite_autoindex_")?;
         indexName.append(name)?;
         indexName.append("_")?;
-        indexName.appendNumber(sequence)?;
+        indexName.appendUnsigned(sequence)?;
         let indexRoot = db.pager.allocatePage()?;
         initRoot(mut db.pager, indexRoot, PAGE_LEAF_INDEX)?;
         addSchemaRow(db, "index", indexName.view(), name, indexRoot, null)?;
@@ -237,7 +237,7 @@ fn executeCreateTable(
             "sqlite_sequence",
             "sqlite_sequence",
             sequenceRoot,
-            "CREATE TABLE sqlite_sequence(name,seq)",
+            ByteStringView.fromText("CREATE TABLE sqlite_sequence(name,seq)"),
         )?;
     }
     db.pager.bumpSchemaCookie()?;
@@ -247,7 +247,7 @@ fn executeCreateTable(
 /// CREATE INDEX: the index is built from the table's rows.
 fn executeCreateIndex(
     stmt: borrow CreateIndexStmt,
-    sql: StringView,
+    sql: ByteStringView,
     db: borrow mut Session,
 ) -> Result<void, SqliteError> {
     let name = stmt.name.name.view();
@@ -291,7 +291,7 @@ fn executeCreateIndex(
                 var self = Vector<RowKey>.create();
                 self.push(writer.keyOf(borrow frame.slots[writer.slot])?)?;
                 if (writer.conflictsIn(index, borrow entry, self.view(), db)?.length != 0) {
-                    var message = String.from("UNIQUE constraint failed: ")?;
+                    var message = ownedText("UNIQUE constraint failed: ")?;
                     message.append(index.keyNames.view())?;
                     return Err(constraintError(message.view()));
                 }
@@ -305,7 +305,7 @@ fn executeCreateIndex(
 /// CREATE VIEW: checked by compiling its SELECT.
 fn executeCreateView(
     stmt: borrow CreateViewStmt,
-    sql: StringView,
+    sql: ByteStringView,
     db: borrow mut Session,
 ) -> Result<void, SqliteError> {
     let name = stmt.name.name.view();
@@ -317,7 +317,7 @@ fn executeCreateView(
     }
     var compiler = newCompiler(db)?;
     let plan = compileSelect(mut compiler, borrow stmt.select, db)?;
-    let none = Vector<String>.create();
+    let none = Vector<ByteString>.create();
     let _ = planScopeColumns(borrow plan, if (stmt.columns.length != 0) borrow stmt.columns else borrow none)?;
     addSchemaRow(db, "view", name, name, 0, sql)?;
     db.pager.bumpSchemaCookie()?;
@@ -349,7 +349,7 @@ fn executeDrop(stmt: borrow DropStmt, db: borrow mut Session) -> Result<void, Sq
             return Ok();
         }
         if (kind.length != 0 && wanted != "trigger") {
-            var message = String.from("use DROP ")?;
+            var message = ownedText("use DROP ")?;
             message.append(match (kind) {
                 "table" => "TABLE",
                 "index" => "INDEX",
@@ -369,7 +369,7 @@ fn executeDrop(stmt: borrow DropStmt, db: borrow mut Session) -> Result<void, Sq
         }, name));
     }
     if (isReservedName(name) && stmt.kind != DropKind.Index) {
-        var message = String.from("table ")?;
+        var message = ownedText("table ")?;
         message.append(name)?;
         message.append(" may not be dropped")?;
         return Err(sqlError(message.view()));
@@ -411,8 +411,8 @@ const SQL_KEYWORDS: [StringView; 147] = [
 
 /// A name as SQLite's createTableStmt writes it (identPut): in double quotes when it is not all letters, digits and
 /// `_`, starts with a digit, is empty, or is a keyword.
-fn appendIdentPut(out: borrow mut String, name: StringView) -> Result<void, AllocError> {
-    var plain = name.length != 0 && !(name[0] >= '0' && name[0] <= '9');
+fn appendIdentPut(out: borrow mut ByteString, name: ByteStringView) -> Result<void, AllocError> {
+    var plain = name.length() != 0 && !(name[0] >= '0' && name[0] <= '9');
     for (c in name.bytes()) {
         plain = plain && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_');
     }
@@ -435,7 +435,7 @@ fn appendIdentPut(out: borrow mut String, name: StringView) -> Result<void, Allo
 }
 
 /// The number of bytes SQLite counts for a name (identLength): its length with each `"` doubled, plus 2.
-fn identLength(name: StringView) -> usize {
+fn identLength(name: ByteStringView) -> usize {
     var n: usize = 2;
     for (c in name.bytes()) {
         n += if (c == '"') 2 else 1;
@@ -446,7 +446,7 @@ fn identLength(name: StringView) -> usize {
 /// CREATE TABLE … AS SELECT: a table with the query's result columns (named as SQLite names them, typed by their
 /// affinities), written as SQLite writes its statement, then filled with the query's rows.
 fn executeCreateTableAs(
-    name: StringView,
+    name: ByteStringView,
     query: borrow SelectStmt,
     db: borrow mut Session,
 ) -> Result<void, SqliteError> {
@@ -456,12 +456,12 @@ fn executeCreateTableAs(
     var compiler = newCompiler(db)?;
     let plan = compileSelect(mut compiler, query, db)?;
     // Unique names: a repeated one gets ":N" (sqlite3ColumnsFromExprList).
-    var names = Vector<String>.withCapacity(plan.columnNames.length)?;
+    var names = Vector<ByteString>.withCapacity(plan.columnNames.length)?;
     for (i in 0..plan.columnNames.length) {
         var candidate = plan.columnNames[i].clone()?;
-        if (candidate.length == 0) {
-            candidate = String.from("column")?;
-            candidate.appendNumber(i + 1)?;
+        if (candidate.length() == 0) {
+            candidate = ownedText("column")?;
+            candidate.appendUnsigned((i + 1) as u64)?;
         }
         var count: u64 = 0;
         loop {
@@ -473,8 +473,8 @@ fn executeCreateTableAs(
                 break;
             }
             // Without a ":digits" ending it already has.
-            var stem = candidate.length;
-            var j = candidate.length - 1;
+            var stem = candidate.length();
+            var j = candidate.length() - 1;
             while (j > 0 && candidate.view()[j] >= '0' && candidate.view()[j] <= '9') {
                 j -= 1;
             }
@@ -482,9 +482,9 @@ fn executeCreateTableAs(
                 stem = j;
             }
             count += 1;
-            var next = String.from(candidate.view()[0..stem])?;
+            var next = ownedText(candidate.view().slice(0, stem))?;
             next.append(":")?;
-            next.appendNumber(count)?;
+            next.appendUnsigned(count)?;
             candidate = next;
         }
         names.push(candidate)?;
@@ -495,7 +495,7 @@ fn executeCreateTableAs(
         length += identLength(names[i].view()) + 5;
     }
     let short = length < 50;
-    var sql = String.from("CREATE TABLE ")?;
+    var sql = ownedText("CREATE TABLE ")?;
     appendIdentPut(mut sql, name)?;
     sql.append("(")?;
     for (i in 0..names.length) {
@@ -518,13 +518,13 @@ fn executeCreateTableAs(
     let insert = InsertStmt {
         with: null,
         conflict: null,
-        table: QualifiedName { schema: null, name: String.from(name)? },
-        columns: Vector<String>.create(),
+        table: QualifiedName { schema: null, name: ownedText(name)? },
+        columns: Vector<ByteString>.create(),
         source: InsertSource.Select(cloneSelect(query)?),
         upserts: Vector<UpsertClause>.create(),
         returning: Vector<ResultColumn>.create(),
         alias: null,
-        returningTexts: Vector<String>.create(),
+        returningTexts: Vector<ByteString>.create(),
     };
     let changes = db.changes;
     let total = db.totalChanges;

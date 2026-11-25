@@ -23,28 +23,11 @@ enum Affinity {
     Real,
 }
 
-fn containsIgnoringCase(text: StringView, word: StringView) -> bool {
-    if (word.length > text.length) {
-        return false;
-    }
-    for (start in 0..text.length - word.length + 1) {
-        var same = true;
-        for (i in 0..word.length) {
-            if (foldAscii(text[start + i]) != foldAscii(word[i])) {
-                same = false;
-                break;
-            }
-        }
-        if (same) {
-            return true;
-        }
-    }
-    return false;
-}
+fn containsIgnoringCase<N: TextView>(text: N, word: StringView) -> bool => text.indexOfIgnoreAsciiCase(word).isSome();
 
 /// The affinity SQLite gives a column declared with `declaredType`: its five rules, in order.
-fn affinityOf(declaredType: StringView) -> Affinity {
-    if (declaredType.length == 0) {
+fn affinityOf<N: TextView>(declaredType: N) -> Affinity {
+    if (declaredType.length() == 0) {
         return Affinity.Blob;
     }
     if (containsIgnoringCase(declaredType, "INT")) {
@@ -77,10 +60,10 @@ enum ForeignKeyAction {
 }
 
 struct ForeignKeySchema {
-    columns: Vector<String>;
-    refTable: String;
+    columns: Vector<ByteString>;
+    refTable: ByteString;
     /// Empty when the parent's primary key is meant.
-    refColumns: Vector<String>;
+    refColumns: Vector<ByteString>;
     onDelete: ForeignKeyAction;
     onUpdate: ForeignKeyAction;
     /// DEFERRABLE INITIALLY DEFERRED.
@@ -89,13 +72,13 @@ struct ForeignKeySchema {
 
 /// An expression of a definition, with the text it was written as.
 struct SchemaExpr {
-    text: String;
+    text: ByteString;
     expr: Expr;
 }
 
 struct ColumnSchema {
-    name: String;
-    declaredType: String;
+    name: ByteString;
+    declaredType: ByteString;
     affinity: Affinity;
     notNull: bool;
     primaryKey: bool;
@@ -119,7 +102,7 @@ struct ColumnSchema {
 }
 
 struct KeyColumn {
-    name: String;
+    name: ByteString;
     descending: bool;
     /// The COLLATE written in the key's column list; `null` to use the table column's collation.
     collation: Collation?;
@@ -134,7 +117,7 @@ struct KeyConstraint {
 }
 
 struct TableSchema {
-    name: String;
+    name: ByteString;
     columns: Vector<ColumnSchema>;
     rootPage: u32;
     withoutRowid: bool;
@@ -155,7 +138,7 @@ struct TableSchema {
     rowidConflict: ConflictAction?;
 
     /// The index of the column called `name` (ASCII case is ignored).
-    fn indexOf(borrow this, name: StringView) -> usize? {
+    fn indexOf(borrow this, name: ByteStringView) -> usize? {
         for (i in 0..this.columns.length) {
             if (this.columns[i].name.view().equalsIgnoreAsciiCase(name)) {
                 return i;
@@ -215,7 +198,7 @@ struct TableSchema {
 
 struct IndexColumnSchema {
     /// The column's name; empty for an expression.
-    name: String;
+    name: ByteString;
     expression: Expr?;
     descending: bool;
     /// The index column's COLLATE, or else its table column's collation.
@@ -223,8 +206,8 @@ struct IndexColumnSchema {
 }
 
 struct IndexSchema {
-    name: String;
-    table: String;
+    name: ByteString;
+    table: ByteString;
     unique: bool;
     rootPage: u32;
     columns: Vector<IndexColumnSchema>;
@@ -254,7 +237,7 @@ fn tokenIsWord(tokens: Slice<Token>, at: usize, word: StringView) -> bool =>
 fn tokenIsOp(tokens: Slice<Token>, at: usize, op: StringView) -> bool => at < tokens.length && tokens[at].isOp(op);
 
 fn definitionError(tokens: Slice<Token>, at: usize) -> SqliteError {
-    var text = String.create();
+    var text = ByteString.create();
     if (at < tokens.length) {
         let _ = text.append("near \"");
         let _ = text.append(tokens[at].text.view());
@@ -277,22 +260,26 @@ fn cloneToken(token: borrow Token) -> Result<Token, AllocError> =>
     );
 
 /// A token as SQL text.
-fn appendToken(out: borrow mut String, token: borrow Token) -> Result<void, AllocError> {
+fn appendToken(out: borrow mut ByteString, token: borrow Token) -> Result<void, AllocError> {
     match (token.kind) {
         TokenKind.QuotedId => { return SqlWriter.appendIdentifier(out, token.text.view()); }
         TokenKind.StringLit => { return SqlWriter.appendStringLiteral(out, token.text.view()); }
         TokenKind.BlobLit => {
             out.append("x'")?;
             out.append(token.text.view())?;
-            return out.append("'");
+            out.append("'")?;
+            return Ok();
         }
-        _ => { return out.append(token.text.view()); }
+        _ => {
+            out.append(token.text.view())?;
+            return Ok();
+        }
     }
 }
 
 /// Tokens as SQL text: one space between them, none inside parentheses' edges, before a comma or around a dot.
-fn renderTokens(tokens: Slice<Token>) -> Result<String, AllocError> {
-    var out = String.create();
+fn renderTokens(tokens: Slice<Token>) -> Result<ByteString, AllocError> {
+    var out = ByteString.create();
     for (i in 0..tokens.length) {
         if (i != 0) {
             let tight = tokens[i].isOp(
@@ -312,35 +299,35 @@ fn renderTokens(tokens: Slice<Token>) -> Result<String, AllocError> {
 
 /// The expression `tokens` spell, with its text.
 /// The SQL text `tokens` were read from, as written; a lone quoted name is its name.
-fn spanText(sql: StringView, tokens: Slice<Token>) -> Result<String, AllocError> {
+fn spanText(sql: ByteStringView, tokens: Slice<Token>) -> Result<ByteString, AllocError> {
     if (tokens.length == 0) {
-        return Ok(String.create());
+        return Ok(ByteString.create());
     }
     if (tokens.length == 1 && tokens[0].kind == TokenKind.QuotedId) {
         return tokens[0].text.clone();
     }
     let start = tokens[0].offset;
     let end = tokens[tokens.length - 1].end;
-    if (start <= end && end <= sql.length) {
-        return String.from(sql[start..end]);
+    if (start <= end && end <= sql.length()) {
+        return ownedText(sql.slice(start, end));
     }
     return renderTokens(tokens);
 }
 
 /// The expression `tokens` spell, with its text.
-fn schemaExpr(sql: StringView, tokens: Slice<Token>) -> Result<SchemaExpr, SqliteError> {
+fn schemaExpr(sql: ByteStringView, tokens: Slice<Token>) -> Result<SchemaExpr, SqliteError> {
     var copy = Vector<Token>.withCapacity(tokens.length + 1)?;
     for (i in 0..tokens.length) {
         copy.push(cloneToken(borrow tokens[i])?)?;
     }
-    copy.push(Token { kind: TokenKind.Eof, text: String.create(), offset: 0, end: 0, doubleQuoted: false })?;
+    copy.push(Token { kind: TokenKind.Eof, text: ByteString.create(), offset: 0, end: 0, doubleQuoted: false })?;
     return Ok(SchemaExpr { text: spanText(sql, tokens)?, expr: Parser.parseExpressionTokens(copy)? });
 }
 
 /// A CHECK constraint with the name its failure reports, as sqlite3AddCheckConstraint gives it: the CONSTRAINT
 /// name before it, else the text of its expression, dequoted as sqlite3Dequote does (so `CHECK ("b" <> 'x')` is
 /// named `b`). The C# named every CHECK by its whole text.
-fn namedCheck(check: SchemaExpr, name: borrow String?) -> Result<SchemaExpr, AllocError> {
+fn namedCheck(check: SchemaExpr, name: borrow ByteString?) -> Result<SchemaExpr, AllocError> {
     var named = check;
     if (name is Some(n)) {
         named.text = n.clone()?;
@@ -352,10 +339,10 @@ fn namedCheck(check: SchemaExpr, name: borrow String?) -> Result<SchemaExpr, All
 
 /// sqlite3Dequote: text that starts with a quote ('…', "…", `…` or […]) up to its closing quote, a doubled quote
 /// standing for one; other text as it is.
-fn dequotedText(text: StringView) -> Result<String, AllocError> {
+fn dequotedText(text: ByteStringView) -> Result<ByteString, AllocError> {
     let bytes = text.bytes();
     if (bytes.length == 0) {
-        return String.from(text);
+        return ownedText(text);
     }
     let open = bytes[0];
     let close: u8 = match (open) {
@@ -363,7 +350,7 @@ fn dequotedText(text: StringView) -> Result<String, AllocError> {
         '"' => '"',
         '`' => '`',
         '[' => ']',
-        _ => { return String.from(text); }
+        _ => { return ownedText(text); }
     };
     var out = Vector<u8>.create();
     var at: usize = 1;
@@ -379,10 +366,7 @@ fn dequotedText(text: StringView) -> Result<String, AllocError> {
         out.push(bytes[at])?;
         at += 1;
     }
-    // The bytes between quotes are whole characters of `text`, a String.
-    var result = String.create();
-    let _ = result.appendUtf8(out.view())?;
-    return Ok(result);
+    return Ok(ByteString.fromBytes(out));
 }
 
 /// With `at` on an opening parenthesis, the index of the one that closes it.
@@ -405,7 +389,7 @@ fn closingParenthesis(tokens: Slice<Token>, at: usize) -> Result<usize, SqliteEr
 }
 
 /// The name at `at`: a word, a quoted identifier or, as SQLite allows, a string.
-fn definitionName(tokens: Slice<Token>, at: usize) -> Result<String, SqliteError> {
+fn definitionName(tokens: Slice<Token>, at: usize) -> Result<ByteString, SqliteError> {
     if (at < tokens.length) {
         let kind = tokens[at].kind;
         if (kind == TokenKind.Word || kind == TokenKind.QuotedId || kind == TokenKind.StringLit) {
@@ -415,11 +399,11 @@ fn definitionName(tokens: Slice<Token>, at: usize) -> Result<String, SqliteError
     return Err(definitionError(tokens, at));
 }
 
-fn collationNamed(name: StringView) -> Result<Collation, SqliteError> {
+fn collationNamed(name: ByteStringView) -> Result<Collation, SqliteError> {
     if (Collation.named(name) is Some(collation)) {
         return Ok(collation);
     }
-    var text = String.from("no such collation sequence: ")?;
+    var text = ownedText("no such collation sequence: ")?;
     text.append(name)?;
     return Err(unsupported(text.view()));
 }
@@ -529,13 +513,13 @@ fn foreignKeyAction(tokens: Slice<Token>, at: borrow mut usize) -> Result<Foreig
 fn foreignKeyClause(
     tokens: Slice<Token>,
     at: borrow mut usize,
-    columns: Vector<String>,
+    columns: Vector<ByteString>,
 ) -> Result<ForeignKeySchema, SqliteError> {
     var i = *at + 1;
     var key = ForeignKeySchema {
         columns: columns,
         refTable: definitionName(tokens, i)?,
-        refColumns: Vector<String>.create(),
+        refColumns: Vector<ByteString>.create(),
         onDelete: ForeignKeyAction.NoAction,
         onUpdate: ForeignKeyAction.NoAction,
         deferred: false,
@@ -600,12 +584,12 @@ fn isColumnConstraintWord(token: borrow Token) -> bool =>
 fn buildColumnSchema(
     definition: borrow ColumnDef,
     withoutRowid: bool,
-    sql: StringView,
+    sql: ByteStringView,
 ) -> Result<ColumnSchema, SqliteError> {
     let tokens = definition.body.view();
     var column = ColumnSchema {
         name: definition.name.clone()?,
-        declaredType: String.create(),
+        declaredType: ByteString.create(),
         affinity: Affinity.Blob,
         notNull: false,
         primaryKey: false,
@@ -631,7 +615,7 @@ fn buildColumnSchema(
     column.declaredType = spanText(sql, tokens[0..i])?;
     column.affinity = affinityOf(column.declaredType.view());
     // The last CONSTRAINT name of the column, which names a CHECK after it (pParse->constraintName).
-    var constraintName: String? = null;
+    var constraintName: ByteString? = null;
     while (i < tokens.length) {
         if (tokenIsWord(tokens, i, "CONSTRAINT")) {
             constraintName = definitionName(tokens, i + 1)?;
@@ -695,7 +679,7 @@ fn buildColumnSchema(
             column.defaultValue = value;
             i = end;
         } else if (tokenIsWord(tokens, i, "REFERENCES")) {
-            var columns = Vector<String>.create();
+            var columns = Vector<ByteString>.create();
             columns.push(definition.name.clone()?)?;
             column.foreignKey = foreignKeyClause(tokens, mut i, columns)?;
         } else if (tokenIsWord(tokens, i, "GENERATED") && tokenIsWord(
@@ -741,14 +725,14 @@ fn cloneKeyColumns(columns: Slice<KeyColumn>) -> Result<Vector<KeyColumn>, Alloc
     return Ok(copy);
 }
 
-fn oneKeyColumn(name: StringView, descending: bool) -> Result<Vector<KeyColumn>, AllocError> {
+fn oneKeyColumn(name: ByteStringView, descending: bool) -> Result<Vector<KeyColumn>, AllocError> {
     var columns = Vector<KeyColumn>.create();
-    columns.push(KeyColumn { name: String.from(name)?, descending: descending, collation: null })?;
+    columns.push(KeyColumn { name: ownedText(name)?, descending: descending, collation: null })?;
     return Ok(columns);
 }
 
-fn cloneNames(columns: Slice<KeyColumn>) -> Result<Vector<String>, AllocError> {
-    var names = Vector<String>.withCapacity(columns.length)?;
+fn cloneNames(columns: Slice<KeyColumn>) -> Result<Vector<ByteString>, AllocError> {
+    var names = Vector<ByteString>.withCapacity(columns.length)?;
     for (i in 0..columns.length) {
         names.push(columns[i].name.clone()?)?;
     }
@@ -756,14 +740,15 @@ fn cloneNames(columns: Slice<KeyColumn>) -> Result<Vector<String>, AllocError> {
 }
 
 /// A table from its CREATE TABLE statement.
-fn buildTableSchema(
+fn buildTableSchema<N: TextView>(
     stmt: borrow CreateTableStmt,
-    name: StringView,
+    nameText: N,
     rootPage: u32,
-    sql: StringView,
+    sql: ByteStringView,
 ) -> Result<TableSchema, SqliteError> {
+    let name = ByteStringView.fromBytes(nameText.bytes());
     var table = TableSchema {
-        name: String.from(name)?,
+        name: ownedText(name)?,
         columns: Vector<ColumnSchema>.create(),
         rootPage: rootPage,
         withoutRowid: stmt.withoutRowid,
@@ -819,7 +804,7 @@ fn buildTableSchema(
     for (c in 0..stmt.constraints.length) {
         let tokens = stmt.constraints[c].view();
         var i: usize = 0;
-        var constraintName: String? = null;
+        var constraintName: ByteString? = null;
         if (tokenIsWord(tokens, i, "CONSTRAINT")) {
             constraintName = definitionName(tokens, i + 1)?;
             i += 2;
@@ -889,12 +874,12 @@ fn buildTableSchema(
 /// An index from its CREATE INDEX statement. `table` is the table it is on, for its columns' collations.
 fn buildIndexSchema(
     stmt: CreateIndexStmt,
-    name: StringView,
+    name: ByteStringView,
     rootPage: u32,
     table: borrow TableSchema,
 ) -> Result<IndexSchema, SqliteError> {
     var index = IndexSchema {
-        name: String.from(name)?,
+        name: ownedText(name)?,
         table: table.name.clone()?,
         unique: stmt.unique,
         rootPage: rootPage,
@@ -905,7 +890,7 @@ fn buildIndexSchema(
     // The columns are taken from the back, so they are put in order afterwards.
     while (columns.pop() is Some(column)) {
         var collation = Collation.Binary;
-        if (column.collation.length != 0) {
+        if (column.collation.length() != 0) {
             collation = collationNamed(column.collation.view())?;
         } else if (column.expression.isNull()) {
             let at = table.indexOf(column.name.view()) ?? {
@@ -934,8 +919,8 @@ struct SchemaCatalog {
     tables: Vector<TableSchema>;
     indexes: Vector<IndexSchema>;
     /// The names of tables and indexes whose definitions this engine cannot read (a virtual table, say).
-    unsupported: Vector<String>;
-    private tablesByName: HashMap<String, usize>;
+    unsupported: Vector<ByteString>;
+    private tablesByName: HashMap<ByteString, usize>;
 
     /// Reads the catalog from the database's sqlite_schema.
     fn load(reader: borrow DatabaseReader) -> Result<SchemaCatalog, SqliteError> =>
@@ -946,8 +931,8 @@ struct SchemaCatalog {
         var catalog = SchemaCatalog {
             tables: Vector<TableSchema>.create(),
             indexes: Vector<IndexSchema>.create(),
-            unsupported: Vector<String>.create(),
-            tablesByName: HashMap<String, usize>.create(),
+            unsupported: Vector<ByteString>.create(),
+            tablesByName: HashMap<ByteString, usize>.create(),
         };
         // Tables first: an index needs its table's columns.
         for (i in 0..entries.length) {
@@ -987,14 +972,18 @@ struct SchemaCatalog {
         return Ok(catalog);
     }
 
-    private fn tableFrom(sql: StringView, name: StringView, rootPage: u32) -> Result<TableSchema, SqliteError> {
+    private fn tableFrom(sql: ByteStringView, name: ByteStringView, rootPage: u32) -> Result<TableSchema, SqliteError> {
         match (Parser.parseStatement(sql)?) {
             Stmt.CreateTable(stmt) => { return buildTableSchema(stmt, name, rootPage, sql); }
             _ => { return Err(corrupt("a table's entry in sqlite_schema is not a CREATE TABLE statement")); }
         }
     }
 
-    private fn indexFrom(borrow this, sql: StringView, entry: borrow SchemaEntry) -> Result<IndexSchema, SqliteError> {
+    private fn indexFrom(
+        borrow this,
+        sql: ByteStringView,
+        entry: borrow SchemaEntry,
+    ) -> Result<IndexSchema, SqliteError> {
         let table = this.table(entry.tableName.view())? ?? {
             return Err(corrupt("an index in sqlite_schema is on a table that is not there"));
         };
@@ -1008,7 +997,8 @@ struct SchemaCatalog {
     }
 
     /// The table called `name` (ASCII case is ignored), or `null`.
-    fn table(borrow this, name: StringView) -> Result<borrow TableSchema?, AllocError> {
+    fn table<N: TextView>(borrow this, nameText: N) -> Result<borrow TableSchema?, AllocError> {
+        let name = ByteStringView.fromBytes(nameText.bytes());
         let key = asciiLower(name)?;
         if (this.tablesByName.get(borrow key) is Some(at)) {
             return Ok(borrow this.tables[*at]);
@@ -1106,7 +1096,7 @@ impl TableSchema {
 
 impl SchemaCatalog {
     /// A copy of the table called `name`.
-    fn tableCopy(borrow this, name: StringView) -> Result<TableSchema, SqliteError> {
+    fn tableCopy(borrow this, name: ByteStringView) -> Result<TableSchema, SqliteError> {
         let table = this.table(name)? ?? {
             return Err(namedError("no such table: ", name));
         };

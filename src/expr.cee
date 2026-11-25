@@ -591,7 +591,7 @@ fn evaluateLike(l: borrow XLike, frame: borrow mut Frame, db: borrow mut Session
 
 /// A column a name can refer to.
 struct ScopeColumn {
-    name: String;
+    name: ByteString;
     affinity: Affinity;
     collation: Collation;
     /// A hidden column (a table function's arguments) is found only by name, never by `*`.
@@ -601,7 +601,7 @@ struct ScopeColumn {
 /// A FROM item as names see it.
 struct ScopeSource {
     /// The name that qualifies its columns: the alias, or the table's name.
-    name: String;
+    name: ByteString;
     columns: Vector<ScopeColumn>;
     slot: usize;
     /// Whether rowid, _rowid_ and oid name its rowid.
@@ -609,7 +609,7 @@ struct ScopeSource {
     /// The column that is the rowid, if one is.
     rowidAlias: usize?;
     /// Columns joined by USING or NATURAL to an earlier source: an unqualified name finds the earlier one.
-    merged: Vector<String>;
+    merged: Vector<ByteString>;
     /// In a RIGHT or FULL join, an unqualified merged column is the first non-NULL of the earlier source's and
     /// this one's.
     coalesceMerged: bool;
@@ -621,7 +621,7 @@ struct Scope {
 
 /// The names a SELECT's result columns give, which WHERE, GROUP BY, HAVING and ORDER BY may use.
 struct OutputAlias {
-    name: String;
+    name: ByteString;
     expr: Expr;
 }
 
@@ -716,7 +716,7 @@ struct Compiler {
 
 /// A common table expression's name in scope.
 struct CteName {
-    name: String;
+    name: ByteString;
     /// Its plan's number, or for the recursive part of a recursive CTE its working table's.
     index: usize;
     working: bool;
@@ -726,22 +726,22 @@ struct CteName {
 /// Parameter numbering: `?` takes the next number, `?N` is N, and a name keeps the number it first got.
 struct ParamTable {
     count: usize;
-    names: Vector<String>;
+    names: Vector<ByteString>;
     numbers: Vector<usize>;
 
     fn create() -> ParamTable =>
-        ParamTable { count: 0, names: Vector<String>.create(), numbers: Vector<usize>.create() };
+        ParamTable { count: 0, names: Vector<ByteString>.create(), numbers: Vector<usize>.create() };
 
     /// The 0-based index of the parameter written as `text`.
-    fn indexOf(borrow mut this, text: StringView) -> Result<usize, SqliteError> {
+    fn indexOf(borrow mut this, text: ByteStringView) -> Result<usize, SqliteError> {
         if (text == "?") {
             this.count += 1;
             return Ok(this.count - 1);
         }
         if (text[0] == '?') {
-            let n = text[1..].parseInt<usize>() ?? 0;
+            let n = parseUsize(text.sliceFrom(1)) ?? 0;
             if (n == 0 || n > 32766) {
-                var message = String.from("variable number must be between ?1 and ?32766")?;
+                var message = ownedText("variable number must be between ?1 and ?32766")?;
                 return Err(sqlError(message.view()));
             }
             this.count = this.count.max(n);
@@ -753,7 +753,7 @@ struct ParamTable {
             }
         }
         this.count += 1;
-        this.names.push(String.from(text)?)?;
+        this.names.push(ownedText(text)?)?;
         this.numbers.push(this.count - 1)?;
         return Ok(this.count - 1);
     }
