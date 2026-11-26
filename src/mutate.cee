@@ -988,9 +988,10 @@ struct IndexMutator {
         var low: usize = 0;
         var high = header.cellCount;
         equal = false;
+        var there = Vector<SqliteValue>.create();
         while (low < high) {
             let middle = low + (high - low) / 2;
-            let there = IndexMutator.entryAt(pager, page, header.cellOffset(page, middle)? + lead)?;
+            indexEntryInto(pager, page, header, middle, mut there)?;
             let c = order.comparePrefixIn(there.view(), entry, pager.textEncoding);
             if (c == 0 && there.length == entry.length) {
                 equal = true;

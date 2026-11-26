@@ -123,6 +123,31 @@ fn indexEntryAt<P: PageSource>(
     return decodeIndexEntry(pager, page, if (header.isLeaf()) offset else offset + 4);
 }
 
+/// `indexEntryAt` into `out`, whose values an earlier entry left (`Record.decodeMaskedInto`): a search that reads
+/// many entries does not allocate for each.
+fn indexEntryInto<P: PageSource>(
+    pager: borrow mut P,
+    page: Slice<u8>,
+    header: borrow BTreePageHeader,
+    index: usize,
+    out: borrow mut Vector<SqliteValue>,
+) -> Result<void, SqliteError> {
+    let cellOffset = header.cellOffset(page, index)?;
+    let offset = if (header.isLeaf()) cellOffset else cellOffset + 4;
+    let length = Varint.read(page, offset)?;
+    let shape = PayloadShape.ofIndex(pager, length.value)?;
+    let start = offset + length.length;
+    let encoding = pager.textEncoding();
+    if (shape.isLocal()) {
+        if (start + shape.total > page.length) {
+            return Err(corrupt("a cell runs past the end of its page"));
+        }
+        return Record.decodeMaskedInto(page[start..start + shape.total], encoding, [], out);
+    }
+    let payload = readOverflowPayload(pager, page, start, shape)?;
+    return Record.decodeMaskedInto(payload.view(), encoding, [], out);
+}
+
 /// The child of an interior index page before cell `index`; `cellCount` names the right-most child.
 fn indexChildAt(page: Slice<u8>, header: borrow BTreePageHeader, index: usize) -> Result<u32, SqliteError> {
     if (index >= header.cellCount) {
@@ -156,9 +181,10 @@ fn cellsBelowLow<P: PageSource>(
 ) -> Result<usize, SqliteError> {
     var low: usize = 0;
     var high = frame.header.cellCount;
+    var entry = Vector<SqliteValue>.create();
     while (low < high) {
         let middle = low + (high - low) / 2;
-        let entry = indexEntryAt(pager, frame.page.view(), frame.header, middle)?;
+        indexEntryInto(pager, frame.page.view(), frame.header, middle, mut entry)?;
         if (range.satisfiesLow(entry.view())) {
             high = middle;
         } else {
@@ -176,9 +202,10 @@ fn cellsWithinHigh<P: PageSource>(
 ) -> Result<usize, SqliteError> {
     var low: usize = 0;
     var high = frame.header.cellCount;
+    var entry = Vector<SqliteValue>.create();
     while (low < high) {
         let middle = low + (high - low) / 2;
-        let entry = indexEntryAt(pager, frame.page.view(), frame.header, middle)?;
+        indexEntryInto(pager, frame.page.view(), frame.header, middle, mut entry)?;
         if (range.satisfiesHigh(entry.view())) {
             low = middle + 1;
         } else {
