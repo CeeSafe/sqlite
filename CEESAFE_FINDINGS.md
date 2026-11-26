@@ -45,7 +45,7 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 49 | fixed in 0.95.7 (ADR 0247: initializers MSVC can nest); CI's Windows job builds with MSVC (`CC=cl`) |
 | 51 | fixed in 0.95.12: `ChildOptions.setEnvironment`, `Process.captureWith` and `runWith`, ADR 0258; workaround removed: on Windows the sqlite3 shell runs by `Process.captureWith` with HOME and USERPROFILE set to a directory that holds its `.sqliterc`, and `tests/capture.py` is gone |
 | 52, 53, 54 | fixed in 0.95.15: a method call through more than one reference, `String.append` of any `TextView`, a string literal where a `ByteStringView` is expected, `v[a..b]`, `v.length` and the parsers on a `ByteStringView`, and `Check.equalTextOf`, ADR 0260; workarounds removed: `parseUsize`/`parseI64`/`parseI32` (src/text.cee) are `parseInt<T>()` on the view, `ByteStringView.fromText` of a literal is the literal, the tests' `equalName` is `Check.equalTextOf`. Kept by choice: `executeAnalyze` binds `target is Some(name)` (one borrow is all it needs), the tokenizer test's `appendLossy` (it shows a token that is not UTF-8), and `.length()` calls, which still work |
-| 55 | open: every local cleared on entry to its function; workaround: hot functions split into thin dispatchers (below) |
+| 55 | fixed in 0.95.20: a borrowed local is no longer zeroed, ADR 0262 (the engine's zeroed aggregate locals fall from 2,469 to 396); the thin dispatchers stay, as the shape the hot functions now have, and the package still builds with 0.95.15 |
 | 50 | fixed in 0.95.9 (ADR 0248: on Windows the float methods call System32's ucrtbase.dll whatever compiler built the program); on Windows older than build 26100 the three bit-for-bit math tests skip, saying why (`WindowsGap.OlderSystemMath`), and CI's windows-2025 job runs them (below) |
 | 40 | misreported: `cfg("target.windows")` (ADR 0179, guide/unsafe-and-c.md "Code for one system") names the system a build is for, in any code; `onWindows()` uses it, and the environment-variable check is gone |
 
@@ -614,3 +614,5 @@ where it is declared in the source, or in its arm, so that a call pays only for 
 
 Workaround: the hot functions are thin dispatchers whose arms call functions of their own (`evaluate` and
 `evaluateOther`, `joinLevel` and `loopLevel`).
+
+Fixed in 0.95.20 (ADR 0262) (status table).
