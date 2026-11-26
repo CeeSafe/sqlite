@@ -215,6 +215,61 @@ fn isTrue(value: borrow SqliteValue) -> bool => truthOf(value) ?? false;
 
 /// Evaluates `expr` against the frame. `db` is there for subqueries and functions that need the database.
 fn evaluate(expr: borrow XExpr, frame: borrow mut Frame, db: borrow mut Session) -> Result<SqliteValue, SqliteError> {
+    // The kinds every row meets are dispatched here, each to a function of its own, and the others in
+    // `evaluateOther`: the C ceesafec writes clears every local of a function when it is entered
+    // (CEESAFE_FINDINGS.md 55), so a function with all the kinds' locals cleared some 800 bytes each call.
+    match (expr) {
+        XExpr.Column(slot, column) => { return evaluateColumn(*slot, *column, frame); }
+        XExpr.Param(index) => { return evaluateParam(*index, frame); }
+        XExpr.Compare(c) => { return evaluateCompare(c, frame, db); }
+        XExpr.Arith(op, left, right) => { return evaluateArith(*op, left, right, frame, db); }
+        XExpr.Call(call) => { return callFunction(call, frame, db); }
+        XExpr.Like(l) => { return evaluateLike(l, frame, db); }
+        _ => { return evaluateOther(expr, frame, db); }
+    }
+}
+
+fn evaluateColumn(slot: usize, column: usize, frame: borrow Frame) -> Result<SqliteValue, SqliteError> {
+    let s = borrow frame.slots[slot];
+    if (s.isNull || column >= s.values.length) {
+        return Ok(SqliteValue.Null);
+    }
+    return Ok(s.values[column].clone()?);
+}
+
+fn evaluateParam(index: usize, frame: borrow Frame) -> Result<SqliteValue, SqliteError> {
+    if (index < frame.params.length) {
+        return Ok(frame.params[index].clone()?);
+    }
+    return Ok(SqliteValue.Null);
+}
+
+fn evaluateArith(
+    op: ArithmeticOp,
+    left: borrow XExpr,
+    right: borrow XExpr,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<SqliteValue, SqliteError> {
+    // Operands held already (a column, a parameter, a constant) are read where they are.
+    if (heldValue(left, frame).isSome() && heldValue(right, frame).isSome()) {
+        if (heldValue(left, frame) is Some(a)) {
+            if (heldValue(right, frame) is Some(b)) {
+                return Ok(arithmetic(op, a, b));
+            }
+        }
+    }
+    let a = evaluate(left, frame, db)?;
+    let b = evaluate(right, frame, db)?;
+    return Ok(arithmetic(op, borrow a, borrow b));
+}
+
+/// `evaluate` for the kinds of expression that are not dispatched there.
+fn evaluateOther(
+    expr: borrow XExpr,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<SqliteValue, SqliteError> {
     match (expr) {
         XExpr.Value(v) => { return Ok(v.clone()?); }
         XExpr.Column(slot, column) => {

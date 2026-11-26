@@ -45,6 +45,7 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 49 | fixed in 0.95.7 (ADR 0247: initializers MSVC can nest); CI's Windows job builds with MSVC (`CC=cl`) |
 | 51 | fixed in 0.95.12: `ChildOptions.setEnvironment`, `Process.captureWith` and `runWith`, ADR 0258; workaround removed: on Windows the sqlite3 shell runs by `Process.captureWith` with HOME and USERPROFILE set to a directory that holds its `.sqliterc`, and `tests/capture.py` is gone |
 | 52, 53, 54 | fixed in 0.95.15: a method call through more than one reference, `String.append` of any `TextView`, a string literal where a `ByteStringView` is expected, `v[a..b]`, `v.length` and the parsers on a `ByteStringView`, and `Check.equalTextOf`, ADR 0260; workarounds removed: `parseUsize`/`parseI64`/`parseI32` (src/text.cee) are `parseInt<T>()` on the view, `ByteStringView.fromText` of a literal is the literal, the tests' `equalName` is `Check.equalTextOf`. Kept by choice: `executeAnalyze` binds `target is Some(name)` (one borrow is all it needs), the tokenizer test's `appendLossy` (it shows a token that is not UTF-8), and `.length()` calls, which still work |
+| 55 | open: every local cleared on entry to its function; workaround: hot functions split into thin dispatchers (below) |
 | 50 | fixed in 0.95.9 (ADR 0248: on Windows the float methods call System32's ucrtbase.dll whatever compiler built the program); on Windows older than build 26100 the three bit-for-bit math tests skip, saying why (`WindowsGap.OlderSystemMath`), and CI's windows-2025 job runs them (below) |
 | 40 | misreported: `cfg("target.windows")` (ADR 0179, guide/unsafe-and-c.md "Code for one system") names the system a build is for, in any code; `onWindows()` uses it, and the environment-variable check is gone |
 
@@ -600,3 +601,16 @@ Workaround: helpers generic over `TextView` (`parseUsize`, `parseI64`, `parseI32
 literal that converts to `ByteStringView` where one is expected, and range slicing on byte views would remove them.
 
 Fixed in 0.95.15 (ADR 0260) (status table).
+
+### 55. Every local of a function is cleared when it is entered
+
+Found profiling the benchmark (`bench/`, ceesafec 0.95.15). The C that ceesafec writes declares each local of a
+function at its top with an initializer (`ceeE_…_SqliteValue v_a_21 = {0};`, `ceeO_bool v_compared_41 = {0};`, and
+the `t_` temporaries), whichever arm of a `match` the call takes. gcc -O2 does not remove the stores, as the locals
+are structs and unions whose addresses are taken: the engine's `evaluate`, a `match` over 30 kinds of expression,
+cleared about 800 bytes of stack (fifty 16-byte stores) on every call before looking at its expression, which was
+a sixth of a table scan's time; `joinLevel`, entered once for each row, cleared 2 KB. A local could be initialized
+where it is declared in the source, or in its arm, so that a call pays only for the arm it takes.
+
+Workaround: the hot functions are thin dispatchers whose arms call functions of their own (`evaluate` and
+`evaluateOther`, `joinLevel` and `loopLevel`).

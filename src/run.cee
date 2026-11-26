@@ -309,9 +309,22 @@ fn joinLevel(
     if (!groupsEnd(core, level, frame, db, sink)?) {
         return Ok();
     }
+    // Each row comes here at the last level: it goes on without entering `loopLevel`, whose many locals the C
+    // ceesafec writes clears on entry (CEESAFE_FINDINGS.md 55).
     if (level == core.sources.length) {
         return acceptRow(core, frame, db, sink);
     }
+    return loopLevel(core, level, frame, db, sink);
+}
+
+/// The nested loop at `level`: each row its source gives, with the next levels run for it.
+fn loopLevel(
+    core: borrow CorePlan,
+    level: usize,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+    sink: borrow mut CoreSink,
+) -> Result<void, SqliteError> {
     let source = borrow core.sources[level];
     var matched = false;
     if (source.group > 1) {
