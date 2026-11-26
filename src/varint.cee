@@ -14,6 +14,19 @@ const VARINT_NINE_BYTE_THRESHOLD: u64 = 0x00FF_FFFF_FFFF_FFFF;
 struct Varint {
     /// Reads the varint at `offset`. A varint that runs past the end of `buf` is `Corrupt`.
     fn read(buf: Slice<u8>, offset: usize) -> Result<VarintRead, SqliteError> {
+        // One byte (every serial type below 128) and two, first: nearly all a record's varints, as SQLite's
+        // getVarint32 takes them.
+        if (offset < buf.length) {
+            let first = buf[offset];
+            if (first < 0x80) {
+                return Ok(VarintRead { value: first as i64, length: 1 });
+            }
+            if (offset + 1 < buf.length && buf[offset + 1] < 0x80) {
+                return Ok(
+                    VarintRead { value: ((((first & 0x7F) as u32) << 7) | (buf[offset + 1] as u32)) as i64, length: 2 },
+                );
+            }
+        }
         var result: u64 = 0;
         for (i in 0..9) {
             if (offset + i >= buf.length) {

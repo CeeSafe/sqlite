@@ -69,24 +69,19 @@ struct Record {
         if (headerLength > payload.length) {
             return Err(corrupt("record header runs past the payload"));
         }
-        var columnCount: usize = 0;
-        var p = header.length;
-        while (p < headerLength) {
-            p += Varint.read(payload, p)?.length;
-            columnCount += 1;
-        }
-        out.truncate(columnCount);
-        while (out.length < columnCount) {
-            out.push(SqliteValue.Null)?;
-        }
+        // One pass over the header: column `i`'s value goes where the last row's was, or is added.
         var headerPos = header.length;
         var bodyPos = headerLength;
-        for (i in 0..columnCount) {
+        var i: usize = 0;
+        while (headerPos < headerLength) {
             let serial = Varint.read(payload, headerPos)?;
             headerPos += serial.length;
             let size = Record.serialTypeSize(serial.value);
             if (bodyPos + size > payload.length) {
                 return Err(corrupt("record body runs past the payload"));
+            }
+            if (i == out.length) {
+                out.push(SqliteValue.Null)?;
             }
             if (wanted.length != 0 && (i >= wanted.length || !wanted[i])) {
                 out[i] = SqliteValue.Null;
@@ -94,7 +89,9 @@ struct Record {
                 Record.readValueInto(payload[bodyPos..bodyPos + size], serial.value, encoding, mut out[i])?;
             }
             bodyPos += size;
+            i += 1;
         }
+        out.truncate(i);
         return Ok();
     }
 
