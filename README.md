@@ -849,33 +849,47 @@ twice: preparing each statement for every run, as this API does (it has no prepa
 is given), and preparing it once, as an application written for SQLite does.
 
 On 2026-11-26, 100,000 rows, the medians of 3 runs in ms; ceesafec 0.95.15, SQLite 3.54.1, gcc 14 at -O2, Debian 13
-on a Xeon E3-1245 V2 (3.4 GHz) with a disk; DELETE journal, synchronous FULL:
+on a Xeon E3-1245 V2 (3.4 GHz) with a disk; DELETE journal, synchronous FULL. "First" is the package as the benchmark
+was added (f045995); "now" after the changes below:
 
-| workload | statements | this engine | SQLite, prepared each time | SQLite, prepared once | × each time | × once |
-|---|---:|---:|---:|---:|---:|---:|
-| insert-txn | 100000 | 3622.1 | 330.0 | 63.3 | 11.0 | 57.2 |
-| insert-autocommit | 1000 | 1100.9 | 806.8 | 835.7 | 1.4 | 1.3 |
-| create-index | 1 | 155.5 | 36.5 | 37.2 | 4.3 | 4.2 |
-| select-rowid | 20000 | 709.8 | 259.3 | 160.8 | 2.7 | 4.4 |
-| select-index-eq | 20000 | 1029.6 | 272.3 | 145.1 | 3.8 | 7.1 |
-| select-index-range | 1000 | 171.7 | 23.2 | 12.8 | 7.4 | 13.4 |
-| scan-like | 10 | 929.3 | 76.8 | 76.8 | 12.1 | 12.1 |
-| scan-aggregate | 10 | 894.0 | 67.8 | 55.6 | 13.2 | 16.1 |
-| group-by | 10 | 857.8 | 284.5 | 285.3 | 3.0 | 3.0 |
-| order-by | 5 | 1456.2 | 63.5 | 64.2 | 22.9 | 22.7 |
-| join | 5 | 1190.0 | 31.5 | 31.7 | 37.7 | 37.6 |
-| update-point | 10000 | 5038.3 | 112.7 | 63.9 | 44.7 | 78.8 |
-| update-bulk | 1 | 594.9 | 25.3 | 24.6 | 23.5 | 24.2 |
-| delete-bulk | 1 | 1090.4 | 62.4 | 62.1 | 17.5 | 17.6 |
-| integrity-check | 1 | 377.0 | 33.3 | 33.6 | 11.3 | 11.2 |
-| vacuum | 1 | 94.9 | 27.6 | 27.8 | 3.4 | 3.4 |
-| final-scan | 1 | 78.2 | 7.3 | 7.4 | 10.7 | 10.5 |
-| total | | 19390.5 | 2520.9 | 1987.7 | 7.7 | 9.8 |
+| workload | statements | first | now | SQLite, prepared each time | SQLite, prepared once | × each time | × once |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| insert-txn | 100000 | 3622.1 | 1225.7 | 339.6 | 63.2 | 3.6 | 19.4 |
+| insert-autocommit | 1000 | 1100.9 | 1050.2 | 766.6 | 785.5 | 1.4 | 1.3 |
+| create-index | 1 | 155.5 | 145.6 | 36.6 | 37.0 | 4.0 | 3.9 |
+| select-rowid | 20000 | 709.8 | 495.9 | 262.3 | 160.9 | 1.9 | 3.1 |
+| select-index-eq | 20000 | 1029.6 | 859.2 | 279.3 | 143.3 | 3.1 | 6.0 |
+| select-index-range | 1000 | 171.7 | 157.7 | 23.7 | 13.1 | 6.7 | 12.1 |
+| scan-like | 10 | 929.3 | 719.0 | 76.7 | 78.0 | 9.4 | 9.2 |
+| scan-aggregate | 10 | 894.0 | 833.6 | 67.8 | 66.0 | 12.3 | 12.6 |
+| group-by | 10 | 857.8 | 880.1 | 284.6 | 290.8 | 3.1 | 3.0 |
+| order-by | 5 | 1456.2 | 771.9 | 63.1 | 63.5 | 12.2 | 12.2 |
+| join | 5 | 1190.0 | 389.1 | 36.9 | 37.4 | 10.6 | 10.4 |
+| update-point | 10000 | 5038.3 | 1051.8 | 114.2 | 63.9 | 9.2 | 16.5 |
+| update-bulk | 1 | 594.9 | 415.6 | 25.6 | 26.1 | 16.2 | 16.0 |
+| delete-bulk | 1 | 1090.4 | 441.9 | 61.9 | 61.6 | 7.1 | 7.2 |
+| integrity-check | 1 | 377.0 | 399.8 | 33.5 | 33.6 | 11.9 | 11.9 |
+| vacuum | 1 | 94.9 | 93.3 | 27.1 | 27.0 | 3.4 | 3.5 |
+| final-scan | 1 | 78.2 | 77.3 | 7.6 | 7.4 | 10.2 | 10.5 |
+| total | | 19390.5 | 10007.8 | 2507.2 | 1958.3 | 4.0 | 5.1 |
 
-Commits that wait on the disk (insert-autocommit) cost about what SQLite's do. Statements on one row cost 3–4×
-SQLite's prepared each time (select-rowid, select-index-eq) but writes of one row inside a transaction 11–45×
-(insert-txn, update-point), and work over many rows 10–40× (scans, sorting, the join, bulk changes): the places to
-look first. The figures are one machine's; run `bench/run.py` for another's.
+What changed, each found with `perf` on this benchmark and done as SQLite does it:
+
+- an index entry in an interior page, or the last of its leaf, is removed in place, not by rebuilding the index
+  (`IndexMutator.remove`), and an UPDATE leaves an index alone when the row's entry in it is unchanged;
+- one change to a table or index leaf is made where its page is: a new cell into the free space, a removed one
+  into the freeblocks (`changeInPlace`, `insertCellInPlace`, `dropCellInPlace`), not by copying every cell;
+- ORDER BY with LIMIT keeps only LIMIT + OFFSET rows as they come, and sorts with `sortBy`, kept stable by each
+  row's place, not lib's in-place `sortStableBy`;
+- a connection keeps the split and the parse of the last 16 texts it ran;
+- a WHERE term is checked in the outermost loop that has every row it reads;
+- comparisons and LIKE read a column or parameter where it is, and a row is decoded into its slot's vector.
+
+What is left, by the profile: work over many rows is 9–16× SQLite's (decoding each record into values, text
+copied for each row, and the expression tree walked for each row, where SQLite's VDBE reads columns in place);
+statements on one row pay for compiling them each time (no plan is kept, as a prepared statement keeps it); a
+table writer is made, with a copy of the table's schema, for each INSERT. The figures are one machine's; run
+`bench/run.py` for another's.
 
 ## Tests
 
