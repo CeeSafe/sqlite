@@ -74,6 +74,97 @@ fn freeOverflowChain(pager: borrow mut WritablePager, first: u32) -> Result<void
     return Ok();
 }
 
+/// The free space of b-tree page `page` before its cell content area, and the header fields that say where it
+/// is: its cell count, the start of the content area and the first freeblock. Null when the header contradicts
+/// itself (the content area starting before the cell pointers end, or past the page).
+fn leafSpace(pager: borrow mut WritablePager, page: u32) -> Result<PageSpace?, SqliteError> {
+    let h = pageHeaderOffset(page);
+    let usable = pager.usable;
+    let bytes = pager.read(page)?;
+    let count = bytes.readBE<u16>(h + 3) as usize;
+    let stored = bytes.readBE<u16>(h + 5) as usize;
+    let content = if (stored == 0) 65536 else stored;
+    let pointersEnd = h + 8 + 2 * count;
+    if (content < pointersEnd || content > usable) {
+        return Ok(null);
+    }
+    return Ok(
+        PageSpace {
+            count: count,
+            first: bytes.readBE<u16>(h + 1) as usize,
+            content: content,
+            gap: content - pointersEnd,
+        },
+    );
+}
+
+struct PageSpace {
+    count: usize;
+    first: usize;
+    content: usize;
+    /// The bytes between the cell pointers and the content area.
+    gap: usize;
+}
+
+/// Puts `cell` at position `at` of the leaf `page` where the page is, as SQLite's insertCell does when the free
+/// space before the content area holds it and its pointer: the other cells stay. False, with nothing changed,
+/// when it does not fit there.
+fn insertCellInPlace(
+    pager: borrow mut WritablePager,
+    page: u32,
+    at: usize,
+    cell: Slice<u8>,
+) -> Result<bool, SqliteError> {
+    let Some(space) = leafSpace(pager, page)? else {
+        return Ok(false);
+    };
+    if (cell.length < 4 || space.gap < cell.length + 2 || at > space.count) {
+        return Ok(false);
+    }
+    let h = pageHeaderOffset(page);
+    let bytes = pager.pageMut(page)?;
+    let start = space.content - cell.length;
+    bytes[start..start + cell.length].copyFrom(cell);
+    var i = space.count;
+    while (i > at) {
+        let moved = bytes.readBE<u16>(h + 8 + 2 * (i - 1));
+        bytes.writeBE(h + 8 + 2 * i, moved);
+        i -= 1;
+    }
+    bytes.writeBE(h + 8 + 2 * at, truncate<u16>(start));
+    bytes.writeBE(h + 3, truncate<u16>(space.count + 1));
+    bytes.writeBE(h + 5, truncate<u16>(start));
+    return Ok(true);
+}
+
+/// Removes cell `at`, of `size` bytes, from the leaf `page` where the page is, as SQLite's dropCell does: its
+/// bytes join the freeblocks and the other cells stay. False, with nothing changed, when it is the page's last
+/// cell or its header contradicts itself.
+fn dropCellInPlace(pager: borrow mut WritablePager, page: u32, at: usize, size: usize) -> Result<bool, SqliteError> {
+    let Some(space) = leafSpace(pager, page)? else {
+        return Ok(false);
+    };
+    if (space.count <= 1 || at >= space.count || size < 4) {
+        return Ok(false);
+    }
+    let h = pageHeaderOffset(page);
+    let usable = pager.usable;
+    let bytes = pager.pageMut(page)?;
+    let offset = bytes.readBE<u16>(h + 8 + 2 * at) as usize;
+    if (offset < space.content || offset + size > usable) {
+        return Err(corrupt("a cell lies outside its page's content area"));
+    }
+    let free = TableMutator.addFreeblock(mut bytes[0..usable], space.first, space.content, offset, size)?;
+    for (i in at..space.count - 1) {
+        let moved = bytes.readBE<u16>(h + 8 + 2 * (i + 1));
+        bytes.writeBE(h + 8 + 2 * i, moved);
+    }
+    bytes.writeBE(h + 1, truncate<u16>(free.first));
+    bytes.writeBE(h + 3, truncate<u16>(space.count - 1));
+    bytes.writeBE(h + 5, truncate<u16>(if (free.content == 65536) 0 else free.content));
+    return Ok(true);
+}
+
 /// A b-tree page's free space as its header gives it: the first freeblock (0: none) and where the cell content
 /// area starts.
 struct FreeSpace {
@@ -854,9 +945,14 @@ struct IndexMutator {
             // The entry is there already: an index holds each row once.
             return Ok(null);
         }
-        var cells = IndexMutator.rawCells(usable, page.view(), header)?;
         if (header.isLeaf()) {
-            cells.insert(at, BTreeBuilder.indexCell(pager, null, record)?)?;
+            let cell = BTreeBuilder.indexCell(pager, null, record)?;
+            // Into the page's free space when it fits there, the other cells staying where they are.
+            if (insertCellInPlace(pager, number, at, cell.view())?) {
+                return Ok(null);
+            }
+            var cells = IndexMutator.rawCells(usable, page.view(), header)?;
+            cells.insert(at, cell)?;
             if (IndexMutator.fits(usable, cells.view(), false)) {
                 IndexMutator.writePage(pager, number, PAGE_LEAF_INDEX, cells.view(), null)?;
                 return Ok(null);
@@ -867,10 +963,13 @@ struct IndexMutator {
             IndexMutator.writePage(pager, number, PAGE_LEAF_INDEX, cells.view()[0..middle], null)?;
             return Ok(IndexSplit { promoted: cells[middle].clone()?, rightPage: rightPage });
         }
-        let child = if (at < header.cellCount) cells[at].readBE<u32>(0) else header.rightMost;
+        let child = if (at < header.cellCount) page.readBE<u32>(
+            header.cellOffset(page.view(), at)?,
+        ) else header.rightMost;
         let split = IndexMutator.insert(pager, child, entry, record, order, depth + 1)? ?? {
             return Ok(null);
         };
+        var cells = IndexMutator.rawCells(usable, page.view(), header)?;
         // The child keeps its page as the left half; what was right of it is now right of the new page.
         var rightMost = header.rightMost;
         var divider = Vector<u8>.withCapacity(split.promoted.length + 4)?;
@@ -984,6 +1083,21 @@ struct IndexMutator {
         let usable = pager.usable;
         let page = IndexMutator.readIndexPage(pager, number)?;
         let header = IndexMutator.indexHeader(page.view(), number)?;
+        if (header.cellCount > 1) {
+            // The others stay where they are: the cell's bytes join the page's freeblocks.
+            let offset = header.cellOffset(page.view(), at)?;
+            let size = IndexMutator.cellExtent(usable, page.view()[offset..usable], 0)?.max(4);
+            if (freeOverflow) {
+                let chain = IndexMutator.overflowOf(usable, page.view()[offset..usable], 0)?;
+                if (chain != 0) {
+                    freeOverflowChain(pager, chain)?;
+                }
+            }
+            if (!dropCellInPlace(pager, number, at, size)?) {
+                return Err(corrupt("an index page's free space is not as its header says"));
+            }
+            return Ok();
+        }
         var cells = IndexMutator.rawCells(usable, page.view(), header)?;
         let removed = cells.remove(at);
         if (freeOverflow) {
