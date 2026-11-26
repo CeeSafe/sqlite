@@ -706,7 +706,16 @@ impl TableWriter {
     }
 
     /// Writes the row in the slot (new, or replacing the one with its key) and adds its index entries.
-    fn writeRow(borrow this, frame: borrow mut Frame, db: borrow mut Session) -> Result<void, SqliteError> {
+    fn writeRow(borrow this, frame: borrow mut Frame, db: borrow mut Session) -> Result<void, SqliteError> =>
+        this.writeRowExcept(frame, db, []);
+
+    /// `writeRow`, but index `i` gets no entry when `unchanged[i]`: an UPDATE left its entry as it was.
+    fn writeRowExcept(
+        borrow this,
+        frame: borrow mut Frame,
+        db: borrow mut Session,
+        unchanged: Slice<bool>,
+    ) -> Result<void, SqliteError> {
         let stored = this.storedValues(frame)?;
         if (this.table.withoutRowid) {
             let key = this.keyOf(borrow frame.slots[this.slot])?;
@@ -725,6 +734,9 @@ impl TableWriter {
             TableMutator.applyBatch(mut db.pager, this.read.root, op.view())?;
         }
         for (i in 0..this.indexes.length) {
+            if (i < unchanged.length && unchanged[i]) {
+                continue;
+            }
             let index = borrow this.indexes[i];
             var ops = Vector<IndexOp>.create();
             if (this.entryFor(index, frame, db)? is Some(entry)) {
@@ -1580,20 +1592,39 @@ fn applyUpdate(
     let oldBeforeWrite: Slot? = if (db.foreignKeys) copySlot(borrow oldSlot)? else null;
     let newKey = writer.keyOf(borrow frame.slots[writer.slot])?;
     let newSlot = replace(mut frame.slots[writer.slot], oldSlot);
+    // An index whose entry for the row stays the same, byte for byte, is left alone, as SQLite leaves it.
+    var unchanged = Vector<bool>.create();
     if (!writer.sameRow(borrow newKey, borrow oldKey)) {
         writer.deleteRow(borrow oldKey, frame, db)?;
+        frame.slots[writer.slot] = newSlot;
     } else {
+        var oldEntries = Vector<Vector<SqliteValue>?>.withCapacity(writer.indexes.length)?;
+        for (x in 0..writer.indexes.length) {
+            oldEntries.push(writer.entryFor(borrow writer.indexes[x], frame, db)?)?;
+        }
+        frame.slots[writer.slot] = newSlot;
         for (x in 0..writer.indexes.length) {
             let index = borrow writer.indexes[x];
+            let newEntry = writer.entryFor(index, frame, db)?;
+            let same = match (borrow oldEntries[x]) {
+                Some(before) => match (borrow newEntry) {
+                    Some(after) => sameValues(before.view(), after.view()),
+                    null => false,
+                },
+                null => newEntry.isNull(),
+            };
+            unchanged.push(same)?;
+            if (same) {
+                continue;
+            }
             var ops = Vector<IndexOp>.create();
-            if (writer.entryFor(index, frame, db)? is Some(entry)) {
+            if (replace(mut oldEntries[x], null) is Some(entry)) {
                 ops.push(IndexOp { entry: entry, remove: true })?;
             }
             writer.applyIndexOps(index, ops, frame, db)?;
         }
     }
-    frame.slots[writer.slot] = newSlot;
-    writer.writeRow(frame, db)?;
+    writer.writeRowExcept(frame, db, unchanged.view())?;
     if (db.foreignKeys) {
         if (table.foreignKeys.length != 0) {
             checkChildRow(table, borrow frame.slots[writer.slot], db)?;
@@ -1991,4 +2022,17 @@ fn rebuildStaleIndexes(db: borrow mut Session) -> Result<void, SqliteError> {
         }
     }
     return Ok();
+}
+
+/// Whether two index entries are the same values, byte for byte (not merely equal in the index's collation).
+fn sameValues(a: Slice<SqliteValue>, b: Slice<SqliteValue>) -> bool {
+    if (a.length != b.length) {
+        return false;
+    }
+    for (i in 0..a.length) {
+        if (!sameValue(borrow a[i], borrow b[i])) {
+            return false;
+        }
+    }
+    return true;
 }
