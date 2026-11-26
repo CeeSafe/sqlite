@@ -553,6 +553,10 @@ fn acceptRow(
         return Ok();
     }
     if (core.isAggregate) {
+        // Without GROUP BY every row is in the one group: after the first, no key is made or looked up.
+        if (core.groupBy.length == 0 && sink.groups.length == 1) {
+            return stepGroup(core, 0, frame, db, sink);
+        }
         var keyValues = Vector<SqliteValue>.withCapacity(core.groupBy.length)?;
         for (g in 0..core.groupBy.length) {
             keyValues.push(evaluate(borrow core.groupBy[g], frame, db)?)?;
@@ -575,24 +579,35 @@ fn acceptRow(
             )?;
             let _ = sink.groupIndex.put(key, index)?;
         }
-        // Bare columns come from the group's first row, or from the row of its one min() or max().
-        var takeRow = false;
-        for (a in 0..core.aggregates.length) {
-            let newBest = sink.groups[index].accumulators[a].step(borrow core.aggregates[a], frame, db)?;
-            if (core.minMax == Some(a) && newBest) {
-                takeRow = true;
-            }
-        }
-        if (takeRow || sink.groups[index].slots.length == 0) {
-            var slots = Vector<Slot>.withCapacity(core.sources.length)?;
-            for (s in 0..core.sources.length) {
-                slots.push(copySlot(borrow frame.slots[core.sources[s].slot])?)?;
-            }
-            sink.groups[index].slots = slots;
-        }
-        return Ok();
+        return stepGroup(core, index, frame, db, sink);
     }
     return project(core, frame, db, sink);
+}
+
+/// Adds the row in the frame to group `index`'s aggregates. Bare columns come from the group's first row, or from
+/// the row of its one min() or max().
+fn stepGroup(
+    core: borrow CorePlan,
+    index: usize,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+    sink: borrow mut CoreSink,
+) -> Result<void, SqliteError> {
+    var takeRow = false;
+    for (a in 0..core.aggregates.length) {
+        let newBest = sink.groups[index].accumulators[a].step(borrow core.aggregates[a], frame, db)?;
+        if (core.minMax == Some(a) && newBest) {
+            takeRow = true;
+        }
+    }
+    if (takeRow || sink.groups[index].slots.length == 0) {
+        var slots = Vector<Slot>.withCapacity(core.sources.length)?;
+        for (s in 0..core.sources.length) {
+            slots.push(copySlot(borrow frame.slots[core.sources[s].slot])?)?;
+        }
+        sink.groups[index].slots = slots;
+    }
+    return Ok();
 }
 
 /// Evaluates the result columns and sort keys for the current row, and keeps them; with window functions, keeps

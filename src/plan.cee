@@ -2110,6 +2110,8 @@ fn seekLevel(
     var ranges = seekRangesOf(seek, borrow core.filter, borrow source.on, frame, db)?;
     var r: usize = 0;
     var cursor = SeekCursor.Done;
+    // The entry each index entry is decoded into: it keeps the room of the values the slot let go.
+    var entry = Vector<SqliteValue>.create();
     loop {
         if (sink.stopAfter is Some(n) && sink.rows.length >= n) {
             return Ok();
@@ -2127,7 +2129,14 @@ fn seekLevel(
             };
             r += 1;
         }
-        if (!nextSeekRow(seek, table, mut cursor, mut frame.slots[source.slot], db.pagerOf(table.database))?) {
+        if (!nextSeekRow(
+            seek,
+            table,
+            mut cursor,
+            mut frame.slots[source.slot],
+            db.pagerOf(table.database),
+            mut entry,
+        )?) {
             cursor = SeekCursor.Done;
             continue;
         }
@@ -2157,13 +2166,14 @@ fn nextSeekRow(
     cursor: borrow mut SeekCursor,
     slot: borrow mut Slot,
     pager: borrow mut WritablePager,
+    entry: borrow mut Vector<SqliteValue>,
 ) -> Result<bool, SqliteError> {
     match (cursor) {
         SeekCursor.Done => { return Ok(false); }
         SeekCursor.Entries(c) => {
-            let Some(entry) = c.next(pager)? else {
+            if (!c.nextInto(pager, entry)?) {
                 return Ok(false);
-            };
+            }
             if (borrow seek.covering is Some(map)) {
                 loadEntryRow(table, map, entry, slot)?;
                 return Ok(true);
@@ -2190,28 +2200,32 @@ fn nextSeekRow(
 fn loadEntryRow(
     table: borrow TablePlan,
     map: borrow Vector<usize?>,
-    entry: Vector<SqliteValue>,
+    entry: borrow mut Vector<SqliteValue>,
     slot: borrow mut Slot,
 ) -> Result<void, SqliteError> {
     let rowId = indexEntryRowId(entry.view())?;
-    var stored = entry;
-    var values = Vector<SqliteValue>.withCapacity(map.length)?;
+    slot.values.truncate(map.length);
+    while (slot.values.length < map.length) {
+        slot.values.push(SqliteValue.Null)?;
+    }
     for (c in 0..map.length) {
-        var v = SqliteValue.Null;
-        if (map[c] is Some(at)) {
-            if (at + 1 >= stored.length) {
-                return Err(corrupt("an index entry is shorter than its index"));
+        match (map[c]) {
+            Some(at) => {
+                if (at + 1 >= entry.length) {
+                    return Err(corrupt("an index entry is shorter than its index"));
+                }
+                // Each takes the other's value: the entry keeps the old one's room for the next entry.
+                let fresh = replace(mut entry[at], SqliteValue.Null);
+                entry[at] = replace(mut slot.values[c], fresh);
             }
-            v = replace(mut stored[at], SqliteValue.Null);
+            null => { slot.values[c] = SqliteValue.Null; }
         }
         if (table.rowidAlias == Some(c)) {
-            v = SqliteValue.Integer(rowId);
-        } else if (c < table.realColumns.length && table.realColumns[c] && v is SqliteValue.Integer(i)) {
-            v = SqliteValue.Real(round<f64>(i));
+            slot.values[c] = SqliteValue.Integer(rowId);
+        } else if (c < table.realColumns.length && table.realColumns[c] && slot.values[c] is SqliteValue.Integer(i)) {
+            slot.values[c] = SqliteValue.Real(round<f64>(i));
         }
-        values.push(v)?;
     }
-    slot.values = values;
     slot.rowId = rowId;
     slot.isNull = false;
     return Ok();

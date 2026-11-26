@@ -246,6 +246,20 @@ struct IndexCursor {
 
     /// The next entry (the indexed columns, then the rowid), or `null` after the last.
     fn next<P: PageSource>(borrow mut this, pager: borrow mut P) -> Result<Vector<SqliteValue>?, SqliteError> {
+        var entry = Vector<SqliteValue>.create();
+        if (this.nextInto(pager, mut entry)?) {
+            return Ok(entry);
+        }
+        return Ok(null);
+    }
+
+    /// The next entry decoded into `entry`, whose values the last one left (`indexEntryInto`): a scan through an
+    /// index does not allocate for each entry. False after the last.
+    fn nextInto<P: PageSource>(
+        borrow mut this,
+        pager: borrow mut P,
+        entry: borrow mut Vector<SqliteValue>,
+    ) -> Result<bool, SqliteError> {
         if (!this.started) {
             this.started = true;
             // The range's keys compare as the database orders its text.
@@ -254,7 +268,7 @@ struct IndexCursor {
         }
         loop {
             if (this.stack.length == 0) {
-                return Ok(null);
+                return Ok(false);
             }
             let top = this.stack.length - 1;
             let leaf = this.stack[top].frame.header.isLeaf();
@@ -283,17 +297,17 @@ struct IndexCursor {
                 continue;
             }
             let cell = if (leaf) step else step / 2;
-            let entry = indexEntryAt(pager, this.stack[top].frame.page.view(), this.stack[top].frame.header, cell)?;
+            indexEntryInto(pager, this.stack[top].frame.page.view(), this.stack[top].frame.header, cell, entry)?;
             // Walking forwards, the entries satisfying the high bound are a prefix, so the first that does not
             // ends the walk; backwards, the same holds of the low bound.
             let low = this.range.satisfiesLow(entry.view());
             let high = this.range.satisfiesHigh(entry.view());
             if ((this.backwards && !low) || (!this.backwards && !high)) {
                 this.stack.clear();
-                return Ok(null);
+                return Ok(false);
             }
             if (low && high) {
-                return Ok(entry);
+                return Ok(true);
             }
         }
     }
