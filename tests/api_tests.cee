@@ -138,6 +138,55 @@ const PARAM_SETUP: StringView = """
     """;
 
 @test
+fn textsRunAgainAreNotAnsweredFromAnOldSchema() -> Result<void, TestFailure> {
+    // The connection keeps the split and the parse of the texts it ran last; what they mean is worked out again
+    // each time, so a text run again after the schema changed answers from the schema as it is.
+    let path = "out/api-kept-texts.db";
+    for (suffix in ["", "-journal", "-wal"]) {
+        var name = String.from(path)!;
+        name.append(suffix)!;
+        let _ = File.remove(name.view());
+    }
+    var c = Connection.open(path)!;
+    let none = Params.create();
+    c.executeScript("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT); INSERT INTO t VALUES (1, 'x'), (2, 'y')")!;
+    let star = "SELECT * FROM t ORDER BY a";
+    Check.equalText("1|x\n2|y\n", answerOf(mut c, star, borrow none).view())?;
+    c.executeScript("ALTER TABLE t ADD COLUMN c DEFAULT 7")!;
+    Check.equalText("1|x|7\n2|y|7\n", answerOf(mut c, star, borrow none).view())?;
+    c.executeScript("DROP TABLE t; CREATE TABLE t(a, z)")!;
+    Check.equalText("", answerOf(mut c, star, borrow none).view())?;
+    let insert = "INSERT INTO t VALUES (?1, ?2); SELECT count(*), sum(a) FROM t";
+    for (i in 1i64..4) {
+        var p = Params.create();
+        p.add(SqliteValue.Integer(i))!;
+        p.add(SqliteValue.Integer(i * 10))!;
+        let _ = c.query(insert, borrow p)!;
+    }
+    Check.equalText("1|10\n2|20\n3|30\n", answerOf(mut c, star, borrow none).view())?;
+    // A text kept from a run without parameters, then given some: its parameters are worked out then.
+    Check.equalText("\n", answerOf(mut c, "SELECT ?1 + ?2", borrow none).view())?;
+    var two = Params.create();
+    two.add(SqliteValue.Integer(2))!;
+    two.add(SqliteValue.Integer(3))!;
+    Check.equalText("5\n", answerOf(mut c, "SELECT ?1 + ?2", borrow two).view())?;
+    // More texts than are kept: the first ones are let go, and come back parsed again.
+    for (i in 0i64..40) {
+        var sql = String.from("SELECT ")!;
+        sql.appendNumber(i)!;
+        sql.append(" + count(*) FROM t")!;
+        var expected = String.create();
+        expected.appendNumber(i + 3)!;
+        expected.append("\n")!;
+        Check.equalText(expected.view(), answerOf(mut c, sql.view(), borrow none).view())?;
+    }
+    Check.equalText("1|10\n2|20\n3|30\n", answerOf(mut c, star, borrow none).view())?;
+    Check.equalText("error: near \"FRM\": syntax error\n", answerOf(mut c, "SELECT * FRM t", borrow none).view())?;
+    Check.equalText("error: near \"FRM\": syntax error\n", answerOf(mut c, "SELECT * FRM t", borrow none).view())?;
+    return Ok();
+}
+
+@test
 fn parametersAreNumberedAsSqliteNumbersThem() -> Result<void, TestFailure> {
     var bindings = Vector<Binding>.create();
     bindings.push(binding("?1", "10"))!;
@@ -227,11 +276,17 @@ fn executeScalarAndCounts() -> Result<void, TestFailure> {
     freshPath(path);
     var connection = Connection.open(path)!;
     let none = Params.create();
-    Check.isTrue(connection.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)", borrow none)! == 0, "api_tests.cee line 218")?;
+    Check.isTrue(
+        connection.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v)", borrow none)! == 0,
+        "api_tests.cee line 218",
+    )?;
     var params = Params.create();
     params.add(SqliteValue.text("a")!)!;
     // Every statement of the text runs; the count is their DML's.
-    let changed = connection.execute("INSERT INTO t(v) VALUES (?1); INSERT INTO t(v) VALUES (?1), (?1);", borrow params)!;
+    let changed = connection.execute(
+        "INSERT INTO t(v) VALUES (?1); INSERT INTO t(v) VALUES (?1), (?1);",
+        borrow params,
+    )!;
     Check.isTrue(changed == 3, "api_tests.cee line 223")?;
     Check.isTrue(connection.lastInsertRowid() == 3, "api_tests.cee line 224")?;
     Check.isTrue(connection.totalChanges() == 3, "api_tests.cee line 225")?;
@@ -465,7 +520,8 @@ fn threadsShareAPool() -> Result<void, TestFailure> {
                     return false;
                 }
                 // Each insert in a transaction of its own, which reads before it writes.
-                let sql = "BEGIN; INSERT INTO t SELECT ?1, ?2 WHERE NOT EXISTS (SELECT 1 FROM t WHERE worker = ?1 AND n = ?2); COMMIT";
+                let sql =
+                    "BEGIN; INSERT INTO t SELECT ?1, ?2 WHERE NOT EXISTS (SELECT 1 FROM t WHERE worker = ?1 AND n = ?2); COMMIT";
                 if (c.get().execute(sql, borrow params).isErr()) {
                     return false;
                 }

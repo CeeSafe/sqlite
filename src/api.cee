@@ -161,8 +161,21 @@ fn hasParameterPrefix(name: ByteStringView) -> bool =>
 /// busy timeout (`PRAGMA busy_timeout`, `setBusyTimeout`; 0 by default, as in SQLite) and then fails with
 /// `SqliteError.Busy`, "database is locked". When a transaction starts it reads the file afresh if another
 /// connection committed since its last one.
+/// A text's statements and their parameters, kept for the next time the same text comes (`Connection.scripts`).
+struct SplitScript {
+    text: ByteString;
+    spans: Vector<StatementSpan>;
+    /// Each statement's parameters; worked out the first time the text comes with parameters.
+    numbered: Vector<StatementParameters>?;
+}
+
+/// How many texts a connection keeps split.
+const SCRIPTS_KEPT: usize = 16;
+
 public struct Connection {
     session: Session;
+    /// The texts run last, split into their statements, with the parameters each takes.
+    scripts: Vector<SplitScript>;
 
     /// Opens the database file at `path`, making an empty database if there is none. `:memory:` and the empty
     /// name give a private database, as in SQLite: here a file of its own, removed when the connection closes.
@@ -173,7 +186,12 @@ public struct Connection {
         if (path.toByteStringView().startsWith("file:")) {
             return Err(unsupported("URI file names are not supported; give a file's path"));
         }
-        return Ok(Connection { session: Session.openWaiting(path, busyTimeout.max(0))? });
+        return Ok(
+            Connection {
+                session: Session.openWaiting(path, busyTimeout.max(0))?,
+                scripts: Vector<SplitScript>.create(),
+            },
+        );
     }
 
     /// Opens the database file at `path` for reading only, as SQLITE_OPEN_READONLY (`sqlite3 -readonly`) does: the
@@ -184,7 +202,7 @@ public struct Connection {
         if (path.toByteStringView().startsWith("file:")) {
             return Err(unsupported("URI file names are not supported; give a file's path"));
         }
-        return Ok(Connection { session: Session.openWith(path, 0, true)? });
+        return Ok(Connection { session: Session.openWith(path, 0, true)?, scripts: Vector<SplitScript>.create() });
     }
 
     /// Closes the connection, rolling back a transaction it left open.
@@ -315,30 +333,64 @@ public struct Connection {
         params: borrow Params,
         changed: borrow mut i64,
     ) -> Result<QueryResult, SqliteError> {
-        let spans = splitScript(sql)?;
-        var numbered = Vector<StatementParameters>.create();
-        if (!params.isEmpty()) {
-            for (i in 0..spans.length) {
+        var split = match (this.takeSplit(sql)) {
+            Some(kept) => kept,
+            null => SplitScript { text: ByteString.copyOf(sql.bytes())?, spans: splitScript(sql)?, numbered: null },
+        };
+        if (!params.isEmpty() && split.numbered.isNull()) {
+            var numbered = Vector<StatementParameters>.withCapacity(split.spans.length)?;
+            for (i in 0..split.spans.length) {
                 // A statement that cannot be read has no parameters here; running it reports why.
-                let parameters = match (statementParameters(sql.slice(spans[i].start, spans[i].end))) {
+                let parameters = match (statementParameters(sql.slice(split.spans[i].start, split.spans[i].end))) {
                     Ok(p) => p,
                     Err(_) => StatementParameters { count: 0, names: Vector<ParameterName>.create() },
                 };
                 numbered.push(parameters)?;
             }
-            params.checkUsed(borrow numbered)?;
+            split.numbered = numbered;
+        }
+        if (!params.isEmpty()) {
+            if (borrow split.numbered is Some(numbered)) {
+                params.checkUsed(numbered)?;
+            }
         }
         var last = QueryResult { columns: Vector<ByteString>.create(), rows: Vector<Vector<SqliteValue>>.create() };
-        for (i in 0..spans.length) {
-            let text = sql.slice(spans[i].start, spans[i].end);
-            let values = if (params.isEmpty()) Vector<SqliteValue>.create() else params.valuesFor(borrow numbered[i])?;
+        for (i in 0..split.spans.length) {
+            let text = sql.slice(split.spans[i].start, split.spans[i].end);
+            var values = Vector<SqliteValue>.create();
+            if (!params.isEmpty()) {
+                if (borrow split.numbered is Some(numbered)) {
+                    values = params.valuesFor(borrow numbered[i])?;
+                }
+            }
             let total = this.session.totalChanges;
             last = this.runOne(text, values.view())?;
             if (this.session.totalChanges != total) {
                 changed += this.session.changes;
             }
         }
+        this.keepSplit(split);
         return Ok(last);
+    }
+
+    /// The split of `sql` kept from an earlier run of it, taken out of the cache while it runs.
+    fn takeSplit(borrow mut this, sql: ByteStringView) -> SplitScript? {
+        var i = this.scripts.length;
+        while (i > 0) {
+            i -= 1;
+            if (this.scripts[i].text.view() == sql) {
+                return this.scripts.remove(i);
+            }
+        }
+        return null;
+    }
+
+    /// Keeps a text's split for its next run, letting the one run longest ago go.
+    fn keepSplit(borrow mut this, split: SplitScript) {
+        if (this.scripts.length >= SCRIPTS_KEPT) {
+            let _ = this.scripts.remove(0);
+        }
+        let _ = this.scripts.push(split);
     }
 
     /// Runs one statement; the session takes and releases the file's locks.

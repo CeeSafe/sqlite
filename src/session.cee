@@ -11,7 +11,19 @@ public struct QueryResult {
     public rows: Vector<Vector<SqliteValue>>;
 }
 
+/// A statement's text and what it parses to, kept for the next time the same text comes (`Session.parsed`).
+struct ParsedStatement {
+    text: ByteString;
+    stmt: Stmt;
+}
+
+/// How many parsed statements a session keeps.
+const PARSED_KEPT: usize = 16;
+
 public struct Session {
+    /// The statements run last, parsed: an application runs the same texts again and again, and parsing one
+    /// depends on its text alone, so the parse is kept, as SQLite's prepared statements keep theirs.
+    parsed: Vector<ParsedStatement>;
     /// The database statements work on now: `active` in the list of databases (main is 0). The others wait in
     /// `stash`, which has `null` at the active one's place.
     pager: WritablePager;
@@ -110,6 +122,7 @@ public struct Session {
             conflictFailure: null,
             staleIndexes: Vector<StaleIndex>.create(),
             runningChanges: 0,
+            parsed: Vector<ParsedStatement>.create(),
             savepointBegan: false,
             trigger: null,
             activeTriggers: Vector<ByteString>.create(),
@@ -273,6 +286,30 @@ public struct Session {
         return result;
     }
 
+    /// The parse of `text` kept from an earlier run of it, taken out of the cache while it runs.
+    fn takeParsed(borrow mut this, text: ByteStringView) -> Stmt? {
+        var i = this.parsed.length;
+        while (i > 0) {
+            i -= 1;
+            if (this.parsed[i].text.view() == text) {
+                return this.parsed.remove(i).stmt;
+            }
+        }
+        return null;
+    }
+
+    /// Keeps the parse of `text` for its next run, letting the one run longest ago go. Without memory for it, it
+    /// is not kept.
+    fn keepParsed(borrow mut this, text: ByteStringView, stmt: Stmt) {
+        let Ok(copy) = ByteString.copyOf(text.bytes()) else {
+            return;
+        };
+        if (this.parsed.length >= PARSED_KEPT) {
+            let _ = this.parsed.remove(0);
+        }
+        let _ = this.parsed.push(ParsedStatement { text: copy, stmt: stmt });
+    }
+
     /// `query`, between taking the locks the statement needs and its transaction's end.
     fn queryLocked(
         borrow mut this,
@@ -287,12 +324,16 @@ public struct Session {
         }
         // Parsed as written, so that `SELECT 3 +;` is an error near ";" as in SQLite; the text without its
         // semicolons is what a definition keeps.
-        let stmt = Parser.parseStatement(written)?;
+        let stmt = match (this.takeParsed(written)) {
+            Some(kept) => kept,
+            null => Parser.parseStatement(written)?,
+        };
         this.lockFor(borrow stmt)?;
         this.beginStatementAll();
         this.conflictFailure = null;
         this.runningChanges = 0;
         let result = this.run(borrow stmt, text, params);
+        this.keepParsed(written, stmt);
         let failure = replace(mut this.conflictFailure, null);
         let keep = result.isOk() || failure == Some(ConflictAction.Fail);
         if (result.isOk()) {
