@@ -211,7 +211,7 @@ fn tableIndexes(
         if (name.length() <= prefix.length() || !name.startsWithIgnoreAsciiCase(prefix.view())) {
             continue;
         }
-        let n = parseUsize(name.sliceFrom(prefix.length())) ?? 0;
+        let n = name[prefix.length..].parseInt<usize>() ?? 0;
         // A WITHOUT ROWID table's primary key, which is the table itself, keeps its number.
         var key: usize? = null;
         if (n >= 1 && n <= table.keys.length && !(table.keys[n - 1].primaryKey && table.withoutRowid)) {

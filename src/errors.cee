@@ -30,9 +30,9 @@ impl SqliteError {
     /// The error's message, as SQLite gives it: bytes, UTF-8 unless a name, a value or the statement's text in
     /// it held bytes that are not (`messageText` for a `String`).
     public fn message(borrow this) -> ByteStringView => match (this) {
-        SqliteError.Alloc(_) => ByteStringView.fromText("out of memory"),
+        SqliteError.Alloc(_) => "out of memory",
         // SQLITE_IOERR's message, as sqlite3_errmsg gives it; the IoError says what the system answered.
-        SqliteError.Io(_) => ByteStringView.fromText("disk I/O error"),
+        SqliteError.Io(_) => "disk I/O error",
         SqliteError.Corrupt(m) => m.view(),
         SqliteError.NotADatabase(m) => m.view(),
         SqliteError.Sql(m) => m.view(),
@@ -40,7 +40,7 @@ impl SqliteError {
         SqliteError.Unsupported(m) => m.view(),
         SqliteError.Busy(m) => m.view(),
         SqliteError.ReadOnly(m) => m.view(),
-        SqliteError.RaiseIgnore => ByteStringView.fromText("RAISE(IGNORE)"),
+        SqliteError.RaiseIgnore => "RAISE(IGNORE)",
     };
 
     /// The message as text, U+FFFD for each byte of it that is not UTF-8.

@@ -1,9 +1,9 @@
 # CeeSafe findings
 
 Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed in CeeSafe later. Compiler:
-`ceesafec 0.93.7` when the port began, `0.95.12` now. Each entry says what was needed, what happened, and the workaround used in this package.
+`ceesafec 0.93.7` when the port began, `0.95.15` now. Each entry says what was needed, what happened, and the workaround used in this package.
 
-## Status (ceesafec 0.95.12)
+## Status (ceesafec 0.95.15)
 
 | Finding | Status |
 |---|---|
@@ -44,7 +44,7 @@ Gaps and rough edges in CeeSafe met while porting the SQLite engine, to be fixed
 | 48 | fixed in 0.95.12: `CEESAFE_LOCK_RULES=strict` or `portable` holds a program's locks to Windows' rules on any host, natively and in the interpreter, ADR 0256; workaround removed: `SQLITE_WINDOWS_LOCKS` runs os_win.c's scheme off Windows, and CI runs the engine's tests so on macOS and Linux (224 pass on macOS, the hot-journal test, whose premise is F_GETLK, skipping). It found one break: the exclusive try of a read-only `-shm`'s DMS byte, which POSIX refuses (EBADF); the byte is now tested (`testLock`, a try-and-release on Windows as os_win.c's) |
 | 49 | fixed in 0.95.7 (ADR 0247: initializers MSVC can nest); CI's Windows job builds with MSVC (`CC=cl`) |
 | 51 | fixed in 0.95.12: `ChildOptions.setEnvironment`, `Process.captureWith` and `runWith`, ADR 0258; workaround removed: on Windows the sqlite3 shell runs by `Process.captureWith` with HOME and USERPROFILE set to a directory that holds its `.sqliterc`, and `tests/capture.py` is gone |
-| 52, 53, 54 | open: found removing 41's workaround (below) |
+| 52, 53, 54 | fixed in 0.95.15: a method call through more than one reference, `String.append` of any `TextView`, a string literal where a `ByteStringView` is expected, `v[a..b]`, `v.length` and the parsers on a `ByteStringView`, and `Check.equalTextOf`, ADR 0260; workarounds removed: `parseUsize`/`parseI64`/`parseI32` (src/text.cee) are `parseInt<T>()` on the view, `ByteStringView.fromText` of a literal is the literal, the tests' `equalName` is `Check.equalTextOf`. Kept by choice: `executeAnalyze` binds `target is Some(name)` (one borrow is all it needs), the tokenizer test's `appendLossy` (it shows a token that is not UTF-8), and `.length()` calls, which still work |
 | 50 | fixed in 0.95.9 (ADR 0248: on Windows the float methods call System32's ucrtbase.dll whatever compiler built the program); on Windows older than build 26100 the three bit-for-bit math tests skip, saying why (`WindowsGap.OlderSystemMath`), and CI's windows-2025 job runs them (below) |
 | 40 | misreported: `cfg("target.windows")` (ADR 0179, guide/unsafe-and-c.md "Code for one system") names the system a build is for, in any code; `onWindows()` uses it, and the environment-variable check is gone |
 
@@ -564,6 +564,8 @@ likewise): the call does not look through the second borrow, as it does for `Str
 Workaround: match without the extra borrow, `if (target is Some(name))`, which gives `name: borrow ByteString`
 (`executeAnalyze`, src/analyze.cee).
 
+Fixed in 0.95.15 (ADR 0260) (status table).
+
 ### 53. `String.append` does not take a `ByteStringView`
 
 Found removing finding 41's workaround (ceesafec 0.95.12). ADR 0253 makes `String` a `TextBuffer`, whose
@@ -574,6 +576,8 @@ is found first and the interface's method is not tried. `s.appendLossy(v)` (only
 
 Workaround: none needed in the engine, whose messages are now built in `ByteString`s; the tests write
 `out.appendLossy(token.text.view())` (tests/tokenizer_tests.cee).
+
+Fixed in 0.95.15 (ADR 0260) (status table).
 
 ### 54. Byte views are not quite text views
 
@@ -594,3 +598,5 @@ Workaround: helpers generic over `TextView` (`parseUsize`, `parseI64`, `parseI32
 `toUtf8()`), `ByteStringView.fromText` for literals, and in the tests `equalName(expected, actual)`
 (tests/parser_tests.cee), `Check.equalText` on `actual.toUtf8() ?? "<not UTF-8>"`. `parseInt` on `TextView`, a
 literal that converts to `ByteStringView` where one is expected, and range slicing on byte views would remove them.
+
+Fixed in 0.95.15 (ADR 0260) (status table).

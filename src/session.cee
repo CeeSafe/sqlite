@@ -771,7 +771,7 @@ impl Session {
         }
         let path = privateDatabasePath("sqlite-temp-")?;
         let state = openDatabaseState(path.view(), this.busyTimeout)?;
-        this.attachState(ByteStringView.fromText("temp"), path.view(), state)?;
+        this.attachState("temp", path.view(), state)?;
         this.databaseShownPaths.push(OsString.create())?;
         let index = this.databaseNames.length - 1;
         this.tempIndex = index;

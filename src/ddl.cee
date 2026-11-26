@@ -237,7 +237,7 @@ fn executeCreateTable(
             "sqlite_sequence",
             "sqlite_sequence",
             sequenceRoot,
-            ByteStringView.fromText("CREATE TABLE sqlite_sequence(name,seq)"),
+            "CREATE TABLE sqlite_sequence(name,seq)",
         )?;
     }
     db.pager.bumpSchemaCookie()?;

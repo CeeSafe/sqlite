@@ -139,7 +139,7 @@ fn patchU16(path: StringView, offset: usize, value: u16) {
 /// A number the sqlite3 shell answers.
 fn shellNumber(path: StringView, sql: StringView) -> Result<usize, TestFailure> {
     let text = askSqlite(path, sql)?;
-    return Ok(parseUsize(text.view().trim()) ?? 0);
+    return Ok(text.view().trim().parseInt<usize>() ?? 0);
 }
 
 const PAGE: usize = 1024;

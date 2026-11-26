@@ -191,7 +191,7 @@ public struct Connection {
     public fn close(this) -> Result<void, SqliteError> {
         var me = this;
         if (me.session.inTransaction) {
-            let _ = me.runOne(ByteStringView.fromText("ROLLBACK"), Vector<SqliteValue>.create().view())?;
+            let _ = me.runOne("ROLLBACK", Vector<SqliteValue>.create().view())?;
         }
         // In WAL mode the log goes into the file and is removed, as when SQLite's last connection closes.
         return me.session.closeLog();

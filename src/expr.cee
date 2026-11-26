@@ -739,7 +739,7 @@ struct ParamTable {
             return Ok(this.count - 1);
         }
         if (text[0] == '?') {
-            let n = parseUsize(text.sliceFrom(1)) ?? 0;
+            let n = text[1..].parseInt<usize>() ?? 0;
             if (n == 0 || n > 32766) {
                 var message = ownedText("variable number must be between ?1 and ?32766")?;
                 return Err(sqlError(message.view()));

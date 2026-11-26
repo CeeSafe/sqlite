@@ -98,7 +98,7 @@ fn ensureStatTable(db: borrow mut Session) -> Result<void, SqliteError> {
         "sqlite_stat1",
         "sqlite_stat1",
         root,
-        ByteStringView.fromText("CREATE TABLE sqlite_stat1(tbl,idx,stat)"),
+        "CREATE TABLE sqlite_stat1(tbl,idx,stat)",
     )?;
     db.pager.bumpSchemaCookie()?;
     return db.reloadSchema();

@@ -253,7 +253,7 @@ fn runTriggerBody(trigger: borrow TriggerPlan, db: borrow mut Session) -> Result
         let changes = db.changes;
         let last = db.lastInsertRowid;
         let running = db.runningChanges;
-        let result = db.run(borrow trigger.body[s], ByteStringView.fromText(""), []);
+        let result = db.run(borrow trigger.body[s], "", []);
         db.changes = changes;
         db.lastInsertRowid = last;
         db.runningChanges = running;

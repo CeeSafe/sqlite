@@ -1886,7 +1886,7 @@ struct Parser {
             if (digits > 16) {
                 return Err(sqlError("hex literal too big"));
             }
-        } else if (parseI64(text).isNull()) {
+        } else if (text.parseInt<i64>().isNull()) {
             kind = LiteralKind.Float;
         }
         return this.literal(kind);

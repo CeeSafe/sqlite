@@ -258,7 +258,7 @@ fn readOnlyHotJournalIsRefused() -> Result<void, TestFailure> {
     var connection = Connection.openReadOnly(path);
     Check.isTrue(
         match (borrow connection) {
-            Err(SqliteError.ReadOnly(m)) => m.view().equals(ByteStringView.fromText("attempt to write a readonly database")),
+            Err(SqliteError.ReadOnly(m)) => m.view().equals("attempt to write a readonly database"),
             _ => false,
         },
         "the journal cannot be played back",

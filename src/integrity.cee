@@ -722,7 +722,7 @@ struct CheckedTable {
 
 /// The number at the end of sqlite_autoindex_T_N.
 fn autoindexNumber(name: ByteStringView) -> usize => match (name.lastIndexOf("_")) {
-    Some(at) => parseUsize(name.sliceFrom(at + 1)) ?? 0,
+    Some(at) => name[at + 1..].parseInt<usize>() ?? 0,
     null => 0,
 };
 
@@ -1143,7 +1143,7 @@ fn checkSchemaRows(db: borrow mut Session, verdict: borrow mut Verdict) -> Resul
         let fields = row.columns.length;
         var cache = HeaderCache { fields: fields, parsed: fields.min(table.columns.length), valid: true };
         if (checkColumns(
-            ByteStringView.fromText("sqlite_master"),
+            "sqlite_master",
             borrow table,
             positions.view(),
             defaults.view(),
@@ -1440,7 +1440,7 @@ fn integrityCheck(
     var limit: i64 = 100;
     var only: ByteString? = null;
     if (argument is Some(a)) {
-        if (parseI32(a) is Some(n)) {
+        if (a.parseInt<i32>() is Some(n)) {
             if (n > 0) {
                 limit = n as i64;
             }

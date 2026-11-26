@@ -171,7 +171,7 @@ fn termError<N: TextView, M: TextView>(n: usize, clause: N, message: M, count: u
 /// A literal positive integer term: an ordinal.
 fn ordinalOf(e: borrow Expr) -> i64? {
     if (e is Expr.Literal(Literal { kind: LiteralKind.Integer, text })) {
-        return parseI64(text.view());
+        return text.view().parseInt<i64>();
     }
     return null;
 }

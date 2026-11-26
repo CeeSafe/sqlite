@@ -28,7 +28,7 @@ struct ParamNumbering {
             return this.checked(this.count);
         }
         if (text[0] == '?') {
-            let n = parseUsize(text.sliceFrom(1)) ?? 0;
+            let n = text[1..].parseInt<usize>() ?? 0;
             if (n == 0 || n > MAX_PARAMETER_NUMBER) {
                 return Err(sqlError("variable number must be between ?1 and ?32766"));
             }

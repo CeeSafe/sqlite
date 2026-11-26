@@ -18,22 +18,6 @@ fn asciiLower<N: TextView>(text: N) -> Result<ByteString, AllocError> {
     return Ok(ByteString.fromBytes(out));
 }
 
-/// The decimal number `text` is, as `StringView.parseInt` reads it; null when it is not one (or not UTF-8).
-fn parseUsize<N: TextView>(text: N) -> usize? {
-    let utf8 = text.toUtf8()?;
-    return utf8.parseInt<usize>();
-}
-
-fn parseI64<N: TextView>(text: N) -> i64? {
-    let utf8 = text.toUtf8()?;
-    return utf8.parseInt<i64>();
-}
-
-fn parseI32<N: TextView>(text: N) -> i32? {
-    let utf8 = text.toUtf8()?;
-    return utf8.parseInt<i32>();
-}
-
 impl SqliteValue {
     /// A text value of a copy of `text`'s bytes: a string literal's value, a name or a definition.
     fn ofText<N: TextView>(text: N) -> Result<SqliteValue, AllocError> => Ok(SqliteValue.Text(ownedText(text)?));
