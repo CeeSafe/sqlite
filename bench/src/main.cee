@@ -1,0 +1,257 @@
+// sqlite_bench: times a set of workloads on this package's engine. bench/c/bench.c runs the same workloads, with
+// the same SQL, parameters and checksums, on SQLite itself, and bench/run.py compares the two (README.md,
+// "Benchmark").
+//
+//   sqlite_bench FILE [N]
+//
+// FILE must not exist; N is the number of rows (default 100000). Each workload prints one line, tab-separated:
+// its name, how many statements it ran, the nanoseconds they took, and a checksum of what they answered, which
+// must be SQLite's.
+
+import sqlite;
+
+fn main() {
+    let path = Process.argument(1) ?? usage();
+    let n: i64 = match (Process.argument(2)) {
+        Some(text) => text.parseInt<i64>() ?? usage(),
+        null => 100000,
+    };
+    if (n < 100) {
+        usage();
+    }
+    var db = match (Connection.open(path)) {
+        Ok(c) => c,
+        Err(e) => fail(e),
+    };
+    match (runAll(mut db, n)) {
+        Ok() => {}
+        Err(e) => { fail(e); }
+    }
+    match (db.close()) {
+        Ok() => {}
+        Err(e) => { fail(e); }
+    }
+}
+
+fn usage() -> never {
+    Console.writeErrorLine("usage: sqlite_bench FILE [N]");
+    Process.exit(2);
+}
+
+fn fail(e: SqliteError) -> never {
+    Console.writeErrorLine(e.message().toUtf8() ?? "an error whose message is not UTF-8");
+    Process.exit(1);
+}
+
+/// The value the workloads give row `i`'s `b`: spread over 0..1000000, with repeats.
+fn rnd(i: i64) -> i64 => (i * 1103515245 + 12345) % 1000000;
+
+/// Row `i`'s `c`: "v" and `rnd(i)`.
+fn label(i: i64) -> Result<SqliteValue, AllocError> {
+    var s = String.from("v")?;
+    s.appendNumber(rnd(i))?;
+    return SqliteValue.text(s.view());
+}
+
+fn one(a: i64) -> Result<Params, AllocError> {
+    var p = Params.create();
+    p.add(SqliteValue.Integer(a))?;
+    return Ok(p);
+}
+
+/// What a value adds to a checksum: an integer itself, a real's thousandths, a text's or blob's length in bytes.
+fn weight(value: borrow SqliteValue) -> i64 => match (value) {
+    SqliteValue.Null => 0,
+    SqliteValue.Integer(v) => *v,
+    SqliteValue.Real(r) => saturatingTruncate<i64>(*r * 1000.0),
+    SqliteValue.Text(t) => truncate<i64>(t.length),
+    SqliteValue.Blob(b) => truncate<i64>(b.length),
+};
+
+/// The checksum of a query's rows: the sum of every value's weight, wrapping.
+fn query(db: borrow mut Connection, sql: StringView, params: borrow Params) -> Result<i64, SqliteError> {
+    let result = db.query(sql, params)?;
+    var total: i64 = 0;
+    for (r in 0..result.rows.length) {
+        let row = borrow result.rows[r];
+        for (c in 0..row.length) {
+            total = total.wrappingAdd(weight(borrow row[c]));
+        }
+    }
+    return Ok(total);
+}
+
+/// A statement that changes rows: its checksum is how many it changed.
+fn change(db: borrow mut Connection, sql: StringView, params: borrow Params) -> Result<i64, SqliteError> =>
+    db.execute(sql, params);
+
+fn report(name: StringView, ops: i64, started: u64, checksum: i64) {
+    let ns = Clock.monotonicNanos() - started;
+    var line = String.create();
+    line.append(name)!;
+    line.append("\t")!;
+    line.appendNumber(ops)!;
+    line.append("\t")!;
+    line.appendNumber(truncate<i64>(ns))!;
+    line.append("\t")!;
+    line.appendNumber(checksum)!;
+    Console.writeLine(line.view());
+}
+
+fn runAll(db: borrow mut Connection, n: i64) -> Result<void, SqliteError> {
+    let none = Params.create();
+    db.executeScript(
+        "CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER, c TEXT); CREATE TABLE t2(k INTEGER PRIMARY KEY, name TEXT); CREATE TABLE t3(a INTEGER, b TEXT)",
+    )?;
+    db.begin()?;
+    for (k in 0i64..1000) {
+        var p = Params.create();
+        p.add(SqliteValue.Integer(k))?;
+        p.add(label(k)?)?;
+        let _ = db.execute("INSERT INTO t2(k, name) VALUES (?1, ?2)", borrow p)?;
+    }
+    db.commit()?;
+
+    // Rows inserted in one transaction.
+    var started = Clock.monotonicNanos();
+    var sum: i64 = 0;
+    db.begin()?;
+    for (i in 1i64..n + 1) {
+        var p = Params.create();
+        p.add(SqliteValue.Integer(i))?;
+        p.add(SqliteValue.Integer(rnd(i)))?;
+        p.add(label(i)?)?;
+        sum += change(db, "INSERT INTO t1(a, b, c) VALUES (?1, ?2, ?3)", borrow p)?;
+    }
+    db.commit()?;
+    report("insert-txn", n, started, sum);
+
+    // Rows inserted each in its own transaction: a commit, with its journal and syncs, per row.
+    let k = n / 100;
+    started = Clock.monotonicNanos();
+    sum = 0;
+    for (i in 0i64..k) {
+        var p = Params.create();
+        p.add(SqliteValue.Integer(i))?;
+        p.add(label(i)?)?;
+        sum += change(db, "INSERT INTO t3(a, b) VALUES (?1, ?2)", borrow p)?;
+    }
+    report("insert-autocommit", k, started, sum);
+
+    started = Clock.monotonicNanos();
+    db.executeScript("CREATE INDEX t1b ON t1(b)")?;
+    report("create-index", 1, started, 0);
+
+    let m = n / 5;
+    started = Clock.monotonicNanos();
+    sum = 0;
+    for (i in 0i64..m) {
+        let p = one((i * 7919) % n + 1)?;
+        sum = sum.wrappingAdd(query(db, "SELECT b, c FROM t1 WHERE a = ?1", borrow p)?);
+    }
+    report("select-rowid", m, started, sum);
+
+    started = Clock.monotonicNanos();
+    sum = 0;
+    for (i in 0i64..m) {
+        let p = one(rnd((i * 7919) % n + 1))?;
+        sum = sum.wrappingAdd(query(db, "SELECT a FROM t1 WHERE b = ?1", borrow p)?);
+    }
+    report("select-index-eq", m, started, sum);
+
+    started = Clock.monotonicNanos();
+    sum = 0;
+    for (i in 0i64..1000) {
+        let p = one((i * 997) % 1000000)?;
+        sum = sum.wrappingAdd(
+            query(db, "SELECT count(*), sum(a) FROM t1 WHERE b >= ?1 AND b < ?1 + 1000", borrow p)?,
+        );
+    }
+    report("select-index-range", 1000, started, sum);
+
+    started = Clock.monotonicNanos();
+    sum = 0;
+    for (i in 0i64..10) {
+        var pattern = String.from("%")?;
+        pattern.appendNumber(i)?;
+        pattern.append("7%")?;
+        var p = Params.create();
+        p.add(SqliteValue.text(pattern.view())?)?;
+        sum = sum.wrappingAdd(query(db, "SELECT count(*) FROM t1 WHERE c LIKE ?1", borrow p)?);
+    }
+    report("scan-like", 10, started, sum);
+
+    started = Clock.monotonicNanos();
+    sum = 0;
+    for (i in 0i64..10) {
+        let p = one(i + 2)?;
+        sum = sum.wrappingAdd(
+            query(db, "SELECT count(*), sum(b), max(length(c)) FROM t1 WHERE a % ?1 = 0", borrow p)?,
+        );
+    }
+    report("scan-aggregate", 10, started, sum);
+
+    started = Clock.monotonicNanos();
+    sum = 0;
+    for (i in 0i64..10) {
+        let p = one(100 + i)?;
+        sum = sum.wrappingAdd(query(db, "SELECT b % ?1, count(*) FROM t1 GROUP BY 1", borrow p)?);
+    }
+    report("group-by", 10, started, sum);
+
+    started = Clock.monotonicNanos();
+    sum = 0;
+    for (i in 0i64..5) {
+        let p = one(i * 1000)?;
+        sum = sum.wrappingAdd(
+            query(db, "SELECT a, c FROM t1 ORDER BY c DESC, a LIMIT 100 OFFSET ?1", borrow p)?,
+        );
+    }
+    report("order-by", 5, started, sum);
+
+    started = Clock.monotonicNanos();
+    sum = 0;
+    for (i in 0i64..5) {
+        let p = one(i)?;
+        sum = sum.wrappingAdd(
+            query(
+                db,
+                "SELECT count(*), sum(t2.k) FROM t1 JOIN t2 ON t2.k = t1.b % 1000 WHERE t1.a % 10 = ?1",
+                borrow p,
+            )?,
+        );
+    }
+    report("join", 5, started, sum);
+
+    let u = n / 10;
+    started = Clock.monotonicNanos();
+    sum = 0;
+    db.begin()?;
+    for (i in 0i64..u) {
+        let p = one((i * 7919) % n + 1)?;
+        sum += change(db, "UPDATE t1 SET b = b + 1 WHERE a = ?1", borrow p)?;
+    }
+    db.commit()?;
+    report("update-point", u, started, sum);
+
+    started = Clock.monotonicNanos();
+    sum = change(db, "UPDATE t1 SET c = c || 'x' WHERE a % 10 = 0", borrow none)?;
+    report("update-bulk", 1, started, sum);
+
+    started = Clock.monotonicNanos();
+    sum = change(db, "DELETE FROM t1 WHERE a % 3 = 0", borrow none)?;
+    report("delete-bulk", 1, started, sum);
+
+    started = Clock.monotonicNanos();
+    sum = query(db, "PRAGMA integrity_check", borrow none)?;
+    report("integrity-check", 1, started, sum);
+
+    started = Clock.monotonicNanos();
+    db.executeScript("VACUUM")?;
+    report("vacuum", 1, started, 0);
+
+    started = Clock.monotonicNanos();
+    sum = query(db, "SELECT count(*), sum(a), sum(b), sum(length(c)) FROM t1", borrow none)?;
+    report("final-scan", 1, started, sum);
+    return Ok();
+}

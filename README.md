@@ -838,6 +838,45 @@ Collations other than BINARY, NOCASE and RTRIM are refused.
   `PRAGMA journal_mode` then answers `delete`. Leaving WAL mode writes the header's format numbers 1 and 1 and
   removes the log, as SQLite does.
 
+## Benchmark
+
+`bench/` times one set of workloads on this engine (`bench/src/main.cee`, through the API) and on SQLite
+(`bench/c/bench.c`, the amalgamation): the same SQL, the same parameters, and a checksum of every answer, which
+must agree. `python3 bench/run.py [--rows N] [--runs R]` downloads the amalgamation (checked against sqlite.org's
+SHA3-256), builds both at -O2, runs each engine R times on new files, taking turns, stops if any checksum differs,
+and checks every engine's last file in SQLite's shell (`PRAGMA integrity_check`, and the same rows). SQLite runs
+twice: preparing each statement for every run, as this API does (it has no prepared statements and parses what it
+is given), and preparing it once, as an application written for SQLite does.
+
+On 2026-11-26, 100,000 rows, the medians of 3 runs in ms; ceesafec 0.95.15, SQLite 3.54.1, gcc 14 at -O2, Debian 13
+on a Xeon E3-1245 V2 (3.4 GHz) with a disk; DELETE journal, synchronous FULL:
+
+| workload | statements | this engine | SQLite, prepared each time | SQLite, prepared once | × each time | × once |
+|---|---:|---:|---:|---:|---:|---:|
+| insert-txn | 100000 | 3622.1 | 330.0 | 63.3 | 11.0 | 57.2 |
+| insert-autocommit | 1000 | 1100.9 | 806.8 | 835.7 | 1.4 | 1.3 |
+| create-index | 1 | 155.5 | 36.5 | 37.2 | 4.3 | 4.2 |
+| select-rowid | 20000 | 709.8 | 259.3 | 160.8 | 2.7 | 4.4 |
+| select-index-eq | 20000 | 1029.6 | 272.3 | 145.1 | 3.8 | 7.1 |
+| select-index-range | 1000 | 171.7 | 23.2 | 12.8 | 7.4 | 13.4 |
+| scan-like | 10 | 929.3 | 76.8 | 76.8 | 12.1 | 12.1 |
+| scan-aggregate | 10 | 894.0 | 67.8 | 55.6 | 13.2 | 16.1 |
+| group-by | 10 | 857.8 | 284.5 | 285.3 | 3.0 | 3.0 |
+| order-by | 5 | 1456.2 | 63.5 | 64.2 | 22.9 | 22.7 |
+| join | 5 | 1190.0 | 31.5 | 31.7 | 37.7 | 37.6 |
+| update-point | 10000 | 5038.3 | 112.7 | 63.9 | 44.7 | 78.8 |
+| update-bulk | 1 | 594.9 | 25.3 | 24.6 | 23.5 | 24.2 |
+| delete-bulk | 1 | 1090.4 | 62.4 | 62.1 | 17.5 | 17.6 |
+| integrity-check | 1 | 377.0 | 33.3 | 33.6 | 11.3 | 11.2 |
+| vacuum | 1 | 94.9 | 27.6 | 27.8 | 3.4 | 3.4 |
+| final-scan | 1 | 78.2 | 7.3 | 7.4 | 10.7 | 10.5 |
+| total | | 19390.5 | 2520.9 | 1987.7 | 7.7 | 9.8 |
+
+Commits that wait on the disk (insert-autocommit) cost about what SQLite's do. Statements on one row cost 3–4×
+SQLite's prepared each time (select-rowid, select-index-eq) but writes of one row inside a transaction 11–45×
+(insert-txn, update-point), and work over many rows 10–40× (scans, sorting, the join, bulk changes): the places to
+look first. The figures are one machine's; run `bench/run.py` for another's.
+
 ## Tests
 
 `ceesafec test` needs the `sqlite3` shell on the path: fixtures are made with it, and answers are compared with

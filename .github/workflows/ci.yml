@@ -122,7 +122,7 @@ jobs:
 
       - name: Check and format
         run: |
-          for package in . cli pgwire daemon; do
+          for package in . cli pgwire daemon bench; do
             (cd "$package" && ceesafec check && ceesafec fmt --check) || exit 1
           done
 
