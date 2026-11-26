@@ -223,6 +223,8 @@ struct TableCursor {
     private started: bool;
     /// Largest rowid first. A frame's `index` is then one more than the next cell (or child) to visit.
     private reverse: bool;
+    /// The cell `advance` stopped at, for `decodeCurrent`.
+    private current: LeafCellAt?;
 
     /// A cursor over every row of the table rooted at `rootPage`.
     fn scan(rootPage: u32) -> TableCursor => TableCursor.range(rootPage, -9223372036854775808, 9223372036854775807);
@@ -236,6 +238,7 @@ struct TableCursor {
         stack: Vector<CursorFrame>.create(),
         started: false,
         reverse: false,
+        current: null,
     };
 
     /// The same rows, largest rowid first.
@@ -271,6 +274,49 @@ struct TableCursor {
             return Ok(null);
         };
         return Ok(readTableLeafRowInto(pager, cell.page.view(), cell.offset, this.wanted.view(), record)?);
+    }
+
+    /// Moves to the next row and gives its rowid, decoding nothing; `null` after the last. `decodeCurrent` then
+    /// decodes the columns wanted, as they are wanted: a row turned away by a term on its first columns never has
+    /// its others decoded.
+    fn advance<P: PageSource>(borrow mut this, pager: borrow mut P) -> Result<i64?, SqliteError> {
+        let Some(cell) = this.nextCell(pager)? else {
+            this.current = null;
+            return Ok(null);
+        };
+        let rowId = TableLeafCell.parse(cell.page.view(), cell.offset)?.rowId;
+        this.current = cell;
+        return Ok(rowId);
+    }
+
+    /// The columns `wanted` marks of the row `advance` stopped at, decoded into `record` (`Record.decodeSomeInto`);
+    /// gives how many columns are known to be in the record.
+    fn decodeCurrent<P: PageSource>(
+        borrow this,
+        pager: borrow mut P,
+        wanted: Slice<bool>,
+        record: borrow mut Vector<SqliteValue>,
+    ) -> Result<usize, SqliteError> {
+        let Some(at) = borrow this.current else {
+            return Err(sqlError("a row is decoded before the cursor reached one"));
+        };
+        let page = at.page.view();
+        let cell = TableLeafCell.parse(page, at.offset)?;
+        let shape = PayloadShape.ofTableLeaf(pager, cell.payloadLength)?;
+        let encoding = pager.textEncoding();
+        if (shape.isLocal()) {
+            if (cell.payloadOffset + shape.total > page.length) {
+                return Err(corrupt("a cell runs past the end of its page"));
+            }
+            return Record.decodeSomeInto(
+                page[cell.payloadOffset..cell.payloadOffset + shape.total],
+                encoding,
+                wanted,
+                record,
+            );
+        }
+        let payload = readOverflowPayload(pager, page, cell.payloadOffset, shape)?;
+        return Record.decodeSomeInto(payload.view(), encoding, wanted, record);
     }
 
     /// The next row's rowid and payload, without decoding it. When the payload's overflow chain cannot be read,

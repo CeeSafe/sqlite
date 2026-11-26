@@ -164,6 +164,7 @@ fn compileJsonEach(
             indexSeek: null,
             group: 0,
             groupOn: null,
+            phases: null,
         },
     );
 }

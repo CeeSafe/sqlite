@@ -95,6 +95,52 @@ struct Record {
         return Ok();
     }
 
+    /// The columns `wanted` marks decoded into `out`, the others left as they are; the header is read no further than
+    /// the last wanted column. Gives how many columns are known to be in the record: all of them when the header
+    /// was read to its end, else one past the last wanted. A wanted column at or past that count is not there (a
+    /// record written before the column was added).
+    fn decodeSomeInto(
+        payload: Slice<u8>,
+        encoding: TextEncoding,
+        wanted: Slice<bool>,
+        out: borrow mut Vector<SqliteValue>,
+    ) -> Result<usize, SqliteError> {
+        var last = wanted.length;
+        while (last > 0 && !wanted[last - 1]) {
+            last -= 1;
+        }
+        if (last == 0) {
+            return Ok(0);
+        }
+        let header = Varint.read(payload, 0)?;
+        let headerLength = checkedTruncate<usize>(header.value) ?? {
+            return Err(corrupt("record header length is negative"));
+        };
+        if (headerLength > payload.length) {
+            return Err(corrupt("record header runs past the payload"));
+        }
+        var headerPos = header.length;
+        var bodyPos = headerLength;
+        var i: usize = 0;
+        while (headerPos < headerLength && i < last) {
+            let serial = Varint.read(payload, headerPos)?;
+            headerPos += serial.length;
+            let size = Record.serialTypeSize(serial.value);
+            if (bodyPos + size > payload.length) {
+                return Err(corrupt("record body runs past the payload"));
+            }
+            while (out.length <= i) {
+                out.push(SqliteValue.Null)?;
+            }
+            if (wanted[i]) {
+                Record.readValueInto(payload[bodyPos..bodyPos + size], serial.value, encoding, mut out[i])?;
+            }
+            bodyPos += size;
+            i += 1;
+        }
+        return Ok(i);
+    }
+
     /// `readValue` into `target`: UTF-8 text into the room of the text `target` holds, when it holds one.
     fn readValueInto(
         body: Slice<u8>,

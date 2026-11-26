@@ -136,6 +136,33 @@ fn expressionsWithoutTables() -> Result<void, TestFailure> {
 }
 
 @test
+fn scansLoadTheColumnsTheTermsReadFirst() -> Result<void, TestFailure> {
+    // A scanned row is loaded in two steps: the columns its ON and WHERE terms read, then, for a row they let
+    // through, the others the query reads. Rows written before ALTER TABLE ADD COLUMN are shorter than the table
+    // (their new columns take the default), REAL columns hold integers, some text runs onto overflow pages.
+    let path = "out/query-two-step-scan.db";
+    makeDatabase(
+        path,
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, r REAL, s TEXT, b BLOB); WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400) INSERT INTO t SELECT i, i % 13, i * 2, CASE WHEN i % 7 = 0 THEN NULL WHEN i % 50 = 0 THEN printf('%.*c', 3000, 'x') ELSE 's' || i END, x'00ff' FROM n; ALTER TABLE t ADD COLUMN d DEFAULT 'dflt'; ALTER TABLE t ADD COLUMN e INTEGER DEFAULT 5; INSERT INTO t(id, a, r, s, d, e) VALUES (401, 1, 2.5, 'late', 'new', 6), (402, NULL, NULL, NULL, NULL, NULL); CREATE TABLE u(k INTEGER PRIMARY KEY, v TEXT, w); INSERT INTO u SELECT i, 'v' || i, i % 3 FROM (WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 12) SELECT i FROM n);",
+    )?;
+    return sameAnswers(path, """
+        SELECT id, s, d, e FROM t WHERE a = 3 ORDER BY id
+        SELECT id, length(s), r, typeof(r) FROM t WHERE id % 50 = 0 ORDER BY id
+        SELECT count(*), sum(e), count(d), group_concat(DISTINCT d) FROM t WHERE r > 100
+        SELECT id, a, r, s, hex(b), d, e FROM t WHERE id > 395
+        SELECT id FROM t WHERE s IS NULL AND a > 5 ORDER BY id LIMIT 5
+        SELECT id, d FROM t WHERE e = 5 AND id > 398
+        SELECT t.id, u.v, u.w FROM t LEFT JOIN u ON u.k = t.a AND u.w = 1 WHERE t.id < 20 ORDER BY t.id
+        SELECT t.id, u.v FROM t JOIN u ON u.k = t.a WHERE u.w = 2 AND t.s LIKE 's1%' ORDER BY t.id LIMIT 8
+        SELECT id, (SELECT count(*) FROM u WHERE u.k < t.a) FROM t WHERE id % 37 = 0 ORDER BY id
+        SELECT a, count(*), max(length(s)) FROM t GROUP BY a ORDER BY a
+        SELECT max(r), min(s), total(e) FROM t
+        SELECT id FROM t WHERE rowid = 200
+        SELECT * FROM t WHERE id = 401
+    """);
+}
+
+@test
 fn whereTermsAreCheckedInTheOutermostLoopTheyCan() -> Result<void, TestFailure> {
     // A term reading only the outer tables turns a row away before the inner loops run for it; one reading a
     // LEFT JOIN's right side, or any source of a RIGHT or FULL JOIN, still waits for the whole row.

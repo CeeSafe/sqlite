@@ -1165,13 +1165,22 @@ fn neededColumns(core: borrow CorePlan, slot: usize, count: usize) -> Result<Vec
     }
     for (s in 0..core.sources.length) {
         let source = borrow core.sources[s];
+        // A LEFT JOIN group's ON (checked once a row of the whole group is made) and a table-valued function's
+        // arguments read earlier sources' columns too.
         known = known && markOptional(borrow source.on, slot, mut needed) && markOptional(
             borrow source.rowidSeek,
             slot,
             mut needed,
-        );
+        ) && markOptional(borrow source.groupOn, slot, mut needed);
         if (borrow source.kind is SourceKind.Pragma(_, argument)) {
             known = known && markOptional(argument, slot, mut needed);
+        }
+        if (borrow source.kind is SourceKind.JsonEach(each)) {
+            known = known && markOptional(borrow each.json, slot, mut needed) && markOptional(
+                borrow each.root,
+                slot,
+                mut needed,
+            );
         }
     }
     return Ok(if (known) needed else null);
@@ -2008,16 +2017,90 @@ fn placeTerms(plan: borrow mut CorePlan) -> Result<void, AllocError> {
             early = 0;
         }
     }
-    let Some(f) = borrow plan.filter else {
-        return Ok();
-    };
-    var terms = Vector<usize>.create();
-    termLevelsIn(f, plan.sources.view(), early, mut terms)?;
-    for (k in 0..terms.length) {
-        plan.levelHasTerms[terms[k]] = true;
+    if (borrow plan.filter is Some(f)) {
+        var terms = Vector<usize>.create();
+        termLevelsIn(f, plan.sources.view(), early, mut terms)?;
+        for (k in 0..terms.length) {
+            plan.levelHasTerms[terms[k]] = true;
+        }
+        plan.termLevels = terms;
     }
-    plan.termLevels = terms;
+    for (level in 0..n) {
+        let phases = columnPhases(plan, level)?;
+        plan.sources[level].phases = phases;
+    }
     return Ok();
+}
+
+/// The columns a table source at `level` loads first and last (`ColumnPhases`); null when its rows are loaded
+/// whole: a WITHOUT ROWID table, VIRTUAL generated columns (computed from the others), a query whose columns are
+/// not all known (windows), or a term that reads the row in a way the masks cannot follow.
+fn columnPhases(plan: borrow CorePlan, level: usize) -> Result<ColumnPhases?, AllocError> {
+    let source = borrow plan.sources[level];
+    let SourceKind.Table(table) = borrow source.kind else {
+        return Ok(null);
+    };
+    if (table.withoutRowid || table.generated.length != 0) {
+        return Ok(null);
+    }
+    let count = table.recordPosition.length;
+    let Some(needed) = neededColumns(plan, source.slot, count)? else {
+        return Ok(null);
+    };
+    var early = Vector<bool>.withCapacity(count)?;
+    early.resize(count, false)?;
+    if (!markOptional(borrow source.on, source.slot, mut early)) {
+        return Ok(null);
+    }
+    if (borrow plan.filter is Some(f)) {
+        var k: usize = 0;
+        if (!markTermsAt(f, plan.termLevels.view(), level, source.slot, mut k, mut early)) {
+            return Ok(null);
+        }
+    }
+    var late = Vector<bool>.withCapacity(count)?;
+    for (c in 0..count) {
+        late.push(needed[c] && !early[c])?;
+    }
+    var width: usize = 0;
+    for (c in 0..count) {
+        if (table.recordPosition[c] is Some(at)) {
+            width = width.max(at + 1);
+        }
+    }
+    var earlyRecord = Vector<bool>.withCapacity(width)?;
+    earlyRecord.resize(width, false)?;
+    var lateRecord = Vector<bool>.withCapacity(width)?;
+    lateRecord.resize(width, false)?;
+    for (c in 0..count) {
+        // The rowid's alias is the rowid, not the NULL its record holds.
+        if (table.rowidAlias == Some(c)) {
+            continue;
+        }
+        if (table.recordPosition[c] is Some(at)) {
+            earlyRecord[at] = early[c];
+            lateRecord[at] = late[c];
+        }
+    }
+    return Ok(ColumnPhases { early: early, late: late, earlyRecord: earlyRecord, lateRecord: lateRecord });
+}
+
+/// Marks the columns of `slot` that the AND terms of `e` placed at `level` read; false when one reads it in a way
+/// `markColumns` cannot follow.
+fn markTermsAt(
+    e: borrow XExpr,
+    levels: Slice<usize>,
+    level: usize,
+    slot: usize,
+    k: borrow mut usize,
+    needed: borrow mut Vector<bool>,
+) -> bool {
+    if (e is XExpr.And(a, b)) {
+        return markTermsAt(a, levels, level, slot, k, needed) && markTermsAt(b, levels, level, slot, k, needed);
+    }
+    let mine = k < levels.length && levels[k] == level;
+    k += 1;
+    return !mine || markColumns(e, slot, needed);
 }
 
 /// The levels of the AND terms of `e`, left to right (`placeTerms`).

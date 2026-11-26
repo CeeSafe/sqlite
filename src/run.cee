@@ -85,6 +85,106 @@ fn loadTableRow(
     return Ok();
 }
 
+/// The nested loop at `level` over a table whose rows are loaded in two steps (`ColumnPhases`): the columns its ON
+/// and this level's WHERE terms read, then, for a row they let through, the rest the query reads. A row turned away
+/// has no other column decoded, and a column no part of the query reads stays NULL for the whole scan.
+fn phasedScan(
+    core: borrow CorePlan,
+    level: usize,
+    table: borrow TablePlan,
+    phases: borrow ColumnPhases,
+    cursor: TableCursor,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+    sink: borrow mut CoreSink,
+) -> Result<void, SqliteError> {
+    let source = borrow core.sources[level];
+    var scan = cursor;
+    var matched = false;
+    var ordinal: usize = 0;
+    // The record each row is decoded into: it keeps the room of the values the slot let go.
+    var record = Vector<SqliteValue>.create();
+    clearSlot(table, mut frame.slots[source.slot])?;
+    loop {
+        if (sink.stopAfter is Some(n) && sink.rows.length >= n) {
+            return Ok();
+        }
+        let Some(rowId) = scan.advance(db.pagerOf(table.database))? else {
+            break;
+        };
+        ordinal += 1;
+        let present = scan.decodeCurrent(db.pagerOf(table.database), phases.earlyRecord.view(), mut record)?;
+        loadColumnsInto(table, rowId, mut record, present, phases.early.view(), mut frame.slots[source.slot])?;
+        if (borrow source.on is Some(on)) {
+            let ok = evaluate(on, frame, db)?;
+            if (!isTrue(borrow ok)) {
+                continue;
+            }
+        }
+        matched = true;
+        markRightMatch(source, level, ordinal - 1, sink)?;
+        if (!termsHold(core, level, frame, db)?) {
+            continue;
+        }
+        let rest = scan.decodeCurrent(db.pagerOf(table.database), phases.lateRecord.view(), mut record)?;
+        loadColumnsInto(table, rowId, mut record, rest, phases.late.view(), mut frame.slots[source.slot])?;
+        joinLevel(core, level + 1, frame, db, sink)?;
+    }
+    return finishLeft(core, level, matched, frame, db, sink);
+}
+
+/// A slot of a table's width, every column NULL.
+fn clearSlot(plan: borrow TablePlan, slot: borrow mut Slot) -> Result<void, AllocError> {
+    let n = plan.recordPosition.length;
+    slot.values.truncate(n);
+    for (c in 0..slot.values.length) {
+        slot.values[c] = SqliteValue.Null;
+    }
+    while (slot.values.length < n) {
+        slot.values.push(SqliteValue.Null)?;
+    }
+    return Ok();
+}
+
+/// The columns `columns` marks loaded into the slot from `record` (decoded by `TableCursor.decodeCurrent`, which
+/// found `present` columns in it), as `loadTableRowInto` loads them; the others are left as they are.
+fn loadColumnsInto(
+    plan: borrow TablePlan,
+    rowId: i64,
+    record: borrow mut Vector<SqliteValue>,
+    present: usize,
+    columns: Slice<bool>,
+    slot: borrow mut Slot,
+) -> Result<void, AllocError> {
+    for (c in 0..columns.length) {
+        if (!columns[c]) {
+            continue;
+        }
+        if (plan.rowidAlias == Some(c)) {
+            slot.values[c] = SqliteValue.Integer(rowId);
+            continue;
+        }
+        match (plan.recordPosition[c]) {
+            Some(at) => {
+                if (at < present && at < record.length) {
+                    // Each takes the other's value: the record keeps the old one's room for the next row.
+                    let fresh = replace(mut record[at], SqliteValue.Null);
+                    record[at] = replace(mut slot.values[c], fresh);
+                } else {
+                    slot.values[c] = plan.defaults[c].clone()?;
+                }
+            }
+            null => { slot.values[c] = SqliteValue.Null; }
+        }
+        if (plan.realColumns[c] && slot.values[c] is SqliteValue.Integer(i)) {
+            slot.values[c] = SqliteValue.Real(round<f64>(i));
+        }
+    }
+    slot.rowId = rowId;
+    slot.isNull = false;
+    return Ok();
+}
+
 /// `loadTableRow` from `record`, leaving in it the values the slot had: their room (a text's bytes) is used again
 /// for the next row (`RowCursor.nextInto`), so a scan does not allocate for each row.
 fn loadTableRowInto(
@@ -335,11 +435,22 @@ fn loopLevel(
             if (borrow source.indexSeek is Some(seek)) {
                 return seekLevel(core, level, table, seek, frame, db, sink);
             }
-            var cursor = RowCursor.scan(table);
+            var only: i64? = null;
             if (borrow source.rowidSeek is Some(seek)) {
                 let Some(rowId) = seekRowid(seek, frame, db)? else {
                     return finishLeft(core, level, matched, frame, db, sink);
                 };
+                only = rowId;
+            }
+            if (borrow source.phases is Some(phases)) {
+                let scan = match (only) {
+                    Some(rowId) => TableCursor.range(table.root, rowId, rowId),
+                    null => TableCursor.scan(table.root),
+                };
+                return phasedScan(core, level, table, phases, scan, frame, db, sink);
+            }
+            var cursor = RowCursor.scan(table);
+            if (only is Some(rowId)) {
                 cursor = RowCursor.Rows(TableCursor.range(table.root, rowId, rowId));
             }
             var ordinal: usize = 0;
