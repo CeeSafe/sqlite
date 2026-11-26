@@ -470,6 +470,13 @@ struct IndexOp {
     remove: bool;
 }
 
+/// An interior page passed on the way down an index, and which child was taken: cell `at`'s, or the right-most
+/// when `at` is the page's cell count.
+struct IndexStep {
+    page: u32;
+    at: usize;
+}
+
 /// What an index page that split hands its parent: the entry between the two halves, as the cell bytes that
 /// follow a child pointer, and the new page to the right of it.
 struct IndexSplit {
@@ -695,46 +702,208 @@ struct IndexMutator {
         return Ok(IndexSplit { promoted: promoted, rightPage: rightPage });
     }
 
-    /// Removes `entry` from a leaf under page `number`. False when the removal needs the tree reshaped: the
-    /// entry is in an interior page, or is the last of its leaf, or is not there.
+    /// The bytes of a cell (`rawCells`' padding left out): its child pointer (`lead` bytes), its payload's
+    /// length, and the part of the payload in the page, with the overflow pointer.
+    private fn cellExtent(usable: usize, cell: Slice<u8>, lead: usize) -> Result<usize, SqliteError> {
+        let length = Varint.read(cell, lead)?;
+        let total = checkedTruncate<usize>(length.value) ?? {
+            return Err(corrupt("a cell's payload length is negative"));
+        };
+        let extent = lead + length.length + cellPayloadSize(usable, total, (usable - 12) * 64 / 255 - 23);
+        if (extent > cell.length) {
+            return Err(corrupt("a cell runs past the end of its page"));
+        }
+        return Ok(extent);
+    }
+
+    /// The first page of the overflow chain a cell's payload goes on in, or 0 when it is all in the cell.
+    private fn overflowOf(usable: usize, cell: Slice<u8>, lead: usize) -> Result<u32, SqliteError> {
+        let length = Varint.read(cell, lead)?;
+        if (length.value <= truncate<i64>((usable - 12) * 64 / 255 - 23)) {
+            return Ok(0);
+        }
+        let extent = IndexMutator.cellExtent(usable, cell, lead)?;
+        return Ok(cell.readBE<u32>(extent - 4));
+    }
+
+    /// Adds `entry` to the index rooted at `root`, growing the tree by a level when the root splits.
+    private fn insertFromRoot(
+        pager: borrow mut WritablePager,
+        root: u32,
+        entry: Slice<SqliteValue>,
+        order: borrow IndexOrder,
+    ) -> Result<void, SqliteError> {
+        let record = Record.encodeIn(entry, pager.textEncoding)?;
+        if (IndexMutator.insert(pager, root, entry, record.view(), order, 0)? is Some(split)) {
+            // The root split: its left half moves to a new page, and the root becomes their parent.
+            let left = pager.allocatePage()?;
+            let content = pager.copy(root)?;
+            pager.write(left)?.copyFrom(content.view());
+            var cells = Vector<Vector<u8>>.create();
+            var divider = Vector<u8>.withCapacity(split.promoted.length + 4)?;
+            divider.pushBE(left)?;
+            divider.extend(split.promoted.view())?;
+            cells.push(divider)?;
+            IndexMutator.writePage(pager, root, PAGE_INTERIOR_INDEX, cells.view(), split.rightPage)?;
+        }
+        return Ok();
+    }
+
+    /// Whether the leaf at the end of `path`, which has `count` cells, can lose one without leaving its parent an
+    /// interior page with no cell: it keeps one, or it is the root, or its parent has two cells or is the root.
+    private fn leafCanLose(
+        pager: borrow mut WritablePager,
+        root: u32,
+        path: Slice<IndexStep>,
+        count: usize,
+    ) -> Result<bool, SqliteError> {
+        if (count > 1 || path.length == 0) {
+            return Ok(true);
+        }
+        let parent = path[path.length - 1].page;
+        if (parent == root) {
+            return Ok(true);
+        }
+        let page = IndexMutator.readIndexPage(pager, parent)?;
+        return Ok(IndexMutator.indexHeader(page.view(), parent)?.cellCount >= 2);
+    }
+
+    /// Removes cell `at` of the leaf `number`, reached by `path` from the root; its overflow pages are freed when
+    /// `freeOverflow` (not when the cell has moved up into an interior page). A leaf that would be left empty
+    /// leaves the tree: its parent drops it with the cell that divided it from its neighbour, whose entry is then
+    /// inserted again, and a root left with one child takes that child's place. `leafCanLose` must hold.
+    private fn removeFromLeaf(
+        pager: borrow mut WritablePager,
+        root: u32,
+        path: Slice<IndexStep>,
+        number: u32,
+        at: usize,
+        freeOverflow: bool,
+        order: borrow IndexOrder,
+    ) -> Result<void, SqliteError> {
+        let usable = pager.usable;
+        let page = IndexMutator.readIndexPage(pager, number)?;
+        let header = IndexMutator.indexHeader(page.view(), number)?;
+        var cells = IndexMutator.rawCells(usable, page.view(), header)?;
+        let removed = cells.remove(at);
+        if (freeOverflow) {
+            let chain = IndexMutator.overflowOf(usable, removed.view(), 0)?;
+            if (chain != 0) {
+                freeOverflowChain(pager, chain)?;
+            }
+        }
+        if (cells.length > 0 || path.length == 0) {
+            return IndexMutator.writePage(pager, number, PAGE_LEAF_INDEX, cells.view(), null);
+        }
+        let step = path[path.length - 1];
+        let parentPage = IndexMutator.readIndexPage(pager, step.page)?;
+        let parentHeader = IndexMutator.indexHeader(parentPage.view(), step.page)?;
+        if (parentHeader.cellCount == 0) {
+            return Err(corrupt("an interior index page has no cells"));
+        }
+        var parentCells = IndexMutator.rawCells(usable, parentPage.view(), parentHeader)?;
+        var rightMost = parentHeader.rightMost;
+        // The leaf is the child of cell `at`, or the right-most child: the cell before that goes.
+        let d = if (step.at < parentHeader.cellCount) step.at else parentHeader.cellCount - 1;
+        if (step.at >= parentHeader.cellCount) {
+            rightMost = parentCells[d].readBE<u32>(0);
+        }
+        let divider = parentCells.remove(d);
+        pager.freePage(number)?;
+        if (parentCells.length == 0) {
+            // Only the root gets here (`leafCanLose`): it takes the content of its one child.
+            let content = pager.copy(rightMost)?;
+            pager.write(root)?.copyFrom(content.view());
+            pager.freePage(rightMost)?;
+        } else {
+            IndexMutator.writePage(pager, step.page, PAGE_INTERIOR_INDEX, parentCells.view(), rightMost)?;
+        }
+        // The divider's entry no longer sits between two children: it goes in again from the root.
+        let entry = IndexMutator.entryAt(pager, divider.view(), 4)?;
+        let chain = IndexMutator.overflowOf(usable, divider.view(), 4)?;
+        if (chain != 0) {
+            freeOverflowChain(pager, chain)?;
+        }
+        return IndexMutator.insertFromRoot(pager, root, entry.view(), order);
+    }
+
+    /// Removes `entry` from the index rooted at `root`, as SQLite's b-tree does: an entry in an interior page
+    /// is replaced by the one before it, the last of the leaf under it, and a leaf left empty leaves the tree
+    /// (`removeFromLeaf`). False, with nothing changed, when the entry is not there, or the entry before it would
+    /// not fit in the interior page, or a page would be left an interior page with no cell: the index must
+    /// then be rebuilt.
     private fn remove(
         pager: borrow mut WritablePager,
         root: u32,
         entry: Slice<SqliteValue>,
         order: borrow IndexOrder,
     ) -> Result<bool, SqliteError> {
+        let usable = pager.usable;
+        var path = Vector<IndexStep>.create();
         var number = root;
-        var depth: usize = 0;
         loop {
-            if (depth >= BTREE_MAX_DEPTH) {
+            if (path.length >= BTREE_MAX_DEPTH) {
                 return Err(corrupt("an index b-tree's pages form a cycle"));
             }
-            depth += 1;
-            let usable = pager.usable;
             let page = IndexMutator.readIndexPage(pager, number)?;
             let header = IndexMutator.indexHeader(page.view(), number)?;
             var equal = false;
             let at = IndexMutator.search(pager, page.view(), header, entry, order, mut equal)?;
-            if (!header.isLeaf()) {
-                if (equal) {
+            if (header.isLeaf()) {
+                if (!equal || !IndexMutator.leafCanLose(pager, root, path.view(), header.cellCount)?) {
                     return Ok(false);
                 }
-                number = if (at < header.cellCount) page.readBE<u32>(
+                IndexMutator.removeFromLeaf(pager, root, path.view(), number, at, true, order)?;
+                return Ok(true);
+            }
+            if (!equal) {
+                let child = if (at < header.cellCount) page.readBE<u32>(
                     header.cellOffset(page.view(), at)?,
                 ) else header.rightMost;
+                path.push(IndexStep { page: number, at: at })?;
+                number = child;
                 continue;
             }
-            if (!equal || (header.cellCount == 1 && number != root)) {
-                return Ok(false);
-            }
+            // In an interior page: the entry before it is the last of the right-most leaf under its left child.
             var cells = IndexMutator.rawCells(usable, page.view(), header)?;
-            let removed = cells.remove(at);
-            let length = Varint.read(removed.view(), 0)?;
-            if (length.value > truncate<i64>((usable - 12) * 64 / 255 - 23)) {
-                freeOverflowChain(pager, removed.readBE<u32>(removed.length - 4))?;
+            let left = cells[at].readBE<u32>(0);
+            let interior = number;
+            path.push(IndexStep { page: interior, at: at })?;
+            var below = left;
+            loop {
+                if (path.length >= BTREE_MAX_DEPTH) {
+                    return Err(corrupt("an index b-tree's pages form a cycle"));
+                }
+                let lower = IndexMutator.readIndexPage(pager, below)?;
+                let lowerHeader = IndexMutator.indexHeader(lower.view(), below)?;
+                if (!lowerHeader.isLeaf()) {
+                    path.push(IndexStep { page: below, at: lowerHeader.cellCount })?;
+                    below = lowerHeader.rightMost;
+                    continue;
+                }
+                if (lowerHeader.cellCount == 0) {
+                    return Err(corrupt("an index leaf page has no cells"));
+                }
+                let last = lowerHeader.cellCount - 1;
+                let lastCell = IndexMutator.rawCells(usable, lower.view(), lowerHeader)?.remove(last);
+                let extent = IndexMutator.cellExtent(usable, lastCell.view(), 0)?;
+                var replacement = Vector<u8>.withCapacity(extent + 4)?;
+                replacement.pushBE(left)?;
+                replacement.extend(lastCell.view()[0..extent])?;
+                let chain = IndexMutator.overflowOf(usable, cells[at].view(), 4)?;
+                cells[at] = replacement;
+                if (!IndexMutator.fits(usable, cells.view(), true) ||
+                    !IndexMutator.leafCanLose(pager, root, path.view(), lowerHeader.cellCount)?) {
+                    return Ok(false);
+                }
+                if (chain != 0) {
+                    freeOverflowChain(pager, chain)?;
+                }
+                IndexMutator.writePage(pager, interior, PAGE_INTERIOR_INDEX, cells.view(), header.rightMost)?;
+                // The entry before moved up with its overflow pages: its leaf loses the cell without freeing them.
+                IndexMutator.removeFromLeaf(pager, root, path.view(), below, last, false, order)?;
+                return Ok(true);
             }
-            IndexMutator.writePage(pager, number, PAGE_LEAF_INDEX, cells.view(), null)?;
-            return Ok(true);
         }
     }
 
@@ -755,19 +924,7 @@ struct IndexMutator {
                 }
                 continue;
             }
-            let record = Record.encodeIn(entry, pager.textEncoding)?;
-            if (IndexMutator.insert(pager, root, entry, record.view(), order, 0)? is Some(split)) {
-                // The root split: its left half moves to a new page, and the root becomes their parent.
-                let left = pager.allocatePage()?;
-                let content = pager.copy(root)?;
-                pager.write(left)?.copyFrom(content.view());
-                var cells = Vector<Vector<u8>>.create();
-                var divider = Vector<u8>.withCapacity(split.promoted.length + 4)?;
-                divider.pushBE(left)?;
-                divider.extend(split.promoted.view())?;
-                cells.push(divider)?;
-                IndexMutator.writePage(pager, root, PAGE_INTERIOR_INDEX, cells.view(), split.rightPage)?;
-            }
+            IndexMutator.insertFromRoot(pager, root, entry, order)?;
         }
         return Ok(true);
     }

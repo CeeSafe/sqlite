@@ -342,6 +342,102 @@ fn insertsIntoAnIndexSplitItsPages() -> Result<void, TestFailure> {
     return Ok();
 }
 
+/// Row `id`'s label in `removesFromAnIndexInPlace`: every fifth long enough for overflow pages at 512 bytes.
+fn paddedLabel(id: i64) -> String {
+    var label = labelOf(id);
+    if (id % 5 == 0) {
+        for (k in 0..truncate<usize>(id % 90)) {
+            label.append(" padding")!;
+        }
+    }
+    return label;
+}
+
+/// Removes row `id` of `t` and its entry in `t_label`; when the index declines the removal it is rebuilt from
+/// the rows not in `gone`, as the executor rebuilds it. Whether it was done in place.
+fn removeRow(
+    pager: borrow mut WritablePager,
+    table: u32,
+    index: u32,
+    id: i64,
+    gone: borrow mut Vector<bool>,
+    order: borrow IndexOrder,
+) -> bool {
+    var one = Vector<TableOp>.create();
+    removal(mut one, id);
+    TableMutator.applyBatch(pager, table, one.view())!;
+    gone[truncate<usize>(id)] = true;
+    var ops = Vector<IndexOp>.create();
+    ops.push(IndexOp { entry: entryOf(SqliteValue.text(paddedLabel(id).view())!, id), remove: true })!;
+    if (IndexMutator.applyBatch(pager, index, ops.view(), order)!) {
+        return true;
+    }
+    var entries = Vector<Vector<SqliteValue>>.create();
+    for (k in 1i64..truncate<i64>(gone.length)) {
+        if (!gone[truncate<usize>(k)]) {
+            entries.push(entryOf(SqliteValue.text(paddedLabel(k).view())!, k))!;
+        }
+    }
+    rebuildFrom(pager, index, mut entries, order);
+    return false;
+}
+
+@test
+fn removesFromAnIndexInPlace() -> Result<void, TestFailure> {
+    // An entry in an interior page is replaced by the one before it, and a leaf left empty leaves the tree, as in
+    // SQLite's b-tree; the C# engine, and this one before, rebuilt the whole index from its table instead.
+    let path = "out/mutate-index-shrink.db";
+    makeDatabase(
+        path,
+        "PRAGMA page_size = 512; CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER, label TEXT COLLATE NOCASE); CREATE INDEX t_label ON t(label); WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 3000) INSERT INTO t SELECT i, i, 'label ' || i || CASE WHEN i % 5 = 0 AND i % 90 > 0 THEN replace(printf('%.*c', i % 90, 'x'), 'x', ' padding') ELSE '' END FROM c;",
+    )?;
+    let table = rootOfTable(path, "t");
+    let index = rootOfIndex(path, "t_label");
+    let order = orderOf(Collation.NoCase, false);
+    var gone = Vector<bool>.create();
+    gone.resize(3001, false)!;
+    var pager = WritablePager.open(path)!;
+    // All but every fiftieth row, in no order, one at a time.
+    var declined: u64 = 0;
+    var removed: u64 = 0;
+    for (step in 0i64..3000) {
+        let id = (step * 7919) % 3000 + 1;
+        if (id % 50 != 0) {
+            removed += 1;
+            if (!removeRow(mut pager, table, index, id, mut gone, order)) {
+                declined += 1;
+            }
+        }
+    }
+    commitAndRead(mut pager);
+    expectIntact(path)?;
+    Check.equalText("60|91500\n", askSqlite(path, "SELECT count(*), sum(id) FROM t INDEXED BY t_label WHERE label > ''")?.view())?;
+    // Only shapes SQLite's balance would fix are declined: an interior page that would be left with no cell, or an
+    // entry before that would not fit where the removed one was.
+    Check.isTrue(declined * 100 < removed, "fewer than one removal in a hundred rebuilds the index")?;
+    // Then the rest: the tree shrinks to its root.
+    for (k in 1i64..61) {
+        let _ = removeRow(mut pager, table, index, k * 50, mut gone, order);
+    }
+    commitAndRead(mut pager);
+    expectIntact(path)?;
+    Check.equalText("0\n", askSqlite(path, "SELECT count(*) FROM t INDEXED BY t_label WHERE label > ''")?.view())?;
+    // The emptied index takes entries again.
+    for (id in 1i64..1001) {
+        let label = paddedLabel(id);
+        var one = Vector<TableOp>.create();
+        upsert(mut one, id, id, label.view());
+        TableMutator.applyBatch(mut pager, table, one.view())!;
+        var ops = Vector<IndexOp>.create();
+        ops.push(IndexOp { entry: entryOf(SqliteValue.text(label.view())!, id), remove: false })!;
+        let _ = IndexMutator.applyBatch(mut pager, index, ops.view(), order)!;
+    }
+    commitAndRead(mut pager);
+    expectIntact(path)?;
+    Check.equalText("1000|500500\n", askSqlite(path, "SELECT count(*), sum(id) FROM t INDEXED BY t_label WHERE label > ''")?.view())?;
+    return Ok();
+}
+
 @test
 fn rollbackForgetsAndUnsupportedFilesAreRefused() -> Result<void, TestFailure> {
     let path = "out/mutate-rollback.db";
