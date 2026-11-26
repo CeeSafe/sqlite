@@ -54,6 +54,68 @@ struct Record {
         return Ok(values);
     }
 
+    /// `decodeMasked` into `out`, whose values the last row left: a text column whose value there is a text gets
+    /// its bytes written into that text's room, so a scan does not allocate for each row once it is under way.
+    fn decodeMaskedInto(
+        payload: Slice<u8>,
+        encoding: TextEncoding,
+        wanted: Slice<bool>,
+        out: borrow mut Vector<SqliteValue>,
+    ) -> Result<void, SqliteError> {
+        let header = Varint.read(payload, 0)?;
+        let headerLength = checkedTruncate<usize>(header.value) ?? {
+            return Err(corrupt("record header length is negative"));
+        };
+        if (headerLength > payload.length) {
+            return Err(corrupt("record header runs past the payload"));
+        }
+        var columnCount: usize = 0;
+        var p = header.length;
+        while (p < headerLength) {
+            p += Varint.read(payload, p)?.length;
+            columnCount += 1;
+        }
+        out.truncate(columnCount);
+        while (out.length < columnCount) {
+            out.push(SqliteValue.Null)?;
+        }
+        var headerPos = header.length;
+        var bodyPos = headerLength;
+        for (i in 0..columnCount) {
+            let serial = Varint.read(payload, headerPos)?;
+            headerPos += serial.length;
+            let size = Record.serialTypeSize(serial.value);
+            if (bodyPos + size > payload.length) {
+                return Err(corrupt("record body runs past the payload"));
+            }
+            if (wanted.length != 0 && (i >= wanted.length || !wanted[i])) {
+                out[i] = SqliteValue.Null;
+            } else {
+                Record.readValueInto(payload[bodyPos..bodyPos + size], serial.value, encoding, mut out[i])?;
+            }
+            bodyPos += size;
+        }
+        return Ok();
+    }
+
+    /// `readValue` into `target`: UTF-8 text into the room of the text `target` holds, when it holds one.
+    fn readValueInto(
+        body: Slice<u8>,
+        serialType: i64,
+        encoding: TextEncoding,
+        target: borrow mut SqliteValue,
+    ) -> Result<void, SqliteError> {
+        if (serialType >= 13 && serialType % 2 == 1 && encoding == TextEncoding.Utf8) {
+            if (target is SqliteValue.Text(text)) {
+                text.clear();
+                text.appendBytes(body)?;
+                return Ok();
+            }
+        }
+        target = Record.readValue(body, serialType, encoding)?;
+        return Ok();
+    }
+
     /// The number of body bytes a serial type takes.
     fn serialTypeSize(serialType: i64) -> usize => match (serialType) {
         0 | 8 | 9 | 10 | 11 => 0,

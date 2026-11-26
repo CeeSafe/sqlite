@@ -1002,6 +1002,17 @@ fn callFunction(
         }
         _ => {}
     }
+    // length() of a column or a parameter reads it where it is: a text is not copied to count its characters.
+    if (call.function is ScalarFunction.Length && args.length == 1 && db.textEncoding() == TextEncoding.Utf8) {
+        if (heldValue(borrow args[0], frame) is Some(x)) {
+            return match (x) {
+                SqliteValue.Null => Ok(SqliteValue.Null),
+                SqliteValue.Blob(b) => Ok(SqliteValue.Integer(truncate<i64>(b.length))),
+                SqliteValue.Text(t) => Ok(SqliteValue.Integer(textLength(t.bytes()))),
+                other => Ok(SqliteValue.Integer(textLength(valueText(other)?.bytes()))),
+            };
+        }
+    }
     var values = Vector<SqliteValue>.withCapacity(args.length)?;
     for (i in 0..args.length) {
         values.push(evaluate(borrow args[i], frame, db)?)?;

@@ -85,6 +85,45 @@ fn loadTableRow(
     return Ok();
 }
 
+/// `loadTableRow` from `record`, leaving in it the values the slot had: their room (a text's bytes) is used again
+/// for the next row (`RowCursor.nextInto`), so a scan does not allocate for each row.
+fn loadTableRowInto(
+    plan: borrow TablePlan,
+    rowId: i64,
+    record: borrow mut Vector<SqliteValue>,
+    slot: borrow mut Slot,
+) -> Result<void, AllocError> {
+    let n = plan.recordPosition.length;
+    slot.values.truncate(n);
+    while (slot.values.length < n) {
+        slot.values.push(SqliteValue.Null)?;
+    }
+    for (c in 0..n) {
+        if (plan.rowidAlias == Some(c)) {
+            slot.values[c] = SqliteValue.Integer(rowId);
+            continue;
+        }
+        match (plan.recordPosition[c]) {
+            Some(at) => {
+                if (at < record.length) {
+                    // Each takes the other's value: the record keeps the old one's room for the next row.
+                    let fresh = replace(mut record[at], SqliteValue.Null);
+                    record[at] = replace(mut slot.values[c], fresh);
+                } else {
+                    slot.values[c] = plan.defaults[c].clone()?;
+                }
+            }
+            null => { slot.values[c] = SqliteValue.Null; }
+        }
+        if (plan.realColumns[c] && slot.values[c] is SqliteValue.Integer(i)) {
+            slot.values[c] = SqliteValue.Real(round<f64>(i));
+        }
+    }
+    slot.rowId = rowId;
+    slot.isNull = false;
+    return Ok();
+}
+
 /// Evaluates VIRTUAL generated columns for the row in `slot`.
 fn computeGenerated(
     plan: borrow TablePlan,
@@ -291,15 +330,17 @@ fn joinLevel(
                 cursor = RowCursor.Rows(TableCursor.range(table.root, rowId, rowId));
             }
             var ordinal: usize = 0;
+            // The record each row is decoded into: it keeps the room of the values the slot let go.
+            var record = Vector<SqliteValue>.create();
             loop {
                 if (sink.stopAfter is Some(n) && sink.rows.length >= n) {
                     return Ok();
                 }
-                let Some(row) = cursor.next(db.pagerOf(table.database))? else {
+                let Some(rowId) = cursor.nextInto(db.pagerOf(table.database), mut record)? else {
                     break;
                 };
                 ordinal += 1;
-                loadTableRow(table, row.rowId, row.columns, mut frame.slots[source.slot])?;
+                loadTableRowInto(table, rowId, mut record, mut frame.slots[source.slot])?;
                 if (table.generated.length != 0) {
                     computeGenerated(table, source.slot, frame, db)?;
                 }
@@ -976,6 +1017,25 @@ impl RowCursor {
             IndexCursor.create(table.root, IndexRange.all(IndexOrder.plain()), false),
         )
             else RowCursor.Rows(TableCursor.scan(table.root));
+
+    /// The next row's rowid (0 in a WITHOUT ROWID table), its record decoded into `record`, whose values the last
+    /// row left; `null` after the last.
+    fn nextInto(
+        borrow mut this,
+        pager: borrow mut WritablePager,
+        record: borrow mut Vector<SqliteValue>,
+    ) -> Result<i64?, SqliteError> {
+        match (this) {
+            RowCursor.Rows(cursor) => { return cursor.nextInto(pager, record); }
+            RowCursor.Keys(cursor) => {
+                let Some(entry) = cursor.next(pager)? else {
+                    return Ok(null);
+                };
+                record = entry;
+                return Ok(0);
+            }
+        }
+    }
 
     fn next(borrow mut this, pager: borrow mut WritablePager) -> Result<CursorRow?, SqliteError> {
         match (this) {
