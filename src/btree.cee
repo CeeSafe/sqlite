@@ -199,10 +199,13 @@ struct CursorFrame {
     index: usize;
 }
 
-/// A leaf cell a cursor stands on: its page, and where in the page it is.
+/// A leaf cell a cursor stands on, parsed once: where it is in the leaf on top of the cursor's stack (which stays
+/// there until the cursor moves), its rowid, and where its payload starts and how long it is.
 struct LeafCellAt {
-    page: Page;
     offset: usize;
+    rowId: i64;
+    payloadLength: i64;
+    payloadOffset: usize;
 }
 
 /// A row's rowid and record bytes: all `total` of them, or only those in its page when `complete` is false.
@@ -256,12 +259,15 @@ struct TableCursor {
         return Ok(me);
     }
 
+    /// The leaf the cursor stands in: the top of its stack, there until the cursor moves.
+    private fn leafBytes(borrow this) -> Slice<u8> => this.stack[this.stack.length - 1].page.view();
+
     /// The next row, or `null` after the last.
     fn next<P: PageSource>(borrow mut this, pager: borrow mut P) -> Result<TableRow?, SqliteError> {
         let Some(cell) = this.nextCell(pager)? else {
             return Ok(null);
         };
-        return Ok(readTableLeafRow(pager, cell.page.view(), cell.offset, this.wanted.view())?);
+        return Ok(readTableLeafRow(pager, this.leafBytes(), cell.offset, this.wanted.view())?);
     }
 
     /// The next row's rowid, its record decoded into `record` (`readTableLeafRowInto`); `null` after the last.
@@ -273,7 +279,7 @@ struct TableCursor {
         let Some(cell) = this.nextCell(pager)? else {
             return Ok(null);
         };
-        return Ok(readTableLeafRowInto(pager, cell.page.view(), cell.offset, this.wanted.view(), record)?);
+        return Ok(readTableLeafRowInto(pager, this.leafBytes(), cell.offset, this.wanted.view(), record)?);
     }
 
     /// Moves to the next row and gives its rowid, decoding nothing; `null` after the last. `decodeCurrent` then
@@ -284,7 +290,7 @@ struct TableCursor {
             this.current = null;
             return Ok(null);
         };
-        let rowId = TableLeafCell.parse(cell.page.view(), cell.offset)?.rowId;
+        let rowId = cell.rowId;
         this.current = cell;
         return Ok(rowId);
     }
@@ -297,13 +303,21 @@ struct TableCursor {
         wanted: Slice<bool>,
         record: borrow mut Vector<SqliteValue>,
     ) -> Result<usize, SqliteError> {
-        let Some(at) = borrow this.current else {
+        let Some(cell) = borrow this.current else {
             return Err(sqlError("a row is decoded before the cursor reached one"));
         };
-        let page = at.page.view();
-        let cell = TableLeafCell.parse(page, at.offset)?;
-        let shape = PayloadShape.ofTableLeaf(pager, cell.payloadLength)?;
+        let page = this.leafBytes();
         let encoding = pager.textEncoding();
+        // A payload that fits in its cell, as nearly every row's does: no shape to work out.
+        let maxLocal = pager.usableSize() - 35;
+        if (cell.payloadLength >= 0 && cell.payloadLength <= truncate<i64>(maxLocal)) {
+            let end = cell.payloadOffset + truncate<usize>(cell.payloadLength);
+            if (end > page.length) {
+                return Err(corrupt("a cell runs past the end of its page"));
+            }
+            return Record.decodeSomeInto(page[cell.payloadOffset..end], encoding, wanted, record);
+        }
+        let shape = PayloadShape.ofTableLeaf(pager, cell.payloadLength)?;
         if (shape.isLocal()) {
             if (cell.payloadOffset + shape.total > page.length) {
                 return Err(corrupt("a cell runs past the end of its page"));
@@ -325,7 +339,7 @@ struct TableCursor {
         let Some(at) = this.nextCell(pager)? else {
             return Ok(null);
         };
-        let page = at.page.view();
+        let page = this.leafBytes();
         let cell = TableLeafCell.parse(page, at.offset)?;
         let shape = PayloadShape.ofTableLeaf(pager, cell.payloadLength)?;
         if (cell.payloadOffset + shape.local > page.length) {
@@ -374,15 +388,21 @@ struct TableCursor {
             let index = this.stack[top].index;
             this.stack[top].index = index + 1;
             if (this.stack[top].header.isLeaf()) {
-                let page = this.stack[top].page.clone();
-                let bytes = page.view();
+                let bytes = this.stack[top].page.view();
                 let offset = this.stack[top].header.cellOffset(bytes, index)?;
                 let cell = TableLeafCell.parse(bytes, offset)?;
                 if (cell.rowId > this.max) {
                     this.stack.clear();
                     return Ok(null);
                 }
-                return Ok(LeafCellAt { page: page, offset: offset });
+                return Ok(
+                    LeafCellAt {
+                        offset: offset,
+                        rowId: cell.rowId,
+                        payloadLength: cell.payloadLength,
+                        payloadOffset: cell.payloadOffset,
+                    },
+                );
             }
             var child = this.stack[top].header.rightMost;
             if (index < this.stack[top].header.cellCount) {
@@ -412,8 +432,7 @@ struct TableCursor {
             this.stack[top].index -= 1;
             let index = this.stack[top].index;
             if (this.stack[top].header.isLeaf()) {
-                let page = this.stack[top].page.clone();
-                let bytes = page.view();
+                let bytes = this.stack[top].page.view();
                 let offset = this.stack[top].header.cellOffset(bytes, index)?;
                 let cell = TableLeafCell.parse(bytes, offset)?;
                 if (cell.rowId < this.min) {
@@ -423,7 +442,14 @@ struct TableCursor {
                 if (cell.rowId > this.max) {
                     continue;
                 }
-                return Ok(LeafCellAt { page: page, offset: offset });
+                return Ok(
+                    LeafCellAt {
+                        offset: offset,
+                        rowId: cell.rowId,
+                        payloadLength: cell.payloadLength,
+                        payloadOffset: cell.payloadOffset,
+                    },
+                );
             }
             var child = this.stack[top].header.rightMost;
             let bytes = this.stack[top].page.view();

@@ -27,6 +27,12 @@ struct Varint {
                 );
             }
         }
+        return Varint.readLong(buf, offset);
+    }
+
+    /// `read` past its one- and two-byte forms, in a function of its own so that `read` stays small enough for the C
+    /// compiler to inline.
+    fn readLong(buf: Slice<u8>, offset: usize) -> Result<VarintRead, SqliteError> {
         var result: u64 = 0;
         for (i in 0..9) {
             if (offset + i >= buf.length) {
