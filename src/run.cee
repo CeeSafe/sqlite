@@ -9,6 +9,11 @@ struct CoreSink {
     groupIndex: HashMap<Vector<u8>, usize>;
     /// Stop once this many rows are kept: a query with LIMIT and nothing that needs every row.
     stopAfter: usize?;
+    /// A query with ORDER BY and LIMIT: only this many rows (LIMIT and OFFSET) are kept, the first in the order;
+    /// the others are let go as they are found, as SQLite's sorter does with a LIMIT.
+    keepFirst: usize?;
+    /// How many rows have arrived (`SortedRow.arrival`).
+    arrived: usize;
     /// A core with window functions: its rows, kept until the windows are computed.
     windowRows: Vector<WindowRow>;
     /// For each RIGHT JOIN source: which of its rows (by their place in its scan) matched.
@@ -561,9 +566,24 @@ fn projectRow(
             keys.push(evaluate(borrow core.sortKeys[k].expr, frame, db)?)?;
         }
     }
-    sink.rows.push(SortedRow { values: values, keys: keys })?;
+    sink.rows.push(SortedRow { values: values, keys: keys, arrival: sink.arrived })?;
+    sink.arrived += 1;
+    if (sink.keepFirst is Some(keep) && sink.rows.length >= 2 * keep + 64) {
+        sortRows(mut sink.rows, core.sortKeys.view(), db.textEncoding());
+        sink.rows.truncate(keep);
+    }
     return Ok();
 }
+
+/// Sorts rows by their ORDER BY keys, rows with equal keys in the order they came.
+fn sortRows(rows: borrow mut Vector<SortedRow>, terms: Slice<XOrderTerm>, encoding: TextEncoding) {
+    rows.sortBy(
+        (x, y) => thenInOrder(compareKeys(x.keys.view(), y.keys.view(), terms, encoding), x.arrival, y.arrival),
+    );
+}
+
+/// `c`, or when it is 0 the order of `a` and `b`: a comparison made stable by the order elements came in.
+fn thenInOrder(c: i32, a: usize, b: usize) -> i32 => if (c != 0) c else if (a < b) -1 else if (a > b) 1 else 0;
 
 /// Runs one core.
 fn runCore(
@@ -582,6 +602,9 @@ fn runCore(
             core,
         )) null
             else stopAfter,
+        keepFirst: if (core.sortKeys.length != 0 && !core.isAggregate && core.windows.length == 0) stopAfter
+            else null,
+        arrived: 0,
         windowRows: Vector<WindowRow>.create(),
         rightMatched: Vector<Vector<bool>>.create(),
         groupReached: Vector<bool>.create(),
@@ -623,7 +646,7 @@ fn runCore(
         }
         let collations = core.groupCollations.view();
         let encoding = db.textEncoding();
-        order.sortStableBy((a, b) => {
+        order.sortBy((a, b) => {
             for (k in 0..collations.length) {
                 let c = compareForOrder(
                     borrow groups[a].key[k],
@@ -637,7 +660,7 @@ fn runCore(
                     return c;
                 }
             }
-            return 0;
+            return thenInOrder(0, *a, *b);
         });
         var sorted = Vector<GroupState>.withCapacity(groups.length)?;
         for (i in 0..order.length) {
@@ -739,8 +762,7 @@ fn runSelect(
         if (core.sortKeys.length != 0) {
             let terms = core.sortKeys.view();
             // Stable, as SQLite's sorter is: rows with equal keys stay in the order they came.
-            let encoding = db.textEncoding();
-            rows.sortStableBy((x, y) => compareKeys(x.keys.view(), y.keys.view(), terms, encoding));
+            sortRows(mut rows, terms, db.textEncoding());
         }
         var out = Vector<Vector<SqliteValue>>.withCapacity(rows.length)?;
         var index: usize = 0;

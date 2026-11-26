@@ -177,8 +177,12 @@ fn computeWindow(
         order.push(r)?;
     }
     let encoding = db.textEncoding();
-    order.sortStableBy(
-        (a, b) => compareWindowRows(spec, borrow rows[a].inputs[w], borrow rows[b].inputs[w], encoding),
+    order.sortBy(
+        (a, b) => thenInOrder(
+            compareWindowRows(spec, borrow rows[a].inputs[w], borrow rows[b].inputs[w], encoding),
+            *a,
+            *b,
+        ),
     );
     let offsets = frameOffsets(spec, frame, db)?;
     var collations = Vector<Collation>.withCapacity(spec.orderBy.length)?;

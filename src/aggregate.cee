@@ -281,7 +281,9 @@ struct Accumulator {
         }
         let terms = spec.orderBy.view();
         let encoding = db.textEncoding();
-        order.sortStableBy((a, b) => compareKeys(kept[a].keys.view(), kept[b].keys.view(), terms, encoding));
+        order.sortBy(
+            (a, b) => thenInOrder(compareKeys(kept[a].keys.view(), kept[b].keys.view(), terms, encoding), *a, *b),
+        );
         var args = Vector<XExpr>.withCapacity(spec.args.length)?;
         for (k in 0..spec.args.length) {
             args.push(XExpr.Column(spec.replaySlot, k))?;

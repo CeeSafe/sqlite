@@ -136,6 +136,28 @@ fn expressionsWithoutTables() -> Result<void, TestFailure> {
 }
 
 @test
+fn sortsWithALimitKeepingOnlyTheFirstRows() -> Result<void, TestFailure> {
+    // With ORDER BY and LIMIT only LIMIT + OFFSET rows are kept as the rows come, the others let go; keys repeat,
+    // so the rows that tie must still come out in the order they were found, as SQLite's sorter gives them.
+    let path = "out/query-sort-limit.db";
+    makeDatabase(
+        path,
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, s TEXT); WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 5000) INSERT INTO t SELECT i, (i * 7919) % 13, CASE WHEN i % 9 = 0 THEN NULL ELSE 'v' || ((i * 31) % 97) END FROM c;",
+    )?;
+    return sameAnswers(path, """
+        SELECT id, k FROM t ORDER BY k LIMIT 10
+        SELECT id, k FROM t ORDER BY k DESC LIMIT 7 OFFSET 900
+        SELECT id, s FROM t ORDER BY s LIMIT 20 OFFSET 400
+        SELECT id, s FROM t ORDER BY s DESC, k LIMIT 15 OFFSET 2000
+        SELECT id FROM t ORDER BY k, s LIMIT 0
+        SELECT id FROM t ORDER BY k LIMIT 3 OFFSET 4998
+        SELECT id FROM t WHERE k > 6 ORDER BY s NULLS LAST LIMIT 12 OFFSET 300
+        SELECT DISTINCT s FROM t ORDER BY s LIMIT 5 OFFSET 30
+        SELECT id, s FROM t ORDER BY s
+    """);
+}
+
+@test
 fn selectsFromTables() -> Result<void, TestFailure> {
     let path = "out/query-tables.db";
     makeDatabase(path, QUERY_FIXTURE)?;

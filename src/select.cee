@@ -134,6 +134,8 @@ enum CtePlan {
 struct SortedRow {
     values: Vector<SqliteValue>;
     keys: Vector<SqliteValue>;
+    /// The order the row came in: rows with equal keys stay in it, as SQLite's sorter keeps them.
+    arrival: usize;
 }
 
 // ── compilation ──────────────────────────────────────────────────────────────────────────────────────────────
