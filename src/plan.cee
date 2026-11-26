@@ -2195,6 +2195,22 @@ fn seekLevel(
     var cursor = SeekCursor.Done;
     // The entry each index entry is decoded into: it keeps the room of the values the slot let go.
     var entry = Vector<SqliteValue>.create();
+    // Rows made from the entries alone need only the entry columns the covering map places, and the rowid after
+    // the key columns.
+    var entryWanted = Vector<bool>.create();
+    if (!table.withoutRowid) {
+        if (borrow seek.covering is Some(map)) {
+            entryWanted.resize(seek.columns.length + 1, false)?;
+            entryWanted[seek.columns.length] = true;
+            for (c in 0..map.length) {
+                if (map[c] is Some(at)) {
+                    if (at < seek.columns.length) {
+                        entryWanted[at] = true;
+                    }
+                }
+            }
+        }
+    }
     loop {
         if (sink.stopAfter is Some(n) && sink.rows.length >= n) {
             return Ok();
@@ -2204,7 +2220,13 @@ fn seekLevel(
                 break;
             }
             cursor = match (replace(mut ranges[r], SeekRange.Rowids(1, 0))) {
-                SeekRange.Entries(range) => SeekCursor.Entries(IndexCursor.create(seek.root, range, seek.backwards)),
+                SeekRange.Entries(range) => SeekCursor.Entries(
+                    IndexCursor.create(
+                        seek.root,
+                        range,
+                        seek.backwards,
+                    ).withEntryColumns(cloneBools(borrow entryWanted)?),
+                ),
                 SeekRange.Rowids(min, max) => SeekCursor.Rowids(
                     if (seek.backwards) TableCursor.range(table.root, min, max).walkingBackwards()
                         else TableCursor.range(table.root, min, max),
@@ -2276,6 +2298,12 @@ fn nextSeekRow(
             return Ok(true);
         }
     }
+}
+
+fn cloneBools(v: borrow Vector<bool>) -> Result<Vector<bool>, AllocError> {
+    var out = Vector<bool>.withCapacity(v.length)?;
+    out.extend(v.view())?;
+    return Ok(out);
 }
 
 /// Makes a row from an index entry: the columns the map places, the rowid alias from the entry's rowid, a REAL

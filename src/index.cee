@@ -74,6 +74,21 @@ struct IndexRange {
     });
 
     /// Whether `entry` is not before the low key. True for a suffix of the entries.
+    /// Whether the range leaves any entry out: an empty key that includes its end bounds nothing.
+    fn bounds(borrow this) -> bool {
+        if (borrow this.min is Some(key)) {
+            if (key.length != 0 || !this.minInclusive) {
+                return true;
+            }
+        }
+        if (borrow this.max is Some(key)) {
+            if (key.length != 0 || !this.maxInclusive) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     fn satisfiesLow(borrow this, entry: Slice<SqliteValue>) -> bool {
         if (borrow this.min is Some(key)) {
             let c = this.order.comparePrefix(entry, key.view());
@@ -146,6 +161,33 @@ fn indexEntryInto<P: PageSource>(
     }
     let payload = readOverflowPayload(pager, page, start, shape)?;
     return Record.decodeMaskedInto(payload.view(), encoding, [], out);
+}
+
+/// `indexEntryInto` of only the columns `wanted` marks (`Record.decodeSomeInto`); the others are left as they were.
+fn indexEntrySomeInto<P: PageSource>(
+    pager: borrow mut P,
+    page: Slice<u8>,
+    header: borrow BTreePageHeader,
+    index: usize,
+    wanted: Slice<bool>,
+    out: borrow mut Vector<SqliteValue>,
+) -> Result<void, SqliteError> {
+    let cellOffset = header.cellOffset(page, index)?;
+    let offset = if (header.isLeaf()) cellOffset else cellOffset + 4;
+    let length = Varint.read(page, offset)?;
+    let shape = PayloadShape.ofIndex(pager, length.value)?;
+    let start = offset + length.length;
+    let encoding = pager.textEncoding();
+    if (shape.isLocal()) {
+        if (start + shape.total > page.length) {
+            return Err(corrupt("a cell runs past the end of its page"));
+        }
+        let _ = Record.decodeSomeInto(page[start..start + shape.total], encoding, wanted, out)?;
+        return Ok();
+    }
+    let payload = readOverflowPayload(pager, page, start, shape)?;
+    let _ = Record.decodeSomeInto(payload.view(), encoding, wanted, out)?;
+    return Ok();
 }
 
 /// The child of an interior index page before cell `index`; `cellCount` names the right-most child.
@@ -233,6 +275,16 @@ struct IndexCursor {
     private backwards: bool;
     private stack: Vector<IndexFrame>;
     private started: bool;
+    /// The columns of an entry to decode, when the range has no bound (which would read the key); empty for all.
+    private entryWanted: Vector<bool>;
+
+    /// Decodes only the entry columns `wanted` marks when the range has no bound; the others are left as they
+    /// were. For a scan whose rows are made from the entries alone (`IndexSeek.covering`).
+    fn withEntryColumns(this, wanted: Vector<bool>) -> IndexCursor {
+        var me = this;
+        me.entryWanted = wanted;
+        return me;
+    }
 
     /// A cursor over the entries of the index rooted at `rootPage` that lie in `range`; `backwards` gives them
     /// last first.
@@ -242,6 +294,7 @@ struct IndexCursor {
         backwards: backwards,
         stack: Vector<IndexFrame>.create(),
         started: false,
+        entryWanted: Vector<bool>.create(),
     };
 
     /// The next entry (the indexed columns, then the rowid), or `null` after the last.
@@ -297,6 +350,18 @@ struct IndexCursor {
                 continue;
             }
             let cell = if (leaf) step else step / 2;
+            if (this.entryWanted.length != 0 && !this.range.bounds()) {
+                // No bound reads the key: only the columns wanted are decoded, and every entry is in the range.
+                indexEntrySomeInto(
+                    pager,
+                    this.stack[top].frame.page.view(),
+                    this.stack[top].frame.header,
+                    cell,
+                    this.entryWanted.view(),
+                    entry,
+                )?;
+                return Ok(true);
+            }
             indexEntryInto(pager, this.stack[top].frame.page.view(), this.stack[top].frame.header, cell, entry)?;
             // Walking forwards, the entries satisfying the high bound are a prefix, so the first that does not
             // ends the walk; backwards, the same holds of the low bound.
