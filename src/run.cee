@@ -58,7 +58,10 @@ fn loadTableRow(
     record: Vector<SqliteValue>,
     slot: borrow mut Slot,
 ) -> Result<void, AllocError> {
-    var values = Vector<SqliteValue>.withCapacity(plan.recordPosition.length)?;
+    // Into the slot's own vector, whose room the last row left: no new one each row.
+    var values = replace(mut slot.values, Vector<SqliteValue>.create());
+    values.clear();
+    values.reserve(plan.recordPosition.length)?;
     var stored = record;
     for (c in 0..plan.recordPosition.length) {
         var v = SqliteValue.Null;

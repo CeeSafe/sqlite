@@ -445,6 +445,29 @@ fn compareOp(
     });
 }
 
+/// The value `expr` stands for when it is one held already, a column of a row in the frame, a parameter or a
+/// constant: borrowed where it is rather than copied. Null for anything to be worked out, and for a column of
+/// a row made NULL (by an outer join), which `evaluate` gives.
+fn heldValue(expr: borrow XExpr, frame: borrow Frame) -> borrow(frame, expr) SqliteValue? {
+    match (expr) {
+        XExpr.Value(v) => { return v; }
+        XExpr.Column(slot, column) => {
+            let s = borrow frame.slots[*slot];
+            if (s.isNull || *column >= s.values.length) {
+                return null;
+            }
+            return borrow s.values[*column];
+        }
+        XExpr.Param(index) => {
+            if (*index < frame.params.length) {
+                return borrow frame.params[*index];
+            }
+            return null;
+        }
+        _ => { return null; }
+    }
+}
+
 fn evaluateCompare(
     c: borrow XCompare,
     frame: borrow mut Frame,
@@ -452,6 +475,21 @@ fn evaluateCompare(
 ) -> Result<SqliteValue, SqliteError> {
     if (borrow c.left is XExpr.RowValue(lefts)) {
         return evaluateRowCompare(c, lefts.view(), frame, db);
+    }
+    let encoding = db.textEncoding();
+    // An operand held already is compared where it is: a column's text is not copied for each row. Held
+    // operands have no effects, so working the other out first changes nothing.
+    if (heldValue(borrow c.left, frame).isSome()) {
+        let b = evaluate(borrow c.right, frame, db)?;
+        if (heldValue(borrow c.left, frame) is Some(a)) {
+            return Ok(boolValue(compareOp(c.op, a, borrow b, c.affinity, c.collation, encoding)?));
+        }
+    }
+    if (heldValue(borrow c.right, frame).isSome()) {
+        let a = evaluate(borrow c.left, frame, db)?;
+        if (heldValue(borrow c.right, frame) is Some(b)) {
+            return Ok(boolValue(compareOp(c.op, borrow a, b, c.affinity, c.collation, encoding)?));
+        }
     }
     let a = evaluate(borrow c.left, frame, db)?;
     let b = evaluate(borrow c.right, frame, db)?;
@@ -557,7 +595,9 @@ fn evaluateIn(i: borrow XIn, frame: borrow mut Frame, db: borrow mut Session) ->
 }
 
 fn evaluateLike(l: borrow XLike, frame: borrow mut Frame, db: borrow mut Session) -> Result<SqliteValue, SqliteError> {
-    let x = evaluate(borrow l.operand, frame, db)?;
+    // A subject held already (a column) is matched where it is; it has no effects, so it may be read last.
+    let held = heldValue(borrow l.operand, frame).isSome();
+    let x = if (held) SqliteValue.Null else evaluate(borrow l.operand, frame, db)?;
     let pattern = evaluate(borrow l.pattern, frame, db)?;
     var escape: u32? = null;
     if (borrow l.escape is Some(e)) {
@@ -573,14 +613,43 @@ fn evaluateLike(l: borrow XLike, frame: borrow mut Frame, db: borrow mut Session
         }
         escape = first;
     }
+    if (held) {
+        if (heldValue(borrow l.operand, frame) is Some(subject)) {
+            return likeOn(l, subject, borrow pattern, escape);
+        }
+    }
+    return likeOn(l, borrow x, borrow pattern, escape);
+}
+
+/// `x LIKE pattern` (or GLOB) on two values: a text is read as its bytes, anything else as its text.
+fn likeOn(
+    l: borrow XLike,
+    x: borrow SqliteValue,
+    pattern: borrow SqliteValue,
+    escape: u32?,
+) -> Result<SqliteValue, SqliteError> {
     if (x.isNull() || pattern.isNull()) {
         return Ok(SqliteValue.Null);
     }
-    let subject = valueText(borrow x)?;
-    let p = valueText(borrow pattern)?;
+    var subjectText = ByteString.create();
+    let subject = match (x) {
+        SqliteValue.Text(t) => t.bytes(),
+        _ => {
+            subjectText = valueText(x)?;
+            subjectText.bytes()
+        }
+    };
+    var patternText = ByteString.create();
+    let p = match (pattern) {
+        SqliteValue.Text(t) => t.bytes(),
+        _ => {
+            patternText = valueText(pattern)?;
+            patternText.bytes()
+        }
+    };
     let matched = match (l.op) {
-        LikeOp.Like => likeMatch(p.bytes(), subject.bytes(), escape),
-        LikeOp.Glob => globMatch(p.bytes(), subject.bytes()),
+        LikeOp.Like => likeMatch(p, subject, escape),
+        LikeOp.Glob => globMatch(p, subject),
         LikeOp.Match => { return Err(sqlError("unable to use function MATCH in the requested context")); },
         LikeOp.Regexp => { return Err(sqlError("no such function: REGEXP")); },
     };
