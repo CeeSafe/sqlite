@@ -136,6 +136,33 @@ fn expressionsWithoutTables() -> Result<void, TestFailure> {
 }
 
 @test
+fn whereTermsAreCheckedInTheOutermostLoopTheyCan() -> Result<void, TestFailure> {
+    // A term reading only the outer tables turns a row away before the inner loops run for it; one reading a
+    // LEFT JOIN's right side, or any source of a RIGHT or FULL JOIN, still waits for the whole row.
+    let path = "out/query-where-levels.db";
+    makeDatabase(
+        path,
+        "CREATE TABLE a(id INTEGER PRIMARY KEY, x, g); CREATE TABLE b(id INTEGER PRIMARY KEY, a_id, y); CREATE TABLE c(id INTEGER PRIMARY KEY, b_id, z); WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 60) INSERT INTO a SELECT i, i % 7, CASE WHEN i % 5 = 0 THEN NULL ELSE i % 3 END FROM n; INSERT INTO b SELECT id, id % 50, id % 4 FROM a WHERE id <= 45; INSERT INTO c SELECT id, id % 30, CASE WHEN id % 6 = 0 THEN NULL ELSE id END FROM a WHERE id <= 40;",
+    )?;
+    return sameAnswers(path, """
+        SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id WHERE a.x = 3 AND b.y > 0 ORDER BY 1, 2
+        SELECT a.id, b.id, c.id FROM a, b, c WHERE c.b_id = b.id AND b.a_id = a.id AND a.g = 1 AND c.z IS NOT NULL ORDER BY 1, 2, 3
+        SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id WHERE a.g IS NULL OR b.y = 2 ORDER BY 1, 2
+        SELECT a.id, b.id FROM a LEFT JOIN b ON b.a_id = a.id WHERE b.id IS NULL ORDER BY 1
+        SELECT a.id, b.id FROM a LEFT JOIN b ON b.a_id = a.id WHERE a.x = 2 AND b.y IS NULL ORDER BY 1
+        SELECT a.id, b.id FROM a LEFT JOIN b ON b.a_id = a.id AND b.y = 1 WHERE coalesce(b.y, 9) = 9 AND a.g = 2 ORDER BY 1
+        SELECT a.id, b.id FROM b RIGHT JOIN a ON b.a_id = a.id WHERE a.x = 1 ORDER BY 1, 2
+        SELECT a.id, b.id FROM a FULL JOIN b ON b.a_id = a.id + 40 WHERE a.id IS NULL OR a.x = 6 ORDER BY 1, 2
+        SELECT count(*) FROM a, b WHERE 1 = 1 AND a.id < 10 AND ? IS NULL
+        SELECT count(*) FROM a, b WHERE 0 AND a.id = b.id
+        SELECT a.id FROM a WHERE a.x = 1 AND EXISTS (SELECT 1 FROM b WHERE b.a_id = a.id AND b.y = a.g) ORDER BY 1
+        SELECT a.id, (SELECT count(*) FROM b, c WHERE c.b_id = b.id AND b.a_id = a.id AND a.x > 2) FROM a ORDER BY 1
+        SELECT a.g, count(*), sum(b.y) FROM a JOIN b ON b.a_id = a.id WHERE a.x <> 0 AND b.y < 3 GROUP BY a.g ORDER BY 1
+        SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id WHERE a.g = 1 ORDER BY a.x DESC, b.id LIMIT 4
+    """);
+}
+
+@test
 fn sortsWithALimitKeepingOnlyTheFirstRows() -> Result<void, TestFailure> {
     // With ORDER BY and LIMIT only LIMIT + OFFSET rows are kept as the rows come, the others let go; keys repeat,
     // so the rows that tie must still come out in the order they were found, as SQLite's sorter gives them.
@@ -550,10 +577,16 @@ fn returningColumnNamesMatchSqlite() -> Result<void, TestFailure> {
     for (i in 0..statements.length) {
         let path = "out/query-returning-names.db";
         let _ = File.remove(path);
-        makeDatabase(path, "CREATE TABLE t(id INTEGER PRIMARY KEY, a, b UNIQUE); INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20);")?;
+        makeDatabase(
+            path,
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a, b UNIQUE); INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20);",
+        )?;
         let theirs = theirNames(path, statements[i]);
         let _ = File.remove(path);
-        makeDatabase(path, "CREATE TABLE t(id INTEGER PRIMARY KEY, a, b UNIQUE); INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20);")?;
+        makeDatabase(
+            path,
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a, b UNIQUE); INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20);",
+        )?;
         var session = Session.open(path)!;
         let mine = ourNames(mut session, statements[i]);
         if (theirs.view() != mine.view()) {

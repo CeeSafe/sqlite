@@ -77,6 +77,12 @@ struct SourcePlan {
 struct CorePlan {
     sources: Vector<SourcePlan>;
     filter: XExpr?;
+    /// For each AND term of `filter`, left to right: the level of the nested loops at which it is checked, the
+    /// first at which every source it reads has its row (as SQLite checks a term in the outermost loop it can);
+    /// the sources' count for a term checked once a row of them all is made (`placeTerms`).
+    termLevels: Vector<usize>;
+    /// Whether any term is checked at each level (one more than the sources: the end).
+    levelHasTerms: Vector<bool>;
     groupBy: Vector<XExpr>;
     groupCollations: Vector<Collation>;
     having: XExpr?;
@@ -1400,6 +1406,8 @@ fn compileCoreBody(
     var plan = CorePlan {
         sources: sources,
         filter: filter,
+        termLevels: Vector<usize>.create(),
+        levelHasTerms: Vector<bool>.create(),
         groupBy: groupBy,
         groupCollations: groupCollations,
         having: having,
@@ -1415,6 +1423,7 @@ fn compileCoreBody(
     };
     // Index seeks, covering reads and ORDER BY from an index (plan.cee).
     planCore(compiler, mut plan, db)?;
+    placeTerms(mut plan)?;
     return Ok(plan);
 }
 

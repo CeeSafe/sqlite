@@ -311,6 +311,9 @@ fn joinLevel(
                 }
                 matched = true;
                 markRightMatch(source, level, ordinal - 1, sink)?;
+                if (!termsHold(core, level, frame, db)?) {
+                    continue;
+                }
                 joinLevel(core, level + 1, frame, db, sink)?;
             }
         }
@@ -331,6 +334,9 @@ fn joinLevel(
                 }
                 matched = true;
                 markRightMatch(source, level, truncate<usize>(rowId - 1), sink)?;
+                if (!termsHold(core, level, frame, db)?) {
+                    continue;
+                }
                 joinLevel(core, level + 1, frame, db, sink)?;
             }
         }
@@ -481,11 +487,16 @@ fn acceptRow(
     db: borrow mut Session,
     sink: borrow mut CoreSink,
 ) -> Result<void, SqliteError> {
-    if (borrow core.filter is Some(f)) {
-        let ok = evaluate(f, frame, db)?;
-        if (!isTrue(borrow ok)) {
-            return Ok();
+    // The WHERE's terms not checked in an outer loop (`placeTerms`).
+    if (core.levelHasTerms.length == 0) {
+        if (borrow core.filter is Some(f)) {
+            let ok = evaluate(f, frame, db)?;
+            if (!isTrue(borrow ok)) {
+                return Ok();
+            }
         }
+    } else if (!termsHold(core, core.sources.length, frame, db)?) {
+        return Ok();
     }
     if (core.isAggregate) {
         var keyValues = Vector<SqliteValue>.withCapacity(core.groupBy.length)?;

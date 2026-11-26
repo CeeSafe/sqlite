@@ -1988,6 +1988,113 @@ fn seekRangeWith(
     );
 }
 
+/// Places each AND term of the WHERE at the first level of the nested loops at which every source it reads has
+/// its row (`CorePlan.termLevels`), so that a row an outer source gives is turned away before the inner loops
+/// run for it, as SQLite codes a term in the outermost loop it can. A term that reads a source whose row may be
+/// made NULL (a LEFT JOIN's right side, every source of a query with a RIGHT JOIN), or anything opaque (a
+/// subquery that reads the row), is checked once a row of all the sources is made, as before.
+fn placeTerms(plan: borrow mut CorePlan) -> Result<void, AllocError> {
+    let n = plan.sources.length;
+    plan.termLevels.clear();
+    plan.levelHasTerms.clear();
+    plan.levelHasTerms.resize(n + 1, false)?;
+    // Terms may be checked early only at the levels before the first source whose row may be NULL.
+    var early = n;
+    for (s in 0..n) {
+        if (plan.sources[s].left || plan.sources[s].group > 1) {
+            early = early.min(s);
+        }
+        if (plan.sources[s].right) {
+            early = 0;
+        }
+    }
+    let Some(f) = borrow plan.filter else {
+        return Ok();
+    };
+    var terms = Vector<usize>.create();
+    termLevelsIn(f, plan.sources.view(), early, mut terms)?;
+    for (k in 0..terms.length) {
+        plan.levelHasTerms[terms[k]] = true;
+    }
+    plan.termLevels = terms;
+    return Ok();
+}
+
+/// The levels of the AND terms of `e`, left to right (`placeTerms`).
+fn termLevelsIn(
+    e: borrow XExpr,
+    sources: Slice<SourcePlan>,
+    early: usize,
+    levels: borrow mut Vector<usize>,
+) -> Result<void, AllocError> {
+    if (e is XExpr.And(a, b)) {
+        termLevelsIn(a, sources, early, levels)?;
+        return termLevelsIn(b, sources, early, levels);
+    }
+    let n = sources.length;
+    var use = SlotUse { highest: null, opaque: false };
+    slotUse(e, mut use);
+    var level = n;
+    if (!use.opaque) {
+        match (use.highest) {
+            null => { level = 0; }
+            Some(slot) => {
+                if (n > 0 && slot < sources[0].slot) {
+                    // Only an outer query's row: known before the first loop.
+                    level = 0;
+                }
+                for (s in 0..n) {
+                    if (sources[s].slot == slot) {
+                        level = s;
+                    }
+                }
+            }
+        }
+    }
+    levels.push(if (level < early) level else n)?;
+    return Ok();
+}
+
+/// Whether the AND terms of the WHERE placed at `level` hold for the row the frame has now.
+fn termsHold(
+    core: borrow CorePlan,
+    level: usize,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<bool, SqliteError> {
+    if (level >= core.levelHasTerms.length || !core.levelHasTerms[level]) {
+        return Ok(true);
+    }
+    let Some(f) = borrow core.filter else {
+        return Ok(true);
+    };
+    var k: usize = 0;
+    return termsHoldIn(f, core.termLevels.view(), level, mut k, frame, db);
+}
+
+fn termsHoldIn(
+    e: borrow XExpr,
+    levels: Slice<usize>,
+    level: usize,
+    k: borrow mut usize,
+    frame: borrow mut Frame,
+    db: borrow mut Session,
+) -> Result<bool, SqliteError> {
+    if (e is XExpr.And(a, b)) {
+        if (!termsHoldIn(a, levels, level, k, frame, db)?) {
+            return Ok(false);
+        }
+        return termsHoldIn(b, levels, level, k, frame, db);
+    }
+    let mine = k < levels.length && levels[k] == level;
+    k += 1;
+    if (!mine) {
+        return Ok(true);
+    }
+    let v = evaluate(e, frame, db)?;
+    return Ok(isTrue(borrow v));
+}
+
 /// The nested loop at `level` through a seek: the rows its ranges hold, in its order.
 fn seekLevel(
     core: borrow CorePlan,
@@ -2034,6 +2141,9 @@ fn seekLevel(
             }
         }
         matched = true;
+        if (!termsHold(core, level, frame, db)?) {
+            continue;
+        }
         joinLevel(core, level + 1, frame, db, sink)?;
     }
     return finishLeft(core, level, matched, frame, db, sink);
