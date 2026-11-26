@@ -165,6 +165,78 @@ fn dropCellInPlace(pager: borrow mut WritablePager, page: u32, at: usize, size: 
     return Ok(true);
 }
 
+/// The bytes of the cell at `offset` of a leaf page of `kind`, as SQLite's cellSizePtr counts them (at least 4).
+fn leafCellSize(usable: usize, kind: u8, bytes: Slice<u8>, offset: usize) -> Result<usize, SqliteError> {
+    if (kind == PAGE_LEAF_TABLE) {
+        let cell = TableLeafCell.parse(bytes, offset)?;
+        let total = checkedTruncate<usize>(cell.payloadLength) ?? {
+            return Err(corrupt("a cell's payload length is negative"));
+        };
+        let end = cell.payloadOffset + cellPayloadSize(usable, total, usable - 35);
+        if (end > usable) {
+            return Err(corrupt("a cell runs past the end of its page"));
+        }
+        return Ok((end - offset).max(4));
+    }
+    if (kind == PAGE_LEAF_INDEX) {
+        return Ok(IndexMutator.cellExtent(usable, bytes[offset..usable], 0)?.max(4));
+    }
+    return Err(corrupt("a b-tree page of an unexpected kind"));
+}
+
+/// All the free bytes of the leaf `page`: the gap before its content area, its freeblocks and its fragments.
+/// Null when its header contradicts itself.
+fn leafFreeTotal(pager: borrow mut WritablePager, page: u32) -> Result<usize?, SqliteError> {
+    let Some(space) = leafSpace(pager, page)? else {
+        return Ok(null);
+    };
+    let h = pageHeaderOffset(page);
+    let usable = pager.usable;
+    let bytes = pager.read(page)?;
+    var total = space.gap + (bytes[h + 7] as usize);
+    var block = space.first;
+    var seen: usize = 0;
+    while (block != 0) {
+        seen += 1;
+        if (block + 4 > usable || seen > usable / 4) {
+            return Ok(null);
+        }
+        total += bytes.readBE<u16>(block + 2) as usize;
+        block = bytes.readBE<u16>(block) as usize;
+    }
+    return Ok(total);
+}
+
+/// Moves the cells of the leaf `page` together at the end of the page, in pointer order, as SQLite's
+/// defragmentPage does: every free byte is then in the gap before the content area, with no freeblock or
+/// fragment. One copy of the page is made; the cells are not copied one by one.
+fn defragmentLeaf(pager: borrow mut WritablePager, page: u32) -> Result<void, SqliteError> {
+    let h = pageHeaderOffset(page);
+    let usable = pager.usable;
+    let before = pager.copy(page)?;
+    let kind = before[h];
+    let count = before.readBE<u16>(h + 3) as usize;
+    let bytes = pager.pageMut(page)?;
+    var end = usable;
+    for (i in 0..count) {
+        let offset = before.readBE<u16>(h + 8 + 2 * i) as usize;
+        if (offset >= usable) {
+            return Err(corrupt("a cell pointer leads outside its page"));
+        }
+        let size = leafCellSize(usable, kind, before.view(), offset)?;
+        if (offset + size > usable || end < h + 8 + 2 * count + size) {
+            return Err(corrupt("a page's cells do not fit in it"));
+        }
+        end -= size;
+        bytes[end..end + size].copyFrom(before.view()[offset..offset + size]);
+        bytes.writeBE(h + 8 + 2 * i, truncate<u16>(end));
+    }
+    bytes.writeBE(h + 1, 0u16);
+    bytes.writeBE(h + 5, truncate<u16>(if (end == 65536) 0 else end));
+    bytes[h + 7] = 0;
+    return Ok();
+}
+
 /// A b-tree page's free space as its header gives it: the first freeblock (0: none) and where the cell content
 /// area starts.
 struct FreeSpace {
@@ -649,8 +721,31 @@ struct TableMutator {
             newSize = Varint.length(truncate<i64>(total)) + Varint.length(op.rowId) +
                 cellPayloadSize(usable, total, maxLocal);
             let grow: usize = if (found) 0 else 2;
-            if (newSize < 4 || content < pointersEnd + grow + newSize) {
+            if (newSize < 4) {
                 return Ok(false);
+            }
+            if (content < pointersEnd + grow + newSize) {
+                // Not in the gap, but in the page's free bytes with the old cell's: the page is defragmented, as
+                // SQLite's allocateSpace does, and the cell goes in then.
+                let free = leafFreeTotal(pager, page)? ?? {
+                    return Ok(false);
+                };
+                let freed = if (found) oldSize else 0;
+                if ((found && count == 1) || free + freed < grow + newSize) {
+                    return Ok(false);
+                }
+                if (oldOverflow != 0) {
+                    freeOverflowChain(pager, oldOverflow)?;
+                }
+                let cell = BTreeBuilder.tableLeafCell(pager, op.rowId, record.view())?;
+                if (found && !dropCellInPlace(pager, page, at, oldSize)?) {
+                    return Err(corrupt("a page's free space is not as its header says"));
+                }
+                defragmentLeaf(pager, page)?;
+                if (!insertCellInPlace(pager, page, at, cell.view())?) {
+                    return Err(corrupt("a page's free space is not as its header says"));
+                }
+                return Ok(true);
             }
         } else if (!found) {
             return Ok(true);
@@ -950,6 +1045,18 @@ struct IndexMutator {
             // Into the page's free space when it fits there, the other cells staying where they are.
             if (insertCellInPlace(pager, number, at, cell.view())?) {
                 return Ok(null);
+            }
+            // In the page's free bytes when they are gathered, as SQLite's allocateSpace defragments the page.
+            if (cell.length >= 4) {
+                if (leafFreeTotal(pager, number)? is Some(free)) {
+                    if (free >= cell.length + 2) {
+                        defragmentLeaf(pager, number)?;
+                        if (!insertCellInPlace(pager, number, at, cell.view())?) {
+                            return Err(corrupt("an index page's free space is not as its header says"));
+                        }
+                        return Ok(null);
+                    }
+                }
             }
             var cells = IndexMutator.rawCells(usable, page.view(), header)?;
             cells.insert(at, cell)?;
