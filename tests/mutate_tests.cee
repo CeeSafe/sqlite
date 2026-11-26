@@ -190,6 +190,83 @@ fn deletesFromTheMiddleAndTheEnds() -> Result<void, TestFailure> {
     return Ok();
 }
 
+@test
+fn changesRowsOneAtATimeWhereTheyAre() -> Result<void, TestFailure> {
+    // One change a batch is made in the leaf's page where it is (a cell into the free space, a removed one into
+    // the freeblocks); the page is written again whole only when the new cell does not fit or it splits.
+    let path = "out/mutate-one-at-a-time.db";
+    mutateFixture(path, "512", "3000")?;
+    let root = rootOfTable(path, "t");
+    var big = String.create();
+    for (k in 0..120) {
+        big.append("overflowing ")!;
+    }
+    var pager = WritablePager.open(path)!;
+    var sum: i64 = 0;
+    var rows: i64 = 0;
+    for (id in 1i64..3001) {
+        sum += id;
+        rows += 1;
+    }
+    for (step in 0i64..6000) {
+        let id = (step * 7919) % 4000 + 1;
+        var one = Vector<TableOp>.create();
+        let present = id <= 3000 && (id % 4 != 0 || step < 4000);
+        if (step % 3 == 0 && present && id % 4 == 0) {
+            removal(mut one, id);
+            sum -= id;
+            rows -= 1;
+        } else if (id > 3000 && step < 4000) {
+            upsert(mut one, id, id, labelOf(id).view()); // new rows between and after the others
+            sum += id;
+            rows += 1;
+        } else if (present && id % 7 == 0) {
+            upsert(mut one, id, -id, big.view()); // grows onto overflow pages
+        } else if (present && id % 7 == 1) {
+            upsert(mut one, id, id, "s"); // shrinks
+        } else {
+            continue;
+        }
+        TableMutator.applyBatch(mut pager, root, one.view())!;
+    }
+    commitAndRead(mut pager);
+    expectIntact(path)?;
+    var expected = String.create();
+    expected.appendNumber(rows)!;
+    expected.append("|")!;
+    expected.appendNumber(sum)!;
+    expected.append("\n")!;
+    Check.equalText(expected.view(), askSqlite(path, "SELECT count(*), sum(id) FROM t")?.view())?;
+    Check.equalText("1440\n", askSqlite(path, "SELECT length(label) FROM t WHERE id = 7")?.view())?;
+    Check.equalText("s\n", askSqlite(path, "SELECT label FROM t WHERE id = 15")?.view())?;
+    // On page 1 the b-tree header follows the database header.
+    var schema = Vector<TableOp>.create();
+    for (i in 2i64..40) {
+        let name = numbered("v", i);
+        var one = Vector<TableOp>.create();
+        one.push(TableOp { rowId: i, record: schemaRecord("view", name.view(), "CREATE VIEW x AS SELECT 1") })!;
+        TableMutator.applyBatch(mut pager, 1, one.view())!;
+    }
+    for (i in 2i64..40) {
+        if (i % 2 == 0) {
+            removal(mut schema, i);
+        }
+    }
+    TableMutator.applyBatch(mut pager, 1, schema.view())!;
+    for (i in 2i64..40) {
+        if (i % 2 == 1) {
+            var one = Vector<TableOp>.create();
+            removal(mut one, i);
+            TableMutator.applyBatch(mut pager, 1, one.view())!;
+        }
+    }
+    pager.bumpSchemaCookie()!;
+    commitAndRead(mut pager);
+    expectIntact(path)?;
+    Check.equalText("table|t\n", askSqlite(path, "SELECT type, name FROM sqlite_schema")?.view())?;
+    return Ok();
+}
+
 fn schemaRecord(kind: StringView, name: StringView, sql: StringView) -> Vector<u8> {
     var row = Vector<SqliteValue>.create();
     row.push(SqliteValue.text(kind)!)!;

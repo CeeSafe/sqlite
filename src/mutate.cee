@@ -74,6 +74,13 @@ fn freeOverflowChain(pager: borrow mut WritablePager, first: u32) -> Result<void
     return Ok();
 }
 
+/// A b-tree page's free space as its header gives it: the first freeblock (0: none) and where the cell content
+/// area starts.
+struct FreeSpace {
+    first: usize;
+    content: usize;
+}
+
 struct TableMutator {
     private fn interiorCapacity(pager: borrow WritablePager, page: u32) -> usize =>
         ((pager.usable - pageHeaderOffset(page) - 12) / 15).max(2);
@@ -418,11 +425,204 @@ struct TableMutator {
         return TableMutator.settle(pager, path, depth - 2, children);
     }
 
+    /// Adds the `size` bytes at `offset` of a b-tree page whose header is at `h` to its freeblocks, as SQLite's
+    /// freeSpace does: the list stays in order of offset, a block that touches its neighbour is merged with it
+    /// (SQLite takes touching blocks for corruption), and a block at the start of the cell content area gives its
+    /// bytes back to the free space before it. `first` and `content` are the header's first freeblock and the
+    /// start of the content area; returns them as they now are.
+    private fn addFreeblock(
+        bytes: SliceMut<u8>,
+        first: usize,
+        content: usize,
+        offset: usize,
+        size: usize,
+    ) -> Result<FreeSpace, SqliteError> {
+        let usable = bytes.length;
+        var head = first;
+        var prev: usize = 0;
+        var next = first;
+        var seen: usize = 0;
+        while (next != 0 && next < offset) {
+            seen += 1;
+            if (next + 4 > usable || seen > usable / 4) {
+                return Err(corrupt("a page's freeblocks are out of bounds or form a cycle"));
+            }
+            prev = next;
+            next = bytes.readBE<u16>(next) as usize;
+        }
+        var length = size;
+        if (next != 0) {
+            if (next < offset + length || next + 4 > usable) {
+                return Err(corrupt("a freeblock overlaps a cell"));
+            }
+            if (next == offset + length) {
+                length += bytes.readBE<u16>(next + 2) as usize;
+                next = bytes.readBE<u16>(next) as usize;
+            }
+        }
+        var block = offset;
+        if (prev != 0) {
+            let prevLength = bytes.readBE<u16>(prev + 2) as usize;
+            if (prev + prevLength > offset) {
+                return Err(corrupt("a freeblock overlaps a cell"));
+            }
+            if (prev + prevLength == offset) {
+                block = prev;
+                length += prevLength;
+            } else {
+                bytes.writeBE(prev, truncate<u16>(offset));
+            }
+        } else {
+            head = offset;
+        }
+        bytes.writeBE(block, truncate<u16>(next));
+        bytes.writeBE(block + 2, truncate<u16>(length));
+        var start = content;
+        if (head == start) {
+            start += bytes.readBE<u16>(head + 2) as usize;
+            head = bytes.readBE<u16>(head) as usize;
+        }
+        return Ok(FreeSpace { first: head, content: start });
+    }
+
+    /// Applies `op` to the leaf at the end of `path` where its page is, as SQLite's insertCell and dropCell do:
+    /// a new cell goes into the free space between the cell pointers and the cells, and a removed or replaced
+    /// one's bytes join the page's freeblocks; no other cell moves. False, with nothing changed, when that cannot
+    /// be done: the new cell does not fit in that space (the page must be compacted or split), or the leaf would
+    /// be left without rows.
+    private fn changeInPlace(
+        pager: borrow mut WritablePager,
+        path: borrow TablePath,
+        op: borrow TableOp,
+    ) -> Result<bool, SqliteError> {
+        let usable = pager.usable;
+        let maxLocal = usable - 35;
+        let page = path.pages[path.pages.length - 1];
+        let h = pageHeaderOffset(page);
+        var at: usize = 0;
+        var count: usize = 0;
+        var found = false;
+        var oldOffset: usize = 0;
+        var oldSize: usize = 0;
+        var oldOverflow: u32 = 0;
+        var first: usize = 0;
+        var content: usize = 0;
+        {
+            let bytes = pager.read(page)?;
+            let header = BTreePageHeader.parse(bytes, page)?;
+            if (header.kind != PAGE_LEAF_TABLE) {
+                return Ok(false);
+            }
+            count = header.cellCount;
+            var low: usize = 0;
+            var high = count;
+            while (low < high) {
+                let middle = low + (high - low) / 2;
+                if (TableLeafCell.parse(bytes, header.cellOffset(bytes, middle)?)?.rowId < op.rowId) {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            at = low;
+            if (at < count) {
+                let offset = header.cellOffset(bytes, at)?;
+                let cell = TableLeafCell.parse(bytes, offset)?;
+                if (cell.rowId == op.rowId) {
+                    let total = checkedTruncate<usize>(cell.payloadLength) ?? {
+                        return Err(corrupt("a cell's payload length is negative"));
+                    };
+                    let end = cell.payloadOffset + cellPayloadSize(usable, total, maxLocal);
+                    if (end > usable) {
+                        return Err(corrupt("a cell runs past the end of its page"));
+                    }
+                    found = true;
+                    oldOffset = offset;
+                    oldSize = end - offset;
+                    if (total > maxLocal) {
+                        oldOverflow = bytes.readBE<u32>(end - 4);
+                    }
+                }
+            }
+            first = bytes.readBE<u16>(h + 1) as usize;
+            let stored = bytes.readBE<u16>(h + 5) as usize;
+            content = if (stored == 0) 65536 else stored;
+        }
+        let pointersEnd = h + 8 + 2 * count;
+        if (content < pointersEnd || content > usable || (found && oldSize < 4)) {
+            return Ok(false);
+        }
+        var newSize: usize = 0;
+        if (borrow op.record is Some(record)) {
+            let total = record.length;
+            newSize = Varint.length(truncate<i64>(total)) + Varint.length(op.rowId) +
+                cellPayloadSize(usable, total, maxLocal);
+            let grow: usize = if (found) 0 else 2;
+            if (newSize < 4 || content < pointersEnd + grow + newSize) {
+                return Ok(false);
+            }
+        } else if (!found) {
+            return Ok(true);
+        } else if (count == 1) {
+            return Ok(false);
+        }
+        if (oldOverflow != 0) {
+            freeOverflowChain(pager, oldOverflow)?;
+        }
+        var cell = Vector<u8>.create();
+        if (borrow op.record is Some(record)) {
+            cell = BTreeBuilder.tableLeafCell(pager, op.rowId, record.view())?;
+            if (cell.length != newSize) {
+                return Err(sqlError("a table cell's size was worked out wrong"));
+            }
+        }
+        let bytes = pager.pageMut(page)?;
+        var space = FreeSpace { first: first, content: content };
+        if (found) {
+            space = TableMutator.addFreeblock(bytes, first, content, oldOffset, oldSize)?;
+        }
+        var n = count;
+        if (cell.length > 0) {
+            let start = space.content - cell.length;
+            bytes[start..start + cell.length].copyFrom(cell.view());
+            space.content = start;
+            if (!found) {
+                var i = n;
+                while (i > at) {
+                    let moved = bytes.readBE<u16>(h + 8 + 2 * (i - 1));
+                    bytes.writeBE(h + 8 + 2 * i, moved);
+                    i -= 1;
+                }
+                n += 1;
+            }
+            bytes.writeBE(h + 8 + 2 * at, truncate<u16>(start));
+        } else {
+            for (i in at..n - 1) {
+                let moved = bytes.readBE<u16>(h + 8 + 2 * (i + 1));
+                bytes.writeBE(h + 8 + 2 * i, moved);
+            }
+            n -= 1;
+        }
+        bytes.writeBE(h + 1, truncate<u16>(space.first));
+        bytes.writeBE(h + 3, truncate<u16>(n));
+        bytes.writeBE(h + 5, truncate<u16>(if (space.content == 65536) 0 else space.content));
+        return Ok(true);
+    }
+
     /// Applies `ops`, which are in rowid order with no rowid twice, to the table rooted at `root`.
     fn applyBatch(pager: borrow mut WritablePager, root: u32, ops: Slice<TableOp>) -> Result<void, SqliteError> {
         var next: usize = 0;
         while (next < ops.length) {
+            if (next != 0 && ops[next].rowId <= ops[next - 1].rowId) {
+                return Err(sqlError("the changes to a table must be in rowid order"));
+            }
             let path = TableMutator.descend(pager, root, ops[next].rowId)?;
+            // A leaf with one change is changed where it is when it can be; otherwise it is written again whole.
+            if ((next + 1 == ops.length || ops[next + 1].rowId > path.upper) &&
+                TableMutator.changeInPlace(pager, path, borrow ops[next])?) {
+                next += 1;
+                continue;
+            }
             var leaf = TableMutator.readLeaf(pager, path.pages[path.pages.length - 1])?;
             // Every op whose rowid belongs in this leaf is applied before the leaf is written once.
             while (next < ops.length && ops[next].rowId <= path.upper) {
